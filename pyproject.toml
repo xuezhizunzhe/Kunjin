@@ -20,6 +20,9 @@ kunjin = "kunjin.cli:app"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+kunjin = ["ledger/*.swift"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

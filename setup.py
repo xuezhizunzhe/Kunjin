@@ -6,5 +6,7 @@ setup(
     version="0.1.0",
     package_dir={"": "src"},
     packages=find_packages("src"),
+    package_data={"kunjin": ["ledger/*.swift"]},
+    include_package_data=True,
     entry_points={"console_scripts": ["kunjin=kunjin.cli:main"]},
 )

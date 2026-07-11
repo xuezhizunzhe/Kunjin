@@ -5,7 +5,8 @@ import re
 
 
 _SECRET_PATTERN = re.compile(
-    r"(?i)\b(authorization|token|request-sign|secret|qr(?:_url)?)\b\s*[:=]\s*([^\s,;]+)"
+    r"(?i)\b(authorization|token|request-sign|secret|qr(?:_url)?|"
+    r"order_id|card_number|phone|managed_path)\b\s*[:=]\s*([^\s,;]+)"
 )
 
 
@@ -30,4 +31,3 @@ def configure_logging(verbose: bool = False) -> logging.Logger:
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.propagate = False
     return logger
-

@@ -26,9 +26,12 @@ class RuntimePaths:
             logs=state_dir / "logs",
         )
 
+    @property
+    def imports(self) -> Path:
+        return self.database.parent / "imports"
+
     def ensure(self) -> "RuntimePaths":
-        for directory in (self.database.parent, self.snapshots, self.logs):
+        for directory in (self.database.parent, self.snapshots, self.imports, self.logs):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             directory.chmod(0o700)
         return self
-

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, time, timedelta, timezone
@@ -19,12 +20,42 @@ from kunjin.adapters.yangjibao import YangjibaoClient, YangjibaoError
 from kunjin.analytics.portfolio import analyze_portfolio
 from kunjin.analytics.research import analyze_fund_history, analyze_sectors
 from kunjin.logging import redact_secrets
+from kunjin.ledger.alipay import AlipayPaymentParser, requires_confirmation
+from kunjin.ledger.ocr import OcrError, VisionOcrClient
+from kunjin.ledger.reconcile import reconcile_fund
+from kunjin.ledger.service import LedgerImportError, LedgerService
+from kunjin.ledger.store import LedgerStateError, LedgerStore
 from kunjin.models import InvestmentThesis
 from kunjin.paths import RuntimePaths
 from kunjin.security.keychain import CredentialStoreError, KeychainTokenStore
 from kunjin.services.research import ResearchSyncService
 from kunjin.services.sync import PortfolioSyncService, SyncError
 from kunjin.storage.repository import Repository
+
+
+_FUND_CODE = re.compile(r"^\d{6}$")
+_COMMAND_PART = re.compile(r"^[a-z][a-z0-9_-]*$")
+_TOP_LEVEL_COMMANDS = {
+    "auth",
+    "fund",
+    "ledger",
+    "market",
+    "portfolio",
+    "report",
+    "status",
+    "sync",
+    "thesis",
+    "version",
+}
+
+
+class CliUsageError(ValueError):
+    code = "invalid_arguments"
+
+
+class KunjinArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise CliUsageError(message)
 
 
 @dataclass
@@ -35,6 +66,7 @@ class ApplicationContext:
     client: YangjibaoClient
     sync_service: PortfolioSyncService
     research_service: ResearchSyncService
+    ledger_service: LedgerService
 
 
 def build_context() -> ApplicationContext:
@@ -48,6 +80,7 @@ def build_context() -> ApplicationContext:
         EastmoneyFundClient(),
         EastmoneyMarketClient(),
     )
+    ledger_store = LedgerStore(repository)
     return ApplicationContext(
         paths=paths,
         repository=repository,
@@ -55,6 +88,12 @@ def build_context() -> ApplicationContext:
         client=client,
         sync_service=PortfolioSyncService(client, repository),
         research_service=research_service,
+        ledger_service=LedgerService(
+            paths=paths,
+            store=ledger_store,
+            ocr_client=VisionOcrClient(),
+            parser=AlipayPaymentParser(),
+        ),
     )
 
 
@@ -101,8 +140,20 @@ def freshness(finished_at: Optional[str], now: Optional[datetime] = None) -> str
     return "fresh" if current <= deadline else "stale"
 
 
+def parse_field_overrides(values: Sequence[str]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for value in values:
+        name, separator, field_value = value.partition("=")
+        if not separator or not name.strip():
+            raise ValueError("field overrides must use NAME=VALUE")
+        result[name.strip()] = field_value.strip()
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="kunjin", description="KunJin fund research CLI")
+    parser = KunjinArgumentParser(
+        prog="kunjin", description="KunJin fund research CLI"
+    )
     parser.add_argument("--json", action="store_true", dest="json_output")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("version")
@@ -153,6 +204,36 @@ def build_parser() -> argparse.ArgumentParser:
     report = subparsers.add_parser("report")
     report_subparsers = report.add_subparsers(dest="report_command", required=True)
     report_subparsers.add_parser("weekly")
+
+    ledger = subparsers.add_parser("ledger")
+    ledger_subparsers = ledger.add_subparsers(dest="ledger_command", required=True)
+    ledger_import = ledger_subparsers.add_parser("import")
+    ledger_import.add_argument("image")
+    ledger_import.add_argument("--fund-code")
+    ledger_subparsers.add_parser("drafts")
+    ledger_confirm = ledger_subparsers.add_parser("confirm")
+    ledger_confirm.add_argument("draft_id", type=int)
+    ledger_confirm.add_argument("--field", action="append", default=[])
+    ledger_add = ledger_subparsers.add_parser("add")
+    ledger_add.add_argument("--type", required=True, dest="transaction_type")
+    ledger_add.add_argument("--fund-code", required=True)
+    ledger_add.add_argument("--fund-name")
+    ledger_add.add_argument("--amount")
+    ledger_add.add_argument("--shares")
+    ledger_add.add_argument("--nav")
+    ledger_add.add_argument("--fee")
+    ledger_add.add_argument("--order-time")
+    ledger_add.add_argument("--confirmation-time")
+    ledger_transactions = ledger_subparsers.add_parser("transactions")
+    ledger_transactions.add_argument("--fund-code")
+    ledger_reconcile = ledger_subparsers.add_parser("reconcile")
+    ledger_reconcile.add_argument("--fund-code", required=True)
+    ledger_document = ledger_subparsers.add_parser("document")
+    document_subparsers = ledger_document.add_subparsers(
+        dest="document_command", required=True
+    )
+    document_delete = document_subparsers.add_parser("delete")
+    document_delete.add_argument("document_id", type=int)
     return parser
 
 
@@ -189,6 +270,126 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             print(f"First-party QR content: {challenge.qr_content}", file=sys.stderr)
         context.client.poll_qr_login(challenge.challenge_id)
         return envelope("auth.login", {"provider": args.provider, "authorized": True})
+
+    if args.command == "ledger" and args.ledger_command == "import":
+        draft = context.ledger_service.import_image(
+            args.image, fund_code_hint=args.fund_code
+        )
+        fields = context.ledger_service.store.list_ocr_fields(
+            draft.source_document_id
+        )
+        fields_by_name = {field.name: field for field in fields}
+        public_fields = {
+            field.name: {
+                "normalized_value": field.normalized_value,
+                "confidence": str(field.confidence),
+                "evidence_level": field.evidence_level.value,
+            }
+            for field in fields
+        }
+        return envelope(
+            "ledger.import",
+            {
+                "document_id": draft.source_document_id,
+                "draft": serialize(draft),
+                "requires_confirmation": requires_confirmation(fields_by_name),
+                "fields": public_fields,
+            },
+        )
+
+    if args.command == "ledger" and args.ledger_command == "drafts":
+        drafts = context.ledger_service.store.list_drafts()
+        return envelope("ledger.drafts", {"drafts": serialize(drafts)})
+
+    if args.command == "ledger" and args.ledger_command == "confirm":
+        transaction = context.ledger_service.confirm_draft(
+            args.draft_id, parse_field_overrides(args.field)
+        )
+        return envelope(
+            "ledger.confirm", {"transaction": serialize(transaction)}
+        )
+
+    if args.command == "ledger" and args.ledger_command == "add":
+        transaction = context.ledger_service.add_manual_transaction(
+            transaction_type=args.transaction_type,
+            fund_code=args.fund_code,
+            fund_name=args.fund_name,
+            amount=args.amount,
+            shares=args.shares,
+            nav=args.nav,
+            fee=args.fee,
+            order_time=args.order_time,
+            confirmation_time=args.confirmation_time,
+        )
+        return envelope("ledger.add", {"transaction": serialize(transaction)})
+
+    if args.command == "ledger" and args.ledger_command == "transactions":
+        transactions = context.ledger_service.store.list_transactions(
+            args.fund_code
+        )
+        return envelope(
+            "ledger.transactions", {"transactions": serialize(transactions)}
+        )
+
+    if args.command == "ledger" and args.ledger_command == "reconcile":
+        if not _FUND_CODE.fullmatch(args.fund_code):
+            raise LedgerImportError(
+                "invalid_fund_code", "fund code must contain six digits"
+            )
+        positions = [
+            position
+            for position in context.repository.latest_positions()
+            if position.fund_code == args.fund_code
+        ]
+        if not positions:
+            return envelope(
+                "ledger.reconcile",
+                errors=[
+                    {
+                        "code": "position_not_found",
+                        "message": "No synchronized position is available for this fund",
+                    }
+                ],
+            )
+        account_titles = sorted({position.account_title for position in positions})
+        if len(account_titles) > 1:
+            return envelope(
+                "ledger.reconcile",
+                {"account_titles": account_titles},
+                errors=[
+                    {
+                        "code": "ambiguous_position_accounts",
+                        "message": "Multiple accounts hold this fund; account selection is required",
+                    }
+                ],
+            )
+        position = max(
+            positions,
+            key=lambda item: (item.observed_at, item.account_title),
+        )
+        result = reconcile_fund(
+            position,
+            context.ledger_service.store.list_transactions(args.fund_code),
+            context.ledger_service.store.list_drafts(),
+        )
+        return envelope(
+            "ledger.reconcile",
+            {"result": serialize(result)},
+            warnings=list(result.warnings),
+        )
+
+    if (
+        args.command == "ledger"
+        and args.ledger_command == "document"
+        and args.document_command == "delete"
+    ):
+        deleted = context.ledger_service.delete_document(args.document_id)
+        warnings = [] if deleted else ["document is not active or does not exist"]
+        return envelope(
+            "ledger.document.delete",
+            {"document_id": args.document_id, "deleted": deleted},
+            warnings=warnings,
+        )
 
     latest_sync = context.repository.latest_successful_sync("yangjibao")
     data_freshness = freshness(None if latest_sync is None else latest_sync.get("finished_at"))
@@ -357,21 +558,75 @@ def run(
     argv: Optional[Sequence[str]] = None,
     context: Optional[ApplicationContext] = None,
 ) -> Tuple[Dict[str, Any], int, bool]:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args: Optional[argparse.Namespace] = None
+    json_output = "--json" in raw_argv
     try:
+        args = build_parser().parse_args(raw_argv)
+        json_output = args.json_output
         if args.command == "version":
             payload = envelope("version", {"version": __version__})
         else:
             payload = execute(args, context or build_context())
         exit_code = 1 if payload["errors"] else 0
-    except (CredentialStoreError, PublicDataError, YangjibaoError, SyncError, ValueError) as exc:
+    except (
+        CredentialStoreError,
+        PublicDataError,
+        YangjibaoError,
+        SyncError,
+        OcrError,
+        LedgerImportError,
+        LedgerStateError,
+        CliUsageError,
+        ValueError,
+    ) as exc:
         code = getattr(exc, "code", "operation_failed")
         payload = envelope(
-            str(args.command),
+            (
+                _command_name(args)
+                if args is not None
+                else _command_name_from_argv(raw_argv)
+            ),
             errors=[{"code": str(code), "message": redact_secrets(str(exc))}],
         )
         exit_code = 1
-    return serialize(payload), exit_code, args.json_output
+    return serialize(payload), exit_code, json_output
+
+
+def _command_name(args: argparse.Namespace) -> str:
+    if args.command != "ledger":
+        return str(args.command)
+    if args.ledger_command == "document":
+        return f"ledger.document.{args.document_command}"
+    return f"ledger.{args.ledger_command}"
+
+
+def _command_name_from_argv(argv: Sequence[str]) -> str:
+    values = [str(value) for value in argv]
+    try:
+        ledger_index = values.index("ledger")
+    except ValueError:
+        for value in values:
+            if value in _TOP_LEVEL_COMMANDS:
+                return value
+        return "cli"
+
+    action_index = ledger_index + 1
+    if action_index >= len(values):
+        return "ledger"
+    action = values[action_index]
+    if not _COMMAND_PART.fullmatch(action):
+        return "ledger"
+    if action != "document":
+        return f"ledger.{action}"
+
+    document_action_index = action_index + 1
+    if document_action_index >= len(values):
+        return "ledger.document"
+    document_action = values[document_action_index]
+    if not _COMMAND_PART.fullmatch(document_action):
+        return "ledger.document"
+    return f"ledger.document.{document_action}"
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

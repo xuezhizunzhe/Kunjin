@@ -8,6 +8,10 @@ from pathlib import Path
 from kunjin.adapters.yangjibao import YangjibaoClient
 from kunjin.adapters.eastmoney import EastmoneyFundClient, EastmoneyMarketClient
 from kunjin.cli import ApplicationContext, run
+from kunjin.ledger.alipay import AlipayPaymentParser
+from kunjin.ledger.models import OcrBlock
+from kunjin.ledger.service import LedgerService
+from kunjin.ledger.store import LedgerStore
 from kunjin.models import AccountObservation, FundNavObservation, PositionObservation, SectorObservation
 from kunjin.paths import RuntimePaths
 from kunjin.services.sync import PortfolioSyncService
@@ -31,6 +35,39 @@ class FakeTokenStore:
         self.token = None
 
 
+class FakeOcrClient:
+    def __init__(self, amount_confidence="0.99"):
+        self.amount_confidence = amount_confidence
+
+    def recognize(self, image_path):
+        return [
+            OcrBlock(
+                text="订单金额 ￥20.00",
+                confidence=Decimal(self.amount_confidence),
+                x=Decimal("0.1"),
+                y=Decimal("0.2"),
+                width=Decimal("0.5"),
+                height=Decimal("0.05"),
+            ),
+            OcrBlock(
+                text="订单时间 2026-07-04 23:11:51",
+                confidence=Decimal("0.98"),
+                x=Decimal("0.1"),
+                y=Decimal("0.4"),
+                width=Decimal("0.7"),
+                height=Decimal("0.05"),
+            ),
+            OcrBlock(
+                text="商家订单号 202607040001",
+                confidence=Decimal("0.97"),
+                x=Decimal("0.1"),
+                y=Decimal("0.6"),
+                width=Decimal("0.7"),
+                height=Decimal("0.05"),
+            ),
+        ]
+
+
 class CliIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -51,7 +88,16 @@ class CliIntegrationTest(unittest.TestCase):
                     share_class="A",
                     formal_nav=Decimal("1.1"),
                     observed_profit=Decimal("0.1"),
-                )
+                ),
+                PositionObservation(
+                    "account-1",
+                    "519755",
+                    "成长基金",
+                    Decimal("11.32"),
+                    now,
+                    formal_nav=Decimal("1.7467"),
+                    observed_profit=Decimal("-0.23"),
+                ),
             ],
         )
         token_store = FakeTokenStore()
@@ -76,7 +122,16 @@ class CliIntegrationTest(unittest.TestCase):
             client,
             PortfolioSyncService(client, repository),
             ResearchSyncService(repository, EastmoneyFundClient(), EastmoneyMarketClient()),
+            LedgerService(
+                paths,
+                LedgerStore(repository),
+                FakeOcrClient(),
+                AlipayPaymentParser(),
+                now=lambda: datetime(2026, 7, 11, tzinfo=timezone.utc),
+            ),
         )
+        self.payment_image = root / "payment.jpg"
+        self.payment_image.write_bytes(b"synthetic payment screenshot")
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -162,6 +217,252 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("016067", payload["data"]["funds"])
         self.assertEqual(payload["data"]["market"]["observations"], 2)
+
+    def test_ledger_import_has_stable_private_json_contract(self) -> None:
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "ledger",
+                "import",
+                str(self.payment_image),
+                "--fund-code",
+                "519755",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(payload, "ledger.import")
+        self.assertEqual(payload["data"]["document_id"], 1)
+        self.assertFalse(payload["data"]["requires_confirmation"])
+        self.assertEqual(
+            payload["data"]["draft"]["field_evidence"]["amount"],
+            "transaction_confirmed",
+        )
+        self.assertEqual(
+            payload["data"]["fields"]["amount"]["normalized_value"], "20.00"
+        )
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("managed_path", rendered)
+        self.assertNotIn(str(self.context.paths.imports), rendered)
+        self.assertNotIn("商家订单号", rendered)
+        self.assertNotIn("synthetic payment screenshot", rendered)
+
+    def test_ledger_import_uses_parser_confirmation_rule(self) -> None:
+        self.context.ledger_service.ocr_client = FakeOcrClient("0.79")
+
+        payload, exit_code, _ = run(
+            ["--json", "ledger", "import", str(self.payment_image)], self.context
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["data"]["requires_confirmation"])
+
+    def test_ledger_drafts_confirm_and_transactions(self) -> None:
+        imported, _, _ = run(
+            ["--json", "ledger", "import", str(self.payment_image)], self.context
+        )
+        draft_id = imported["data"]["draft"]["id"]
+
+        drafts, exit_code, _ = run(["--json", "ledger", "drafts"], self.context)
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(drafts, "ledger.drafts")
+        self.assertEqual([item["id"] for item in drafts["data"]["drafts"]], [draft_id])
+
+        confirmed, exit_code, _ = run(
+            [
+                "--json",
+                "ledger",
+                "confirm",
+                str(draft_id),
+                "--field",
+                "fund_code=519755",
+            ],
+            self.context,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(confirmed, "ledger.confirm")
+        self.assertEqual(
+            confirmed["data"]["transaction"]["field_evidence"]["fund_code"],
+            "user_confirmed",
+        )
+
+        transactions, exit_code, _ = run(
+            ["--json", "ledger", "transactions", "--fund-code", "519755"],
+            self.context,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(transactions, "ledger.transactions")
+        self.assertEqual(len(transactions["data"]["transactions"]), 1)
+
+    def test_ledger_add_and_reconcile_do_not_sync(self) -> None:
+        class SyncMustNotRun:
+            def sync_portfolio(inner_self, trigger):
+                raise AssertionError("ledger reconcile must not synchronize")
+
+        self.context.sync_service = SyncMustNotRun()
+        added, exit_code, _ = run(
+            [
+                "--json",
+                "ledger",
+                "add",
+                "--type",
+                "subscription",
+                "--fund-code",
+                "519755",
+                "--amount",
+                "20.00",
+                "--order-time",
+                "2026-07-04T23:11:51+08:00",
+            ],
+            self.context,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(added, "ledger.add")
+        self.assertEqual(
+            added["data"]["transaction"]["evidence_level"], "user_confirmed"
+        )
+
+        reconciled, exit_code, _ = run(
+            ["--json", "ledger", "reconcile", "--fund-code", "519755"],
+            self.context,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(reconciled, "ledger.reconcile")
+        self.assertEqual(reconciled["data"]["result"]["status"], "consistent")
+        self.assertEqual(
+            reconciled["data"]["result"]["evidence_level"], "position_inferred"
+        )
+
+    def test_ledger_reconcile_missing_position_has_stable_error(self) -> None:
+        payload, exit_code, _ = run(
+            ["--json", "ledger", "reconcile", "--fund-code", "000001"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "ledger.reconcile")
+        self.assertEqual(payload["errors"][0]["code"], "position_not_found")
+
+    def test_ledger_reconcile_rejects_invalid_fund_code(self) -> None:
+        payload, exit_code, _ = run(
+            ["--json", "ledger", "reconcile", "--fund-code", "123"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "ledger.reconcile")
+        self.assertEqual(payload["errors"][0]["code"], "invalid_fund_code")
+
+    def test_ledger_reconcile_rejects_ambiguous_position_accounts(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.context.repository.replace_snapshot(
+            AccountObservation("yangjibao", "account-2", "另一个账户", now),
+            [
+                PositionObservation(
+                    "account-2",
+                    "519755",
+                    "成长基金",
+                    Decimal("1"),
+                    now,
+                    formal_nav=Decimal("1.7467"),
+                    observed_profit=Decimal("0"),
+                )
+            ],
+        )
+
+        payload, exit_code, _ = run(
+            ["--json", "ledger", "reconcile", "--fund-code", "519755"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "ledger.reconcile")
+        self.assertEqual(
+            payload["errors"][0]["code"], "ambiguous_position_accounts"
+        )
+        self.assertEqual(payload["data"]["account_titles"], ["另一个账户", "学习账户"])
+
+    def test_ledger_document_delete_removes_only_managed_copy(self) -> None:
+        imported, _, _ = run(
+            [
+                "--json",
+                "ledger",
+                "import",
+                str(self.payment_image),
+                "--fund-code",
+                "519755",
+            ],
+            self.context,
+        )
+        document_id = imported["data"]["document_id"]
+
+        payload, exit_code, _ = run(
+            ["--json", "ledger", "document", "delete", str(document_id)],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(payload, "ledger.document.delete")
+        self.assertTrue(payload["data"]["deleted"])
+        self.assertTrue(self.payment_image.is_file())
+
+    def test_invalid_ledger_field_override_is_a_stable_error(self) -> None:
+        imported, _, _ = run(
+            ["--json", "ledger", "import", str(self.payment_image)], self.context
+        )
+        draft_id = imported["data"]["draft"]["id"]
+
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "ledger",
+                "confirm",
+                str(draft_id),
+                "--field",
+                "amount-without-equals",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "ledger.confirm")
+        self.assertEqual(payload["errors"][0]["code"], "operation_failed")
+
+    def test_json_argument_errors_return_stable_envelopes(self) -> None:
+        cases = [
+            (
+                ["--json", "ledger", "confirm", "abc"],
+                "ledger.confirm",
+            ),
+            (
+                ["--json", "ledger", "add", "--type", "subscription"],
+                "ledger.add",
+            ),
+            (
+                ["--json", "ledger", "unknown"],
+                "ledger.unknown",
+            ),
+            (
+                ["--json", "ledger", "document", "delete", "abc"],
+                "ledger.document.delete",
+            ),
+        ]
+        for argv, command in cases:
+            with self.subTest(argv=argv):
+                payload, exit_code, json_output = run(argv, self.context)
+
+                self.assertEqual(exit_code, 1)
+                self.assertTrue(json_output)
+                self.assert_envelope(payload, command)
+                self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
+    def assert_envelope(self, payload, command) -> None:
+        self.assertEqual(
+            set(payload),
+            {"schema_version", "command", "as_of", "data", "warnings", "errors"},
+        )
+        self.assertEqual(payload["command"], command)
 
 
 if __name__ == "__main__":

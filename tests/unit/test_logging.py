@@ -18,7 +18,24 @@ class LoggingTest(unittest.TestCase):
 
         self.assertEqual(record.getMessage(), "token=[REDACTED]")
 
+    def test_redact_secrets_removes_ledger_sensitive_values(self) -> None:
+        value = (
+            "order_id=202607041234 card_number:6222021234567890 "
+            "phone=13800138000 managed_path=/Users/person/private/import.jpg"
+        )
+
+        redacted = redact_secrets(value)
+
+        for secret in (
+            "202607041234",
+            "6222021234567890",
+            "13800138000",
+            "/Users/person/private/import.jpg",
+        ):
+            self.assertNotIn(secret, redacted)
+        for key in ("order_id", "card_number", "phone", "managed_path"):
+            self.assertIn(f"{key}=[REDACTED]", redacted)
+
 
 if __name__ == "__main__":
     unittest.main()
-

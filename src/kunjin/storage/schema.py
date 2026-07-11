@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -95,4 +95,82 @@ CREATE TABLE IF NOT EXISTS investment_theses (
     created_at TEXT NOT NULL,
     active INTEGER NOT NULL CHECK(active IN (0, 1)) DEFAULT 1
 );
+"""
+
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS imported_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256 TEXT NOT NULL UNIQUE,
+    original_name TEXT NOT NULL,
+    managed_path TEXT,
+    document_type TEXT NOT NULL CHECK(document_type IN ('alipay_payment', 'unknown')),
+    imported_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active', 'deleted')) DEFAULT 'active',
+    deleted_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ocr_fields (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES imported_documents(id),
+    field_name TEXT NOT NULL,
+    raw_text TEXT NOT NULL,
+    normalized_value TEXT,
+    confidence TEXT NOT NULL,
+    evidence_level TEXT NOT NULL CHECK(evidence_level IN (
+        'transaction_confirmed', 'user_confirmed', 'position_inferred'
+    )),
+    UNIQUE(document_id, field_name)
+);
+
+CREATE TABLE IF NOT EXISTS transaction_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_document_id INTEGER REFERENCES imported_documents(id),
+    transaction_type TEXT NOT NULL,
+    fund_code TEXT CHECK(fund_code IS NULL OR length(fund_code) = 6),
+    fund_name TEXT,
+    amount TEXT,
+    shares TEXT,
+    nav TEXT,
+    fee TEXT,
+    order_time TEXT,
+    confirmation_time TEXT,
+    evidence_level TEXT NOT NULL CHECK(evidence_level IN (
+        'transaction_confirmed', 'user_confirmed', 'position_inferred'
+    )),
+    field_evidence_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'confirmed', 'rejected')) DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_document_id INTEGER REFERENCES imported_documents(id),
+    transaction_type TEXT NOT NULL,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    fund_name TEXT,
+    amount TEXT,
+    shares TEXT,
+    nav TEXT,
+    fee TEXT,
+    order_time TEXT,
+    confirmation_time TEXT,
+    evidence_level TEXT NOT NULL CHECK(evidence_level IN (
+        'transaction_confirmed', 'user_confirmed', 'position_inferred'
+    )),
+    field_evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS transactions_no_update
+BEFORE UPDATE ON transactions
+BEGIN
+    SELECT RAISE(ABORT, 'transactions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS transactions_no_delete
+BEFORE DELETE ON transactions
+BEGIN
+    SELECT RAISE(ABORT, 'transactions are immutable');
+END;
 """
