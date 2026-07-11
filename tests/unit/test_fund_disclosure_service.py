@@ -147,6 +147,13 @@ class FundDisclosureServiceTest(unittest.TestCase):
             "not_disclosed",
         )
 
+    def test_classification_sync_fetches_only_basic_profile(self) -> None:
+        result = self.service.sync_classification("519755")
+
+        self.assertEqual(tuple(result.sections), ("basic_profile",))
+        self.assertEqual(len(self.client.requested_urls), 1)
+        self.assertIn("jbgk_519755.html", self.client.requested_urls[0])
+
     def test_sync_all_keeps_profile_successes_when_holdings_fetch_fails(self) -> None:
         self.client.failures.add(DocumentKind.QUARTERLY_HOLDINGS)
         self.client.overrides[DocumentKind.ANNOUNCEMENT] = "<p>暂无基金公告</p>"

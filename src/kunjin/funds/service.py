@@ -67,6 +67,7 @@ PROFILE_SECTIONS = (
     "size_history",
     "announcements",
 )
+CLASSIFICATION_SECTIONS = ("basic_profile",)
 HOLDING_SECTIONS = ("quarterly_holdings", "industry_exposure")
 AGE_LIMITS = {
     DocumentKind.BASIC_PROFILE: timedelta(days=30),
@@ -127,6 +128,9 @@ class FundDisclosureService:
 
     def sync_profile(self, fund_code: str) -> FundDisclosureSyncResult:
         return self._sync(fund_code, PROFILE_SECTIONS)
+
+    def sync_classification(self, fund_code: str) -> FundDisclosureSyncResult:
+        return self._sync(fund_code, CLASSIFICATION_SECTIONS)
 
     def sync_holdings(self, fund_code: str) -> FundDisclosureSyncResult:
         return self._sync(fund_code, HOLDING_SECTIONS)

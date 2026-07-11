@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -335,5 +335,62 @@ CREATE TABLE IF NOT EXISTS fund_section_syncs (
     error_code TEXT,
     error_message TEXT,
     PRIMARY KEY(fund_code, section)
+);
+"""
+
+SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS fund_peer_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    anchor_fund_code TEXT NOT NULL CHECK(length(anchor_fund_code) = 6),
+    rule_version TEXT NOT NULL,
+    rule_key TEXT NOT NULL,
+    rule_description TEXT NOT NULL,
+    candidate_source_url TEXT NOT NULL,
+    candidate_source_tier INTEGER NOT NULL CHECK(candidate_source_tier BETWEEN 1 AND 3),
+    candidate_source_checksum TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('success', 'partial')),
+    warning TEXT,
+    UNIQUE(anchor_fund_code, rule_version, input_fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS fund_peer_group_members (
+    peer_group_id INTEGER NOT NULL REFERENCES fund_peer_groups(id) ON DELETE RESTRICT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    membership_kind TEXT NOT NULL CHECK(membership_kind IN (
+        'anchor', 'user_supplied', 'held', 'discovered'
+    )),
+    classification_key TEXT NOT NULL,
+    acceptance_reason TEXT NOT NULL,
+    warning TEXT,
+    profile_source_document_id INTEGER REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    PRIMARY KEY(peer_group_id, fund_code)
+);
+
+CREATE TABLE IF NOT EXISTS fund_peer_group_syncs (
+    anchor_fund_code TEXT PRIMARY KEY CHECK(length(anchor_fund_code) = 6),
+    current_peer_group_id INTEGER REFERENCES fund_peer_groups(id) ON DELETE RESTRICT,
+    state TEXT NOT NULL CHECK(state IN ('success', 'partial', 'source_unavailable')),
+    last_attempted_at TEXT NOT NULL,
+    last_success_at TEXT,
+    error_code TEXT,
+    warning TEXT
+);
+
+CREATE TABLE IF NOT EXISTS fund_comparison_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    comparison_kind TEXT NOT NULL CHECK(comparison_kind IN (
+        'peer', 'explicit', 'portfolio_overlap'
+    )),
+    anchor_fund_code TEXT CHECK(anchor_fund_code IS NULL OR length(anchor_fund_code) = 6),
+    peer_group_id INTEGER REFERENCES fund_peer_groups(id) ON DELETE RESTRICT,
+    calculation_version TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('success', 'partial', 'insufficient_data')),
+    input_fingerprint TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    warning TEXT,
+    UNIQUE(comparison_kind, input_fingerprint, calculation_version)
 );
 """

@@ -1,0 +1,1 @@
+var r = [["519755","JYDHCLHB","交银多策略回报灵活配置混合A","混合型-灵活","JIAOYINDUOCELUEHUIBAO"],["000001","HXCZHH","华夏成长混合","混合型-灵活","HUAXIACHENGZHANGHUNHE"],["000002","HXCZHH","华夏成长混合(后端)","混合型-灵活","HUAXIACHENGZHANGHUNHE"],["000003","ZHKZZZQA","中海可转债债券A","债券型-混合二级","ZHONGHAIKEZHUANZHAIZHAIQUANA"]];

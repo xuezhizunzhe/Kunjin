@@ -21,7 +21,9 @@ from kunjin.funds.official_domains import (
 
 
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
-FETCHABLE_HOSTS = frozenset({"fundf10.eastmoney.com", "api.fund.eastmoney.com"})
+FETCHABLE_HOSTS = frozenset(
+    {"fund.eastmoney.com", "fundf10.eastmoney.com", "api.fund.eastmoney.com"}
+)
 FUND_CODE_PATTERN = re.compile(r"^\d{6}$")
 
 F10_PAGE_PATHS: Dict[DocumentKind, str] = {

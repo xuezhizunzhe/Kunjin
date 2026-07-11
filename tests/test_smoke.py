@@ -66,6 +66,28 @@ class SmokeTest(unittest.TestCase):
                 args = build_parser().parse_args(argv)
                 self.assertTrue(args.json_output)
 
+    def test_peer_and_overlap_commands_are_packaged(self) -> None:
+        cases = [
+            ["--json", "sync", "fund-peers", "519755"],
+            [
+                "--json",
+                "sync",
+                "fund-peers",
+                "519755",
+                "--candidate",
+                "000001",
+                "--candidate",
+                "000002",
+            ],
+            ["--json", "fund", "peers", "519755"],
+            ["--json", "fund", "compare", "519755", "000001"],
+            ["--json", "portfolio", "overlap"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                args = build_parser().parse_args(argv)
+                self.assertTrue(args.json_output)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from kunjin.adapters.eastmoney import EastmoneyFundClient, EastmoneyMarketClient
+from kunjin.adapters.eastmoney import (
+    FUND_NAV_MAX_PAGES,
+    EastmoneyFundClient,
+    EastmoneyMarketClient,
+)
 from kunjin.storage.repository import Repository
 
 
@@ -23,8 +27,15 @@ class ResearchSyncService:
         self.fund_client = fund_client
         self.market_client = market_client
 
-    def sync_fund(self, fund_code: str) -> ResearchSyncResult:
-        _, name, fund_type, observations = self.fund_client.fetch_nav_history(fund_code)
+    def sync_fund(
+        self,
+        fund_code: str,
+        max_pages: int = FUND_NAV_MAX_PAGES,
+    ) -> ResearchSyncResult:
+        _, name, fund_type, observations = self.fund_client.fetch_nav_history(
+            fund_code,
+            max_pages=max_pages,
+        )
         self.repository.save_fund_history(
             fund_code, name, fund_type, "eastmoney", observations
         )
@@ -37,4 +48,3 @@ class ResearchSyncService:
             observations.extend(items)
         self.repository.save_sector_snapshots(observations)
         return ResearchSyncResult("market_sectors", len(observations))
-

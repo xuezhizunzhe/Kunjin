@@ -50,8 +50,13 @@ Set `PYTHONPYCACHEPREFIX=/private/tmp/kunjin-pycache` if the execution environme
 14. Before answering about quarterly holdings or industry exposure, inspect `fund holdings CODE`. Run `--json sync fund-holdings CODE` first when holdings are stale, missing, unknown, or a newer report window is due. Use `--period YYYY-MM-DD` when the user asks about an exact reporting period.
 15. Preserve exact report dates, publication dates, source URLs, source tiers, conflicts, warnings, and missing evidence in the answer. A successful section must not conceal a failed or stale section.
 16. For current market form, run `--json sync market` before `--json market sectors`.
-17. Record a decision thesis only when the user provides a reason, horizon, and invalidation condition.
-18. Use `--json report weekly` for a combined learning-oriented summary.
+17. For latest peer questions, run `--json fund peers CODE` and inspect its status, data dates, coverage, warnings, errors, and stored-group freshness. Run `--json sync fund-peers CODE` when the group is missing or stale, then read it again.
+18. For an explicit latest comparison, synchronize profile, holdings, and formal NAV for every code before running `--json fund compare CODE1 CODE2`.
+19. For current portfolio overlap, run `--json sync portfolio`, refresh stale held-fund holdings with `--json sync fund-holdings CODE`, then run `--json portfolio overlap`.
+20. Preserve aligned NAV dates, manager-team dates, metric-specific orderings, disclosure scope, coverage, source tier, warnings, and errors. Never turn platform directory order into merit.
+21. Provide a buy/hold/add/reduce/sell interpretation only when the user explicitly requests one. Include opposing evidence, the relevant horizon, invalidation conditions, and data limitations; never operate an account or place a trade.
+22. Record a decision thesis only when the user provides a reason, horizon, and invalidation condition.
+23. Use `--json report weekly` for a combined learning-oriented summary.
 
 ## Commands
 
@@ -63,6 +68,7 @@ kunjin --json sync portfolio
 kunjin --json status
 kunjin --json portfolio show
 kunjin --json portfolio analyze
+kunjin --json portfolio overlap
 kunjin --json ledger import /absolute/path/to/alipay.jpg --fund-code 519755
 kunjin --json ledger drafts
 kunjin --json ledger confirm 1 --field fund_code=519755
@@ -79,6 +85,10 @@ kunjin --json fund fees 017811
 kunjin --json fund holdings 017811
 kunjin --json fund holdings 017811 --period 2026-06-30
 kunjin --json fund announcements 017811
+kunjin --json sync fund-peers 519755
+kunjin --json sync fund-peers 519755 --candidate 000001
+kunjin --json fund peers 519755
+kunjin --json fund compare 519755 000001
 kunjin --json sync market
 kunjin --json market sectors
 kunjin --json sync daily
@@ -105,13 +115,24 @@ Replace `kunjin` with the full source command when the virtualenv command is una
 - Holdings are disclosed snapshots, not real-time positions. Always retain the
   report period, publication date, and disclosure scope.
 - Preserve source conflicts instead of silently choosing a lower-tier value.
+- Treat the candidate directory as tier-2 enumeration evidence only. Its order
+  and any platform ranking are not evidence that one fund is better.
+- Preserve the common formal-NAV dates for each comparable window. Do not compare
+  members over silently different periods or combine metric orderings into a
+  universal score.
+- Treat A/C sibling fees and NAV histories separately even when their disclosed
+  holdings relationship is shared.
+- Describe overlap as `top10_disclosed_overlap`, retain report periods and
+  coverage, and never interpret missing or stale holdings as zero exposure.
 - Call portfolio metrics deterministic calculations only when KunJin returns that evidence level.
 - Treat Yangjibao values as observations, not authoritative Alipay transaction confirmations.
 - Treat an Alipay payment screenshot as evidence only for fields visible in the screenshot. It is not a fund confirmation document by itself.
 - A fund-code hint and draft corrections supplied by the user are `user_confirmed`, not `transaction_confirmed`.
 - Treat reconciliation cost derived from current value and observed profit as `position_inferred`; never present it as a reconstructed purchase lot or authoritative cost basis.
 - Do not infer purchase lots, shares, NAV, fees, dividends, or cost basis when fields are unavailable.
-- Do not turn recent performance into a buy or sell instruction.
+- Do not turn recent performance into a buy or sell interpretation unless the
+  user explicitly requests one and the response includes opposing evidence,
+  horizon, invalidation conditions, and data limitations.
 - State `insufficient_data` plainly when KunJin cannot support a conclusion.
 
 ## Latest News Workflow
@@ -137,11 +158,11 @@ news adapter exists.
 
 ## Unsupported Requests
 
-Candidate-fund peer screening or ranking, holdings-overlap analysis, valuation,
-earnings, persistent capital flows, and automated news ingestion are not
-implemented yet. Fund research covers formal-NAV performance and risk plus
+Valuation, earnings, persistent capital flows, and automated news ingestion are
+not implemented yet. Fund research covers formal-NAV performance and risk plus
 sourced identity, manager, fee, size, benchmark, quarterly holding, industry,
-and announcement disclosures. Market research currently covers sector strength
-and breadth. Weekly reports explicitly mark missing news and causal evidence.
-Identify missing evidence and do not substitute guesses, platform rankings, or
-unverified snippets.
+announcement, peer-comparison, and disclosed-overlap evidence. Market research
+currently covers sector strength and breadth. Peer comparison has no universal
+score or automatic trade path. Weekly reports explicitly mark missing news and
+causal evidence. Identify missing evidence and do not substitute guesses,
+platform rankings, or unverified snippets.

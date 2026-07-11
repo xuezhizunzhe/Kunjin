@@ -62,7 +62,7 @@ class SchemaV4Test(unittest.TestCase):
             rows = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([int(row["version"]) for row in rows], [1, 2, 3, 4, 5])
+        self.assertEqual([int(row["version"]) for row in rows], [1, 2, 3, 4, 5, 6])
         self.assertTrue(
             {
                 "imported_documents",

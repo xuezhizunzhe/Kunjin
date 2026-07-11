@@ -9,6 +9,14 @@ from kunjin.adapters.yangjibao import YangjibaoClient
 from kunjin.adapters.eastmoney import EastmoneyFundClient, EastmoneyMarketClient
 from kunjin.cli import ApplicationContext, run
 from kunjin.funds.models import DisclosureBundle
+from kunjin.funds.peers.models import (
+    MembershipKind,
+    PeerGroup,
+    PeerGroupMember,
+    PeerGroupStatus,
+    PeerSyncState,
+)
+from kunjin.funds.peers.service import PeerSyncResult
 from kunjin.funds.service import FundDisclosureSyncResult, SectionSyncResult
 from kunjin.funds.store import FundDisclosureStore
 from kunjin.ledger.alipay import AlipayPaymentParser
@@ -103,6 +111,62 @@ class FakeDisclosureStore:
 
     def load_bundle(self, fund_code):
         return self.bundle
+
+
+class FakePeerService:
+    def __init__(self, result, refresh_result=None) -> None:
+        self.result = result
+        self.refresh_result = refresh_result
+        self.calls = []
+        self.refresh_calls = 0
+
+    def sync_peers(self, fund_code, user_candidates=()):
+        self.calls.append((fund_code, tuple(user_candidates)))
+        return self.result
+
+    def refresh_existing_groups(self):
+        self.refresh_calls += 1
+        return self.refresh_result or {}
+
+
+class FakePeerStore:
+    def __init__(self, group=None) -> None:
+        self.group = group
+        self.saved = []
+
+    def load_current_group(self, fund_code):
+        return self.group
+
+    def save_comparison(self, *args, **kwargs):
+        self.saved.append((args, kwargs))
+        return 7
+
+
+def peer_group(*codes):
+    return PeerGroup(
+        id=3,
+        anchor_fund_code=codes[0],
+        rule_version="1",
+        rule_key="混合型-灵活|active_or_unspecified|equity_bond",
+        rule_description="同类型、管理方式与基准族",
+        candidate_source_url="https://fund.eastmoney.com/js/fundcode_search.js",
+        candidate_source_tier=2,
+        candidate_source_checksum="a" * 64,
+        input_fingerprint="b" * 64,
+        created_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        status=PeerGroupStatus.SUCCESS,
+        members=tuple(
+            PeerGroupMember(
+                code,
+                MembershipKind.ANCHOR if index == 0 else MembershipKind.DISCOVERED,
+                "混合型-灵活|active_or_unspecified|equity_bond",
+                "classification_match",
+                None,
+                None,
+            )
+            for index, code in enumerate(codes)
+        ),
+    )
 
 
 def empty_disclosure_bundle(fund_code="519755"):
@@ -317,6 +381,161 @@ class CliIntegrationTest(unittest.TestCase):
                 for key in ("sources", "freshness", "warnings", "conflicts", "errors"):
                     self.assertIn(key, payload["data"])
 
+    def test_peer_commands_have_stable_contracts_and_do_not_leak_tokens(self) -> None:
+        result = PeerSyncResult(
+            "519755",
+            PeerSyncState.PARTIAL,
+            3,
+            2,
+            1,
+            0,
+            ("candidate_discovery_unavailable",),
+            ({"code": "candidate_failed", "message": "000001"},),
+        )
+        service = FakePeerService(result)
+        store = FakePeerStore(peer_group("519755", "000001"))
+        self.context.peer_service = service
+        self.context.peer_store = store
+        self.context.fund_disclosure_store = FakeDisclosureStore(
+            empty_disclosure_bundle()
+        )
+
+        cases = (
+            (
+                [
+                    "--json",
+                    "sync",
+                    "fund-peers",
+                    "519755",
+                    "--candidate",
+                    "000001",
+                    "--candidate",
+                    "000002",
+                ],
+                "sync.fund-peers",
+                0,
+            ),
+            (["--json", "fund", "peers", "519755"], "fund.peers", 0),
+            (
+                ["--json", "fund", "compare", "519755", "000001"],
+                "fund.compare",
+                0,
+            ),
+            (["--json", "portfolio", "overlap"], "portfolio.overlap", 1),
+        )
+        reports = {}
+        for argv, command, expected_exit_code in cases:
+            with self.subTest(command=command):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, expected_exit_code)
+                self.assert_envelope(payload, command)
+                self.assertNotIn(
+                    "never-print-this", json.dumps(payload, ensure_ascii=False)
+                )
+                reports[command] = payload
+
+        self.assertEqual(reports["fund.peers"]["data"]["status"], "partial")
+        self.assertEqual(reports["fund.compare"]["data"]["status"], "partial")
+        self.assertEqual(
+            reports["portfolio.overlap"]["data"]["status"],
+            "insufficient_data",
+        )
+        self.assertEqual(
+            reports["portfolio.overlap"]["errors"][0]["code"],
+            "insufficient_data",
+        )
+
+        self.assertEqual(
+            service.calls, [("519755", ("000001", "000002"))]
+        )
+        self.assertEqual(len(store.saved), 3)
+
+        first_compare, exit_code, _ = run(
+            ["--json", "fund", "compare", "519755", "000001"], self.context
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(first_compare["data"]["comparison_run_id"], 7)
+        explicit_calls = [call for call in store.saved if call[0][0] == "explicit"]
+        self.assertEqual(explicit_calls[0][0][5], explicit_calls[1][0][5])
+
+    def test_peer_sync_partial_success_keeps_member_errors_in_data(self) -> None:
+        result = PeerSyncResult(
+            "519755",
+            PeerSyncState.PARTIAL,
+            3,
+            2,
+            1,
+            1,
+            (),
+            ({"code": "candidate_sync_failed", "message": "000001"},),
+        )
+        self.context.peer_service = FakePeerService(result)
+
+        payload, exit_code, _ = run(
+            ["--json", "sync", "fund-peers", "519755"], self.context
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["errors"], [])
+        self.assertEqual(payload["data"]["errors"][0]["code"], "candidate_sync_failed")
+
+    def test_peer_group_too_small_exits_one_and_missing_group_is_insufficient(self) -> None:
+        self.context.peer_store = FakePeerStore(peer_group("519755"))
+        self.context.fund_disclosure_store = FakeDisclosureStore(
+            empty_disclosure_bundle()
+        )
+
+        payload, exit_code, _ = run(
+            ["--json", "fund", "peers", "519755"], self.context
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["errors"][0]["code"], "peer_group_too_small")
+
+        self.context.peer_store = FakePeerStore()
+        missing, exit_code, _ = run(
+            ["--json", "fund", "peers", "519755"], self.context
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(missing["data"]["status"], "insufficient_data")
+        self.assertEqual(missing["errors"][0]["code"], "insufficient_data")
+
+    def test_peer_read_commands_validate_inputs_without_syncing(self) -> None:
+        class SyncMustNotRun:
+            def sync_peers(self, fund_code, user_candidates=()):
+                raise AssertionError("read commands must not synchronize")
+
+        self.context.peer_service = SyncMustNotRun()
+        self.context.peer_store = FakePeerStore(peer_group("519755", "000001"))
+        self.context.fund_disclosure_store = FakeDisclosureStore(
+            empty_disclosure_bundle()
+        )
+
+        for argv in (
+            ["--json", "sync", "fund-peers", "123"],
+            ["--json", "sync", "fund-peers", "519755", "--candidate", "abc"],
+            ["--json", "fund", "peers", "123"],
+            ["--json", "fund", "compare", "519755"],
+            ["--json", "fund", "compare", "519755", "519755"],
+            ["--json", "fund", "compare", "519755", "abc123"],
+        ):
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assertIn(
+                    payload["errors"][0]["code"],
+                    {"invalid_fund_code", "invalid_arguments"},
+                )
+
+        for argv, command in (
+            (["--json", "sync", "fund-peers"], "sync.fund-peers"),
+            (["--json", "fund", "compare"], "fund.compare"),
+        ):
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, command)
+                self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
     def test_disclosure_sync_partial_success_exits_zero_and_total_failure_exits_one(self) -> None:
         self.context.fund_disclosure_store = FakeDisclosureStore(
             empty_disclosure_bundle()
@@ -420,6 +639,79 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertIn(("holdings", "016067"), disclosures.calls)
         self.assertIn(("holdings", "519755"), disclosures.calls)
         self.assertGreaterEqual(len(payload["errors"]), 3)
+
+    def test_daily_sync_isolates_peer_refresh_failures(self) -> None:
+        class PortfolioService:
+            def sync_portfolio(inner_self, trigger):
+                return SyncResult(1, 1, 1, datetime.now(timezone.utc))
+
+        class ResearchService:
+            def sync_fund(inner_self, fund_code):
+                return ResearchSyncResult(fund_code, 10)
+
+            def sync_market(inner_self):
+                return ResearchSyncResult("market_sectors", 2)
+
+        fresh = {
+            name: SectionSyncResult(name, "success", 1, "fresh")
+            for name in (
+                "basic_profile",
+                "manager_history",
+                "fee_schedule",
+                "size_history",
+                "announcements",
+                "quarterly_holdings",
+                "industry_exposure",
+            )
+        }
+        peer_result = PeerSyncResult(
+            "519755",
+            PeerSyncState.SOURCE_UNAVAILABLE,
+            3,
+            2,
+            1,
+            0,
+            ("peer_group_refresh_failed",),
+            (
+                {
+                    "fund_code": "519755",
+                    "stage": "refresh",
+                    "error_code": "network_unavailable",
+                    "message": "directory unavailable",
+                },
+            ),
+        )
+        peer_service = FakePeerService(
+            peer_result, refresh_result={"519755": peer_result}
+        )
+        self.context.sync_service = PortfolioService()
+        self.context.research_service = ResearchService()
+        self.context.fund_disclosure_service = FakeDisclosureService(
+            profile=disclosure_sync_result(),
+            holdings=disclosure_sync_result(profile=False),
+            snapshots=fresh,
+        )
+        self.context.peer_service = peer_service
+
+        payload, exit_code, _ = run(["--json", "sync", "daily"], self.context)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(tuple(payload["data"]["peer_groups"]), ("519755",))
+        self.assertEqual(
+            payload["data"]["peer_groups"]["519755"]["status"],
+            "source_unavailable",
+        )
+        self.assertEqual(payload["data"]["market"]["observations"], 2)
+        self.assertEqual(set(payload["data"]["funds"]), {"016067", "519755"})
+        for fund_result in payload["data"]["funds"].values():
+            self.assertIn("nav", fund_result)
+            self.assertEqual(fund_result["profile"], {"status": "fresh"})
+            self.assertEqual(fund_result["holdings"], {"status": "fresh"})
+        self.assertEqual(peer_service.refresh_calls, 1)
+        self.assertEqual(peer_service.calls, [])
+        self.assertEqual(payload["errors"][0]["code"], "network_unavailable")
+        self.assertIn("519755", payload["errors"][0]["message"])
+        self.assertIn("directory unavailable", payload["errors"][0]["message"])
 
     def test_ledger_import_has_stable_private_json_contract(self) -> None:
         payload, exit_code, _ = run(

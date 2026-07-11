@@ -156,6 +156,16 @@ class EastmoneyMarketClient:
     def __init__(self, http: Optional[HttpsJsonClient] = None) -> None:
         self.http = http or HttpsJsonClient()
 
+    def _fetch_sector_payload(
+        self, url: str, referer: str
+    ) -> Tuple[Dict[str, Any], List[Any]]:
+        payload = self.http.request_json(url, referer)
+        data = payload.get("data")
+        items = None if not isinstance(data, dict) else data.get("diff")
+        if not isinstance(items, list):
+            raise PublicDataError("sector ranking response is incomplete")
+        return payload, items
+
     def fetch_sectors(self, sector_kind: str) -> Tuple[Dict[str, Any], List[SectorObservation]]:
         if sector_kind not in {"industry", "concept"}:
             raise ValueError("sector kind must be industry or concept")
@@ -173,12 +183,19 @@ class EastmoneyMarketClient:
                 "fields": "f12,f14,f3,f8,f104,f105",
             }
         )
-        url = f"https://push2.eastmoney.com/api/qt/clist/get?{query}"
-        payload = self.http.request_json(url, "https://quote.eastmoney.com/center/boardlist.html")
-        data = payload.get("data")
-        items = None if not isinstance(data, dict) else data.get("diff")
-        if not isinstance(items, list):
-            raise PublicDataError("sector ranking response is incomplete")
+        referer = "https://quote.eastmoney.com/center/boardlist.html"
+        primary_url = f"https://push2.eastmoney.com/api/qt/clist/get?{query}"
+        fallback_url = f"https://push2delay.eastmoney.com/api/qt/clist/get?{query}"
+        try:
+            payload, items = self._fetch_sector_payload(primary_url, referer)
+        except PublicDataError as primary_error:
+            try:
+                payload, items = self._fetch_sector_payload(fallback_url, referer)
+            except PublicDataError as fallback_error:
+                raise PublicDataError(
+                    "sector ranking endpoints failed: "
+                    f"primary: {primary_error}; fallback: {fallback_error}"
+                ) from fallback_error
         retrieved_at = datetime.now(timezone.utc)
         observations: List[SectorObservation] = []
         for item in items:

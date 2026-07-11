@@ -32,6 +32,19 @@ class PaginatedHttp:
         return next(self.payloads)
 
 
+class SequencedHttp:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.calls = []
+
+    def request_json(self, url, referer):
+        self.calls.append((url, referer))
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
 def fixture(name):
     path = Path(__file__).parents[1] / "fixtures" / "eastmoney" / name
     return json.loads(path.read_text())
@@ -84,12 +97,52 @@ class EastmoneyTest(unittest.TestCase):
             client.fetch_nav_history("bad")
 
     def test_sector_ranking_is_normalized(self) -> None:
-        client = EastmoneyMarketClient(FakeHttp(fixture("sectors.json")))
+        http = SequencedHttp([fixture("sectors.json")])
+        client = EastmoneyMarketClient(http)
 
         _, sectors = client.fetch_sectors("industry")
 
         self.assertEqual(sectors[0].sector_name, "半导体")
         self.assertEqual(str(sectors[0].pct_change), "2.5")
+        self.assertEqual(len(http.calls), 1)
+        self.assertEqual(
+            http.calls[0][0].split("?", 1)[0],
+            "https://push2.eastmoney.com/api/qt/clist/get",
+        )
+
+    def test_sector_ranking_uses_delay_endpoint_after_primary_error(self) -> None:
+        http = SequencedHttp([{}, fixture("sectors.json")])
+        client = EastmoneyMarketClient(http)
+
+        _, sectors = client.fetch_sectors("concept")
+
+        self.assertEqual(sectors[0].sector_name, "半导体")
+        self.assertEqual(len(http.calls), 2)
+        primary_url, primary_referer = http.calls[0]
+        fallback_url, fallback_referer = http.calls[1]
+        self.assertEqual(
+            fallback_url.split("?", 1)[0],
+            "https://push2delay.eastmoney.com/api/qt/clist/get",
+        )
+        self.assertEqual(primary_url.split("?", 1)[1], fallback_url.split("?", 1)[1])
+        self.assertEqual(primary_referer, fallback_referer)
+
+    def test_sector_ranking_reports_primary_and_fallback_errors(self) -> None:
+        http = SequencedHttp(
+            [
+                PublicDataError("primary unavailable"),
+                PublicDataError("fallback unavailable"),
+            ]
+        )
+        client = EastmoneyMarketClient(http)
+
+        with self.assertRaisesRegex(
+            PublicDataError,
+            "primary unavailable.*fallback unavailable",
+        ):
+            client.fetch_sectors("industry")
+
+        self.assertEqual(len(http.calls), 2)
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ class SchemaV5Test(unittest.TestCase):
             transaction = connection.execute(
                 "SELECT id, fund_code, amount FROM transactions WHERE id = 1"
             ).fetchone()
-        self.assertEqual([int(row["version"]) for row in versions], [1, 2, 3, 4, 5])
+        self.assertEqual([int(row["version"]) for row in versions], [1, 2, 3, 4, 5, 6])
         self.assertEqual(dict(transaction), {"id": 1, "fund_code": "519755", "amount": "20.00"})
 
 

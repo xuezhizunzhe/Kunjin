@@ -19,6 +19,15 @@ from kunjin.adapters.eastmoney import (
 from kunjin.adapters.yangjibao import YangjibaoClient, YangjibaoError
 from kunjin.analytics.portfolio import analyze_portfolio
 from kunjin.analytics.research import analyze_fund_history, analyze_sectors
+from kunjin.funds.peers.analytics import PEER_CALCULATION_VERSION
+from kunjin.funds.peers.research import (
+    build_explicit_compare_report,
+    build_peer_report,
+    build_portfolio_overlap_report,
+    comparison_fingerprint,
+)
+from kunjin.funds.peers.service import PeerResearchService
+from kunjin.funds.peers.store import PeerStore
 from kunjin.funds.research import build_disclosure_report
 from kunjin.funds.service import (
     HOLDING_SECTIONS,
@@ -85,6 +94,8 @@ class ApplicationContext:
     ledger_service: LedgerService
     fund_disclosure_store: Optional[FundDisclosureStore] = None
     fund_disclosure_service: Optional[FundDisclosureService] = None
+    peer_store: Optional[PeerStore] = None
+    peer_service: Optional[PeerResearchService] = None
 
 
 def build_context() -> ApplicationContext:
@@ -100,6 +111,11 @@ def build_context() -> ApplicationContext:
     )
     ledger_store = LedgerStore(repository)
     fund_disclosure_store = FundDisclosureStore(repository)
+    fund_text_client = FundTextClient()
+    fund_disclosure_service = FundDisclosureService(
+        fund_text_client, fund_disclosure_store
+    )
+    peer_store = PeerStore(repository)
     return ApplicationContext(
         paths=paths,
         repository=repository,
@@ -114,8 +130,15 @@ def build_context() -> ApplicationContext:
             parser=AlipayPaymentParser(),
         ),
         fund_disclosure_store=fund_disclosure_store,
-        fund_disclosure_service=FundDisclosureService(
-            FundTextClient(), fund_disclosure_store
+        fund_disclosure_service=fund_disclosure_service,
+        peer_store=peer_store,
+        peer_service=PeerResearchService(
+            fund_text_client,
+            fund_disclosure_service,
+            fund_disclosure_store,
+            research_service,
+            repository,
+            peer_store,
         ),
     )
 
@@ -199,6 +222,9 @@ def build_parser() -> argparse.ArgumentParser:
     sync_fund_profile.add_argument("fund_code")
     sync_fund_holdings = sync_subparsers.add_parser("fund-holdings")
     sync_fund_holdings.add_argument("fund_code")
+    sync_fund_peers = sync_subparsers.add_parser("fund-peers")
+    sync_fund_peers.add_argument("fund_code")
+    sync_fund_peers.add_argument("--candidate", action="append", default=[])
     sync_subparsers.add_parser("market")
     sync_subparsers.add_parser("daily")
 
@@ -206,6 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_subparsers = portfolio.add_subparsers(dest="portfolio_command", required=True)
     portfolio_subparsers.add_parser("show")
     portfolio_subparsers.add_parser("analyze")
+    portfolio_subparsers.add_parser("overlap")
 
     fund = subparsers.add_parser("fund")
     fund_subparsers = fund.add_subparsers(dest="fund_command", required=True)
@@ -220,6 +247,10 @@ def build_parser() -> argparse.ArgumentParser:
     fund_holdings.add_argument("--period")
     fund_announcements = fund_subparsers.add_parser("announcements")
     fund_announcements.add_argument("fund_code")
+    fund_peers = fund_subparsers.add_parser("peers")
+    fund_peers.add_argument("fund_code")
+    fund_compare = fund_subparsers.add_parser("compare")
+    fund_compare.add_argument("fund_codes", nargs="+")
 
     market = subparsers.add_parser("market")
     market_subparsers = market.add_subparsers(dest="market_command", required=True)
@@ -280,6 +311,83 @@ def _positions_payload(context: ApplicationContext) -> List[Dict[str, Any]]:
 def _validate_fund_code(fund_code: str) -> None:
     if not _FUND_CODE.fullmatch(fund_code):
         raise InvalidFundCodeError("fund code must contain six digits")
+
+
+def _validate_compare_codes(fund_codes: Sequence[str]) -> Tuple[str, ...]:
+    codes = tuple(fund_codes)
+    for fund_code in codes:
+        _validate_fund_code(fund_code)
+    if len(codes) < 2 or len(codes) > 10 or len(set(codes)) != len(codes):
+        raise CliUsageError("fund compare requires 2 to 10 unique fund codes")
+    return codes
+
+
+def _peer_components(context: ApplicationContext) -> Tuple[PeerStore, FundDisclosureStore]:
+    if context.peer_store is None:
+        raise ValueError("peer store is unavailable")
+    if context.fund_disclosure_store is None:
+        raise ValueError("fund disclosure store is unavailable")
+    return context.peer_store, context.fund_disclosure_store
+
+
+def _comparison_inputs(
+    context: ApplicationContext, fund_codes: Sequence[str]
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Any]]:
+    if context.fund_disclosure_store is None:
+        raise ValueError("fund disclosure store is unavailable")
+    codes = tuple(fund_codes)
+    bundles = {
+        code: context.fund_disclosure_store.load_bundle(code) for code in codes
+    }
+    histories = {code: context.repository.fund_history(code) for code in codes}
+    positions = context.repository.latest_positions()
+    return bundles, histories, positions
+
+
+def _comparison_status(report: Dict[str, Any]) -> str:
+    warnings = set(report.get("warnings", ()))
+    data_gaps = tuple(report.get("data_gaps", ()))
+    if "peer_group_too_small" in warnings:
+        return "insufficient_data"
+    coverage = report.get("coverage", {})
+    if report.get("comparison_kind") == "portfolio_overlap":
+        usable_weight = Decimal(
+            str(coverage.get("portfolio_weight_coverage") or "0")
+        )
+        if coverage.get("held_funds_total", 0) == 0 or usable_weight == 0:
+            return "insufficient_data"
+        return "partial" if warnings or data_gaps or report.get("errors") else "success"
+    if coverage.get("members_with_disclosures", 0) == 0:
+        return "insufficient_data"
+    return "partial" if warnings or data_gaps or report.get("errors") else "success"
+
+
+def _save_comparison_report(
+    peer_store: PeerStore,
+    comparison_kind: str,
+    report: Dict[str, Any],
+    as_of: datetime,
+    anchor_fund_code: Optional[str] = None,
+    peer_group_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    status = _comparison_status(report)
+    fingerprint_payload = dict(report)
+    fingerprint_payload.pop("as_of", None)
+    fingerprint = comparison_fingerprint(
+        {"calculation_date": as_of.date(), "report": fingerprint_payload}
+    )
+    warnings = list(report.get("warnings", ()))
+    run_id = peer_store.save_comparison(
+        comparison_kind,
+        anchor_fund_code,
+        peer_group_id,
+        as_of,
+        status,
+        fingerprint,
+        report,
+        None if not warnings else ";".join(warnings),
+    )
+    return {**report, "status": status, "comparison_run_id": run_id}
 
 
 def _parse_report_period(value: Optional[str]) -> Optional[date]:
@@ -401,6 +509,29 @@ def _append_section_sync_errors(
                 {
                     "code": item.error_code or "source_unavailable",
                     "message": f"{fund_code}/{section}: {item.status}",
+                }
+            )
+
+
+def _append_peer_refresh_errors(
+    errors: List[Dict[str, str]], peer_results: Dict[str, Any]
+) -> None:
+    for anchor_code, result in peer_results.items():
+        status = getattr(result.status, "value", result.status)
+        if status != "source_unavailable":
+            continue
+        details = result.errors or ({},)
+        for detail in details:
+            code = str(
+                detail.get("error_code")
+                or detail.get("code")
+                or next(reversed(result.warnings), "peer_group_refresh_failed")
+            )
+            message = str(detail.get("message") or "peer group refresh failed")
+            errors.append(
+                {
+                    "code": code,
+                    "message": f"{anchor_code}: {redact_secrets(message)}",
                 }
             )
 
@@ -584,6 +715,38 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             )
         return envelope(command, result["data"], errors=errors)
 
+    if args.command == "sync" and args.sync_command == "fund-peers":
+        _validate_fund_code(args.fund_code)
+        candidates = tuple(args.candidate)
+        for candidate in candidates:
+            _validate_fund_code(candidate)
+        if len(candidates) != len(set(candidates)):
+            raise CliUsageError("candidate fund codes must be unique")
+        if context.peer_service is None:
+            raise ValueError("peer research service is unavailable")
+        result = context.peer_service.sync_peers(
+            args.fund_code, user_candidates=candidates
+        )
+        data = serialize(result)
+        data["errors"] = serialize(result.errors)
+        errors: List[Dict[str, str]] = []
+        if result.status.value == "source_unavailable":
+            error_code = next(
+                reversed(result.warnings), "peer_sync_failed"
+            )
+            errors.append(
+                {
+                    "code": error_code,
+                    "message": "Peer group synchronization did not produce a new usable group",
+                }
+            )
+        return envelope(
+            "sync.fund-peers",
+            data,
+            warnings=list(result.warnings),
+            errors=errors,
+        )
+
     if args.command == "sync" and args.sync_command == "market":
         result = context.research_service.sync_market()
         return envelope("sync.market", serialize(result))
@@ -669,6 +832,21 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                     )
             fund_results[fund_code] = fund_result
         results["funds"] = fund_results
+        if context.peer_service is not None:
+            try:
+                peer_results = context.peer_service.refresh_existing_groups()
+                results["peer_groups"] = serialize(peer_results)
+                _append_peer_refresh_errors(errors, peer_results)
+            except Exception as exc:
+                results["peer_groups"] = {}
+                errors.append(
+                    {
+                        "code": str(
+                            getattr(exc, "code", "peer_group_refresh_failed")
+                        ),
+                        "message": redact_secrets(str(exc)),
+                    }
+                )
         try:
             results["market"] = serialize(context.research_service.sync_market())
         except Exception as exc:
@@ -709,6 +887,28 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             warnings=list(analysis.warnings),
         )
 
+    if args.command == "portfolio" and args.portfolio_command == "overlap":
+        peer_store, disclosure_store = _peer_components(context)
+        positions = context.repository.latest_positions()
+        fund_codes = tuple(sorted({position.fund_code for position in positions}))
+        bundles = {
+            code: disclosure_store.load_bundle(code) for code in fund_codes
+        }
+        as_of = datetime.now(timezone.utc)
+        report = build_portfolio_overlap_report(bundles, positions, as_of)
+        data = _save_comparison_report(
+            peer_store, "portfolio_overlap", report, as_of
+        )
+        errors = []
+        if data["status"] == "insufficient_data":
+            errors.append(
+                {
+                    "code": "insufficient_data",
+                    "message": "No usable portfolio weight is available for overlap analysis",
+                }
+            )
+        return envelope("portfolio.overlap", data, errors=errors)
+
     if args.command == "fund" and args.fund_command == "research":
         _validate_fund_code(args.fund_code)
         history = context.repository.fund_history(args.fund_code)
@@ -719,6 +919,74 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             {"profile": profile, "analysis": analysis},
             warnings=list(analysis.get("warnings", [])),
         )
+
+    if args.command == "fund" and args.fund_command == "peers":
+        _validate_fund_code(args.fund_code)
+        peer_store, _ = _peer_components(context)
+        group = peer_store.load_current_group(args.fund_code)
+        if group is None:
+            return envelope(
+                "fund.peers",
+                {
+                    "status": "insufficient_data",
+                    "anchor_fund_code": args.fund_code,
+                    "rule_version": None,
+                    "calculation_version": PEER_CALCULATION_VERSION,
+                    "data_dates": {},
+                    "coverage": {},
+                    "sources": [],
+                    "advantages": [],
+                    "tradeoffs": [],
+                    "data_gaps": ["current_peer_group_missing"],
+                    "watch_reasons": [],
+                    "warnings": ["current_peer_group_missing"],
+                    "errors": [],
+                },
+                errors=[
+                    {
+                        "code": "insufficient_data",
+                        "message": "No current peer group is available for this fund",
+                    }
+                ],
+            )
+        fund_codes = tuple(member.fund_code for member in group.members)
+        bundles, histories, positions = _comparison_inputs(context, fund_codes)
+        as_of = datetime.now(timezone.utc)
+        report = build_peer_report(group, bundles, histories, positions, as_of)
+        data = _save_comparison_report(
+            peer_store,
+            "peer",
+            report,
+            as_of,
+            anchor_fund_code=args.fund_code,
+            peer_group_id=group.id,
+        )
+        errors = []
+        if data["status"] == "insufficient_data":
+            errors.append(
+                {
+                    "code": "peer_group_too_small",
+                    "message": "The current peer group has fewer than two usable members",
+                }
+            )
+        return envelope("fund.peers", data, errors=errors)
+
+    if args.command == "fund" and args.fund_command == "compare":
+        fund_codes = _validate_compare_codes(args.fund_codes)
+        peer_store, _ = _peer_components(context)
+        bundles, histories, positions = _comparison_inputs(context, fund_codes)
+        as_of = datetime.now(timezone.utc)
+        report = build_explicit_compare_report(
+            fund_codes, bundles, histories, positions, as_of
+        )
+        data = _save_comparison_report(
+            peer_store,
+            "explicit",
+            report,
+            as_of,
+            anchor_fund_code=fund_codes[0],
+        )
+        return envelope("fund.compare", data)
 
     if args.command == "fund" and args.fund_command in {
         "profile",
@@ -884,22 +1152,33 @@ def _command_name(args: argparse.Namespace) -> str:
 
 def _command_name_from_argv(argv: Sequence[str]) -> str:
     values = [str(value) for value in argv]
-    try:
-        ledger_index = values.index("ledger")
-    except ValueError:
-        for value in values:
-            if value in _TOP_LEVEL_COMMANDS:
-                return value
+    command_index = next(
+        (index for index, value in enumerate(values) if value in _TOP_LEVEL_COMMANDS),
+        None,
+    )
+    if command_index is None:
         return "cli"
+    command = values[command_index]
+    if command not in {
+        "auth",
+        "fund",
+        "ledger",
+        "market",
+        "portfolio",
+        "report",
+        "sync",
+        "thesis",
+    }:
+        return command
 
-    action_index = ledger_index + 1
+    action_index = command_index + 1
     if action_index >= len(values):
-        return "ledger"
+        return command
     action = values[action_index]
     if not _COMMAND_PART.fullmatch(action):
-        return "ledger"
-    if action != "document":
-        return f"ledger.{action}"
+        return command
+    if command != "ledger" or action != "document":
+        return f"{command}.{action}"
 
     document_action_index = action_index + 1
     if document_action_index >= len(values):

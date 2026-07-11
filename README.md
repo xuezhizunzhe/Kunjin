@@ -8,8 +8,8 @@ Phase one synchronizes personal account and holding observations from Yangjibao,
 stores redacted snapshots in SQLite, and calculates reproducible portfolio totals
 and concentration metrics. The current build also supports formal-NAV fund risk
 research, sourced fund identity and disclosure research, A-share sector
-strength/breadth, investment theses, weekly reports, and a weekday post-close
-synchronization job.
+strength/breadth, deterministic peer comparison and disclosed-holdings overlap,
+investment theses, weekly reports, and a weekday post-close synchronization job.
 
 KunJin does not log in to or operate Alipay, modify Yangjibao data, place fund
 orders, or produce automatic trading instructions.
@@ -53,6 +53,7 @@ When PyPI access is available, install terminal QR rendering with:
 .venv/bin/kunjin --json status
 .venv/bin/kunjin --json portfolio show
 .venv/bin/kunjin --json portfolio analyze
+.venv/bin/kunjin --json portfolio overlap
 .venv/bin/kunjin --json sync fund 017811
 .venv/bin/kunjin --json fund research 017811
 .venv/bin/kunjin --json sync fund-profile 017811
@@ -62,6 +63,10 @@ When PyPI access is available, install terminal QR rendering with:
 .venv/bin/kunjin --json fund holdings 017811
 .venv/bin/kunjin --json fund holdings 017811 --period 2026-06-30
 .venv/bin/kunjin --json fund announcements 017811
+.venv/bin/kunjin --json sync fund-peers 519755
+.venv/bin/kunjin --json sync fund-peers 519755 --candidate 000001
+.venv/bin/kunjin --json fund peers 519755
+.venv/bin/kunjin --json fund compare 519755 000001
 .venv/bin/kunjin --json sync market
 .venv/bin/kunjin --json market sectors
 .venv/bin/kunjin --json thesis add 017811 \
@@ -167,6 +172,28 @@ not discard previously verified facts from other sections.
 
 Recent sector strength is never presented as proof that a sector is suitable to buy.
 
+## Peer Comparison And Holdings Overlap
+
+`sync fund-peers CODE` creates or refreshes a validated peer group with at most
+20 members. Automatic candidate discovery uses the Eastmoney static fund
+directory as tier-2 enumeration evidence only; directory order and platform
+rankings are never treated as merit. `sync daily` refreshes only peer groups that
+were already created, so holding a fund does not automatically enroll it in peer
+screening.
+
+`fund peers CODE` and `fund compare CODE...` calculate deterministic orderings
+for individual supported metrics rather than a universal score. Formal-NAV
+return, volatility, and drawdown comparisons retain their common aligned dates;
+manager-team windows retain the exact dates on which the current team was in
+place. A/C sibling shares may reuse the same disclosed holdings relationship,
+but their fees and formal-NAV histories remain separate comparisons.
+
+Fund and portfolio overlap reports use the common securities visible in the
+latest usable quarterly disclosures. They explicitly label this as
+`top10_disclosed_overlap`, retain report periods and coverage, and do not treat
+missing or stale holdings as zero exposure. These reports are research evidence,
+not automatic buy or sell instructions.
+
 ## Learning Journal and Reports
 
 A thesis requires a reason, expected horizon, and invalidation condition. Weekly
@@ -190,9 +217,11 @@ The installer creates the plist but does not load it automatically.
 - Exact subscription lots, fund transaction confirmations, dividends, and
   redemption fees remain unavailable unless the imported evidence actually
   contains those fields or a future authoritative source provides them.
-- Peer screening, peer ranking, holdings-overlap analysis, full
-  valuation/fundamental sector research, persistent capital flows, and automatic
-  news persistence are not complete.
+- Full valuation and earnings research, persistent capital flows, and automatic
+  news persistence are not implemented.
+- Peer reports do not provide a universal composite score or automatic trade;
+  their metric-specific orderings require the user to choose a horizon and weigh
+  opposing evidence.
 - Freshness currently understands weekdays but not exchange holiday calendars.
 - The Yangjibao browser-plugin interface is unofficial and may change.
 - Public fund and sector endpoints are also unofficial public interfaces and may change.

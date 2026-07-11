@@ -21,6 +21,7 @@ from kunjin.storage.schema import (
     SCHEMA_V3,
     SCHEMA_V4,
     SCHEMA_V5,
+    SCHEMA_V6,
     SCHEMA_VERSION,
 )
 
@@ -77,6 +78,11 @@ class Repository:
                     (4, _utc_now().isoformat()),
                 )
                 connection.executescript(SCHEMA_V5)
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (5, _utc_now().isoformat()),
+                )
+                connection.executescript(SCHEMA_V6)
                 connection.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (SCHEMA_VERSION, _utc_now().isoformat()),
