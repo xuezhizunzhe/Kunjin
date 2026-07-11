@@ -15,7 +15,14 @@ from kunjin.models import (
     SectorObservation,
     StoredPosition,
 )
-from kunjin.storage.schema import SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_VERSION
+from kunjin.storage.schema import (
+    SCHEMA_V1,
+    SCHEMA_V2,
+    SCHEMA_V3,
+    SCHEMA_V4,
+    SCHEMA_V5,
+    SCHEMA_VERSION,
+)
 
 
 def _utc_now() -> datetime:
@@ -65,6 +72,11 @@ class Repository:
                     (3, _utc_now().isoformat()),
                 )
                 connection.executescript(SCHEMA_V4)
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (4, _utc_now().isoformat()),
+                )
+                connection.executescript(SCHEMA_V5)
                 connection.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (SCHEMA_VERSION, _utc_now().isoformat()),

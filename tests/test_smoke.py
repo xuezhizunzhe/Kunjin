@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import kunjin.ledger.ocr
-from kunjin.cli import run
+from kunjin.cli import build_parser, run
 from kunjin.ledger.alipay import AlipayPaymentParser
 from kunjin.ledger.service import LedgerService
 from kunjin.ledger.store import LedgerStore
@@ -51,6 +51,20 @@ class SmokeTest(unittest.TestCase):
         self.assertTrue(json_output)
         self.assertEqual(payload["command"], "ledger.drafts")
         self.assertEqual(payload["data"]["drafts"], [])
+
+    def test_fund_disclosure_commands_are_packaged(self) -> None:
+        cases = [
+            ["--json", "sync", "fund-profile", "519755"],
+            ["--json", "sync", "fund-holdings", "519755"],
+            ["--json", "fund", "profile", "519755"],
+            ["--json", "fund", "fees", "519755"],
+            ["--json", "fund", "holdings", "519755", "--period", "2026-06-30"],
+            ["--json", "fund", "announcements", "519755"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                args = build_parser().parse_args(argv)
+                self.assertTrue(args.json_output)
 
 
 if __name__ == "__main__":

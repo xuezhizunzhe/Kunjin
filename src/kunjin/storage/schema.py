@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -173,4 +173,167 @@ BEFORE DELETE ON transactions
 BEGIN
     SELECT RAISE(ABORT, 'transactions are immutable');
 END;
+"""
+
+SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS fund_source_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    document_kind TEXT NOT NULL CHECK(document_kind IN (
+        'basic_profile', 'manager_history', 'fee_schedule', 'size_history',
+        'benchmark', 'quarterly_holdings', 'industry_exposure', 'announcement'
+    )),
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_tier INTEGER NOT NULL CHECK(source_tier BETWEEN 1 AND 3),
+    publisher TEXT NOT NULL,
+    published_at TEXT,
+    retrieved_at TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    UNIQUE(fund_code, document_kind, url, checksum)
+);
+
+CREATE TABLE IF NOT EXISTS fund_identities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    record_key TEXT NOT NULL,
+    fund_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    fund_type TEXT,
+    established_date TEXT,
+    manager_name TEXT,
+    source_document_id INTEGER NOT NULL REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    UNIQUE(fund_code, record_key, source_document_id)
+);
+
+CREATE TABLE IF NOT EXISTS fund_share_classes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    record_key TEXT NOT NULL,
+    related_fund_code TEXT NOT NULL CHECK(length(related_fund_code) = 6),
+    share_class TEXT NOT NULL CHECK(share_class IN ('A', 'C')),
+    fund_name TEXT,
+    source_document_id INTEGER NOT NULL REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    UNIQUE(fund_code, record_key, source_document_id)
+);
+
+CREATE TABLE IF NOT EXISTS fund_manager_tenures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    record_key TEXT NOT NULL,
+    manager_name TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT,
+    source_document_id INTEGER NOT NULL REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    UNIQUE(fund_code, record_key, source_document_id)
+);
+
+CREATE TABLE IF NOT EXISTS fund_fee_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    record_key TEXT NOT NULL,
+    fee_type TEXT NOT NULL CHECK(fee_type IN (
+        'management', 'custody', 'sales_service', 'subscription', 'redemption'
+    )),
+    share_class TEXT CHECK(share_class IS NULL OR share_class IN ('A', 'C')),
+    rate TEXT,
+    fixed_amount TEXT,
+    amount_min TEXT,
+    amount_max TEXT,
+    holding_days_min INTEGER,
+    holding_days_max INTEGER,
+    rule_order INTEGER NOT NULL,
+    effective_from TEXT,
+    effective_to TEXT,
+    raw_rule_text TEXT NOT NULL,
+    source_document_id INTEGER NOT NULL REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    UNIQUE(fund_code, record_key, source_document_id)
+);
+
+CREATE TABLE IF NOT EXISTS fund_sizes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    record_key TEXT NOT NULL,
+    report_date TEXT NOT NULL,
+    net_assets TEXT,
+    total_shares TEXT,
+    published_at TEXT,
+    source_document_id INTEGER NOT NULL REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    UNIQUE(fund_code, record_key, source_document_id)
+);
+
+CREATE TABLE IF NOT EXISTS fund_benchmarks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    record_key TEXT NOT NULL,
+    description TEXT NOT NULL,
+    effective_from TEXT,
+    effective_to TEXT,
+    source_document_id INTEGER NOT NULL REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    UNIQUE(fund_code, record_key, source_document_id)
+);
+
+CREATE TABLE IF NOT EXISTS fund_holdings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    record_key TEXT NOT NULL,
+    report_period TEXT NOT NULL,
+    published_at TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    security_code TEXT NOT NULL,
+    security_name TEXT NOT NULL,
+    asset_type TEXT NOT NULL CHECK(asset_type IN ('stock', 'bond', 'fund', 'cash', 'other')),
+    weight TEXT NOT NULL,
+    disclosure_scope TEXT NOT NULL,
+    shares TEXT,
+    market_value TEXT,
+    source_document_id INTEGER NOT NULL REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    UNIQUE(fund_code, record_key, source_document_id)
+);
+
+CREATE TABLE IF NOT EXISTS fund_industry_exposure (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    record_key TEXT NOT NULL,
+    report_period TEXT NOT NULL,
+    published_at TEXT NOT NULL,
+    classification_standard TEXT NOT NULL,
+    industry_name TEXT NOT NULL,
+    weight TEXT NOT NULL,
+    industry_code TEXT,
+    market_value TEXT,
+    source_document_id INTEGER NOT NULL REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    UNIQUE(fund_code, record_key, source_document_id)
+);
+
+CREATE TABLE IF NOT EXISTS fund_announcements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    record_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    category TEXT,
+    publisher TEXT NOT NULL,
+    published_at TEXT NOT NULL,
+    url TEXT NOT NULL,
+    source_tier INTEGER NOT NULL CHECK(source_tier BETWEEN 1 AND 3),
+    source_document_id INTEGER NOT NULL REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    UNIQUE(fund_code, url, source_document_id)
+);
+
+CREATE TABLE IF NOT EXISTS fund_section_syncs (
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    section TEXT NOT NULL CHECK(section IN (
+        'basic_profile', 'manager_history', 'fee_schedule', 'size_history',
+        'benchmark', 'quarterly_holdings', 'industry_exposure', 'announcement'
+    )),
+    state TEXT NOT NULL CHECK(state IN ('success', 'not_disclosed', 'source_unavailable')),
+    current_source_document_id INTEGER REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    last_attempted_at TEXT NOT NULL,
+    last_success_at TEXT,
+    warning TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    PRIMARY KEY(fund_code, section)
+);
 """

@@ -4,8 +4,8 @@ import argparse
 import json
 import re
 import sys
-from dataclasses import asdict, dataclass, is_dataclass
-from datetime import datetime, time, timedelta, timezone
+from dataclasses import asdict, dataclass, is_dataclass, replace
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -19,6 +19,14 @@ from kunjin.adapters.eastmoney import (
 from kunjin.adapters.yangjibao import YangjibaoClient, YangjibaoError
 from kunjin.analytics.portfolio import analyze_portfolio
 from kunjin.analytics.research import analyze_fund_history, analyze_sectors
+from kunjin.funds.research import build_disclosure_report
+from kunjin.funds.service import (
+    HOLDING_SECTIONS,
+    PROFILE_SECTIONS,
+    FundDisclosureService,
+)
+from kunjin.funds.sources import FundTextClient
+from kunjin.funds.store import FundDisclosureStore
 from kunjin.logging import redact_secrets
 from kunjin.ledger.alipay import AlipayPaymentParser, requires_confirmation
 from kunjin.ledger.ocr import OcrError, VisionOcrClient
@@ -53,6 +61,14 @@ class CliUsageError(ValueError):
     code = "invalid_arguments"
 
 
+class InvalidFundCodeError(ValueError):
+    code = "invalid_fund_code"
+
+
+class InvalidReportPeriodError(ValueError):
+    code = "invalid_report_period"
+
+
 class KunjinArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise CliUsageError(message)
@@ -67,6 +83,8 @@ class ApplicationContext:
     sync_service: PortfolioSyncService
     research_service: ResearchSyncService
     ledger_service: LedgerService
+    fund_disclosure_store: Optional[FundDisclosureStore] = None
+    fund_disclosure_service: Optional[FundDisclosureService] = None
 
 
 def build_context() -> ApplicationContext:
@@ -81,6 +99,7 @@ def build_context() -> ApplicationContext:
         EastmoneyMarketClient(),
     )
     ledger_store = LedgerStore(repository)
+    fund_disclosure_store = FundDisclosureStore(repository)
     return ApplicationContext(
         paths=paths,
         repository=repository,
@@ -93,6 +112,10 @@ def build_context() -> ApplicationContext:
             store=ledger_store,
             ocr_client=VisionOcrClient(),
             parser=AlipayPaymentParser(),
+        ),
+        fund_disclosure_store=fund_disclosure_store,
+        fund_disclosure_service=FundDisclosureService(
+            FundTextClient(), fund_disclosure_store
         ),
     )
 
@@ -172,6 +195,10 @@ def build_parser() -> argparse.ArgumentParser:
     sync_subparsers.add_parser("portfolio")
     sync_fund = sync_subparsers.add_parser("fund")
     sync_fund.add_argument("fund_code")
+    sync_fund_profile = sync_subparsers.add_parser("fund-profile")
+    sync_fund_profile.add_argument("fund_code")
+    sync_fund_holdings = sync_subparsers.add_parser("fund-holdings")
+    sync_fund_holdings.add_argument("fund_code")
     sync_subparsers.add_parser("market")
     sync_subparsers.add_parser("daily")
 
@@ -184,6 +211,15 @@ def build_parser() -> argparse.ArgumentParser:
     fund_subparsers = fund.add_subparsers(dest="fund_command", required=True)
     fund_research = fund_subparsers.add_parser("research")
     fund_research.add_argument("fund_code")
+    fund_profile = fund_subparsers.add_parser("profile")
+    fund_profile.add_argument("fund_code")
+    fund_fees = fund_subparsers.add_parser("fees")
+    fund_fees.add_argument("fund_code")
+    fund_holdings = fund_subparsers.add_parser("holdings")
+    fund_holdings.add_argument("fund_code")
+    fund_holdings.add_argument("--period")
+    fund_announcements = fund_subparsers.add_parser("announcements")
+    fund_announcements.add_argument("fund_code")
 
     market = subparsers.add_parser("market")
     market_subparsers = market.add_subparsers(dest="market_command", required=True)
@@ -239,6 +275,134 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _positions_payload(context: ApplicationContext) -> List[Dict[str, Any]]:
     return [serialize(position) for position in context.repository.latest_positions()]
+
+
+def _validate_fund_code(fund_code: str) -> None:
+    if not _FUND_CODE.fullmatch(fund_code):
+        raise InvalidFundCodeError("fund code must contain six digits")
+
+
+def _parse_report_period(value: Optional[str]) -> Optional[date]:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise InvalidReportPeriodError(
+            "report period must be a valid date in YYYY-MM-DD format"
+        ) from None
+
+
+def _disclosure_report(
+    context: ApplicationContext,
+    fund_code: str,
+    period: Optional[date] = None,
+) -> Dict[str, Any]:
+    _validate_fund_code(fund_code)
+    if context.fund_disclosure_store is None:
+        raise ValueError("fund disclosure store is unavailable")
+    bundle = context.fund_disclosure_store.load_bundle(fund_code)
+    if period is not None:
+        period_holdings = tuple(
+            item for item in bundle.holdings if item.report_period == period
+        )
+        period_industry = tuple(
+            item
+            for item in bundle.industry_exposure
+            if item.report_period == period
+        )
+        warnings = bundle.warnings
+        if not period_holdings and not period_industry:
+            warnings += ("requested_report_period_not_found",)
+        bundle = replace(
+            bundle,
+            holdings=period_holdings,
+            industry_exposure=period_industry,
+            warnings=warnings,
+        )
+    return build_disclosure_report(bundle, datetime.now(timezone.utc))
+
+
+def _disclosure_errors(context: ApplicationContext, fund_code: str) -> List[Dict[str, str]]:
+    if context.fund_disclosure_store is None:
+        return []
+    statuses = context.fund_disclosure_store.load_bundle(fund_code).section_statuses
+    return [
+        {
+            "section": section,
+            "code": str(status.get("error_code") or "source_unavailable"),
+            "message": str(status.get("error_message") or "source is unavailable"),
+        }
+        for section, status in sorted(statuses.items())
+        if status.get("error_code")
+    ]
+
+
+def _report_metadata(
+    report: Dict[str, Any], errors: Optional[List[Dict[str, str]]] = None
+) -> Dict[str, Any]:
+    return {
+        "sources": report["sources"],
+        "freshness": report["freshness"],
+        "warnings": report["warnings"],
+        "conflicts": report["conflicts"],
+        "errors": errors or [],
+    }
+
+
+def _sync_disclosure(
+    context: ApplicationContext, fund_code: str, profile: bool
+) -> Dict[str, Any]:
+    _validate_fund_code(fund_code)
+    if context.fund_disclosure_service is None:
+        raise ValueError("fund disclosure service is unavailable")
+    result = (
+        context.fund_disclosure_service.sync_profile(fund_code)
+        if profile
+        else context.fund_disclosure_service.sync_holdings(fund_code)
+    )
+    report = _disclosure_report(context, fund_code)
+    failed_sections = [
+        {
+            "section": section,
+            "code": item.error_code or item.status,
+            "message": item.status,
+        }
+        for section, item in result.sections.items()
+        if item.error_code is not None or item.status == "source_unavailable"
+    ]
+    data = {
+        "fund_code": fund_code,
+        "sections": serialize(result.sections),
+        **_report_metadata(report, failed_sections),
+    }
+    successful = any(
+        item.error_code is None and item.status in {"success", "not_disclosed"}
+        for item in result.sections.values()
+    )
+    return {"data": data, "successful": successful}
+
+
+def _sections_due(
+    service: FundDisclosureService, fund_code: str, sections: Sequence[str]
+) -> bool:
+    return any(
+        service.section_snapshot(fund_code, section).freshness != "fresh"
+        for section in sections
+    )
+
+
+def _append_section_sync_errors(
+    errors: List[Dict[str, str]], fund_code: str, result: Any
+) -> None:
+    for section, item in result.sections.items():
+        if item.error_code is not None or item.status == "source_unavailable":
+            errors.append(
+                {
+                    "code": item.error_code or "source_unavailable",
+                    "message": f"{fund_code}/{section}: {item.status}",
+                }
+            )
 
 
 def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, Any]:
@@ -399,8 +563,26 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         return envelope("sync.portfolio", serialize(result))
 
     if args.command == "sync" and args.sync_command == "fund":
+        _validate_fund_code(args.fund_code)
         result = context.research_service.sync_fund(args.fund_code)
         return envelope("sync.fund", serialize(result))
+
+    if args.command == "sync" and args.sync_command in {
+        "fund-profile",
+        "fund-holdings",
+    }:
+        profile = args.sync_command == "fund-profile"
+        result = _sync_disclosure(context, args.fund_code, profile)
+        command = f"sync.{args.sync_command}"
+        errors = []
+        if not result["successful"]:
+            errors.append(
+                {
+                    "code": "fund_disclosure_sync_failed",
+                    "message": "No requested disclosure section synchronized successfully",
+                }
+            )
+        return envelope(command, result["data"], errors=errors)
 
     if args.command == "sync" and args.sync_command == "market":
         result = context.research_service.sync_market()
@@ -420,12 +602,13 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                     "message": redact_secrets(str(exc)),
                 }
             )
-        fund_results = {}
+        fund_results: Dict[str, Any] = {}
         for fund_code in sorted(
             {position.fund_code for position in context.repository.latest_positions()}
         ):
+            fund_result: Dict[str, Any] = {}
             try:
-                fund_results[fund_code] = serialize(
+                fund_result["nav"] = serialize(
                     context.research_service.sync_fund(fund_code)
                 )
             except Exception as exc:
@@ -435,6 +618,56 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                         "message": f"{fund_code}: {redact_secrets(str(exc))}",
                     }
                 )
+            if context.fund_disclosure_service is not None:
+                try:
+                    if _sections_due(
+                        context.fund_disclosure_service,
+                        fund_code,
+                        PROFILE_SECTIONS,
+                    ):
+                        disclosure_result = (
+                            context.fund_disclosure_service.sync_profile(fund_code)
+                        )
+                        fund_result["profile"] = serialize(disclosure_result)
+                        _append_section_sync_errors(
+                            errors, fund_code, disclosure_result
+                        )
+                    else:
+                        fund_result["profile"] = {"status": "fresh"}
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "code": str(
+                                getattr(exc, "code", "fund_profile_sync_failed")
+                            ),
+                            "message": f"{fund_code}: {redact_secrets(str(exc))}",
+                        }
+                    )
+                try:
+                    if _sections_due(
+                        context.fund_disclosure_service,
+                        fund_code,
+                        HOLDING_SECTIONS,
+                    ):
+                        disclosure_result = (
+                            context.fund_disclosure_service.sync_holdings(fund_code)
+                        )
+                        fund_result["holdings"] = serialize(disclosure_result)
+                        _append_section_sync_errors(
+                            errors, fund_code, disclosure_result
+                        )
+                    else:
+                        fund_result["holdings"] = {"status": "fresh"}
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "code": str(
+                                getattr(exc, "code", "fund_holdings_sync_failed")
+                            ),
+                            "message": f"{fund_code}: {redact_secrets(str(exc))}",
+                        }
+                    )
+            fund_results[fund_code] = fund_result
         results["funds"] = fund_results
         try:
             results["market"] = serialize(context.research_service.sync_market())
@@ -477,6 +710,7 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         )
 
     if args.command == "fund" and args.fund_command == "research":
+        _validate_fund_code(args.fund_code)
         history = context.repository.fund_history(args.fund_code)
         analysis = analyze_fund_history(history)
         profile = context.repository.fund_profile(args.fund_code)
@@ -485,6 +719,52 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             {"profile": profile, "analysis": analysis},
             warnings=list(analysis.get("warnings", [])),
         )
+
+    if args.command == "fund" and args.fund_command in {
+        "profile",
+        "fees",
+        "holdings",
+        "announcements",
+    }:
+        period = (
+            _parse_report_period(args.period)
+            if args.fund_command == "holdings"
+            else None
+        )
+        report = _disclosure_report(context, args.fund_code, period)
+        errors = _disclosure_errors(context, args.fund_code)
+        metadata = _report_metadata(report, errors)
+        if args.fund_command == "profile":
+            data = {
+                "fund_code": report["fund_code"],
+                "identity": report["identity"],
+                "share_classes": report["share_classes"],
+                "managers": report["managers"],
+                "sizes": report["sizes"],
+                "benchmarks": report["benchmarks"],
+                **metadata,
+            }
+        elif args.fund_command == "fees":
+            data = {
+                "fund_code": report["fund_code"],
+                "fees": report["fees"],
+                **metadata,
+            }
+        elif args.fund_command == "holdings":
+            data = {
+                "fund_code": report["fund_code"],
+                "requested_period": None if period is None else period.isoformat(),
+                "holdings": report["holdings"],
+                "industry_exposure": report["industry_exposure"],
+                **metadata,
+            }
+        else:
+            data = {
+                "fund_code": report["fund_code"],
+                "announcements": report["announcements"],
+                **metadata,
+            }
+        return envelope(f"fund.{args.fund_command}", data)
 
     if args.command == "market" and args.market_command == "sectors":
         analysis = analyze_sectors(context.repository.latest_sector_snapshots())
@@ -595,7 +875,8 @@ def run(
 
 def _command_name(args: argparse.Namespace) -> str:
     if args.command != "ledger":
-        return str(args.command)
+        nested = getattr(args, f"{args.command}_command", None)
+        return str(args.command) if nested is None else f"{args.command}.{nested}"
     if args.ledger_command == "document":
         return f"ledger.document.{args.document_command}"
     return f"ledger.{args.ledger_command}"

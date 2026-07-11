@@ -7,8 +7,9 @@ to KunJin's local SQLite database and private import directory.
 Phase one synchronizes personal account and holding observations from Yangjibao,
 stores redacted snapshots in SQLite, and calculates reproducible portfolio totals
 and concentration metrics. The current build also supports formal-NAV fund risk
-research, A-share sector strength/breadth, investment theses, weekly reports, and
-a weekday post-close synchronization job.
+research, sourced fund identity and disclosure research, A-share sector
+strength/breadth, investment theses, weekly reports, and a weekday post-close
+synchronization job.
 
 KunJin does not log in to or operate Alipay, modify Yangjibao data, place fund
 orders, or produce automatic trading instructions.
@@ -54,6 +55,13 @@ When PyPI access is available, install terminal QR rendering with:
 .venv/bin/kunjin --json portfolio analyze
 .venv/bin/kunjin --json sync fund 017811
 .venv/bin/kunjin --json fund research 017811
+.venv/bin/kunjin --json sync fund-profile 017811
+.venv/bin/kunjin --json sync fund-holdings 017811
+.venv/bin/kunjin --json fund profile 017811
+.venv/bin/kunjin --json fund fees 017811
+.venv/bin/kunjin --json fund holdings 017811
+.venv/bin/kunjin --json fund holdings 017811 --period 2026-06-30
+.venv/bin/kunjin --json fund announcements 017811
 .venv/bin/kunjin --json sync market
 .venv/bin/kunjin --json market sectors
 .venv/bin/kunjin --json thesis add 017811 \
@@ -142,9 +150,20 @@ Tests override these directories and never use live credentials.
 
 - Formal-NAV 30/90/365-day returns when sufficient history exists.
 - Annualized daily volatility, maximum drawdown, trough, and recovery dates.
+- Sourced fund identity, A/C share-class relationships, manager tenure, fee
+  schedules, size history, benchmark descriptions, quarterly disclosed
+  holdings, industry exposure, and announcements.
+- Exact report and publication dates, source URLs and tiers, section freshness,
+  source failures, warnings, and conflicts in structured JSON.
 - Sector daily strength, turnover observations, and advancing-stock breadth.
-- Explicit warnings when benchmark, manager, fee, holdings, valuation, earnings,
-  persistent flows, catalysts, crowding, or news evidence is missing.
+- Explicit warnings when required disclosure, valuation, earnings, persistent
+  flows, catalysts, crowding, or news evidence is missing.
+
+`sync fund CODE` remains the formal-NAV history command. Run `sync fund-profile
+CODE` for identity, manager, fee, size, benchmark, and announcement sections;
+run `sync fund-holdings CODE` for quarterly holdings and industry exposure.
+Each disclosure section is synchronized independently, so a failed source does
+not discard previously verified facts from other sections.
 
 Recent sector strength is never presented as proof that a sector is suitable to buy.
 
@@ -171,8 +190,9 @@ The installer creates the plist but does not load it automatically.
 - Exact subscription lots, fund transaction confirmations, dividends, and
   redemption fees remain unavailable unless the imported evidence actually
   contains those fields or a future authoritative source provides them.
-- Manager/fee/holding history, benchmark comparison, full valuation/fundamental
-  sector research, peer screening, and automatic news persistence are not complete.
+- Peer screening, peer ranking, holdings-overlap analysis, full
+  valuation/fundamental sector research, persistent capital flows, and automatic
+  news persistence are not complete.
 - Freshness currently understands weekdays but not exchange holiday calendars.
 - The Yangjibao browser-plugin interface is unofficial and may change.
 - Public fund and sector endpoints are also unofficial public interfaces and may change.

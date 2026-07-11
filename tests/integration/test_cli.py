@@ -8,6 +8,9 @@ from pathlib import Path
 from kunjin.adapters.yangjibao import YangjibaoClient
 from kunjin.adapters.eastmoney import EastmoneyFundClient, EastmoneyMarketClient
 from kunjin.cli import ApplicationContext, run
+from kunjin.funds.models import DisclosureBundle
+from kunjin.funds.service import FundDisclosureSyncResult, SectionSyncResult
+from kunjin.funds.store import FundDisclosureStore
 from kunjin.ledger.alipay import AlipayPaymentParser
 from kunjin.ledger.models import OcrBlock
 from kunjin.ledger.service import LedgerService
@@ -66,6 +69,77 @@ class FakeOcrClient:
                 height=Decimal("0.05"),
             ),
         ]
+
+
+class FakeDisclosureService:
+    def __init__(self, profile=None, holdings=None, snapshots=None) -> None:
+        self.profile_result = profile
+        self.holdings_result = holdings
+        self.snapshots = snapshots or {}
+        self.calls = []
+
+    def sync_profile(self, fund_code):
+        self.calls.append(("profile", fund_code))
+        if isinstance(self.profile_result, Exception):
+            raise self.profile_result
+        return self.profile_result
+
+    def sync_holdings(self, fund_code):
+        self.calls.append(("holdings", fund_code))
+        if isinstance(self.holdings_result, Exception):
+            raise self.holdings_result
+        return self.holdings_result
+
+    def section_snapshot(self, fund_code, section):
+        return self.snapshots.get(
+            section,
+            SectionSyncResult(section, "missing", 0, "missing"),
+        )
+
+
+class FakeDisclosureStore:
+    def __init__(self, bundle) -> None:
+        self.bundle = bundle
+
+    def load_bundle(self, fund_code):
+        return self.bundle
+
+
+def empty_disclosure_bundle(fund_code="519755"):
+    return DisclosureBundle(
+        fund_code=fund_code,
+        identity=None,
+        share_classes=(),
+        manager_tenures=(),
+        fee_rules=(),
+        sizes=(),
+        benchmarks=(),
+        holdings=(),
+        industry_exposure=(),
+        announcements=(),
+        source_documents={},
+        section_states={},
+        section_statuses={},
+    )
+
+
+def disclosure_sync_result(fund_code="519755", profile=True, total_failure=False):
+    names = (
+        ("basic_profile", "manager_history", "fee_schedule", "size_history", "announcements")
+        if profile
+        else ("quarterly_holdings", "industry_exposure")
+    )
+    sections = {}
+    for index, name in enumerate(names):
+        failed = total_failure or index == len(names) - 1
+        sections[name] = SectionSyncResult(
+            name,
+            "source_unavailable" if failed else "success",
+            0 if failed else 1,
+            "missing" if failed else "fresh",
+            error_code="remote_unavailable" if failed else None,
+        )
+    return FundDisclosureSyncResult(fund_code, sections, ())
 
 
 class CliIntegrationTest(unittest.TestCase):
@@ -129,6 +203,7 @@ class CliIntegrationTest(unittest.TestCase):
                 AlipayPaymentParser(),
                 now=lambda: datetime(2026, 7, 11, tzinfo=timezone.utc),
             ),
+            fund_disclosure_store=FundDisclosureStore(repository),
         )
         self.payment_image = root / "payment.jpg"
         self.payment_image.write_bytes(b"synthetic payment screenshot")
@@ -217,6 +292,134 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("016067", payload["data"]["funds"])
         self.assertEqual(payload["data"]["market"]["observations"], 2)
+
+    def test_fund_disclosure_commands_have_stable_contracts(self) -> None:
+        bundle = empty_disclosure_bundle()
+        self.context.fund_disclosure_store = FakeDisclosureStore(bundle)
+        self.context.fund_disclosure_service = FakeDisclosureService(
+            profile=disclosure_sync_result(),
+            holdings=disclosure_sync_result(profile=False),
+        )
+
+        cases = [
+            (["--json", "sync", "fund-profile", "519755"], "sync.fund-profile"),
+            (["--json", "sync", "fund-holdings", "519755"], "sync.fund-holdings"),
+            (["--json", "fund", "profile", "519755"], "fund.profile"),
+            (["--json", "fund", "fees", "519755"], "fund.fees"),
+            (["--json", "fund", "holdings", "519755"], "fund.holdings"),
+            (["--json", "fund", "announcements", "519755"], "fund.announcements"),
+        ]
+        for argv, command in cases:
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 0)
+                self.assert_envelope(payload, command)
+                for key in ("sources", "freshness", "warnings", "conflicts", "errors"):
+                    self.assertIn(key, payload["data"])
+
+    def test_disclosure_sync_partial_success_exits_zero_and_total_failure_exits_one(self) -> None:
+        self.context.fund_disclosure_store = FakeDisclosureStore(
+            empty_disclosure_bundle()
+        )
+        service = FakeDisclosureService(
+            profile=disclosure_sync_result(),
+            holdings=disclosure_sync_result(profile=False, total_failure=True),
+        )
+        self.context.fund_disclosure_service = service
+
+        partial, exit_code, _ = run(
+            ["--json", "sync", "fund-profile", "519755"], self.context
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(partial["errors"], [])
+        self.assertTrue(partial["data"]["errors"])
+
+        failed, exit_code, _ = run(
+            ["--json", "sync", "fund-holdings", "519755"], self.context
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(failed["errors"][0]["code"], "fund_disclosure_sync_failed")
+        self.assertEqual(len(failed["data"]["errors"]), 2)
+
+    def test_disclosure_commands_reject_invalid_fund_code(self) -> None:
+        for argv in (
+            ["--json", "sync", "fund-profile", "123"],
+            ["--json", "sync", "fund-holdings", "abc123"],
+            ["--json", "fund", "profile", "123"],
+            ["--json", "fund", "fees", "123"],
+            ["--json", "fund", "holdings", "123"],
+            ["--json", "fund", "announcements", "123"],
+        ):
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(payload["errors"][0]["code"], "invalid_fund_code")
+
+    def test_fund_holdings_rejects_invalid_period(self) -> None:
+        payload, exit_code, _ = run(
+            ["--json", "fund", "holdings", "519755", "--period", "2026-02-30"],
+            self.context,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["errors"][0]["code"], "invalid_report_period")
+
+    def test_fund_holdings_marks_a_missing_requested_period(self) -> None:
+        self.context.fund_disclosure_store = FakeDisclosureStore(
+            empty_disclosure_bundle()
+        )
+
+        payload, exit_code, _ = run(
+            ["--json", "fund", "holdings", "519755", "--period", "2026-06-30"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["holdings"]["evidence_level"], "insufficient_data")
+        self.assertIn("requested_report_period_not_found", payload["data"]["warnings"])
+
+    def test_daily_sync_isolates_nav_profile_and_holdings_failures(self) -> None:
+        class PortfolioService:
+            def sync_portfolio(inner_self, trigger):
+                return SyncResult(1, 1, 1, datetime.now(timezone.utc))
+
+        class ResearchService:
+            def sync_fund(inner_self, fund_code):
+                if fund_code == "016067":
+                    raise RuntimeError("NAV unavailable")
+                return ResearchSyncResult(fund_code, 10)
+
+            def sync_market(inner_self):
+                return ResearchSyncResult("market_sectors", 2)
+
+        stale = {
+            name: SectionSyncResult(name, "success", 1, "stale")
+            for name in (
+                "basic_profile",
+                "manager_history",
+                "fee_schedule",
+                "size_history",
+                "announcements",
+                "quarterly_holdings",
+                "industry_exposure",
+            )
+        }
+        disclosures = FakeDisclosureService(
+            profile=RuntimeError("profile unavailable"),
+            holdings=disclosure_sync_result(profile=False),
+            snapshots=stale,
+        )
+        self.context.sync_service = PortfolioService()
+        self.context.research_service = ResearchService()
+        self.context.fund_disclosure_service = disclosures
+
+        payload, exit_code, _ = run(["--json", "sync", "daily"], self.context)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["data"]["market"]["observations"], 2)
+        self.assertIn("519755", payload["data"]["funds"])
+        self.assertIn(("holdings", "016067"), disclosures.calls)
+        self.assertIn(("holdings", "519755"), disclosures.calls)
+        self.assertGreaterEqual(len(payload["errors"]), 3)
 
     def test_ledger_import_has_stable_private_json_contract(self) -> None:
         payload, exit_code, _ = run(

@@ -1,6 +1,6 @@
 ---
 name: kunjin-fund
-description: Use KunJin as the single Codex entry point for personal fund work. Trigger when the user asks to import an Alipay payment screenshot, inspect or reconcile the personal ledger, synchronize Yangjibao, analyze current fund holdings, research a fund code from formal NAV, inspect current A-share sector strength, check data freshness, or revoke Yangjibao authorization. Clearly distinguish verified facts, user-confirmed fields, deterministic calculations, inferred position values, recent strength, and unsupported evidence instead of inventing data.
+description: Use KunJin as the single Codex entry point for personal fund work. Trigger when the user asks to import an Alipay payment screenshot, inspect or reconcile the personal ledger, synchronize Yangjibao, analyze current fund holdings, research a fund code from formal NAV or sourced disclosures, inspect current A-share sector strength, check data freshness, or revoke Yangjibao authorization. Clearly distinguish verified facts, user-confirmed fields, deterministic calculations, inferred position values, recent strength, and unsupported evidence instead of inventing data.
 ---
 
 # KunJin Fund
@@ -45,10 +45,13 @@ Set `PYTHONPYCACHEPREFIX=/private/tmp/kunjin-pycache` if the execution environme
 9. Run `--json portfolio show` to inspect normalized positions.
 10. Run `--json portfolio analyze` for totals, weights, HHI, largest-position share, profit coverage, and missing-data warnings.
 11. Explain facts, deterministic calculations, limitations, and possible interpretations separately.
-12. For a named fund, run `--json sync fund CODE` before `--json fund research CODE` when latest data is requested.
-13. For current market form, run `--json sync market` before `--json market sectors`.
-14. Record a decision thesis only when the user provides a reason, horizon, and invalidation condition.
-15. Use `--json report weekly` for a combined learning-oriented summary.
+12. For a named fund's latest formal-NAV performance or risk, run `--json sync fund CODE` before `--json fund research CODE`.
+13. Before answering about identity, share classes, managers, fees, size, benchmark, or announcements, inspect the relevant `freshness.sections` returned by `fund profile`, `fund fees`, or `fund announcements`. Run `--json sync fund-profile CODE` first when any required section is stale, missing, unknown, or unavailable.
+14. Before answering about quarterly holdings or industry exposure, inspect `fund holdings CODE`. Run `--json sync fund-holdings CODE` first when holdings are stale, missing, unknown, or a newer report window is due. Use `--period YYYY-MM-DD` when the user asks about an exact reporting period.
+15. Preserve exact report dates, publication dates, source URLs, source tiers, conflicts, warnings, and missing evidence in the answer. A successful section must not conceal a failed or stale section.
+16. For current market form, run `--json sync market` before `--json market sectors`.
+17. Record a decision thesis only when the user provides a reason, horizon, and invalidation condition.
+18. Use `--json report weekly` for a combined learning-oriented summary.
 
 ## Commands
 
@@ -69,6 +72,13 @@ kunjin --json ledger reconcile --fund-code 519755
 kunjin --json ledger document delete 1
 kunjin --json sync fund 017811
 kunjin --json fund research 017811
+kunjin --json sync fund-profile 017811
+kunjin --json sync fund-holdings 017811
+kunjin --json fund profile 017811
+kunjin --json fund fees 017811
+kunjin --json fund holdings 017811
+kunjin --json fund holdings 017811 --period 2026-06-30
+kunjin --json fund announcements 017811
 kunjin --json sync market
 kunjin --json market sectors
 kunjin --json sync daily
@@ -84,6 +94,17 @@ Replace `kunjin` with the full source command when the virtualenv command is una
 
 - Treat formal NAV and intraday estimated NAV as different data types.
 - Preserve the reported `as_of`, `freshness`, `warnings`, and `errors` in the explanation.
+- Treat fund-company, regulator, and exchange documents as tier-1 only when the
+  publisher and domain have been validated. Clearly label Eastmoney F10 pages as
+  tier-2 fallback evidence.
+- Preserve manager start and end dates exactly. Never attribute a predecessor's
+  return to the current manager.
+- Keep fee tiers, share classes, amount conditions, and holding-period conditions
+  separate. Never calculate an exact personal fee without the required transaction
+  and holding-period evidence.
+- Holdings are disclosed snapshots, not real-time positions. Always retain the
+  report period, publication date, and disclosure scope.
+- Preserve source conflicts instead of silently choosing a lower-tier value.
 - Call portfolio metrics deterministic calculations only when KunJin returns that evidence level.
 - Treat Yangjibao values as observations, not authoritative Alipay transaction confirmations.
 - Treat an Alipay payment screenshot as evidence only for fields visible in the screenshot. It is not a fund confirmation document by itself.
@@ -116,4 +137,11 @@ news adapter exists.
 
 ## Unsupported Requests
 
-Fund manager/fee/holding analysis, benchmark comparison, valuation, earnings, persistent capital flows, automated news ingestion, and candidate-fund peer comparison are not implemented yet. Fund research currently covers formal-NAV performance and risk; market research currently covers sector strength and breadth. Weekly reports explicitly mark missing news and causal evidence. Identify missing evidence and do not substitute guesses, platform rankings, or unverified snippets.
+Candidate-fund peer screening or ranking, holdings-overlap analysis, valuation,
+earnings, persistent capital flows, and automated news ingestion are not
+implemented yet. Fund research covers formal-NAV performance and risk plus
+sourced identity, manager, fee, size, benchmark, quarterly holding, industry,
+and announcement disclosures. Market research currently covers sector strength
+and breadth. Weekly reports explicitly mark missing news and causal evidence.
+Identify missing evidence and do not substitute guesses, platform rankings, or
+unverified snippets.
