@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.error
@@ -13,6 +14,8 @@ from kunjin.models import FundNavObservation, SectorObservation
 
 
 FUND_CODE = re.compile(r"^\d{6}$")
+FUND_NAV_PAGE_SIZE = 20
+FUND_NAV_MAX_PAGES = 50
 
 
 class PublicDataError(RuntimeError):
@@ -29,8 +32,9 @@ def _decimal(value: Any) -> Optional[Decimal]:
 
 
 class HttpsJsonClient:
-    def __init__(self, timeout_seconds: int = 20) -> None:
+    def __init__(self, timeout_seconds: int = 20, retries: int = 1) -> None:
         self.timeout_seconds = timeout_seconds
+        self.retries = retries
 
     def request_json(self, url: str, referer: str) -> Dict[str, Any]:
         if urllib.parse.urlparse(url).scheme != "https":
@@ -44,15 +48,24 @@ class HttpsJsonClient:
             },
             method="GET",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise PublicDataError(f"public data HTTP error: {exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise PublicDataError("public data network request failed") from exc
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise PublicDataError("public data returned malformed JSON") from exc
+        for attempt in range(self.retries + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                raise PublicDataError(f"public data HTTP error: {exc.code}") from exc
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                http.client.RemoteDisconnected,
+                ConnectionResetError,
+            ) as exc:
+                if attempt < self.retries:
+                    continue
+                raise PublicDataError("public data network request failed") from exc
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise PublicDataError("public data returned malformed JSON") from exc
         if not isinstance(payload, dict):
             raise PublicDataError("public data response is not an object")
         return payload
@@ -63,47 +76,80 @@ class EastmoneyFundClient:
         self.http = http or HttpsJsonClient()
 
     def fetch_nav_history(
-        self, fund_code: str, page_size: int = 1000
+        self,
+        fund_code: str,
+        page_size: int = FUND_NAV_PAGE_SIZE,
+        max_pages: int = FUND_NAV_MAX_PAGES,
     ) -> Tuple[Dict[str, Any], Optional[str], Optional[str], List[FundNavObservation]]:
         if not FUND_CODE.fullmatch(fund_code):
             raise ValueError(f"invalid fund code: {fund_code}")
-        query = urllib.parse.urlencode(
-            {
-                "fundCode": fund_code,
-                "pageIndex": "1",
-                "pageSize": str(page_size),
-                "startDate": "",
-                "endDate": "",
-            }
-        )
-        url = f"https://api.fund.eastmoney.com/f10/lsjz?{query}"
-        payload = self.http.request_json(url, f"https://fundf10.eastmoney.com/jjjz_{fund_code}.html")
-        if payload.get("ErrCode") not in (None, 0):
-            raise PublicDataError(str(payload.get("ErrMsg") or "fund NAV business error"))
-        data = payload.get("Data")
-        if not isinstance(data, dict) or not isinstance(data.get("LSJZList"), list):
-            raise PublicDataError("fund NAV response is incomplete")
+        if not 1 <= page_size <= FUND_NAV_PAGE_SIZE:
+            raise ValueError(f"page_size must be between 1 and {FUND_NAV_PAGE_SIZE}")
+        if max_pages < 1:
+            raise ValueError("max_pages must be positive")
+
         retrieved_at = datetime.now(timezone.utc)
         observations: List[FundNavObservation] = []
-        for item in data["LSJZList"]:
-            if not isinstance(item, dict) or not item.get("FSRQ") or not item.get("DWJZ"):
-                continue
-            observation = FundNavObservation(
-                fund_code=fund_code,
-                nav_date=date.fromisoformat(str(item["FSRQ"])),
-                unit_nav=_decimal(item["DWJZ"]) or Decimal("0"),
-                accumulated_nav=_decimal(item.get("LJJZ")),
-                daily_growth=_decimal(item.get("JZZZL")),
-                source="eastmoney",
-                retrieved_at=retrieved_at,
+        first_payload: Optional[Dict[str, Any]] = None
+        name: Optional[Any] = None
+        fund_type: Optional[Any] = None
+        total_count: Optional[int] = None
+
+        for page_index in range(1, max_pages + 1):
+            query = urllib.parse.urlencode(
+                {
+                    "fundCode": fund_code,
+                    "pageIndex": str(page_index),
+                    "pageSize": str(page_size),
+                    "startDate": "",
+                    "endDate": "",
+                }
             )
-            observation.validate()
-            observations.append(observation)
+            url = f"https://api.fund.eastmoney.com/f10/lsjz?{query}"
+            payload = self.http.request_json(
+                url, f"https://fundf10.eastmoney.com/jjjz_{fund_code}.html"
+            )
+            if first_payload is None:
+                first_payload = payload
+            if payload.get("ErrCode") not in (None, 0):
+                raise PublicDataError(str(payload.get("ErrMsg") or "fund NAV business error"))
+            data = payload.get("Data")
+            if not isinstance(data, dict) or not isinstance(data.get("LSJZList"), list):
+                raise PublicDataError("fund NAV response is incomplete")
+            items = data["LSJZList"]
+            name = name or data.get("FundName") or payload.get("FundName")
+            fund_type = fund_type or data.get("FundType")
+            if total_count is None and payload.get("TotalCount") is not None:
+                total_count = int(payload["TotalCount"])
+
+            for item in items:
+                if not isinstance(item, dict) or not item.get("FSRQ") or not item.get("DWJZ"):
+                    continue
+                observation = FundNavObservation(
+                    fund_code=fund_code,
+                    nav_date=date.fromisoformat(str(item["FSRQ"])),
+                    unit_nav=_decimal(item["DWJZ"]) or Decimal("0"),
+                    accumulated_nav=_decimal(item.get("LJJZ")),
+                    daily_growth=_decimal(item.get("JZZZL")),
+                    source="eastmoney",
+                    retrieved_at=retrieved_at,
+                )
+                observation.validate()
+                observations.append(observation)
+
+            if len(items) < page_size or (
+                total_count is not None and len(observations) >= total_count
+            ):
+                break
         if not observations:
             raise PublicDataError("fund NAV history is empty")
-        name = data.get("FundName") or payload.get("FundName")
-        fund_type = data.get("FundType")
-        return payload, None if name is None else str(name), None if fund_type is None else str(fund_type), observations
+        assert first_payload is not None
+        return (
+            first_payload,
+            None if name is None else str(name),
+            None if fund_type is None else str(fund_type),
+            observations,
+        )
 
 
 class EastmoneyMarketClient:
@@ -152,4 +198,3 @@ class EastmoneyMarketClient:
             observation.validate()
             observations.append(observation)
         return payload, observations
-
