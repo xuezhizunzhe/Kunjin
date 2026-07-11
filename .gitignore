@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+*.db
+*.sqlite
+*.sqlite3
+snapshots/
+logs/
+.env
+*.token
+*token*.json
+

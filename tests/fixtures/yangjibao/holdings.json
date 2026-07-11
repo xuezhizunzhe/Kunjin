@@ -1,0 +1,22 @@
+{
+  "code": 200,
+  "data": [
+    {
+      "code": "016067",
+      "short_name": "鹏华新能源汽车主题混合A",
+      "hold_share": "8.50",
+      "last_net": "1.1000",
+      "hold_earn": "-0.20",
+      "nv_info": {"gsz": "1.1050"}
+    },
+    {
+      "code": "017811",
+      "short_name": "东方人工智能主题混合C",
+      "hold_share": "9.10",
+      "last_net": "1.0200",
+      "hold_earn": "0.15",
+      "nv_info": {"vgsz": "1.0180"}
+    }
+  ]
+}
+
