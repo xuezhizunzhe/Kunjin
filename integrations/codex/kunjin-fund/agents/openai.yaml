@@ -1,0 +1,4 @@
+interface:
+  display_name: "KunJin Fund Research"
+  short_description: "Sync and analyze personal funds with evidence"
+  default_prompt: "Use $kunjin-fund to sync my portfolio and explain its current risks with evidence."

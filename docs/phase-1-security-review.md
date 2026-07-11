@@ -51,3 +51,10 @@ available.
   rate-limit, licensing, and data-quality reviews.
 - Personal values must not be committed to Git fixtures or issue reports.
 
+## Public Research Sources
+
+Formal fund NAV and sector-ranking adapters use HTTPS-only Eastmoney public
+interfaces without user authentication. They send no Yangjibao token. The fund
+adapter stores formal NAV separately from any personal or intraday estimate. The
+sector adapter stores daily strength and breadth only; it does not claim that the
+data covers valuation, earnings, persistent flows, catalysts, or crowding.

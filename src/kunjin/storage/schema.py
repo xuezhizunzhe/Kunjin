@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -50,3 +50,49 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 """
 
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS funds (
+    fund_code TEXT PRIMARY KEY CHECK(length(fund_code) = 6),
+    fund_name TEXT,
+    fund_type TEXT,
+    source TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fund_nav (
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    nav_date TEXT NOT NULL,
+    unit_nav TEXT NOT NULL,
+    accumulated_nav TEXT,
+    daily_growth TEXT,
+    source TEXT NOT NULL,
+    retrieved_at TEXT NOT NULL,
+    PRIMARY KEY(fund_code, nav_date, source)
+);
+
+CREATE TABLE IF NOT EXISTS sector_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sector_code TEXT NOT NULL,
+    sector_name TEXT NOT NULL,
+    sector_kind TEXT NOT NULL CHECK(sector_kind IN ('industry', 'concept')),
+    pct_change TEXT,
+    turnover_rate TEXT,
+    advancers INTEGER,
+    decliners INTEGER,
+    source TEXT NOT NULL,
+    retrieved_at TEXT NOT NULL,
+    UNIQUE(sector_code, sector_kind, retrieved_at, source)
+);
+"""
+
+SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS investment_theses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fund_code TEXT NOT NULL CHECK(length(fund_code) = 6),
+    rationale TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    invalidation TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK(active IN (0, 1)) DEFAULT 1
+);
+"""

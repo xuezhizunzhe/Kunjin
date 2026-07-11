@@ -10,11 +10,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from kunjin import __version__
+from kunjin.adapters.eastmoney import (
+    EastmoneyFundClient,
+    EastmoneyMarketClient,
+    PublicDataError,
+)
 from kunjin.adapters.yangjibao import YangjibaoClient, YangjibaoError
 from kunjin.analytics.portfolio import analyze_portfolio
+from kunjin.analytics.research import analyze_fund_history, analyze_sectors
 from kunjin.logging import redact_secrets
+from kunjin.models import InvestmentThesis
 from kunjin.paths import RuntimePaths
 from kunjin.security.keychain import CredentialStoreError, KeychainTokenStore
+from kunjin.services.research import ResearchSyncService
 from kunjin.services.sync import PortfolioSyncService, SyncError
 from kunjin.storage.repository import Repository
 
@@ -26,6 +34,7 @@ class ApplicationContext:
     token_store: KeychainTokenStore
     client: YangjibaoClient
     sync_service: PortfolioSyncService
+    research_service: ResearchSyncService
 
 
 def build_context() -> ApplicationContext:
@@ -34,12 +43,18 @@ def build_context() -> ApplicationContext:
     repository.migrate()
     token_store = KeychainTokenStore()
     client = YangjibaoClient(token_store)
+    research_service = ResearchSyncService(
+        repository,
+        EastmoneyFundClient(),
+        EastmoneyMarketClient(),
+    )
     return ApplicationContext(
         paths=paths,
         repository=repository,
         token_store=token_store,
         client=client,
         sync_service=PortfolioSyncService(client, repository),
+        research_service=research_service,
     )
 
 
@@ -104,11 +119,40 @@ def build_parser() -> argparse.ArgumentParser:
     sync = subparsers.add_parser("sync")
     sync_subparsers = sync.add_subparsers(dest="sync_command", required=True)
     sync_subparsers.add_parser("portfolio")
+    sync_fund = sync_subparsers.add_parser("fund")
+    sync_fund.add_argument("fund_code")
+    sync_subparsers.add_parser("market")
+    sync_subparsers.add_parser("daily")
 
     portfolio = subparsers.add_parser("portfolio")
     portfolio_subparsers = portfolio.add_subparsers(dest="portfolio_command", required=True)
     portfolio_subparsers.add_parser("show")
     portfolio_subparsers.add_parser("analyze")
+
+    fund = subparsers.add_parser("fund")
+    fund_subparsers = fund.add_subparsers(dest="fund_command", required=True)
+    fund_research = fund_subparsers.add_parser("research")
+    fund_research.add_argument("fund_code")
+
+    market = subparsers.add_parser("market")
+    market_subparsers = market.add_subparsers(dest="market_command", required=True)
+    market_subparsers.add_parser("sectors")
+
+    thesis = subparsers.add_parser("thesis")
+    thesis_subparsers = thesis.add_subparsers(dest="thesis_command", required=True)
+    thesis_add = thesis_subparsers.add_parser("add")
+    thesis_add.add_argument("fund_code")
+    thesis_add.add_argument("--reason", required=True)
+    thesis_add.add_argument("--horizon", required=True)
+    thesis_add.add_argument("--invalidation", required=True)
+    thesis_list = thesis_subparsers.add_parser("list")
+    thesis_list.add_argument("--fund-code")
+    thesis_review = thesis_subparsers.add_parser("review")
+    thesis_review.add_argument("fund_code")
+
+    report = subparsers.add_parser("report")
+    report_subparsers = report.add_subparsers(dest="report_command", required=True)
+    report_subparsers.add_parser("weekly")
     return parser
 
 
@@ -153,6 +197,55 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         result = context.sync_service.sync_portfolio(trigger="manual")
         return envelope("sync.portfolio", serialize(result))
 
+    if args.command == "sync" and args.sync_command == "fund":
+        result = context.research_service.sync_fund(args.fund_code)
+        return envelope("sync.fund", serialize(result))
+
+    if args.command == "sync" and args.sync_command == "market":
+        result = context.research_service.sync_market()
+        return envelope("sync.market", serialize(result))
+
+    if args.command == "sync" and args.sync_command == "daily":
+        results: Dict[str, Any] = {}
+        errors: List[Dict[str, str]] = []
+        try:
+            results["portfolio"] = serialize(
+                context.sync_service.sync_portfolio(trigger="scheduled")
+            )
+        except Exception as exc:
+            errors.append(
+                {
+                    "code": str(getattr(exc, "code", "portfolio_sync_failed")),
+                    "message": redact_secrets(str(exc)),
+                }
+            )
+        fund_results = {}
+        for fund_code in sorted(
+            {position.fund_code for position in context.repository.latest_positions()}
+        ):
+            try:
+                fund_results[fund_code] = serialize(
+                    context.research_service.sync_fund(fund_code)
+                )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "code": str(getattr(exc, "code", "fund_sync_failed")),
+                        "message": f"{fund_code}: {redact_secrets(str(exc))}",
+                    }
+                )
+        results["funds"] = fund_results
+        try:
+            results["market"] = serialize(context.research_service.sync_market())
+        except Exception as exc:
+            errors.append(
+                {
+                    "code": str(getattr(exc, "code", "market_sync_failed")),
+                    "message": redact_secrets(str(exc)),
+                }
+            )
+        return envelope("sync.daily", results, errors=errors)
+
     if args.command == "status":
         return envelope(
             "status",
@@ -182,6 +275,78 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             warnings=list(analysis.warnings),
         )
 
+    if args.command == "fund" and args.fund_command == "research":
+        history = context.repository.fund_history(args.fund_code)
+        analysis = analyze_fund_history(history)
+        profile = context.repository.fund_profile(args.fund_code)
+        return envelope(
+            "fund.research",
+            {"profile": profile, "analysis": analysis},
+            warnings=list(analysis.get("warnings", [])),
+        )
+
+    if args.command == "market" and args.market_command == "sectors":
+        analysis = analyze_sectors(context.repository.latest_sector_snapshots())
+        return envelope(
+            "market.sectors",
+            analysis,
+            warnings=list(analysis.get("warnings", [])),
+        )
+
+    if args.command == "thesis" and args.thesis_command == "add":
+        thesis = InvestmentThesis(
+            fund_code=args.fund_code,
+            rationale=args.reason,
+            horizon=args.horizon,
+            invalidation=args.invalidation,
+            created_at=datetime.now(timezone.utc),
+        )
+        thesis_id = context.repository.add_thesis(thesis)
+        return envelope("thesis.add", {"id": thesis_id, "thesis": serialize(thesis)})
+
+    if args.command == "thesis" and args.thesis_command == "list":
+        theses = context.repository.list_theses(args.fund_code)
+        return envelope("thesis.list", {"theses": serialize(theses)})
+
+    if args.command == "thesis" and args.thesis_command == "review":
+        theses = context.repository.list_theses(args.fund_code)
+        research = analyze_fund_history(context.repository.fund_history(args.fund_code))
+        warnings = list(research.get("warnings", []))
+        if not theses:
+            warnings.append("no recorded thesis exists for this fund")
+        return envelope(
+            "thesis.review",
+            {"theses": serialize(theses), "fund_research": research},
+            warnings=warnings,
+        )
+
+    if args.command == "report" and args.report_command == "weekly":
+        positions = context.repository.latest_positions()
+        portfolio = analyze_portfolio(positions)
+        funds = {
+            fund_code: analyze_fund_history(context.repository.fund_history(fund_code))
+            for fund_code in sorted({position.fund_code for position in positions})
+        }
+        sectors = analyze_sectors(context.repository.latest_sector_snapshots())
+        warnings = list(portfolio.warnings) + list(sectors.get("warnings", []))
+        warnings.append(
+            "news and causal attribution are not persisted yet; verify relevant events from official sources"
+        )
+        return envelope(
+            "report.weekly",
+            {
+                "portfolio": serialize(portfolio),
+                "funds": funds,
+                "sectors": sectors,
+                "learning_questions": [
+                    "Did the original thesis still hold this week?",
+                    "Was the result driven by the intended mechanism or broad market movement?",
+                    "What evidence would invalidate the position next week?",
+                ],
+            },
+            warnings=warnings,
+        )
+
     return envelope(
         str(args.command),
         errors=[{"code": "unknown_command", "message": "Unknown command"}],
@@ -199,7 +364,7 @@ def run(
         else:
             payload = execute(args, context or build_context())
         exit_code = 1 if payload["errors"] else 0
-    except (CredentialStoreError, YangjibaoError, SyncError, ValueError) as exc:
+    except (CredentialStoreError, PublicDataError, YangjibaoError, SyncError, ValueError) as exc:
         code = getattr(exc, "code", "operation_failed")
         payload = envelope(
             str(args.command),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Dict, List, Optional
 
@@ -78,3 +78,58 @@ class PortfolioAnalysis:
     evidence_level: str
     warnings: List[str] = field(default_factory=list)
 
+
+@dataclass(frozen=True)
+class FundNavObservation:
+    fund_code: str
+    nav_date: date
+    unit_nav: Decimal
+    accumulated_nav: Optional[Decimal]
+    daily_growth: Optional[Decimal]
+    source: str
+    retrieved_at: datetime
+
+    def validate(self) -> None:
+        if not FUND_CODE_PATTERN.fullmatch(self.fund_code):
+            raise ValueError(f"invalid fund code: {self.fund_code}")
+        if self.unit_nav <= 0:
+            raise ValueError("unit NAV must be positive")
+
+
+@dataclass(frozen=True)
+class SectorObservation:
+    sector_code: str
+    sector_name: str
+    sector_kind: str
+    pct_change: Optional[Decimal]
+    turnover_rate: Optional[Decimal]
+    advancers: Optional[int]
+    decliners: Optional[int]
+    source: str
+    retrieved_at: datetime
+
+    def validate(self) -> None:
+        if self.sector_kind not in {"industry", "concept"}:
+            raise ValueError("sector kind must be industry or concept")
+        if not self.sector_code or not self.sector_name:
+            raise ValueError("sector code and name are required")
+
+
+@dataclass(frozen=True)
+class InvestmentThesis:
+    fund_code: str
+    rationale: str
+    horizon: str
+    invalidation: str
+    created_at: datetime
+    active: bool = True
+
+    def validate(self) -> None:
+        if not FUND_CODE_PATTERN.fullmatch(self.fund_code):
+            raise ValueError(f"invalid fund code: {self.fund_code}")
+        if not self.rationale.strip():
+            raise ValueError("rationale is required")
+        if not self.horizon.strip():
+            raise ValueError("horizon is required")
+        if not self.invalidation.strip():
+            raise ValueError("invalidation condition is required")

@@ -1,15 +1,19 @@
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 from kunjin.adapters.yangjibao import YangjibaoClient
+from kunjin.adapters.eastmoney import EastmoneyFundClient, EastmoneyMarketClient
 from kunjin.cli import ApplicationContext, run
-from kunjin.models import AccountObservation, PositionObservation
+from kunjin.models import AccountObservation, FundNavObservation, PositionObservation, SectorObservation
 from kunjin.paths import RuntimePaths
 from kunjin.services.sync import PortfolioSyncService
+from kunjin.services.research import ResearchSyncService
+from kunjin.models import SyncResult
+from kunjin.services.research import ResearchSyncResult
 from kunjin.storage.repository import Repository
 
 
@@ -52,12 +56,26 @@ class CliIntegrationTest(unittest.TestCase):
         )
         token_store = FakeTokenStore()
         client = YangjibaoClient(token_store)
+        repository.save_fund_history(
+            "017811",
+            "人工智能混合C",
+            "混合型",
+            "eastmoney",
+            [
+                FundNavObservation("017811", date(2026, 6, 1), Decimal("1.0"), None, None, "eastmoney", now),
+                FundNavObservation("017811", date(2026, 7, 1), Decimal("1.1"), None, None, "eastmoney", now),
+            ],
+        )
+        repository.save_sector_snapshots(
+            [SectorObservation("BK1", "半导体", "industry", Decimal("2"), Decimal("3"), 8, 2, "eastmoney", now)]
+        )
         self.context = ApplicationContext(
             paths,
             repository,
             token_store,
             client,
             PortfolioSyncService(client, repository),
+            ResearchSyncService(repository, EastmoneyFundClient(), EastmoneyMarketClient()),
         )
 
     def tearDown(self) -> None:
@@ -85,6 +103,65 @@ class CliIntegrationTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["data"]["analysis"]["evidence_level"], "deterministic_calculation")
+
+    def test_fund_research_is_structured(self) -> None:
+        payload, exit_code, _ = run(["--json", "fund", "research", "017811"], self.context)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["profile"]["fund_code"], "017811")
+        self.assertEqual(payload["data"]["analysis"]["evidence_level"], "deterministic_calculation")
+
+    def test_market_sectors_state_scope(self) -> None:
+        payload, exit_code, _ = run(["--json", "market", "sectors"], self.context)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["scope"], "recent_strength_and_breadth_only")
+
+    def test_thesis_add_and_review(self) -> None:
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "thesis",
+                "add",
+                "017811",
+                "--reason",
+                "AI盈利改善",
+                "--horizon",
+                "12个月",
+                "--invalidation",
+                "持续落后且风格漂移",
+            ],
+            self.context,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["thesis"]["fund_code"], "017811")
+
+        review, exit_code, _ = run(["--json", "thesis", "review", "017811"], self.context)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(review["data"]["theses"]), 1)
+
+    def test_weekly_report_preserves_missing_evidence_warning(self) -> None:
+        payload, exit_code, _ = run(["--json", "report", "weekly"], self.context)
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(any("news" in warning for warning in payload["warnings"]))
+
+    def test_daily_sync_combines_sources(self) -> None:
+        class PortfolioService:
+            def sync_portfolio(inner_self, trigger):
+                return SyncResult(1, 1, 1, datetime.now(timezone.utc))
+
+        class ResearchService:
+            def sync_fund(inner_self, fund_code):
+                return ResearchSyncResult(fund_code, 10)
+
+            def sync_market(inner_self):
+                return ResearchSyncResult("market_sectors", 2)
+
+        self.context.sync_service = PortfolioService()
+        self.context.research_service = ResearchService()
+        payload, exit_code, _ = run(["--json", "sync", "daily"], self.context)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("016067", payload["data"]["funds"])
+        self.assertEqual(payload["data"]["market"]["observations"], 2)
 
 
 if __name__ == "__main__":
