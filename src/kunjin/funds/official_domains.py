@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import MappingProxyType
 from typing import Mapping, Tuple
 
-
 # A domain is trusted only together with one of its audited publisher names.
 REGULATOR_AND_EXCHANGE_DOMAINS: Mapping[str, Tuple[str, ...]] = MappingProxyType(
     {

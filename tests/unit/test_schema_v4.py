@@ -31,7 +31,10 @@ class SchemaV4Test(unittest.TestCase):
                 INSERT INTO transactions(
                     transaction_type, fund_code, evidence_level,
                     field_evidence_json, created_at
-                ) VALUES ('subscription', '519755', 'user_confirmed', '{}', '2026-07-11T00:00:00+00:00')
+                ) VALUES (
+                    'subscription', '519755', 'user_confirmed', '{}',
+                    '2026-07-11T00:00:00+00:00'
+                )
                 """
             )
             with self.assertRaisesRegex(Exception, "transactions are immutable"):
@@ -62,7 +65,7 @@ class SchemaV4Test(unittest.TestCase):
             rows = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([int(row["version"]) for row in rows], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([int(row["version"]) for row in rows], list(range(1, 10)))
         self.assertTrue(
             {
                 "imported_documents",

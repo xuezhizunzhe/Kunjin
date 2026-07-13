@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-import re
 from typing import AbstractSet, Dict, Mapping, Optional, Sequence, Tuple, cast
 
 from kunjin.funds.models import (
@@ -13,7 +13,6 @@ from kunjin.funds.models import (
 )
 from kunjin.funds.peers.models import PairwiseOverlap, SharedExposure, WindowMetric
 from kunjin.models import FundNavObservation
-
 
 PEER_CALCULATION_VERSION = "1"
 START_TOLERANCE_DAYS = 7

@@ -5,7 +5,6 @@ from html.parser import HTMLParser
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
-
 IGNORED_ELEMENTS = {"script", "style", "iframe"}
 HEADING_ELEMENTS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 

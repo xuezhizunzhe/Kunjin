@@ -20,7 +20,6 @@ from kunjin.funds.peers.classification import (
 )
 from kunjin.funds.peers.models import DirectoryCandidate, MembershipKind
 
-
 AS_OF = date(2026, 7, 11)
 SOURCE_URL = "https://fund.eastmoney.com/js/fundcode_search.js"
 CHECKSUM = "a" * 64
@@ -158,7 +157,10 @@ class CandidateOrderingTests(unittest.TestCase):
         expected = tuple(
             sorted(
                 (f"{code:06d}" for code in range(1, 61)),
-                key=lambda code: (hashlib.sha256(f"519755:{code}".encode("ascii")).hexdigest(), code),
+                key=lambda code: (
+                    hashlib.sha256(f"519755:{code}".encode("ascii")).hexdigest(),
+                    code,
+                ),
             )[:DISCOVERY_VALIDATION_LIMIT]
         )
 

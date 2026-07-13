@@ -1,7 +1,21 @@
+import json
 import logging
 import unittest
+from datetime import datetime, timezone
+from decimal import Decimal
 
+from kunjin.allocation.crypto import EncryptedAllocationAssessment
+from kunjin.allocation.engine import AllocationCapitalInputs, AllocationInputs
+from kunjin.allocation.models import (
+    AllocationResult,
+    AllocationSafeSummary,
+    AllocationStatus,
+)
+from kunjin.allocation.serialization import encode_exact_result
+from kunjin.allocation.service import AllocationExecution
 from kunjin.logging import SecretRedactionFilter, redact_secrets
+from kunjin.suitability.models import AssessmentAmounts
+from tests.unit.test_allocation_serialization_crypto import exact_result
 
 
 class LoggingTest(unittest.TestCase):
@@ -35,6 +49,489 @@ class LoggingTest(unittest.TestCase):
             self.assertNotIn(secret, redacted)
         for key in ("order_id", "card_number", "phone", "managed_path"):
             self.assertIn(f"{key}=[REDACTED]", redacted)
+
+    def test_redact_secrets_removes_profile_financial_and_encryption_values(self) -> None:
+        fields = {
+            "monthly_net_income": "12001",
+            "monthly_essential_expenses": "5001",
+            "monthly_required_debt_service": "1501",
+            "monthly_investment_ceiling": "1001",
+            "minimum_operating_cash": "3001",
+            "minimum_monthly_cash_buffer": "1002",
+            "immediately_available_cash": "50001",
+            "cash_like_assets": "10001",
+            "emergency_reserve": "40001",
+            "low_risk_fixed_income_assets": "5002",
+            "manual_equity_fund_assets": "101",
+            "manual_bond_fund_assets": "102",
+            "manual_sector_fund_assets": "103",
+            "other_volatile_assets": "104",
+            "maximum_tolerable_loss": "20001",
+            "maximum_tolerable_drawdown": "0.201",
+            "debt_principal": "500001",
+            "outstanding_principal": "500002",
+            "effective_annual_rate": "0.0351",
+            "monthly_payment": "1502",
+            "goal_amount": "200001",
+            "target_amount": "200002",
+            "obligation_amount": "10002",
+            "amount_already_reserved": "3002",
+            "profile_key": "profile-secret",
+            "encryption_key": "encryption-secret",
+            "keychain_secret": "keychain-secret",
+            "nonce": "nonce-secret",
+            "ciphertext": "ciphertext-secret",
+            "encrypted_payload": "payload-secret",
+            "keyed_payload_fingerprint": "fingerprint-secret",
+        }
+        value = " ".join(f"{key}={secret}" for key, secret in fields.items())
+
+        redacted = redact_secrets(value)
+
+        for key, secret in fields.items():
+            self.assertNotIn(secret, redacted)
+            self.assertIn(f"{key}=[REDACTED]", redacted)
+
+    def test_redaction_preserves_fund_codes_nav_values_and_dates(self) -> None:
+        value = "fund_code=519755 nav=1.7467 nav_date=2026-07-12"
+
+        self.assertEqual(redact_secrets(value), value)
+
+    def test_redact_secrets_removes_phase_b_derived_and_encrypted_values(self) -> None:
+        fields = {
+            "verified_emergency_reserve": "91001.11",
+            "required_emergency_reserve": "91002.22",
+            "emergency_reserve_shortfall": "91003.33",
+            "required_monthly_obligation_saving": "91004.44",
+            "required_monthly_goal_saving": "91005.55",
+            "monthly_safety_residual": "91006.66",
+            "safe_monthly_ceiling": "91007.77",
+            "encrypted_amount_results": "phase-b-ciphertext-sentinel",
+        }
+        for key, secret in fields.items():
+            with self.subTest(key=key, format="bare"):
+                self.assertEqual(
+                    redact_secrets(f"{key}={secret}"),
+                    f"{key}=[REDACTED]",
+                )
+            with self.subTest(key=key, format="json"):
+                self.assertEqual(
+                    redact_secrets(json.dumps({key: secret})),
+                    json.dumps({key: "[REDACTED]"}),
+                )
+            with self.subTest(key=key, format="python_dict"):
+                self.assertEqual(
+                    redact_secrets(repr({key: secret})),
+                    repr({key: "[REDACTED]"}),
+                )
+
+    def test_filter_redacts_phase_b_structured_fields(self) -> None:
+        fields = {
+            "verified_emergency_reserve": "92001.11",
+            "required_emergency_reserve": "92002.22",
+            "emergency_reserve_shortfall": "92003.33",
+            "required_monthly_obligation_saving": "92004.44",
+            "required_monthly_goal_saving": "92005.55",
+            "monthly_safety_residual": "92006.66",
+            "safe_monthly_ceiling": "92007.77",
+            "encrypted_amount_results": "structured-ciphertext-sentinel",
+        }
+        record = logging.LogRecord(
+            "x",
+            logging.INFO,
+            __file__,
+            1,
+            "assessment complete",
+            (),
+            None,
+        )
+        for key, secret in fields.items():
+            setattr(record, key, secret)
+        record.status = "blocked"
+        record.amount = "diagnostic"
+        record.goal = "count-only"
+        record.debt = "type-only"
+
+        SecretRedactionFilter().filter(record)
+
+        for key in fields:
+            self.assertEqual(getattr(record, key), "[REDACTED]")
+        self.assertEqual(record.status, "blocked")
+        self.assertEqual(record.amount, "diagnostic")
+        self.assertEqual(record.goal, "count-only")
+        self.assertEqual(record.debt, "type-only")
+
+    def test_redact_secrets_consumes_complete_phase_b_decimal_repr_values(self) -> None:
+        fields = (
+            "verified_emergency_reserve",
+            "required_emergency_reserve",
+            "emergency_reserve_shortfall",
+            "required_monthly_obligation_saving",
+            "required_monthly_goal_saving",
+            "monthly_safety_residual",
+            "safe_monthly_ceiling",
+            "encrypted_amount_results",
+        )
+        for index, key in enumerate(fields, start=1):
+            sentinel = f"9300{index}.0{index}"
+            for quote in ("'", '"'):
+                decimal_repr = f"Decimal( {quote}{sentinel}{quote} )"
+                with self.subTest(key=key, quote=quote, format="bare_decimal"):
+                    self.assertEqual(
+                        redact_secrets(f"{key}={decimal_repr}"),
+                        f"{key}=[REDACTED]",
+                    )
+                with self.subTest(key=key, quote=quote, format="dict_decimal"):
+                    rendered = f"{{'{key}': {decimal_repr}}}"
+                    self.assertEqual(
+                        redact_secrets(rendered),
+                        f"{{'{key}': [REDACTED]}}",
+                    )
+
+    def test_assessment_amounts_decimal_repr_is_redacted_in_exception_and_log(self) -> None:
+        sentinels = tuple(Decimal(f"9400{index}.0{index}") for index in range(1, 8))
+        amounts = AssessmentAmounts(*sentinels)
+        message = f"assessment failed: {amounts!r}"
+        error = RuntimeError(message)
+        record = logging.LogRecord(
+            "x",
+            logging.ERROR,
+            __file__,
+            1,
+            "assessment failed: %r",
+            (amounts,),
+            None,
+        )
+
+        redacted_exception = redact_secrets(str(error))
+        SecretRedactionFilter().filter(record)
+
+        for sentinel in sentinels:
+            self.assertNotIn(str(sentinel), redacted_exception)
+            self.assertNotIn(str(sentinel), record.getMessage())
+        self.assertNotIn("Decimal(", redacted_exception)
+        self.assertNotIn("Decimal(", record.getMessage())
+        self.assertEqual(redacted_exception.count("[REDACTED]"), 7)
+        self.assertEqual(record.getMessage().count("[REDACTED]"), 7)
+
+    def test_phase_b_sentinels_do_not_survive_exception_or_log_redaction(self) -> None:
+        sentinel = "919191.91"
+        message = f"safe_monthly_ceiling={sentinel}"
+        error = RuntimeError(message)
+        record = logging.LogRecord(
+            "x",
+            logging.ERROR,
+            __file__,
+            1,
+            "assessment failed: %s",
+            (error,),
+            None,
+        )
+
+        redacted_exception = redact_secrets(str(error))
+        SecretRedactionFilter().filter(record)
+
+        self.assertNotIn(sentinel, redacted_exception)
+        self.assertNotIn(sentinel, record.getMessage())
+        self.assertEqual(redacted_exception, "safe_monthly_ceiling=[REDACTED]")
+        self.assertEqual(
+            record.getMessage(),
+            "assessment failed: safe_monthly_ceiling=[REDACTED]",
+        )
+
+    def test_redaction_keeps_generic_diagnostic_fields(self) -> None:
+        value = "status=blocked amount=unknown goal=short_term debt=unsupported"
+
+        self.assertEqual(redact_secrets(value), value)
+
+    def test_allocation_amount_keys_are_redacted_recursively(self) -> None:
+        sentinels = {
+            "total_financial_assets": Decimal("811001.01"),
+            "liquid_protection_assets": Decimal("811002.02"),
+            "protected_short_term_assigned": Decimal("811003.03"),
+            "protected_liquid_claims": Decimal("811004.04"),
+            "investable_stock_assets": Decimal("811005.05"),
+            "monthly_discretionary_allocation_ceiling": Decimal("811006.06"),
+            "target_amount": Decimal("811007.07"),
+            "amount_already_reserved": Decimal("811008.08"),
+            "confirmed_monthly_saving": Decimal("811009.09"),
+            "zero_return_funding": Decimal("811010.10"),
+            "funding_gap": Decimal("811011.11"),
+            "assigned_amount": Decimal("811012.12"),
+            "weighted_equity_contribution": Decimal("811013.13"),
+            "weighted_horizon_numerator": Decimal("811014.14"),
+            "stress_loss_amount": Decimal("811015.15"),
+            "fixed_income_stress_loss_amount": Decimal("811016.16"),
+            "equity_stress_loss_amount": Decimal("811017.17"),
+            "loss_amount_equity_ceiling_amount": Decimal("811018.18"),
+        }
+        value = {
+            "goal_funding_details": [{"target_amount": sentinels["target_amount"]}],
+            "obligation_funding_details": {"funding_gap": sentinels["funding_gap"]},
+            "nested": sentinels,
+        }
+
+        redacted = redact_secrets(value)
+        rendered = json.dumps(redacted, default=str)
+
+        for sentinel in sentinels.values():
+            self.assertNotIn(str(sentinel), rendered)
+        self.assertEqual(redacted["goal_funding_details"], "[REDACTED]")
+        self.assertEqual(redacted["obligation_funding_details"], "[REDACTED]")
+        for key in sentinels:
+            self.assertEqual(redacted["nested"][key], "[REDACTED]")
+
+    def test_allocation_encryption_metadata_is_redacted_in_structured_logs(self) -> None:
+        fields = {
+            "allocation_exact_result": {"investable_stock_assets": Decimal("812001.01")},
+            "exact_result_payload": b"phase-c-exact-payload-sentinel",
+            "encrypted_exact_result": "phase-c-encrypted-result-sentinel",
+            "allocation_nonce": "phase-c-nonce-sentinel",
+            "allocation_ciphertext": "phase-c-ciphertext-sentinel",
+            "allocation_keyed_fingerprint": "phase-c-fingerprint-sentinel",
+        }
+        record = logging.LogRecord("x", logging.INFO, __file__, 1, "allocation complete", (), None)
+        for key, secret in fields.items():
+            setattr(record, key, secret)
+        record.status = "range_available"
+        record.maximum_equity_weight = "0.37"
+        record.context = {"nested": {"investable_stock_assets": Decimal("812002.02")}}
+
+        SecretRedactionFilter().filter(record)
+
+        for key in fields:
+            self.assertEqual(getattr(record, key), "[REDACTED]")
+        self.assertEqual(record.status, "range_available")
+        self.assertEqual(record.maximum_equity_weight, "0.37")
+        self.assertEqual(
+            record.context,
+            {"nested": {"investable_stock_assets": "[REDACTED]"}},
+        )
+
+    def test_allocation_exact_result_object_is_redacted_before_log_rendering(self) -> None:
+        value = exact_result()
+        sentinel_amount = "100.00"
+        sentinel_names = ("near-purpose", "later-purpose", "known-obligation")
+
+        record = logging.LogRecord(
+            "x",
+            logging.ERROR,
+            __file__,
+            1,
+            "allocation failed: %r",
+            (value,),
+            None,
+        )
+        error = RuntimeError(f"allocation failed: {value!r}")
+
+        SecretRedactionFilter().filter(record)
+        redacted_error = redact_secrets(str(error))
+
+        self.assertEqual(record.getMessage(), "allocation failed: '[REDACTED]'")
+        self.assertNotIn(sentinel_amount, record.getMessage())
+        self.assertNotIn(sentinel_amount, redacted_error)
+        for sentinel_name in sentinel_names:
+            self.assertNotIn(sentinel_name, record.getMessage())
+            self.assertNotIn(sentinel_name, redacted_error)
+
+    def test_secret_repr_redaction_preserves_safe_parenthesized_suffix(self) -> None:
+        value = f"exact={exact_result()!r} safe-suffix=(keep-this) done"
+
+        redacted = redact_secrets(value)
+
+        self.assertEqual(redacted, "exact=[REDACTED] safe-suffix=(keep-this) done")
+
+    def test_secret_repr_redaction_preserves_text_between_two_objects(self) -> None:
+        exact = exact_result()
+        value = (
+            f"first={exact.goal_funding_details[0]!r} "
+            f"SAFE-MIDDLE=(keep) second={exact.obligation_funding_details[0]!r}"
+        )
+
+        redacted = redact_secrets(value)
+
+        self.assertEqual(
+            redacted,
+            "first=[REDACTED] SAFE-MIDDLE=(keep) second=[REDACTED]",
+        )
+
+    def test_canonical_allocation_payload_is_redacted_as_text_and_bytes(self) -> None:
+        payload = encode_exact_result(exact_result())
+        text_payload = payload.decode("utf-8")
+
+        for value in (payload, text_payload, f"allocation failed: {text_payload}"):
+            with self.subTest(value_type=type(value).__name__):
+                rendered = str(redact_secrets(value))
+                self.assertNotIn("near-purpose", rendered)
+                self.assertNotIn("known-obligation", rendered)
+                self.assertNotIn('"amount":"100.00"', rendered)
+
+    def test_canonical_payload_is_redacted_among_other_json_objects(self) -> None:
+        payload = encode_exact_result(exact_result()).decode("utf-8")
+        cases = (
+            f'prefix={{"safe":"before"}} exact={payload} suffix={{"code":"ok"}}',
+            f'{payload} trailing={{"safe":"after"}}',
+            f'{{"safe":1}} {payload} {{"safe":2}} {payload}',
+        )
+
+        for value in cases:
+            with self.subTest(value=value[:40]):
+                rendered = redact_secrets(value)
+                self.assertNotIn("near-purpose", rendered)
+                self.assertNotIn("known-obligation", rendered)
+                self.assertNotIn('"amount":"100.00"', rendered)
+                self.assertIn("[REDACTED]", rendered)
+        self.assertIn('{"safe":"before"}', redact_secrets(cases[0]))
+        self.assertIn('{"code":"ok"}', redact_secrets(cases[0]))
+        self.assertIn('{"safe":"after"}', redact_secrets(cases[1]))
+
+    def test_prefixed_exact_payload_bytes_are_redacted_in_structured_log_context(self) -> None:
+        payload = encode_exact_result(exact_result())
+        record = logging.LogRecord(
+            "x", logging.INFO, __file__, 1, "allocation payload captured", (), None
+        )
+        record.context = {"blob": b"safe-prefix:" + payload + b":safe-suffix"}
+
+        SecretRedactionFilter().filter(record)
+
+        rendered = str(record.context["blob"])
+        self.assertIn("safe-prefix", rendered)
+        self.assertIn("safe-suffix", rendered)
+        self.assertIn("[REDACTED]", rendered)
+        self.assertNotIn("near-purpose", rendered)
+        self.assertNotIn("known-obligation", rendered)
+        self.assertNotIn('"amount":"100.00"', rendered)
+
+    def test_malformed_exact_payload_with_all_markers_fails_closed(self) -> None:
+        payload = encode_exact_result(exact_result()).decode("utf-8")[:-1]
+
+        redacted = redact_secrets(f"safe-prefix {payload}")
+
+        self.assertEqual(redacted, "[REDACTED]")
+
+    def test_actual_allocation_wrappers_and_fingerprints_are_redacted(self) -> None:
+        exact = exact_result()
+        encrypted = EncryptedAllocationAssessment(
+            algorithm="AES-256-GCM",
+            key_version="v1",
+            nonce="allocation-nonce-sentinel",
+            ciphertext="allocation-ciphertext-sentinel",
+            keyed_fingerprint="allocation-fingerprint-sentinel",
+        )
+        result = AllocationResult(
+            status=AllocationStatus.RANGE_AVAILABLE,
+            capability="research_only",
+            blocks=(),
+            binding_constraints=(),
+            profile_conflicts=(),
+            safe_summary=AllocationSafeSummary(0, 0, 0, 0, 0, ()),
+            permitted_region=None,
+            exact=exact,
+        )
+        capital = AllocationCapitalInputs(
+            assessment_date=exact.assessment_date,
+            total_financial_assets=exact.total_financial_assets,
+            liquid_protection_assets=exact.liquid_protection_assets,
+            verified_emergency_reserve=exact.verified_emergency_reserve,
+            minimum_operating_cash=exact.minimum_operating_cash,
+            protected_short_term_assigned=exact.protected_short_term_assigned,
+            protected_liquid_claims=exact.protected_liquid_claims,
+            investable_stock_assets=exact.investable_stock_assets,
+            monthly_discretionary_allocation_ceiling=(
+                exact.monthly_discretionary_allocation_ceiling
+            ),
+            maximum_tolerable_loss=exact.maximum_tolerable_loss,
+            maximum_tolerable_drawdown=exact.maximum_tolerable_drawdown,
+            residual_horizon_date=exact.residual_horizon_date,
+            goal_funding_details=exact.goal_funding_details,
+            obligation_funding_details=exact.obligation_funding_details,
+            assigned_sleeves=exact.assigned_sleeves,
+        )
+        inputs = AllocationInputs((), (), (), capital)
+        execution = AllocationExecution(
+            result=result,
+            assessment_id=1,
+            profile_version_id=1,
+            profile_version=1,
+            suitability_assessment_id=1,
+            policy_version="1",
+            assessed_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
+            valid_until=datetime(2026, 7, 13, tzinfo=timezone.utc),
+            freshness="fresh",
+        )
+        wrappers = (
+            encrypted,
+            exact.goal_funding_details[0],
+            exact.obligation_funding_details[0],
+            result,
+            execution,
+            inputs,
+            capital,
+        )
+        record = logging.LogRecord(
+            "x", logging.INFO, __file__, 1, "allocation wrappers: %r", (wrappers,), None
+        )
+        record.context = {
+            "encrypted": encrypted,
+            "wrappers": wrappers,
+            "input_fingerprint": "input-fingerprint-sentinel",
+            "profile_keyed_fingerprint": "profile-fingerprint-sentinel",
+            "suitability_input_fingerprint": "suitability-fingerprint-sentinel",
+        }
+
+        SecretRedactionFilter().filter(record)
+
+        rendered = record.getMessage()
+        for sentinel in (
+            "allocation-nonce-sentinel",
+            "allocation-ciphertext-sentinel",
+            "allocation-fingerprint-sentinel",
+            "input-fingerprint-sentinel",
+            "profile-fingerprint-sentinel",
+            "suitability-fingerprint-sentinel",
+        ):
+            self.assertNotIn(sentinel, rendered)
+            self.assertNotIn(sentinel, json.dumps(record.context))
+        self.assertEqual(record.context["encrypted"], "[REDACTED]")
+        self.assertEqual(record.context["wrappers"], ("[REDACTED]",) * len(wrappers))
+
+    def test_aggregate_inputs_preserve_safe_percentages_only(self) -> None:
+        value = {
+            "aggregate_inputs": {
+                "weighted_horizon_numerator": Decimal("814001.01"),
+                "weighted_horizon_equity_ceiling": "0.47",
+                "fixed_income_stress_loss": "0.10",
+                "equity_stress_loss": "0.50",
+            }
+        }
+
+        redacted = redact_secrets(value)
+
+        record = logging.LogRecord(
+            "x",
+            logging.INFO,
+            __file__,
+            1,
+            "aggregate: %r",
+            (exact_result().aggregate_inputs,),
+            None,
+        )
+        SecretRedactionFilter().filter(record)
+
+        self.assertEqual(
+            redacted,
+            {
+                "aggregate_inputs": {
+                    "weighted_horizon_numerator": "[REDACTED]",
+                    "weighted_horizon_equity_ceiling": "0.47",
+                    "fixed_income_stress_loss": "0.10",
+                    "equity_stress_loss": "0.50",
+                }
+            },
+        )
+        self.assertNotIn("380.0000", record.getMessage())
+        self.assertIn("weighted_horizon_equity_ceiling=Decimal('0.47')", record.getMessage())
+        self.assertIn("equity_stress_loss=Decimal('0.50')", record.getMessage())
 
 
 if __name__ == "__main__":

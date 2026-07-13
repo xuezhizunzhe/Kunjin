@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from kunjin.models import FundNavObservation, SectorObservation
 
-
 FUND_CODE = re.compile(r"^\d{6}$")
 FUND_NAV_PAGE_SIZE = 20
 FUND_NAV_MAX_PAGES = 50

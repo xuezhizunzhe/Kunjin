@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -16,14 +18,27 @@ from kunjin.models import (
     StoredPosition,
 )
 from kunjin.storage.schema import (
+    LEGACY_SCHEMA_V8,
     SCHEMA_V1,
     SCHEMA_V2,
     SCHEMA_V3,
     SCHEMA_V4,
     SCHEMA_V5,
     SCHEMA_V6,
+    SCHEMA_V7,
+    SCHEMA_V8,
+    SCHEMA_V9,
     SCHEMA_VERSION,
 )
+from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
+from kunjin.suitability.policy import SuitabilityPolicyV1
+
+_SUITABILITY_TABLES = {
+    "suitability_policy_versions",
+    "suitability_assessments",
+}
+_LEGACY_V8_POLICY_TABLE = "__kunjin_legacy_v8_policy_versions"
+_LEGACY_V8_ASSESSMENT_TABLE = "__kunjin_legacy_v8_assessments"
 
 
 def _utc_now() -> datetime:
@@ -36,6 +51,489 @@ def _as_text(value: Optional[Decimal]) -> Optional[str]:
 
 def _as_decimal(value: Optional[str]) -> Optional[Decimal]:
     return None if value is None else Decimal(value)
+
+
+def _iter_sql_statements(script: str) -> Iterator[str]:
+    buffer: List[str] = []
+    for character in script:
+        buffer.append(character)
+        if character != ";":
+            continue
+        candidate = "".join(buffer)
+        if sqlite3.complete_statement(candidate):
+            statement = candidate.strip()
+            if statement:
+                yield statement
+            buffer.clear()
+    if "".join(buffer).strip():
+        raise sqlite3.OperationalError("incomplete schema statement")
+
+
+def _execute_schema(connection: sqlite3.Connection, script: str) -> None:
+    for statement in _iter_sql_statements(script):
+        connection.execute(statement)
+
+
+def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
+    return (
+        (1, SCHEMA_V1),
+        (2, SCHEMA_V2),
+        (3, SCHEMA_V3),
+        (4, SCHEMA_V4),
+        (5, SCHEMA_V5),
+        (6, SCHEMA_V6),
+        (7, SCHEMA_V7),
+        (8, SCHEMA_V8),
+        (9, SCHEMA_V9),
+    )
+
+
+def _read_schema_objects(connection: sqlite3.Connection) -> Dict[str, Tuple[str, str, str]]:
+    rows = connection.execute(
+        """
+        SELECT type, name, tbl_name, sql
+        FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+        """
+    ).fetchall()
+    return {
+        str(row["name"]): (
+            str(row["type"]),
+            str(row["tbl_name"]),
+            "" if row["sql"] is None else str(row["sql"]),
+        )
+        for row in rows
+    }
+
+
+@lru_cache(maxsize=16)
+def _expected_schema_objects(schemas: Tuple[str, ...]) -> Dict[str, Tuple[str, str, str]]:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        for schema in schemas:
+            _execute_schema(connection, schema)
+        return _read_schema_objects(connection)
+    finally:
+        connection.close()
+
+
+def _owned_suitability_objects(
+    objects: Dict[str, Tuple[str, str, str]],
+) -> Dict[str, Tuple[str, str, str]]:
+    return {
+        name: value
+        for name, value in objects.items()
+        if _ascii_identifier(name).startswith("suitability_")
+        or _ascii_identifier(value[1]) in _SUITABILITY_TABLES
+    }
+
+
+def _ascii_identifier(value: str) -> str:
+    return value.translate(
+        str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+    )
+
+
+def _validate_migration_markers(applied_versions: set) -> int:
+    if any(version <= 0 or version > SCHEMA_VERSION for version in applied_versions):
+        raise sqlite3.DatabaseError("invalid schema migration markers")
+    if not applied_versions:
+        return 0
+    maximum = max(applied_versions)
+    if applied_versions != set(range(1, maximum + 1)):
+        raise sqlite3.DatabaseError("invalid schema migration markers")
+    return maximum
+
+
+def _reject_unexpected_suitability_foreign_keys(connection: sqlite3.Connection) -> None:
+    table_rows = connection.execute(
+        """
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+        """
+    ).fetchall()
+    for row in table_rows:
+        table = str(row["name"])
+        normalized_table = _ascii_identifier(table)
+        quoted_table = table.replace('"', '""')
+        foreign_keys = connection.execute(f'PRAGMA foreign_key_list("{quoted_table}")').fetchall()
+        for foreign_key in foreign_keys:
+            target = str(foreign_key["table"])
+            normalized_target = _ascii_identifier(target)
+            expected_policy_reference = (
+                normalized_table == "suitability_assessments"
+                and normalized_target == "suitability_policy_versions"
+            )
+            if normalized_target in _SUITABILITY_TABLES and not expected_policy_reference:
+                raise sqlite3.DatabaseError(
+                    "unexpected foreign key references legacy suitability schema"
+                )
+
+
+def _legacy_v8_normalization_checkpoint(stage: str) -> None:
+    del stage
+
+
+def _legacy_text(value: object, name: str, *, nonempty: bool = True) -> str:
+    if type(value) is not str or "\x00" in value:
+        raise sqlite3.DatabaseError(f"invalid legacy V8 {name}")
+    if nonempty and not value.strip():
+        raise sqlite3.DatabaseError(f"invalid legacy V8 {name}")
+    return value
+
+
+def _legacy_digest(value: object, name: str) -> str:
+    text = _legacy_text(value, name)
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise sqlite3.DatabaseError(f"invalid legacy V8 {name}")
+    return text
+
+
+def _legacy_datetime(value: object, name: str) -> datetime:
+    text = _legacy_text(value, name)
+    parse_value = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(parse_value)
+    except ValueError:
+        raise sqlite3.DatabaseError(f"invalid legacy V8 {name}") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise sqlite3.DatabaseError(f"invalid legacy V8 {name}")
+    canonical = parsed.isoformat()
+    if canonical != text and not (text.endswith("Z") and canonical == parse_value):
+        raise sqlite3.DatabaseError(f"invalid legacy V8 {name}")
+    return parsed
+
+
+def _legacy_json(value: object, name: str) -> object:
+    text = _legacy_text(value, name)
+
+    def object_without_duplicates(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = item
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("unsupported constant")
+
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=object_without_duplicates,
+            parse_constant=reject_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise sqlite3.DatabaseError(f"invalid legacy V8 {name}") from None
+
+
+def _legacy_reason_values(value: object, enum_type, name: str) -> Tuple[str, ...]:
+    parsed = _legacy_json(value, name)
+    if not isinstance(parsed, list):
+        raise sqlite3.DatabaseError(f"invalid legacy V8 {name}")
+    reasons = []
+    for item in parsed:
+        if type(item) is not str:
+            raise sqlite3.DatabaseError(f"invalid legacy V8 {name}")
+        try:
+            enum_type(item)
+        except ValueError:
+            raise sqlite3.DatabaseError(f"invalid legacy V8 {name}") from None
+        reasons.append(item)
+    if len(reasons) != len(set(reasons)):
+        raise sqlite3.DatabaseError(f"invalid legacy V8 {name}")
+    return tuple(reasons)
+
+
+def _validate_legacy_safe_summary(value: object) -> None:
+    parsed = _legacy_json(value, "safe_summary_json")
+    integer_keys = {
+        "debt_count",
+        "goal_count",
+        "obligation_count",
+        "required_reserve_months",
+    }
+    expected_keys = integer_keys | {"risk_answers_consistent"}
+    if not isinstance(parsed, dict) or set(parsed) != expected_keys:
+        raise sqlite3.DatabaseError("invalid legacy V8 safe_summary_json")
+    if any(type(parsed[key]) is not int or parsed[key] < 0 for key in integer_keys):
+        raise sqlite3.DatabaseError("invalid legacy V8 safe_summary_json")
+    if type(parsed["risk_answers_consistent"]) is not bool:
+        raise sqlite3.DatabaseError("invalid legacy V8 safe_summary_json")
+
+
+def _validate_legacy_v8_rows(connection: sqlite3.Connection) -> None:
+    profile_ids = {
+        int(row["id"])
+        for row in connection.execute("SELECT id FROM financial_profile_versions").fetchall()
+        if type(row["id"]) is int and int(row["id"]) > 0
+    }
+    policy_versions = set()
+    policy_rows = connection.execute(
+        "SELECT * FROM suitability_policy_versions ORDER BY version"
+    ).fetchall()
+    fixed_policy = SuitabilityPolicyV1()
+    fixed_policy.validate()
+    fixed_canonical = fixed_policy.canonical_json().decode("utf-8")
+    fixed_checksum = fixed_policy.checksum()
+    fixed_effective_at = fixed_policy.effective_at.isoformat()
+    for row in policy_rows:
+        version = _legacy_text(row["version"], "policy version")
+        canonical_policy = _legacy_text(row["canonical_policy_json"], "canonical_policy_json")
+        parsed_policy = _legacy_json(canonical_policy, "canonical_policy_json")
+        if not isinstance(parsed_policy, dict) or canonical_policy != json.dumps(
+            parsed_policy, separators=(",", ":"), sort_keys=True
+        ):
+            raise sqlite3.DatabaseError("invalid legacy V8 canonical_policy_json")
+        if parsed_policy.get("version") != version:
+            raise sqlite3.DatabaseError("invalid legacy V8 policy JSON version")
+        checksum = _legacy_digest(row["policy_checksum"], "policy_checksum")
+        effective_at_text = _legacy_text(row["effective_at"], "effective_at")
+        effective_at = _legacy_datetime(row["effective_at"], "effective_at")
+        created_at = _legacy_datetime(row["created_at"], "policy created_at")
+        if (
+            version != fixed_policy.version
+            or canonical_policy != fixed_canonical
+            or checksum != fixed_checksum
+            or effective_at_text != fixed_effective_at
+        ):
+            raise sqlite3.DatabaseError("invalid legacy V8 fixed suitability policy")
+        if created_at < effective_at:
+            raise sqlite3.DatabaseError("invalid legacy V8 policy timestamp ordering")
+        policy_versions.add(version)
+
+    assessment_rows = connection.execute(
+        "SELECT * FROM suitability_assessments ORDER BY id"
+    ).fetchall()
+    for row in assessment_rows:
+        if type(row["id"]) is not int or row["id"] <= 0:
+            raise sqlite3.DatabaseError("invalid legacy V8 assessment id")
+        if (
+            type(row["profile_version_id"]) is not int
+            or row["profile_version_id"] <= 0
+            or row["profile_version_id"] not in profile_ids
+        ):
+            raise sqlite3.DatabaseError("invalid legacy V8 profile_version_id")
+        policy_version = _legacy_text(row["policy_version"], "assessment policy version")
+        if policy_version not in policy_versions:
+            raise sqlite3.DatabaseError("invalid legacy V8 assessment policy version")
+        _legacy_digest(row["input_fingerprint"], "input_fingerprint")
+        try:
+            status = AssessmentStatus(_legacy_text(row["status"], "assessment status"))
+        except ValueError:
+            raise sqlite3.DatabaseError("invalid legacy V8 assessment status") from None
+        hard_blocks = _legacy_reason_values(
+            row["hard_blocks_json"], BlockReason, "hard_blocks_json"
+        )
+        constraints = _legacy_reason_values(
+            row["constraints_json"], ConstraintReason, "constraints_json"
+        )
+        expected_status = AssessmentStatus.READY_FOR_ALLOCATION
+        if hard_blocks:
+            expected_status = AssessmentStatus.BLOCKED
+        elif constraints:
+            expected_status = AssessmentStatus.CONSTRAINED
+        if status is not expected_status:
+            raise sqlite3.DatabaseError("invalid legacy V8 assessment status reasons")
+        _validate_legacy_safe_summary(row["safe_summary_json"])
+        _legacy_text(row["encrypted_amount_results"], "encrypted_amount_results")
+        if _legacy_text(row["encryption_algorithm"], "encryption_algorithm") != "AES-256-GCM":
+            raise sqlite3.DatabaseError("invalid legacy V8 encryption_algorithm")
+        _legacy_text(row["encryption_key_version"], "encryption_key_version")
+        _legacy_text(row["nonce"], "nonce")
+        _legacy_digest(row["keyed_payload_fingerprint"], "keyed_payload_fingerprint")
+        assessed_at = _legacy_datetime(row["assessed_at"], "assessed_at")
+        valid_until = _legacy_datetime(row["valid_until"], "valid_until")
+        _legacy_datetime(row["created_at"], "assessment created_at")
+        if valid_until <= assessed_at:
+            raise sqlite3.DatabaseError("invalid legacy V8 assessment timestamp ordering")
+
+
+def _normalization_name_collisions(connection: sqlite3.Connection) -> None:
+    reserved = {
+        _LEGACY_V8_POLICY_TABLE,
+        _LEGACY_V8_ASSESSMENT_TABLE,
+    }
+    actual_names = {_ascii_identifier(name) for name in _read_schema_objects(connection)}
+    temp_names = {
+        _ascii_identifier(str(row["name"]))
+        for row in connection.execute(
+            "SELECT name FROM sqlite_temp_master ORDER BY name"
+        ).fetchall()
+    }
+    if reserved & actual_names or reserved & temp_names:
+        raise sqlite3.DatabaseError("legacy V8 normalization name collision")
+    if _SUITABILITY_TABLES & temp_names:
+        raise sqlite3.DatabaseError("legacy V8 normalization name collision")
+
+
+def _legacy_assessment_sequence(connection: sqlite3.Connection):
+    matching_rows = []
+    for row in connection.execute(
+        "SELECT name, seq, typeof(name) AS name_type, typeof(seq) AS seq_type "
+        "FROM sqlite_sequence ORDER BY rowid"
+    ).fetchall():
+        raw_name = row["name"]
+        if type(raw_name) is bytes:
+            try:
+                comparable_name = raw_name.decode("ascii")
+            except UnicodeDecodeError:
+                comparable_name = ""
+        elif type(raw_name) is str:
+            comparable_name = raw_name
+        else:
+            comparable_name = ""
+        if _ascii_identifier(comparable_name) == "suitability_assessments":
+            matching_rows.append(row)
+    if len(matching_rows) > 1:
+        raise sqlite3.DatabaseError("invalid legacy V8 assessment sequence")
+    if not matching_rows:
+        return None
+    row = matching_rows[0]
+    if (
+        row["name"] != "suitability_assessments"
+        or row["seq_type"] != "integer"
+        or int(row["seq"]) < 0
+    ):
+        raise sqlite3.DatabaseError("invalid legacy V8 assessment sequence")
+    return row["seq"]
+
+
+def _normalize_legacy_v8(connection: sqlite3.Connection) -> None:
+    _normalization_name_collisions(connection)
+
+    _reject_unexpected_suitability_foreign_keys(connection)
+    _validate_legacy_v8_rows(connection)
+    preserved_sequence = _legacy_assessment_sequence(connection)
+
+    connection.execute(
+        f'CREATE TEMP TABLE "{_LEGACY_V8_POLICY_TABLE}" AS '
+        "SELECT * FROM main.suitability_policy_versions"
+    )
+    connection.execute(
+        f'CREATE TEMP TABLE "{_LEGACY_V8_ASSESSMENT_TABLE}" AS '
+        "SELECT * FROM main.suitability_assessments ORDER BY id"
+    )
+    _legacy_v8_normalization_checkpoint("backed_up")
+
+    connection.execute("DROP TABLE main.suitability_assessments")
+    connection.execute("DROP TABLE main.suitability_policy_versions")
+
+    _execute_schema(connection, SCHEMA_V8)
+    _legacy_v8_normalization_checkpoint("schema_created")
+    connection.execute(
+        f"""
+        INSERT INTO suitability_policy_versions(
+            version, canonical_policy_json, policy_checksum, effective_at, created_at
+        )
+        SELECT
+            version, canonical_policy_json, policy_checksum, effective_at, created_at
+        FROM temp."{_LEGACY_V8_POLICY_TABLE}"
+        """
+    )
+    connection.execute(
+        f"""
+        INSERT INTO suitability_assessments(
+            id, profile_version_id, policy_version, input_fingerprint, status,
+            hard_blocks_json, constraints_json, safe_summary_json,
+            encrypted_amount_results, encryption_algorithm, encryption_key_version,
+            nonce, keyed_payload_fingerprint, assessed_at, valid_until, created_at
+        )
+        SELECT
+            id, profile_version_id, policy_version, input_fingerprint, status,
+            hard_blocks_json, constraints_json, safe_summary_json,
+            encrypted_amount_results, encryption_algorithm, encryption_key_version,
+            nonce, keyed_payload_fingerprint, assessed_at, valid_until, created_at
+        FROM temp."{_LEGACY_V8_ASSESSMENT_TABLE}"
+        ORDER BY id
+        """
+    )
+    _legacy_v8_normalization_checkpoint("rows_copied")
+    connection.execute(f'DROP TABLE temp."{_LEGACY_V8_ASSESSMENT_TABLE}"')
+    connection.execute(f'DROP TABLE temp."{_LEGACY_V8_POLICY_TABLE}"')
+    connection.execute("DELETE FROM sqlite_sequence WHERE name = 'suitability_assessments'")
+    if preserved_sequence is not None:
+        connection.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)",
+            ("suitability_assessments", preserved_sequence),
+        )
+    _legacy_v8_normalization_checkpoint("legacy_dropped")
+
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise sqlite3.IntegrityError("legacy V8 normalization violated foreign keys")
+    if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise sqlite3.DatabaseError("legacy V8 normalization failed integrity check")
+
+
+def _normalize_exact_legacy_v8_if_needed(
+    connection: sqlite3.Connection,
+    applied_versions: set,
+    migrations: Tuple[Tuple[int, str], ...],
+) -> None:
+    if applied_versions != set(range(1, 9)):
+        return
+
+    actual = _read_schema_objects(connection)
+    schemas_before_v8 = tuple(schema for version, schema in migrations if version < 8)
+    expected_before_v8 = _expected_schema_objects(schemas_before_v8)
+    for name, expected_object in expected_before_v8.items():
+        if actual.get(name) != expected_object:
+            return
+
+    actual_owned = _owned_suitability_objects(actual)
+    strict_owned = _owned_suitability_objects(
+        _expected_schema_objects(schemas_before_v8 + (SCHEMA_V8,))
+    )
+    if actual_owned == strict_owned:
+        return
+    legacy_owned = _owned_suitability_objects(
+        _expected_schema_objects(schemas_before_v8 + (LEGACY_SCHEMA_V8,))
+    )
+    if actual_owned != legacy_owned:
+        return
+    _normalize_legacy_v8(connection)
+
+
+def _validate_applied_schema(
+    connection: sqlite3.Connection,
+    applied_versions: set,
+    migrations: Tuple[Tuple[int, str], ...],
+) -> None:
+    maximum = _validate_migration_markers(applied_versions)
+
+    schemas = tuple(schema for version, schema in migrations if version <= maximum)
+    expected = _expected_schema_objects(schemas)
+    actual = _read_schema_objects(connection)
+    for name, expected_object in expected.items():
+        if actual.get(name) != expected_object:
+            raise sqlite3.DatabaseError("applied schema does not match migration markers")
+
+    if maximum >= 8:
+        expected_suitability = _owned_suitability_objects(expected)
+        actual_suitability = _owned_suitability_objects(actual)
+        if actual_suitability != expected_suitability:
+            raise sqlite3.DatabaseError("suitability schema does not match V8")
+
+    if 9 not in applied_versions:
+        return
+    expected_before_v9 = _expected_schema_objects(
+        tuple(schema for version, schema in migrations if version < 9)
+    )
+    expected_v9 = {
+        name: value for name, value in expected.items() if name not in expected_before_v9
+    }
+    allocation_tables = {"allocation_policy_versions", "allocation_assessments"}
+    actual_v9 = {
+        name: value
+        for name, value in actual.items()
+        if name.startswith("allocation_") or value[1] in allocation_tables
+    }
+    if actual_v9 != expected_v9:
+        raise sqlite3.DatabaseError("allocation schema does not match V9")
 
 
 class Repository:
@@ -56,37 +554,55 @@ class Repository:
     def migrate(self) -> None:
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
-            with connection:
-                connection.executescript(SCHEMA_V1)
-                connection.execute(
-                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (1, _utc_now().isoformat()),
-                )
-                connection.executescript(SCHEMA_V2)
-                connection.execute(
-                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (2, _utc_now().isoformat()),
-                )
-                connection.executescript(SCHEMA_V3)
-                connection.execute(
-                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (3, _utc_now().isoformat()),
-                )
-                connection.executescript(SCHEMA_V4)
-                connection.execute(
-                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (4, _utc_now().isoformat()),
-                )
-                connection.executescript(SCHEMA_V5)
-                connection.execute(
-                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (5, _utc_now().isoformat()),
-                )
-                connection.executescript(SCHEMA_V6)
-                connection.execute(
-                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (SCHEMA_VERSION, _utc_now().isoformat()),
-                )
+            migrations = _migration_definitions()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                marker_exists = connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'schema_migrations'
+                    """
+                ).fetchone()
+                if marker_exists is None:
+                    _execute_schema(connection, SCHEMA_V1)
+                    connection.execute(
+                        """
+                        INSERT INTO schema_migrations(version, applied_at)
+                        VALUES (1, strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'))
+                        """
+                    )
+
+                applied_versions = {
+                    int(row["version"])
+                    for row in connection.execute(
+                        "SELECT version FROM schema_migrations"
+                    ).fetchall()
+                }
+                _validate_migration_markers(applied_versions)
+                _normalize_exact_legacy_v8_if_needed(connection, applied_versions, migrations)
+                _validate_applied_schema(connection, applied_versions, migrations)
+                for version, schema in migrations:
+                    if version in applied_versions:
+                        continue
+                    _execute_schema(connection, schema)
+                    connection.execute(
+                        """
+                        INSERT INTO schema_migrations(version, applied_at)
+                        VALUES (?, strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'))
+                        """,
+                        (version,),
+                    )
+                final_versions = {
+                    int(row["version"])
+                    for row in connection.execute(
+                        "SELECT version FROM schema_migrations"
+                    ).fetchall()
+                }
+                _validate_applied_schema(connection, final_versions, migrations)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
         self.database.chmod(0o600)
 
     def table_names(self) -> set:
@@ -99,7 +615,8 @@ class Repository:
     def begin_sync(self, source: str, trigger: str) -> int:
         with self.connect() as connection, connection:
             cursor = connection.execute(
-                "INSERT INTO sync_runs(source, trigger, started_at, status) VALUES (?, ?, ?, 'running')",
+                "INSERT INTO sync_runs(source, trigger, started_at, status) "
+                "VALUES (?, ?, ?, 'running')",
                 (source, trigger, _utc_now().isoformat()),
             )
             return int(cursor.lastrowid)

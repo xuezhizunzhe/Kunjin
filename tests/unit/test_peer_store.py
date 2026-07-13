@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 import sqlite3
 import tempfile
@@ -16,7 +15,6 @@ from kunjin.funds.peers.models import (
 )
 from kunjin.funds.peers.store import PeerStore, canonical_fingerprint
 from kunjin.storage.repository import Repository
-
 
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -226,7 +224,10 @@ class PeerStoreTest(unittest.TestCase):
                 "SELECT result_json FROM fund_comparison_runs WHERE id = ?", (run_id,)
             ).fetchone()["result_json"]
         self.assertEqual(result_json, '{"a":{"中文":true},"z":1}')
-        self.assertEqual(self.store.load_comparison(run_id)["result"], {"a": {"中文": True}, "z": 1})
+        self.assertEqual(
+            self.store.load_comparison(run_id)["result"],
+            {"a": {"中文": True}, "z": 1},
+        )
 
         for value in (math.nan, math.inf, -math.inf):
             with self.subTest(value=value), self.assertRaises(ValueError):

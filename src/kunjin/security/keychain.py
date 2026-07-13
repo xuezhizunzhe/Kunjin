@@ -46,7 +46,9 @@ class KeychainTokenStore:
                 ]
             )
         except subprocess.CalledProcessError as exc:
-            raise CredentialStoreError(redact_secrets(exc.stderr or "keychain save failed")) from exc
+            raise CredentialStoreError(
+                redact_secrets(exc.stderr or "keychain save failed")
+            ) from exc
 
     def load(self) -> Optional[str]:
         try:
@@ -65,7 +67,9 @@ class KeychainTokenStore:
         except subprocess.CalledProcessError as exc:
             if exc.returncode == 44:
                 return None
-            raise CredentialStoreError(redact_secrets(exc.stderr or "keychain load failed")) from exc
+            raise CredentialStoreError(
+                redact_secrets(exc.stderr or "keychain load failed")
+            ) from exc
 
     def delete(self) -> None:
         try:
@@ -84,4 +88,3 @@ class KeychainTokenStore:
                 raise CredentialStoreError(
                     redact_secrets(exc.stderr or "keychain delete failed")
                 ) from exc
-

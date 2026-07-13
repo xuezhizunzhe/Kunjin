@@ -8,7 +8,15 @@ from kunjin.models import FundNavObservation, SectorObservation
 
 class ResearchTest(unittest.TestCase):
     def nav(self, day, value):
-        return FundNavObservation("017811", day, Decimal(value), None, None, "eastmoney", datetime.now(timezone.utc))
+        return FundNavObservation(
+            "017811",
+            day,
+            Decimal(value),
+            None,
+            None,
+            "eastmoney",
+            datetime.now(timezone.utc),
+        )
 
     def test_fund_research_calculates_drawdown_and_recovery(self) -> None:
         history = [
@@ -28,7 +36,11 @@ class ResearchTest(unittest.TestCase):
 
     def test_sector_analysis_does_not_claim_investment_merit(self) -> None:
         now = datetime.now(timezone.utc)
-        sectors = [SectorObservation("BK1", "半导体", "industry", Decimal("2"), None, 8, 2, "eastmoney", now)]
+        sectors = [
+            SectorObservation(
+                "BK1", "半导体", "industry", Decimal("2"), None, 8, 2, "eastmoney", now
+            )
+        ]
 
         result = analyze_sectors(sectors)
 

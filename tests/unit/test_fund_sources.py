@@ -16,7 +16,6 @@ from kunjin.funds.sources import (
     classify_source,
 )
 
-
 PUBLIC_DNS_RESULT = [
     (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("1.1.1.1", 443))
 ]
@@ -86,8 +85,12 @@ class FundTextClientTest(unittest.TestCase):
         self.client = FundTextClient(timeout_seconds=3)
 
     def test_fetches_bounded_https_text_and_records_metadata(self) -> None:
-        response = make_response("基金资料".encode("gb18030"), content_type="text/html; charset=gbk")
-        with patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT), patch(
+        response = make_response(
+            "基金资料".encode("gb18030"), content_type="text/html; charset=gbk"
+        )
+        with patch(
+            "kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT
+        ), patch(
             "kunjin.funds.sources.urllib.request.urlopen", return_value=response
         ) as urlopen:
             result = self.client.fetch(
@@ -104,8 +107,12 @@ class FundTextClientTest(unittest.TestCase):
 
     def test_allows_audited_api_host_without_cross_host_redirects(self) -> None:
         final_url = "https://api.fund.eastmoney.com/f10/JJGG?fundcode=519755&pageIndex=1&pageSize=20&type=0"
-        response = make_response(b'{"Data":[]}', final_url=final_url, content_type="application/json")
-        with patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT), patch(
+        response = make_response(
+            b'{"Data":[]}', final_url=final_url, content_type="application/json"
+        )
+        with patch(
+            "kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT
+        ), patch(
             "kunjin.funds.sources.urllib.request.urlopen", return_value=response
         ):
             result = self.client.fetch(final_url, "https://fundf10.eastmoney.com/")
@@ -113,8 +120,12 @@ class FundTextClientTest(unittest.TestCase):
         self.assertEqual(result.final_url, final_url)
 
     def test_uses_fallback_decoding_for_unknown_charset(self) -> None:
-        response = make_response("基金资料".encode("gb18030"), content_type="text/html; charset=big5")
-        with patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT), patch(
+        response = make_response(
+            "基金资料".encode("gb18030"), content_type="text/html; charset=big5"
+        )
+        with patch(
+            "kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT
+        ), patch(
             "kunjin.funds.sources.urllib.request.urlopen", return_value=response
         ):
             result = self.client.fetch(
@@ -166,7 +177,9 @@ class FundTextClientTest(unittest.TestCase):
 
     def test_rejects_oversized_response(self) -> None:
         response = make_response(b"x" * (MAX_RESPONSE_BYTES + 1))
-        with patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT), patch(
+        with patch(
+            "kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT
+        ), patch(
             "kunjin.funds.sources.urllib.request.urlopen", return_value=response
         ):
             with self.assertRaises(FundSourceError):
@@ -183,7 +196,9 @@ class FundTextClientTest(unittest.TestCase):
             "http://fundf10.eastmoney.com/jbgk_519755.html",
             "https://example.com/jbgk_519755.html",
         )
-        with patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT), patch(
+        with patch(
+            "kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT
+        ), patch(
             "kunjin.funds.sources.urllib.request.urlopen", return_value=accepted
         ):
             self.client.fetch(
@@ -228,7 +243,11 @@ class OfficialSourceClassificationTest(unittest.TestCase):
     def test_registered_fund_company_requires_exact_normalized_manager_name(self) -> None:
         official_url = "https://www.fund001.com/web/notice/519755.pdf"
         self.assertEqual(
-            classify_source(official_url, " 交银施罗德基金管理有限公司 ", "交银施罗德基金管理有限公司"),
+            classify_source(
+                official_url,
+                " 交银施罗德基金管理有限公司 ",
+                "交银施罗德基金管理有限公司",
+            ),
             1,
         )
         self.assertEqual(

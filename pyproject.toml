@@ -8,14 +8,14 @@ version = "0.1.0"
 description = "Local, read-only fund research foundation for Codex"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = []
+dependencies = ["cryptography>=43,<46"]
 
 [project.optional-dependencies]
 qr = ["qrcode>=7.4,<9"]
 dev = ["pytest>=8,<9", "ruff>=0.5,<1"]
 
 [project.scripts]
-kunjin = "kunjin.cli:app"
+kunjin = "kunjin.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -32,3 +32,5 @@ target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+# Keep Python 3.9-compatible annotations while retaining other pyupgrade checks.
+ignore = ["UP006", "UP007", "UP035", "UP037", "UP045"]

@@ -65,7 +65,11 @@ def analyze_portfolio(positions: Sequence[StoredPosition]) -> PortfolioAnalysis:
 
     weights = {code: value / total_value for code, value in values.items()}
     hhi = sum((weight * weight for weight in weights.values()), Decimal("0"))
-    profit_values = [position.observed_profit for position in positions if position.observed_profit is not None]
+    profit_values = [
+        position.observed_profit
+        for position in positions
+        if position.observed_profit is not None
+    ]
     coverage = Decimal(len(profit_values)) / Decimal(len(positions))
     observed_profit = (
         sum(profit_values, Decimal("0")) if len(profit_values) == len(positions) else None
@@ -86,4 +90,3 @@ def analyze_portfolio(positions: Sequence[StoredPosition]) -> PortfolioAnalysis:
         evidence_level="deterministic_calculation",
         warnings=warnings,
     )
-

@@ -32,7 +32,6 @@ from kunjin.funds.store import FundDisclosureStore
 from kunjin.services.research import ResearchSyncService
 from kunjin.storage.repository import Repository
 
-
 PEER_NAV_MAX_PAGES = 20
 _FUND_CODE_PATTERN = re.compile(r"^\d{6}$")
 _RULE_DESCRIPTION = "相同基金类型、管理方式和业绩基准族。"

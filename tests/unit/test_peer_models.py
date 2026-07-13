@@ -17,7 +17,6 @@ from kunjin.funds.peers.models import (
     WindowMetric,
 )
 
-
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
 SOURCE_URL = "https://fund.eastmoney.com/js/fundcode_search.js"
 CHECKSUM = "a" * 64

@@ -21,8 +21,10 @@ orders, or produce automatic trading instructions.
 - Yangjibao app for QR authorization
 - Apple Vision and `/usr/bin/swift` for local screenshot OCR
 
-Phase-one runtime uses the Python standard library. The optional `qrcode` package
-improves terminal QR rendering but is not required by the storage or analytics code.
+The runtime has one bounded non-standard-library security dependency:
+`cryptography>=43,<46`. It provides AES-256-GCM encryption for the personal
+financial profile. The optional `qrcode` package improves terminal QR rendering
+but is not required by the storage or analytics code.
 
 ## Offline Installation
 
@@ -32,6 +34,7 @@ offline-compatible setup is:
 ```bash
 cd /Users/yanzihao/KunJin
 python3 -m venv .venv
+.venv/bin/pip install 'cryptography>=43,<46'
 .venv/bin/python setup.py develop
 .venv/bin/kunjin --json version
 ```
@@ -49,6 +52,18 @@ When PyPI access is available, install terminal QR rendering with:
 .venv/bin/kunjin --json auth status
 .venv/bin/kunjin auth login yangjibao
 .venv/bin/kunjin --json auth revoke yangjibao
+.venv/bin/kunjin profile edit
+.venv/bin/kunjin --json profile status
+.venv/bin/kunjin --json profile history
+.venv/bin/kunjin suitability assess
+.venv/bin/kunjin --json suitability assess
+.venv/bin/kunjin --json suitability status
+.venv/bin/kunjin --json suitability history
+.venv/bin/kunjin allocation ranges
+.venv/bin/kunjin --json allocation ranges
+.venv/bin/kunjin --json allocation status
+.venv/bin/kunjin --json allocation history
+.venv/bin/kunjin --json allocation policy
 .venv/bin/kunjin --json sync portfolio
 .venv/bin/kunjin --json status
 .venv/bin/kunjin --json portfolio show
@@ -80,6 +95,132 @@ When PyPI access is available, install terminal QR rendering with:
 
 `auth login` is interactive and intentionally rejects JSON mode. The token is
 saved directly in macOS Keychain and is never returned in command output.
+
+## Personal Financial Profile (Phase A)
+
+Phase A stores and versions a personal financial profile. Enter exact income,
+debt, reserve, asset, goal, and loss-budget values only through the local
+interactive terminal:
+
+```bash
+.venv/bin/kunjin profile edit
+.venv/bin/kunjin --json profile status
+.venv/bin/kunjin --json profile history
+```
+
+Do not paste exact financial values into Codex chat. `profile status` and
+`profile history` expose metadata only, so their JSON output can be inspected
+without revealing the encrypted values.
+
+The profile payload is encrypted with AES-256-GCM before it is stored in SQLite.
+Its encryption key is stored separately in macOS Keychain under service
+`com.kunjin.profile-encryption` and account `v1`. Losing that Keychain key makes
+the existing encrypted profile unavailable with `encrypted_profile_unavailable`;
+KunJin does not reveal, decrypt, or reset the old profile, and does not silently
+create a replacement key while trying to read it.
+
+Profile presence is storage readiness, not suitability approval. Phase A does
+not calculate suitability, asset allocation, purchase approval, or purchase
+amounts.
+
+## Suitability And Financial Safety (Phase B)
+
+Run the four Phase B commands as follows:
+
+```bash
+.venv/bin/kunjin suitability assess
+.venv/bin/kunjin --json suitability assess
+.venv/bin/kunjin --json suitability status
+.venv/bin/kunjin --json suitability history
+```
+
+`suitability assess` without `--json` is the explicit local exact view. It may
+show derived reserve and monthly-capacity amounts in the terminal. Do not paste
+that output into Codex chat. `--json suitability assess` performs and persists
+the same deterministic assessment but returns amount-free metadata, stable
+reason codes, counts, booleans, and dates. JSON status and history are also
+amount-free; exact derived results are encrypted at rest.
+
+An assessment is fresh for at most 24 hours and never beyond the active
+profile's validity. A changed, replaced, expired, missing, or unauthenticated
+profile or assessment cannot reuse an earlier successful result.
+
+Phase B has three financial states:
+
+- `blocked`: one or more financial-safety rules failed; inspect every returned
+  reason code and address the condition locally before proceeding.
+- `constrained`: no hard block applies, but near-term commitments or the
+  confirmed monthly ceiling restrict available capacity.
+- `ready_for_allocation`: the Phase B safety foundation passed and may proceed
+  to Phase C allocation-range analysis.
+
+All three states still have capability `research_only`. `ready_for_allocation`
+is not a buy recommendation. Phase B does not calculate an allocation, classify
+a fund, or approve an amount. Directional and position-size requests remain
+`research_only` until later phases pass. KunJin therefore does not claim 90%
+coverage of the beginner fund-purchase workflow.
+
+## Transparent Allocation Ranges (Phase C)
+
+Phase C is a strict continuation of Phase B, not a bypass. For a directional or
+position-size question, first run `--json suitability assess`. A `blocked`
+result stops the workflow. Only `constrained` or `ready_for_allocation` may
+proceed to `--json allocation ranges`. Missing, stale, mismatched, tampered, or
+unauthenticated Phase B evidence fails closed.
+
+Phase C uses three abstract layers only:
+
+- `protected_cash`, with a fixed 0% stress loss.
+- `high_quality_fixed_income`, with a fixed 10% stress loss.
+- `diversified_equity`, with a fixed 50% stress loss.
+
+These are policy abstractions, not classifications of real funds. In particular,
+a bond fund, pure-debt fund, or fixed-income-plus fund is not automatically
+`high_quality_fixed_income`; product classification remains Phase D work.
+
+The permitted region is the intersection of transparent inequalities. Equity
+is capped independently by each goal or obligation horizon, the loss-amount and
+drawdown budgets, behavioral willingness, and financial stability. The maximum
+equity ceiling is not a target, minimum, recommended contribution mix, or buy
+amount. Zero equity remains feasible. The monthly discretionary ceiling is also
+an upper bound, not a recommendation.
+
+Every allocation requires a declared purpose and date. Phase C uses the earliest
+eligible positive-gap goal as the residual-capital horizon; without one it
+returns `allocation_horizon_missing`. Goal and obligation funding is shown in
+zero-return states, so optimistic expected returns are never used to make a goal
+appear feasible.
+
+Protected cash, operating cash, and short-term assigned capital cannot be reused
+as investable capital. If protected liquid claims exceed the declared liquid
+protection assets, the protected-capital overlap block
+`protected_capital_overlap_or_shortfall` prevents a range. Asset fields must be
+mutually exclusive, although KunJin cannot independently prove that the user's
+real accounts do not overlap.
+
+Use these Phase C commands:
+
+```bash
+.venv/bin/kunjin allocation ranges
+.venv/bin/kunjin --json allocation ranges
+.venv/bin/kunjin --json allocation status
+.venv/bin/kunjin --json allocation history
+.venv/bin/kunjin --json allocation policy
+```
+
+The non-JSON `allocation ranges` command is the owner's exact local view and may
+show CNY amounts and private goal or obligation names. Do not paste it into chat.
+The JSON commands are amount-free views containing percentages, counts, dates,
+stable codes, inequalities, and binding constraints. Exact results are encrypted
+at rest with AES-256-GCM. Assessments bind to the authenticated Phase B snapshot
+and active profile, are fresh for at most 24 hours and never beyond profile
+validity, and retain immutable authenticated history.
+
+Every Phase C state remains `research_only`. Phase C does not classify real
+funds, compare current holdings with the region, choose a target point, or issue
+a trade or purchase amount. Those portfolio-construction and pre-purchase
+controls remain Phase D and Phase E, so Phase C does not complete 90% of the
+beginner purchase workflow.
 
 ## Personal Transaction Ledger
 

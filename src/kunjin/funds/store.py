@@ -26,7 +26,6 @@ from kunjin.funds.models import (
 )
 from kunjin.storage.repository import Repository
 
-
 _RECORD_TYPES: Dict[str, Tuple[Type[Any], ...]] = {
     DocumentKind.BASIC_PROFILE.value: (FundIdentity, FundShareClass, FundBenchmark),
     DocumentKind.MANAGER_HISTORY.value: (FundManagerTenure,),
@@ -130,7 +129,10 @@ class FundDisclosureStore:
             if not isinstance(record, allowed_types):
                 raise ValueError("record type does not match publication section")
             record.validate()
-            if isinstance(record, (FundHolding, FundIndustryExposure)) and record.published_at is None:
+            if (
+                isinstance(record, (FundHolding, FundIndustryExposure))
+                and record.published_at is None
+            ):
                 raise ValueError(
                     "holding and industry records require a verified publication date"
                 )

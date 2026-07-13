@@ -8,7 +8,6 @@ from kunjin.funds.html import FundParseError
 from kunjin.funds.peers.models import DirectoryCandidate
 from kunjin.funds.sources import TextResponse
 
-
 PEER_DIRECTORY_URL = "https://fund.eastmoney.com/js/fundcode_search.js"
 PEER_DIRECTORY_REFERER = "https://fund.eastmoney.com/"
 MAX_DIRECTORY_ROWS = 30_000

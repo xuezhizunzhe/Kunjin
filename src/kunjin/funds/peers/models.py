@@ -8,7 +8,6 @@ from enum import Enum
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
-
 FUND_CODE_PATTERN = re.compile(r"^\d{6}$")
 CHECKSUM_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 PEER_MEMBER_LIMIT = 20

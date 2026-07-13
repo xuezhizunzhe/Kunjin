@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import unittest
 import json
+import unittest
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -12,11 +12,11 @@ from kunjin.funds.models import (
     AssetType,
     DocumentKind,
     FeeType,
-    FundBenchmark,
     FundAnnouncement,
+    FundBenchmark,
     FundFeeRule,
-    FundIdentity,
     FundHolding,
+    FundIdentity,
     FundIndustryExposure,
     FundManagerTenure,
     FundShareClass,
@@ -32,7 +32,6 @@ from kunjin.funds.parsers import (
     parse_size_history,
 )
 from kunjin.funds.sources import TextResponse
-
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "funds"
 
@@ -52,15 +51,19 @@ def response(name: str, path: str) -> TextResponse:
 class BasicProfileParserTest(unittest.TestCase):
     def test_parses_realistic_alternating_profile_rows(self) -> None:
         base = response("basic_profile.html", "jbgk_519755.html")
-        realistic = """
-        <p>成立日期：2015-06-02 基金经理：示例经理 类型：混合型</p>
-        <table>
-          <tr><td>基金全称</td><td>交银施罗德多策略回报灵活配置混合型证券投资基金</td><td>基金简称</td><td>交银多策略回报灵活配置混合A</td></tr>
-          <tr><td>基金代码</td><td>519755（前端）</td><td>基金类型</td><td>混合型</td></tr>
-          <tr><td>成立日期/规模</td><td>2015年06月02日 / 31.957亿份</td><td>资产规模</td><td>12.34亿元</td></tr>
-          <tr><td>基金管理人</td><td>交银施罗德基金管理有限公司</td><td>基金状态</td><td>开放申购 开放赎回</td></tr>
-        </table>
-        """
+        realistic = (
+            "\n        <p>成立日期：2015-06-02 基金经理：示例经理 类型：混合型</p>\n"
+            "        <table>\n"
+            "          <tr><td>基金全称</td><td>交银施罗德多策略回报灵活配置混合型证券"
+            "投资基金</td><td>基金简称</td><td>交银多策略回报灵活配置混合A</td></tr>\n"
+            "          <tr><td>基金代码</td><td>519755（前端）</td><td>基金类型</td>"
+            "<td>混合型</td></tr>\n"
+            "          <tr><td>成立日期/规模</td><td>2015年06月02日 / 31.957亿份</td>"
+            "<td>资产规模</td><td>12.34亿元</td></tr>\n"
+            "          <tr><td>基金管理人</td><td>交银施罗德基金管理有限公司</td>"
+            "<td>基金状态</td><td>开放申购 开放赎回</td></tr>\n"
+            "        </table>\n        "
+        )
 
         section = parse_basic_profile(
             TextResponse(**{**base.__dict__, "text": realistic}), "519755"
@@ -149,12 +152,13 @@ class BasicProfileParserTest(unittest.TestCase):
 class ManagerHistoryParserTest(unittest.TestCase):
     def test_splits_explicit_co_manager_names_into_individual_tenures(self) -> None:
         source = response("manager_history.html", "jjjl_519755.html")
-        text = """
-        <table>
-          <tr><th>基金经理</th><th>任职日期</th><th>离任日期</th></tr>
-          <tr><td><a>王艺伟</a>、<a>姜承操</a> <a>徐森洲</a></td><td>2025-01-09</td><td>至今</td></tr>
-        </table>
-        """
+        text = (
+            "\n        <table>\n"
+            "          <tr><th>基金经理</th><th>任职日期</th><th>离任日期</th></tr>\n"
+            "          <tr><td><a>王艺伟</a>、<a>姜承操</a> <a>徐森洲</a></td>"
+            "<td>2025-01-09</td><td>至今</td></tr>\n"
+            "        </table>\n        "
+        )
 
         section = parse_manager_history(
             TextResponse(**{**source.__dict__, "text": text}), "519755"
@@ -416,7 +420,9 @@ class FundHoldingParserTest(unittest.TestCase):
           </table>"""
         wrapped = "var apidata={content:" + json.dumps(content, ensure_ascii=False) + "};"
 
-        section = parse_quarterly_holdings(TextResponse(**{**base.__dict__, "text": wrapped}), "519755")
+        section = parse_quarterly_holdings(
+            TextResponse(**{**base.__dict__, "text": wrapped}), "519755"
+        )
 
         holding = section.records[0]
         self.assertEqual(holding.report_period, date(2026, 6, 30))
@@ -449,7 +455,9 @@ class FundHoldingParserTest(unittest.TestCase):
             ensure_ascii=False,
         )
 
-        section = parse_industry_exposure(TextResponse(**{**base.__dict__, "text": payload}), "519755")
+        section = parse_industry_exposure(
+            TextResponse(**{**base.__dict__, "text": payload}), "519755"
+        )
 
         exposure = section.records[0]
         self.assertEqual(exposure.classification_standard, "证监会行业分类")
@@ -600,9 +608,26 @@ class FundHoldingParserTest(unittest.TestCase):
 class FundAnnouncementParserTest(unittest.TestCase):
     def test_parses_realistic_announcement_json_as_tier_two_index(self) -> None:
         base = response("announcements.html", "f10/JJGG?fundcode=519755")
-        payload = json.dumps({"Data": [{"TITLE": "交银多策略回报灵活配置混合型证券投资基金2025年第4季度报告", "NEWCATEGORY": "3", "PUBLISHDATEDesc": "2026-01-21", "ATTACHTYPE": ".pdf", "ID": "AN202601210001"}]}, ensure_ascii=False)
+        payload = json.dumps(
+            {
+                "Data": [
+                    {
+                        "TITLE": "交银多策略回报灵活配置混合型证券投资基金2025年第4季度报告",
+                        "NEWCATEGORY": "3",
+                        "PUBLISHDATEDesc": "2026-01-21",
+                        "ATTACHTYPE": ".pdf",
+                        "ID": "AN202601210001",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
 
-        section = parse_announcements(TextResponse(**{**base.__dict__, "text": payload}), "519755", "交银施罗德基金管理有限公司")
+        section = parse_announcements(
+            TextResponse(**{**base.__dict__, "text": payload}),
+            "519755",
+            "交银施罗德基金管理有限公司",
+        )
 
         announcement = section.records[0]
         self.assertEqual(announcement.category, "定期报告")

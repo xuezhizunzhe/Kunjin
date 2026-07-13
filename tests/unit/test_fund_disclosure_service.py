@@ -4,7 +4,7 @@ import hashlib
 import json
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -18,7 +18,6 @@ from kunjin.funds.service import (
 from kunjin.funds.sources import FundSourceError, TextResponse
 from kunjin.funds.store import FundDisclosureStore
 from kunjin.storage.repository import Repository
-
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "funds"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -99,8 +98,18 @@ class FundDisclosureServiceTest(unittest.TestCase):
         self.assertEqual(result.sections["quarterly_holdings"].status, "success")
         holding = self.store.load_bundle("519755").holdings[0]
         self.assertEqual(holding.published_at, datetime(2026, 7, 20, tzinfo=SHANGHAI))
-        self.assertTrue(any("FundArchivesDatas.aspx?type=jjcc" in url for url in self.client.requested_urls))
-        self.assertTrue(any("api.fund.eastmoney.com/f10/JJGG" in url for url in self.client.requested_urls))
+        self.assertTrue(
+            any(
+                "FundArchivesDatas.aspx?type=jjcc" in url
+                for url in self.client.requested_urls
+            )
+        )
+        self.assertTrue(
+            any(
+                "api.fund.eastmoney.com/f10/JJGG" in url
+                for url in self.client.requested_urls
+            )
+        )
 
     def test_dynamic_holdings_without_matching_announcement_fail_explicitly(self) -> None:
         content = """<h4>2025年4季度股票投资明细</h4><table>
@@ -113,7 +122,10 @@ class FundDisclosureServiceTest(unittest.TestCase):
         result = self.service.sync_holdings("519755")
 
         self.assertEqual(result.sections["quarterly_holdings"].status, "source_unavailable")
-        self.assertEqual(result.sections["quarterly_holdings"].error_code, "missing_publication_date")
+        self.assertEqual(
+            result.sections["quarterly_holdings"].error_code,
+            "missing_publication_date",
+        )
 
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()

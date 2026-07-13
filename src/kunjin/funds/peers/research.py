@@ -13,10 +13,8 @@ from kunjin.funds.models import (
     DocumentKind,
     FeeType,
     FundFeeRule,
-    FundIndustryExposure,
     SourceDocument,
 )
-from kunjin.funds.research import build_disclosure_report
 from kunjin.funds.peers.analytics import (
     PEER_CALCULATION_VERSION,
     calculate_size_stability,
@@ -29,8 +27,8 @@ from kunjin.funds.peers.analytics import (
 )
 from kunjin.funds.peers.classification import PEER_RULE_VERSION, classify_peer
 from kunjin.funds.peers.models import PairwiseOverlap, PeerGroup, WindowMetric
+from kunjin.funds.research import build_disclosure_report
 from kunjin.models import FundNavObservation, StoredPosition
-
 
 WINDOW_DAYS = {"90d": 90, "365d": 365}
 ONGOING_FEE_TYPES = {

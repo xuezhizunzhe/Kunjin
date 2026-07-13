@@ -22,7 +22,6 @@ from kunjin.funds.models import (
 )
 from kunjin.funds.research import build_disclosure_report
 
-
 AS_OF = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
 
 
@@ -50,13 +49,33 @@ def source(
 
 def complete_bundle() -> DisclosureBundle:
     sources = {
-        1: source(1, DocumentKind.BASIC_PROFILE, published_at=datetime(2026, 7, 1, tzinfo=timezone.utc)),
+        1: source(
+            1,
+            DocumentKind.BASIC_PROFILE,
+            published_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        ),
         2: source(2, DocumentKind.MANAGER_HISTORY),
         3: source(3, DocumentKind.FEE_SCHEDULE),
-        4: source(4, DocumentKind.SIZE_HISTORY, published_at=datetime(2026, 7, 5, tzinfo=timezone.utc)),
-        5: source(5, DocumentKind.QUARTERLY_HOLDINGS, published_at=datetime(2026, 7, 8, tzinfo=timezone.utc)),
-        6: source(6, DocumentKind.INDUSTRY_EXPOSURE, published_at=datetime(2026, 7, 8, tzinfo=timezone.utc)),
-        7: source(7, DocumentKind.ANNOUNCEMENT, published_at=datetime(2026, 7, 8, tzinfo=timezone.utc)),
+        4: source(
+            4,
+            DocumentKind.SIZE_HISTORY,
+            published_at=datetime(2026, 7, 5, tzinfo=timezone.utc),
+        ),
+        5: source(
+            5,
+            DocumentKind.QUARTERLY_HOLDINGS,
+            published_at=datetime(2026, 7, 8, tzinfo=timezone.utc),
+        ),
+        6: source(
+            6,
+            DocumentKind.INDUSTRY_EXPOSURE,
+            published_at=datetime(2026, 7, 8, tzinfo=timezone.utc),
+        ),
+        7: source(
+            7,
+            DocumentKind.ANNOUNCEMENT,
+            published_at=datetime(2026, 7, 8, tzinfo=timezone.utc),
+        ),
     }
     statuses = {
         kind.value: {
@@ -86,7 +105,14 @@ def complete_bundle() -> DisclosureBundle:
         share_classes=(FundShareClass("519755", "519755", "A", "示例基金A", 1),),
         manager_tenures=(FundManagerTenure("519755", "张三", date(2024, 1, 1), None, 2),),
         fee_rules=(
-            FundFeeRule("519755", FeeType.MANAGEMENT, 3, share_class="A", rate=Decimal("1.20"), rule_order=1),
+            FundFeeRule(
+                "519755",
+                FeeType.MANAGEMENT,
+                3,
+                share_class="A",
+                rate=Decimal("1.20"),
+                rule_order=1,
+            ),
             FundFeeRule(
                 "519755", FeeType.REDEMPTION, 3, share_class="A", rate=Decimal("1.50"),
                 holding_days_min=0, holding_days_max=6, rule_order=2,
@@ -98,7 +124,11 @@ def complete_bundle() -> DisclosureBundle:
                 datetime(2026, 7, 5, tzinfo=timezone.utc), 4,
             ),
         ),
-        benchmarks=(FundBenchmark("519755", "沪深300指数收益率*80%+中债指数收益率*20%", None, None, 1),),
+        benchmarks=(
+            FundBenchmark(
+                "519755", "沪深300指数收益率*80%+中债指数收益率*20%", None, None, 1
+            ),
+        ),
         holdings=(
             FundHolding(
                 "519755", date(2026, 6, 30), datetime(2026, 7, 8, tzinfo=timezone.utc), 1,
@@ -152,7 +182,10 @@ class FundDisclosureResearchTest(unittest.TestCase):
             replace(
                 bundle,
                 manager_tenures=(),
-                section_states={**bundle.section_states, DocumentKind.MANAGER_HISTORY.value: "not_disclosed"},
+                section_states={
+                    **bundle.section_states,
+                    DocumentKind.MANAGER_HISTORY.value: "not_disclosed",
+                },
                 section_statuses=statuses,
             ),
             AS_OF,
@@ -167,7 +200,9 @@ class FundDisclosureResearchTest(unittest.TestCase):
             replace(
                 bundle,
                 manager_tenures=(
-                    FundManagerTenure("519755", "前任经理", date(2020, 1, 1), date(2023, 12, 31), 2),
+                    FundManagerTenure(
+                        "519755", "前任经理", date(2020, 1, 1), date(2023, 12, 31), 2
+                    ),
                 ),
             ),
             AS_OF,
@@ -259,7 +294,10 @@ class FundDisclosureResearchTest(unittest.TestCase):
             AS_OF,
         )
 
-        fee_classes = {(item["fee_type"], item["share_class"], item["rate"]) for item in result["fees"]["rules"]}
+        fee_classes = {
+            (item["fee_type"], item["share_class"], item["rate"])
+            for item in result["fees"]["rules"]
+        }
         self.assertIn(("management", "A", "1.20"), fee_classes)
         self.assertIn(("sales_service", "C", "0.40"), fee_classes)
         self.assertIn("share_classes_have_different_fee_schedules", result["warnings"])

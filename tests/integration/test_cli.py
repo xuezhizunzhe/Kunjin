@@ -1,13 +1,24 @@
 import json
 import tempfile
 import unittest
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
-from kunjin.adapters.yangjibao import YangjibaoClient
 from kunjin.adapters.eastmoney import EastmoneyFundClient, EastmoneyMarketClient
-from kunjin.cli import ApplicationContext, run
+from kunjin.adapters.yangjibao import YangjibaoClient
+from kunjin.allocation.crypto import AllocationCipher
+from kunjin.allocation.policy import AllocationPolicyV1
+from kunjin.allocation.service import (
+    AllocationCalculationError,
+    AllocationPolicyError,
+    AllocationService,
+    EncryptedProfileUnavailableError,
+)
+from kunjin.allocation.store import AllocationAssessmentStore, AllocationPolicyStore
+from kunjin.cli import ApplicationContext, build_context, run
 from kunjin.funds.models import DisclosureBundle
 from kunjin.funds.peers.models import (
     MembershipKind,
@@ -23,13 +34,32 @@ from kunjin.ledger.alipay import AlipayPaymentParser
 from kunjin.ledger.models import OcrBlock
 from kunjin.ledger.service import LedgerService
 from kunjin.ledger.store import LedgerStore
-from kunjin.models import AccountObservation, FundNavObservation, PositionObservation, SectorObservation
+from kunjin.models import (
+    AccountObservation,
+    FundNavObservation,
+    PositionObservation,
+    SectorObservation,
+    SyncResult,
+)
 from kunjin.paths import RuntimePaths
+from kunjin.services.research import ResearchSyncResult, ResearchSyncService
 from kunjin.services.sync import PortfolioSyncService
-from kunjin.services.research import ResearchSyncService
-from kunjin.models import SyncResult
-from kunjin.services.research import ResearchSyncResult
 from kunjin.storage.repository import Repository
+from kunjin.suitability.crypto import AssessmentCipher, ProfileCipher, ProfileCryptoError
+from kunjin.suitability.models import PlannedObligation
+from kunjin.suitability.policy import SuitabilityPolicyV1
+from kunjin.suitability.service import (
+    ProfileService,
+    SuitabilityAssessmentError,
+    SuitabilityPolicyError,
+    SuitabilityService,
+)
+from kunjin.suitability.store import (
+    ProfileStore,
+    SuitabilityAssessmentStore,
+    SuitabilityPolicyStore,
+)
+from tests.unit.test_suitability_models import valid_profile
 
 
 class FakeTokenStore:
@@ -44,6 +74,17 @@ class FakeTokenStore:
 
     def delete(self):
         self.token = None
+
+
+class FakeProfileKeyStore:
+    def __init__(self) -> None:
+        self.key = b"fake-profile-key-secret-value!!!"
+
+    def load_existing_key(self):
+        return self.key
+
+    def load_or_create_key(self):
+        return self.key
 
 
 class FakeOcrClient:
@@ -246,21 +287,46 @@ class CliIntegrationTest(unittest.TestCase):
             "混合型",
             "eastmoney",
             [
-                FundNavObservation("017811", date(2026, 6, 1), Decimal("1.0"), None, None, "eastmoney", now),
-                FundNavObservation("017811", date(2026, 7, 1), Decimal("1.1"), None, None, "eastmoney", now),
+                FundNavObservation(
+                    "017811", date(2026, 6, 1), Decimal("1.0"), None, None, "eastmoney", now
+                ),
+                FundNavObservation(
+                    "017811", date(2026, 7, 1), Decimal("1.1"), None, None, "eastmoney", now
+                ),
             ],
         )
         repository.save_sector_snapshots(
-            [SectorObservation("BK1", "半导体", "industry", Decimal("2"), Decimal("3"), 8, 2, "eastmoney", now)]
+            [
+                SectorObservation(
+                    "BK1", "半导体", "industry", Decimal("2"), Decimal("3"), 8, 2, "eastmoney", now
+                )
+            ]
+        )
+        self.profile_key_store = FakeProfileKeyStore()
+        self.suitability_now = datetime(2026, 7, 12, 12, tzinfo=timezone.utc)
+        profile_service = ProfileService(
+            ProfileStore(repository),
+            ProfileCipher(self.profile_key_store),
+            now=lambda: self.suitability_now,
+        )
+        suitability_service = SuitabilityService(
+            profile_service,
+            SuitabilityPolicyStore(repository),
+            SuitabilityAssessmentStore(repository),
+            AssessmentCipher(self.profile_key_store),
+            SuitabilityPolicyV1(),
+            now=lambda: self.suitability_now,
         )
         self.context = ApplicationContext(
-            paths,
-            repository,
-            token_store,
-            client,
-            PortfolioSyncService(client, repository),
-            ResearchSyncService(repository, EastmoneyFundClient(), EastmoneyMarketClient()),
-            LedgerService(
+            paths=paths,
+            repository=repository,
+            token_store=token_store,
+            client=client,
+            sync_service=PortfolioSyncService(client, repository),
+            research_service=ResearchSyncService(
+                repository, EastmoneyFundClient(), EastmoneyMarketClient()
+            ),
+            ledger_service=LedgerService(
                 paths,
                 LedgerStore(repository),
                 FakeOcrClient(),
@@ -268,6 +334,16 @@ class CliIntegrationTest(unittest.TestCase):
                 now=lambda: datetime(2026, 7, 11, tzinfo=timezone.utc),
             ),
             fund_disclosure_store=FundDisclosureStore(repository),
+            profile_service=profile_service,
+            suitability_service=suitability_service,
+            allocation_service=AllocationService(
+                suitability_service,
+                AllocationPolicyStore(repository),
+                AllocationAssessmentStore(repository),
+                AllocationCipher(self.profile_key_store),
+                AllocationPolicyV1(),
+                now=lambda: self.suitability_now,
+            ),
         )
         self.payment_image = root / "payment.jpg"
         self.payment_image.write_bytes(b"synthetic payment screenshot")
@@ -283,6 +359,722 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(
             set(payload),
             {"schema_version", "command", "as_of", "data", "warnings", "errors"},
+        )
+
+    def test_profile_edit_rejects_json_with_stable_error(self) -> None:
+        payload, exit_code, json_output = run(["--json", "profile", "edit"], self.context)
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "profile.edit")
+        self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+        self.assertEqual(
+            payload["errors"][0]["message"],
+            "profile edit is interactive and does not support JSON mode",
+        )
+
+    def test_profile_status_reports_missing_without_sensitive_values(self) -> None:
+        payload, exit_code, _ = run(["--json", "profile", "status"], self.context)
+
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(payload, "profile.status")
+        self.assertEqual(payload["data"], {"state": "missing", "freshness": "missing"})
+
+    def test_profile_status_and_history_expose_metadata_only(self) -> None:
+        self.context.profile_service.confirm_profile(valid_profile())
+        active = self.context.profile_service._store.active_encrypted()
+        self.assertIsNotNone(active)
+
+        status, status_exit_code, _ = run(["--json", "profile", "status"], self.context)
+        history, history_exit_code, _ = run(["--json", "profile", "history"], self.context)
+
+        self.assertEqual(status_exit_code, 0)
+        self.assertEqual(history_exit_code, 0)
+        self.assert_envelope(status, "profile.status")
+        self.assert_envelope(history, "profile.history")
+        self.assertEqual(status["data"]["state"], "confirmed")
+        self.assertEqual(len(history["data"]["profiles"]), 1)
+        rendered = json.dumps({"status": status, "history": history}, ensure_ascii=False)
+        for sensitive in (
+            "12000",
+            "500000",
+            "40000",
+            "fake-profile-key-secret-value",
+            active.encrypted.ciphertext,
+            active.encrypted.nonce,
+            active.encrypted.keyed_fingerprint,
+            str(self.context.paths.database),
+        ):
+            self.assertNotIn(sensitive, rendered)
+
+    def test_profile_crypto_error_has_stable_command_and_error_code(self) -> None:
+        class UnavailableProfileService:
+            def status(inner_self):
+                raise ProfileCryptoError("profile encryption key is unavailable")
+
+        self.context.profile_service = UnavailableProfileService()
+
+        payload, exit_code, _ = run(["--json", "profile", "status"], self.context)
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "profile.status")
+        self.assertEqual(
+            payload["errors"],
+            [
+                {
+                    "code": "encrypted_profile_unavailable",
+                    "message": "profile encryption key is unavailable",
+                }
+            ],
+        )
+
+    def test_profile_crypto_error_redacts_financial_and_encryption_details(self) -> None:
+        database_path = str(self.context.paths.database)
+
+        class LeakingProfileService:
+            def status(inner_self):
+                raise ProfileCryptoError(
+                    "monthly_net_income=918273645001 "
+                    "emergency_reserve=918273645002 "
+                    "ciphertext=ciphertext-secret "
+                    "nonce=nonce-secret "
+                    "keyed_payload_fingerprint=fingerprint-secret "
+                    "profile_key=fake-profile-key-secret-value "
+                    f"managed_path={database_path}"
+                )
+
+        self.context.profile_service = LeakingProfileService()
+
+        payload, exit_code, _ = run(["--json", "profile", "status"], self.context)
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "profile.status")
+        rendered = json.dumps(payload, ensure_ascii=False)
+        for sensitive in (
+            "918273645001",
+            "918273645002",
+            "ciphertext-secret",
+            "nonce-secret",
+            "fingerprint-secret",
+            "fake-profile-key-secret-value",
+            database_path,
+        ):
+            self.assertNotIn(sensitive, rendered)
+
+    def test_profile_decryption_failure_envelope_contains_no_private_material(self) -> None:
+        original_service = self.context.profile_service
+        original_service.confirm_profile(valid_profile())
+        active = original_service._store.active_encrypted()
+        self.assertIsNotNone(active)
+        with self.context.repository.connect() as connection, connection:
+            connection.execute("DROP TRIGGER financial_profile_payload_no_update")
+            connection.execute(
+                "UPDATE financial_profile_versions SET encrypted_payload = ? "
+                "WHERE status = 'confirmed'",
+                ("AAAA",),
+            )
+
+        class DecryptingProfileService:
+            def status(inner_self):
+                original_service.load_active_profile()
+                raise AssertionError("decryption failure was expected")
+
+        self.context.profile_service = DecryptingProfileService()
+
+        payload, exit_code, _ = run(["--json", "profile", "status"], self.context)
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "profile.status")
+        self.assertEqual(
+            payload["errors"],
+            [
+                {
+                    "code": "encrypted_profile_unavailable",
+                    "message": "profile decryption failed",
+                }
+            ],
+        )
+        rendered = json.dumps(payload, ensure_ascii=False)
+        for sensitive in (
+            "12000",
+            "500000",
+            "40000",
+            active.encrypted.ciphertext,
+            active.encrypted.nonce,
+            active.encrypted.keyed_fingerprint,
+            "fake-profile-key-secret-value",
+            str(self.context.paths.database),
+        ):
+            self.assertNotIn(sensitive, rendered)
+
+    def test_suitability_assess_returns_all_financial_states_with_exit_zero(self) -> None:
+        profiles = (
+            (
+                replace(
+                    valid_profile(),
+                    debts=(replace(valid_profile().debts[0], delinquent=True),),
+                ),
+                "blocked",
+            ),
+            (
+                replace(
+                    valid_profile(),
+                    immediately_available_cash=Decimal("1000000"),
+                    cash_like_assets=Decimal("0"),
+                    emergency_reserve=Decimal("1000000"),
+                ),
+                "constrained",
+            ),
+            (
+                replace(
+                    valid_profile(),
+                    immediately_available_cash=Decimal("1000000"),
+                    cash_like_assets=Decimal("0"),
+                    emergency_reserve=Decimal("1000000"),
+                    obligations=(),
+                    goals=(),
+                ),
+                "ready_for_allocation",
+            ),
+        )
+
+        for profile, expected_status in profiles:
+            with self.subTest(expected_status=expected_status):
+                self.context.profile_service.confirm_profile(profile)
+                payload, exit_code, json_output = run(
+                    ["--json", "suitability", "assess"], self.context
+                )
+
+                self.assertEqual(exit_code, 0)
+                self.assertTrue(json_output)
+                self.assert_envelope(payload, "suitability.assess")
+                self.assertEqual(payload["data"]["status"], expected_status)
+                self.assertEqual(payload["data"]["capability"], "research_only")
+
+    def test_suitability_local_assess_is_explicit_exact_amount_view(self) -> None:
+        synthetic = replace(
+            valid_profile(),
+            monthly_net_income=Decimal("200000"),
+            monthly_essential_expenses=Decimal("1000"),
+            monthly_required_debt_service=Decimal("0"),
+            monthly_investment_ceiling=Decimal("95311"),
+            minimum_monthly_cash_buffer=Decimal("0"),
+            immediately_available_cash=Decimal("73129"),
+            cash_like_assets=Decimal("0"),
+            emergency_reserve=Decimal("73129"),
+            debts=(),
+            obligations=(
+                PlannedObligation(
+                    "private-synthetic-obligation",
+                    Decimal("72217"),
+                    date(2027, 1, 1),
+                    Decimal("0"),
+                ),
+            ),
+            goals=(),
+        )
+        self.context.profile_service.confirm_profile(synthetic)
+
+        payload, exit_code, json_output = run(["suitability", "assess"], self.context)
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(json_output)
+        self.assert_envelope(payload, "suitability.assess")
+        self.assertEqual(payload["data"]["capability"], "research_only")
+        amounts = payload["data"]["amounts"]
+        self.assertEqual(amounts["verified_emergency_reserve"], "73129.00")
+        self.assertEqual(amounts["required_emergency_reserve"], "84217.00")
+        self.assertEqual(amounts["safe_monthly_ceiling"], "95311.00")
+        self.assertNotIn("private-synthetic-obligation", json.dumps(payload))
+
+    def test_suitability_json_views_are_amount_free_and_hide_private_material(self) -> None:
+        synthetic = replace(
+            valid_profile(),
+            monthly_net_income=Decimal("200000"),
+            monthly_essential_expenses=Decimal("1000"),
+            monthly_required_debt_service=Decimal("0"),
+            monthly_investment_ceiling=Decimal("95311"),
+            minimum_monthly_cash_buffer=Decimal("0"),
+            immediately_available_cash=Decimal("73129"),
+            cash_like_assets=Decimal("0"),
+            emergency_reserve=Decimal("73129"),
+            debts=valid_profile().debts,
+            obligations=(
+                PlannedObligation(
+                    "private-synthetic-obligation",
+                    Decimal("72217"),
+                    date(2027, 1, 1),
+                    Decimal("0"),
+                ),
+            ),
+            goals=(),
+        )
+        self.context.profile_service.confirm_profile(synthetic)
+        assess, assess_exit, _ = run(["--json", "suitability", "assess"], self.context)
+        status, status_exit, _ = run(["--json", "suitability", "status"], self.context)
+        history, history_exit, _ = run(["--json", "suitability", "history"], self.context)
+
+        self.assertEqual((assess_exit, status_exit, history_exit), (0, 0, 0))
+        self.assert_envelope(assess, "suitability.assess")
+        self.assert_envelope(status, "suitability.status")
+        self.assert_envelope(history, "suitability.history")
+        self.assertEqual(
+            assess["data"]["profile_conflicts"],
+            ["monthly_required_debt_service_vs_debts"],
+        )
+        self.assertNotIn("profile_conflicts", status["data"])
+        self.assertNotIn("profile_conflicts", history["data"]["assessments"][0])
+        self.assertEqual(history["data"]["assessments"][0]["capability"], "research_only")
+        stored = self.context.suitability_service._assessment_store.history()[0]
+        rendered = json.dumps(
+            {"assess": assess, "status": status, "history": history},
+            ensure_ascii=False,
+        )
+        for sensitive in (
+            "73129",
+            "84217",
+            "95311",
+            "private-synthetic-obligation",
+            stored.input_fingerprint,
+            self.context.suitability_service._policy.canonical_json().decode("utf-8"),
+            "canonical_policy_json",
+            "policy_checksum",
+            "high_interest_annual_rate",
+            '"verified_emergency_reserve":',
+            '"required_emergency_reserve":',
+            '"emergency_reserve_shortfall":',
+            '"required_monthly_obligation_saving":',
+            '"required_monthly_goal_saving":',
+            '"monthly_safety_residual":',
+            '"safe_monthly_ceiling":',
+            '"amounts"',
+        ):
+            self.assertNotIn(sensitive, rendered)
+        encrypted = self.context.suitability_service._assessment_store.latest_for(
+            stored.profile_version_id,
+            stored.policy_version,
+        ).encrypted
+        for sensitive in (
+            encrypted.ciphertext,
+            encrypted.nonce,
+            encrypted.keyed_fingerprint,
+        ):
+            self.assertNotIn(sensitive, rendered)
+
+    def test_suitability_status_missing_and_history_empty_are_amount_free(self) -> None:
+        status, status_exit_code, _ = run(["--json", "suitability", "status"], self.context)
+        history, history_exit_code, _ = run(["--json", "suitability", "history"], self.context)
+
+        self.assertEqual((status_exit_code, history_exit_code), (0, 0))
+        self.assertEqual(
+            status["data"],
+            {"state": "missing", "freshness": "missing", "capability": "research_only"},
+        )
+        self.assertEqual(history["data"], {"assessments": []})
+
+    def test_suitability_service_unavailable_is_stable_usage_error(self) -> None:
+        self.context.suitability_service = None
+
+        payload, exit_code, _ = run(["--json", "suitability", "assess"], self.context)
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "suitability.assess")
+        self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+        self.assertEqual(payload["errors"][0]["message"], "suitability service is unavailable")
+
+    def test_suitability_technical_errors_have_stable_nonzero_envelopes(self) -> None:
+        cases = (
+            (
+                ProfileCryptoError("profile encryption key is unavailable"),
+                "encrypted_profile_unavailable",
+            ),
+            (SuitabilityPolicyError("suitability policy is unavailable"), "policy_unavailable"),
+            (
+                SuitabilityAssessmentError("suitability assessment could not be calculated"),
+                "assessment_calculation_failed",
+            ),
+        )
+        for error, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+
+                class FailingSuitabilityService:
+                    def assess(inner_self):
+                        raise error
+
+                self.context.suitability_service = FailingSuitabilityService()
+                payload, exit_code, _ = run(["--json", "suitability", "assess"], self.context)
+
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, "suitability.assess")
+                self.assertEqual(payload["errors"][0]["code"], expected_code)
+
+    def test_build_context_shares_one_profile_key_store_for_both_ciphers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = RuntimePaths(root / "kunjin.db", root / "snapshots", root / "logs")
+            key_store = FakeProfileKeyStore()
+            with (
+                patch("kunjin.cli.RuntimePaths.from_environment", return_value=paths),
+                patch("kunjin.cli.ProfileKeyStore", return_value=key_store) as key_store_factory,
+            ):
+                context = build_context()
+
+        self.assertEqual(key_store_factory.call_count, 1)
+        self.assertIs(context.profile_service._cipher._key_store, key_store)
+        self.assertIs(context.suitability_service._assessment_cipher._key_store, key_store)
+        self.assertIs(context.allocation_service._cipher._key_store, key_store)
+
+    def test_allocation_ranges_returns_financial_blocks_with_exit_zero(self) -> None:
+        blocked_profile = replace(valid_profile(), emergency_reserve=Decimal("0.00"))
+        self.context.profile_service.confirm_profile(blocked_profile)
+        suitability, suitability_exit, _ = run(["--json", "suitability", "assess"], self.context)
+
+        payload, exit_code, json_output = run(["--json", "allocation", "ranges"], self.context)
+
+        self.assertEqual(suitability_exit, 0)
+        self.assertEqual(suitability["data"]["status"], "blocked")
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "allocation.ranges")
+        self.assertEqual(payload["data"]["status"], "blocked")
+        self.assertEqual(payload["data"]["blocks"], ["suitability_blocked"])
+        self.assertEqual(payload["data"]["capability"], "research_only")
+
+        self.context.profile_service.confirm_profile(
+            replace(valid_profile(), obligations=(), goals=())
+        )
+        suitability, suitability_exit, _ = run(["--json", "suitability", "assess"], self.context)
+        payload, exit_code, _ = run(["--json", "allocation", "ranges"], self.context)
+
+        self.assertEqual(suitability_exit, 0)
+        self.assertEqual(suitability["data"]["status"], "ready_for_allocation")
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["status"], "blocked")
+        self.assertEqual(payload["data"]["blocks"], ["allocation_horizon_missing"])
+
+    def test_allocation_profile_conflict_is_amount_free_financial_block(self) -> None:
+        profile = replace(
+            valid_profile(),
+            can_postpone_goal_use=False,
+            goals=(
+                replace(
+                    valid_profile().goals[0],
+                    name="private-postponement-conflict-goal",
+                    use_date_can_be_postponed=True,
+                ),
+            ),
+        )
+        self.context.profile_service.confirm_profile(profile)
+        suitability, suitability_exit, _ = run(["--json", "suitability", "assess"], self.context)
+
+        payload, exit_code, _ = run(["--json", "allocation", "ranges"], self.context)
+
+        self.assertEqual(suitability_exit, 0)
+        self.assertIn(
+            suitability["data"]["status"],
+            {"constrained", "ready_for_allocation"},
+        )
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(payload, "allocation.ranges")
+        self.assertEqual(payload["data"]["status"], "blocked")
+        self.assertEqual(payload["data"]["blocks"], ["allocation_profile_conflict"])
+        self.assertEqual(
+            payload["data"]["profile_conflicts"],
+            ["profile_disallows_goal_postponement"],
+        )
+        self.assertEqual(self.context.allocation_service._assessment_store.history(), ())
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("private-postponement-conflict-goal", rendered)
+        self.assertNotIn('"exact"', rendered)
+
+    def test_allocation_json_views_are_amount_free_and_policy_is_transparent(self) -> None:
+        synthetic = replace(
+            valid_profile(),
+            monthly_net_income=Decimal("87654321.09"),
+            goals=(
+                replace(
+                    valid_profile().goals[0],
+                    name="private-allocation-goal-sentinel",
+                ),
+            ),
+        )
+        self.context.profile_service.confirm_profile(synthetic)
+        suitability, suitability_exit, _ = run(["--json", "suitability", "assess"], self.context)
+        ranges, ranges_exit, _ = run(["--json", "allocation", "ranges"], self.context)
+        status, status_exit, _ = run(["--json", "allocation", "status"], self.context)
+        history, history_exit, _ = run(["--json", "allocation", "history"], self.context)
+        policy, policy_exit, _ = run(["--json", "allocation", "policy"], self.context)
+
+        self.assertEqual(
+            (suitability_exit, ranges_exit, status_exit, history_exit, policy_exit),
+            (0, 0, 0, 0, 0),
+        )
+        self.assertEqual(ranges["data"]["status"], "range_available")
+        self.assertEqual(status["data"]["state"], "fresh")
+        self.assertEqual(len(history["data"]["assessments"]), 1)
+        self.assertEqual(policy["data"]["version"], "1")
+        self.assertIn("checksum", policy["data"])
+        self.assertIn("stress_loss_by_layer", policy["data"])
+        rendered = json.dumps(
+            {
+                "suitability": suitability,
+                "ranges": ranges,
+                "status": status,
+                "history": history,
+                "policy": policy,
+            },
+            ensure_ascii=False,
+        )
+        stored = self.context.allocation_service._assessment_store.history()[0]
+        encrypted = self.context.allocation_service._assessment_store.get(stored.id).encrypted
+        for sensitive in (
+            "87654321.09",
+            "private-allocation-goal-sentinel",
+            stored.input_fingerprint,
+            encrypted.ciphertext,
+            encrypted.nonce,
+            encrypted.keyed_fingerprint,
+            '"exact"',
+            "target_allocation",
+            "purchase_amount",
+            "protected_capital_amount",
+            "monthly_discretionary_ceiling",
+        ):
+            self.assertNotIn(sensitive, rendered)
+
+    def test_allocation_local_ranges_is_the_only_exact_view(self) -> None:
+        synthetic = replace(
+            valid_profile(),
+            monthly_net_income=Decimal("87654321.09"),
+            goals=(
+                replace(
+                    valid_profile().goals[0],
+                    name="private-local-allocation-goal",
+                ),
+            ),
+        )
+        self.context.profile_service.confirm_profile(synthetic)
+        run(["--json", "suitability", "assess"], self.context)
+
+        ranges, ranges_exit, ranges_json = run(["allocation", "ranges"], self.context)
+        status, status_exit, _ = run(["allocation", "status"], self.context)
+        history, history_exit, _ = run(["allocation", "history"], self.context)
+        policy, policy_exit, _ = run(["allocation", "policy"], self.context)
+
+        self.assertEqual(
+            (ranges_exit, status_exit, history_exit, policy_exit),
+            (0, 0, 0, 0),
+        )
+        self.assertFalse(ranges_json)
+        self.assertIn("exact", ranges["data"])
+        self.assertIn("private-local-allocation-goal", json.dumps(ranges))
+        for amount_free in (status, history, policy):
+            rendered = json.dumps(amount_free, ensure_ascii=False)
+            self.assertNotIn("private-local-allocation-goal", rendered)
+            self.assertNotIn('"exact"', rendered)
+
+    def test_allocation_service_unavailable_is_stable_usage_error(self) -> None:
+        self.context.allocation_service = None
+
+        payload, exit_code, _ = run(["--json", "allocation", "ranges"], self.context)
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "allocation.ranges")
+        self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+        self.assertEqual(payload["errors"][0]["message"], "allocation service is unavailable")
+
+    def test_allocation_technical_errors_have_stable_nonzero_envelopes(self) -> None:
+        cases = (
+            (
+                AllocationPolicyError("allocation policy is unavailable"),
+                "allocation_policy_unavailable",
+            ),
+            (
+                AllocationCalculationError("allocation range could not be calculated"),
+                "allocation_calculation_failed",
+            ),
+            (
+                EncryptedProfileUnavailableError("encrypted profile is unavailable"),
+                "encrypted_profile_unavailable",
+            ),
+        )
+        for error, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+
+                class FailingAllocationService:
+                    def ranges(inner_self):
+                        raise error
+
+                self.context.allocation_service = FailingAllocationService()
+                payload, exit_code, _ = run(["--json", "allocation", "ranges"], self.context)
+
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, "allocation.ranges")
+                self.assertEqual(payload["errors"][0]["code"], expected_code)
+
+    def test_allocation_errors_never_echo_private_exception_text(self) -> None:
+        sentinel = "private-goal=918273645001 fingerprint=secret-fingerprint"
+        cases = (
+            (
+                AllocationPolicyError(sentinel),
+                "allocation_policy_unavailable",
+                "allocation policy is unavailable",
+            ),
+            (
+                AllocationCalculationError(sentinel),
+                "allocation_calculation_failed",
+                "allocation calculation failed",
+            ),
+            (
+                EncryptedProfileUnavailableError(sentinel),
+                "encrypted_profile_unavailable",
+                "encrypted profile is unavailable",
+            ),
+            (
+                ProfileCryptoError(sentinel),
+                "encrypted_profile_unavailable",
+                "encrypted profile is unavailable",
+            ),
+        )
+        for error, expected_code, expected_message in cases:
+            with self.subTest(expected_code=expected_code, error_type=type(error)):
+
+                class FailingAllocationService:
+                    def ranges(inner_self):
+                        raise error
+
+                self.context.allocation_service = FailingAllocationService()
+                payload, exit_code, _ = run(["--json", "allocation", "ranges"], self.context)
+
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(payload["errors"][0]["code"], expected_code)
+                self.assertEqual(payload["errors"][0]["message"], expected_message)
+                self.assertNotIn(sentinel, json.dumps(payload))
+
+    def test_allocation_unknown_service_errors_are_fixed_for_every_command(self) -> None:
+        sentinel = "private-goal=918273645001 traceback=secret-traceback"
+        for error_type in (ValueError, RuntimeError):
+            for action in ("ranges", "status", "history", "policy"):
+                with self.subTest(error_type=error_type, action=action):
+
+                    class FailingAllocationService:
+                        def ranges(inner_self):
+                            raise error_type(sentinel)
+
+                        def status(inner_self):
+                            raise error_type(sentinel)
+
+                        def history(inner_self):
+                            raise error_type(sentinel)
+
+                        def policy(inner_self):
+                            raise error_type(sentinel)
+
+                    self.context.allocation_service = FailingAllocationService()
+                    payload, exit_code, _ = run(["--json", "allocation", action], self.context)
+
+                    self.assertEqual(exit_code, 1)
+                    self.assert_envelope(payload, f"allocation.{action}")
+                    self.assertEqual(
+                        payload["errors"],
+                        [
+                            {
+                                "code": "allocation_calculation_failed",
+                                "message": "allocation calculation failed",
+                            }
+                        ],
+                    )
+                    rendered = json.dumps(payload, ensure_ascii=False)
+                    self.assertNotIn(sentinel, rendered)
+                    self.assertNotIn("918273645001", rendered)
+                    self.assertNotIn("secret-traceback", rendered)
+
+    def test_allocation_amount_free_boundary_rejects_malicious_service_values(self) -> None:
+        sentinel = "private-goal-918273645001"
+
+        @dataclass
+        class PrivateDataclass:
+            name: str = sentinel
+
+        class PrivateObject:
+            def __str__(self):
+                return sentinel
+
+        malicious = {
+            "private_name": sentinel,
+            "amount": Decimal("918273645001.25"),
+            "nested": [PrivateDataclass(), {"custom": PrivateObject()}],
+        }
+
+        class MaliciousExecution:
+            def safe_json(self):
+                return malicious
+
+            def local_view(self):
+                return malicious
+
+        class MaliciousAllocationService:
+            def ranges(self):
+                return MaliciousExecution()
+
+            def status(self):
+                return malicious
+
+            def history(self):
+                return (malicious,)
+
+            def policy(self):
+                return malicious
+
+        self.context.allocation_service = MaliciousAllocationService()
+        for action in ("ranges", "status", "history", "policy"):
+            with self.subTest(action=action):
+                payload, exit_code, _ = run(["--json", "allocation", action], self.context)
+
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, f"allocation.{action}")
+                self.assertEqual(
+                    payload["errors"],
+                    [
+                        {
+                            "code": "allocation_calculation_failed",
+                            "message": "allocation calculation failed",
+                        }
+                    ],
+                )
+                rendered = json.dumps(payload, ensure_ascii=False)
+                self.assertNotIn(sentinel, rendered)
+                self.assertNotIn("918273645001", rendered)
+
+    def test_legacy_phase_b_date_fingerprint_requires_reassessment_stably(self) -> None:
+        profile = self.context.profile_service.confirm_profile(valid_profile())
+        suitability, suitability_exit, _ = run(["--json", "suitability", "assess"], self.context)
+        loaded = self.context.profile_service.load_active()
+        legacy_payload = "|".join(
+            (
+                str(profile.id),
+                loaded.encrypted_keyed_fingerprint,
+                SuitabilityPolicyV1().checksum(),
+                self.suitability_now.date().isoformat(),
+            )
+        ).encode("ascii")
+        legacy_fingerprint = AssessmentCipher(self.profile_key_store).fingerprint(legacy_payload)
+        with self.context.repository.connect() as connection, connection:
+            connection.execute("DROP TRIGGER suitability_assessment_no_update")
+            connection.execute(
+                "UPDATE suitability_assessments SET input_fingerprint = ? WHERE id = ?",
+                (legacy_fingerprint, suitability["data"]["assessment_id"]),
+            )
+
+        payload, exit_code, _ = run(["--json", "allocation", "ranges"], self.context)
+
+        self.assertEqual(suitability_exit, 0)
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "allocation.ranges")
+        self.assertEqual(payload["errors"][0]["code"], "allocation_calculation_failed")
+        self.assertEqual(
+            payload["errors"][0]["message"],
+            "allocation calculation failed",
         )
 
     def test_portfolio_output_never_contains_token(self) -> None:
@@ -396,9 +1188,7 @@ class CliIntegrationTest(unittest.TestCase):
         store = FakePeerStore(peer_group("519755", "000001"))
         self.context.peer_service = service
         self.context.peer_store = store
-        self.context.fund_disclosure_store = FakeDisclosureStore(
-            empty_disclosure_bundle()
-        )
+        self.context.fund_disclosure_store = FakeDisclosureStore(empty_disclosure_bundle())
 
         cases = (
             (
@@ -429,9 +1219,7 @@ class CliIntegrationTest(unittest.TestCase):
                 payload, exit_code, _ = run(argv, self.context)
                 self.assertEqual(exit_code, expected_exit_code)
                 self.assert_envelope(payload, command)
-                self.assertNotIn(
-                    "never-print-this", json.dumps(payload, ensure_ascii=False)
-                )
+                self.assertNotIn("never-print-this", json.dumps(payload, ensure_ascii=False))
                 reports[command] = payload
 
         self.assertEqual(reports["fund.peers"]["data"]["status"], "partial")
@@ -445,9 +1233,7 @@ class CliIntegrationTest(unittest.TestCase):
             "insufficient_data",
         )
 
-        self.assertEqual(
-            service.calls, [("519755", ("000001", "000002"))]
-        )
+        self.assertEqual(service.calls, [("519755", ("000001", "000002"))])
         self.assertEqual(len(store.saved), 3)
 
         first_compare, exit_code, _ = run(
@@ -471,9 +1257,7 @@ class CliIntegrationTest(unittest.TestCase):
         )
         self.context.peer_service = FakePeerService(result)
 
-        payload, exit_code, _ = run(
-            ["--json", "sync", "fund-peers", "519755"], self.context
-        )
+        payload, exit_code, _ = run(["--json", "sync", "fund-peers", "519755"], self.context)
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["errors"], [])
@@ -481,20 +1265,14 @@ class CliIntegrationTest(unittest.TestCase):
 
     def test_peer_group_too_small_exits_one_and_missing_group_is_insufficient(self) -> None:
         self.context.peer_store = FakePeerStore(peer_group("519755"))
-        self.context.fund_disclosure_store = FakeDisclosureStore(
-            empty_disclosure_bundle()
-        )
+        self.context.fund_disclosure_store = FakeDisclosureStore(empty_disclosure_bundle())
 
-        payload, exit_code, _ = run(
-            ["--json", "fund", "peers", "519755"], self.context
-        )
+        payload, exit_code, _ = run(["--json", "fund", "peers", "519755"], self.context)
         self.assertEqual(exit_code, 1)
         self.assertEqual(payload["errors"][0]["code"], "peer_group_too_small")
 
         self.context.peer_store = FakePeerStore()
-        missing, exit_code, _ = run(
-            ["--json", "fund", "peers", "519755"], self.context
-        )
+        missing, exit_code, _ = run(["--json", "fund", "peers", "519755"], self.context)
         self.assertEqual(exit_code, 1)
         self.assertEqual(missing["data"]["status"], "insufficient_data")
         self.assertEqual(missing["errors"][0]["code"], "insufficient_data")
@@ -506,9 +1284,7 @@ class CliIntegrationTest(unittest.TestCase):
 
         self.context.peer_service = SyncMustNotRun()
         self.context.peer_store = FakePeerStore(peer_group("519755", "000001"))
-        self.context.fund_disclosure_store = FakeDisclosureStore(
-            empty_disclosure_bundle()
-        )
+        self.context.fund_disclosure_store = FakeDisclosureStore(empty_disclosure_bundle())
 
         for argv in (
             ["--json", "sync", "fund-peers", "123"],
@@ -537,25 +1313,19 @@ class CliIntegrationTest(unittest.TestCase):
                 self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
 
     def test_disclosure_sync_partial_success_exits_zero_and_total_failure_exits_one(self) -> None:
-        self.context.fund_disclosure_store = FakeDisclosureStore(
-            empty_disclosure_bundle()
-        )
+        self.context.fund_disclosure_store = FakeDisclosureStore(empty_disclosure_bundle())
         service = FakeDisclosureService(
             profile=disclosure_sync_result(),
             holdings=disclosure_sync_result(profile=False, total_failure=True),
         )
         self.context.fund_disclosure_service = service
 
-        partial, exit_code, _ = run(
-            ["--json", "sync", "fund-profile", "519755"], self.context
-        )
+        partial, exit_code, _ = run(["--json", "sync", "fund-profile", "519755"], self.context)
         self.assertEqual(exit_code, 0)
         self.assertEqual(partial["errors"], [])
         self.assertTrue(partial["data"]["errors"])
 
-        failed, exit_code, _ = run(
-            ["--json", "sync", "fund-holdings", "519755"], self.context
-        )
+        failed, exit_code, _ = run(["--json", "sync", "fund-holdings", "519755"], self.context)
         self.assertEqual(exit_code, 1)
         self.assertEqual(failed["errors"][0]["code"], "fund_disclosure_sync_failed")
         self.assertEqual(len(failed["data"]["errors"]), 2)
@@ -583,9 +1353,7 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(payload["errors"][0]["code"], "invalid_report_period")
 
     def test_fund_holdings_marks_a_missing_requested_period(self) -> None:
-        self.context.fund_disclosure_store = FakeDisclosureStore(
-            empty_disclosure_bundle()
-        )
+        self.context.fund_disclosure_store = FakeDisclosureStore(empty_disclosure_bundle())
 
         payload, exit_code, _ = run(
             ["--json", "fund", "holdings", "519755", "--period", "2026-06-30"],
@@ -681,9 +1449,7 @@ class CliIntegrationTest(unittest.TestCase):
                 },
             ),
         )
-        peer_service = FakePeerService(
-            peer_result, refresh_result={"519755": peer_result}
-        )
+        peer_service = FakePeerService(peer_result, refresh_result={"519755": peer_result})
         self.context.sync_service = PortfolioService()
         self.context.research_service = ResearchService()
         self.context.fund_disclosure_service = FakeDisclosureService(
@@ -734,9 +1500,7 @@ class CliIntegrationTest(unittest.TestCase):
             payload["data"]["draft"]["field_evidence"]["amount"],
             "transaction_confirmed",
         )
-        self.assertEqual(
-            payload["data"]["fields"]["amount"]["normalized_value"], "20.00"
-        )
+        self.assertEqual(payload["data"]["fields"]["amount"]["normalized_value"], "20.00")
         rendered = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn("managed_path", rendered)
         self.assertNotIn(str(self.context.paths.imports), rendered)
@@ -754,9 +1518,7 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertTrue(payload["data"]["requires_confirmation"])
 
     def test_ledger_drafts_confirm_and_transactions(self) -> None:
-        imported, _, _ = run(
-            ["--json", "ledger", "import", str(self.payment_image)], self.context
-        )
+        imported, _, _ = run(["--json", "ledger", "import", str(self.payment_image)], self.context)
         draft_id = imported["data"]["draft"]["id"]
 
         drafts, exit_code, _ = run(["--json", "ledger", "drafts"], self.context)
@@ -814,9 +1576,7 @@ class CliIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(exit_code, 0)
         self.assert_envelope(added, "ledger.add")
-        self.assertEqual(
-            added["data"]["transaction"]["evidence_level"], "user_confirmed"
-        )
+        self.assertEqual(added["data"]["transaction"]["evidence_level"], "user_confirmed")
 
         reconciled, exit_code, _ = run(
             ["--json", "ledger", "reconcile", "--fund-code", "519755"],
@@ -825,9 +1585,7 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assert_envelope(reconciled, "ledger.reconcile")
         self.assertEqual(reconciled["data"]["result"]["status"], "consistent")
-        self.assertEqual(
-            reconciled["data"]["result"]["evidence_level"], "position_inferred"
-        )
+        self.assertEqual(reconciled["data"]["result"]["evidence_level"], "position_inferred")
 
     def test_ledger_reconcile_missing_position_has_stable_error(self) -> None:
         payload, exit_code, _ = run(
@@ -873,9 +1631,7 @@ class CliIntegrationTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assert_envelope(payload, "ledger.reconcile")
-        self.assertEqual(
-            payload["errors"][0]["code"], "ambiguous_position_accounts"
-        )
+        self.assertEqual(payload["errors"][0]["code"], "ambiguous_position_accounts")
         self.assertEqual(payload["data"]["account_titles"], ["另一个账户", "学习账户"])
 
     def test_ledger_document_delete_removes_only_managed_copy(self) -> None:
@@ -903,9 +1659,7 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertTrue(self.payment_image.is_file())
 
     def test_invalid_ledger_field_override_is_a_stable_error(self) -> None:
-        imported, _, _ = run(
-            ["--json", "ledger", "import", str(self.payment_image)], self.context
-        )
+        imported, _, _ = run(["--json", "ledger", "import", str(self.payment_image)], self.context)
         draft_id = imported["data"]["draft"]["id"]
 
         payload, exit_code, _ = run(

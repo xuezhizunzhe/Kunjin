@@ -10,7 +10,6 @@ from kunjin.ledger.alipay import (
 )
 from kunjin.ledger.models import EvidenceLevel, OcrBlock
 
-
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[1]
     / "fixtures"

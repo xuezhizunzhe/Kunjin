@@ -6,7 +6,6 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Dict, List, Optional
 
-
 FUND_CODE_PATTERN = re.compile(r"^\d{6}$")
 
 

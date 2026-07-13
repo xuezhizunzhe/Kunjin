@@ -9,7 +9,6 @@ from zoneinfo import ZoneInfo
 
 from kunjin.ledger.models import EvidenceLevel, ExtractedField, OcrBlock
 
-
 MIN_CONFIDENCE = Decimal("0.80")
 
 _AMOUNT_LABELS = ("支付金额", "订单金额")

@@ -4,7 +4,6 @@ import argparse
 import plistlib
 from pathlib import Path
 
-
 LABEL = "com.kunjin.daily-sync"
 
 
@@ -40,7 +39,11 @@ def main() -> int:
     parser.add_argument("--home", help="Override the home directory for isolated verification")
     args = parser.parse_args()
     home = Path(args.home) if args.home else Path.home()
-    output = Path(args.output) if args.output else home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+    output = (
+        Path(args.output)
+        if args.output
+        else home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     (home / ".local" / "state" / "kunjin" / "logs").mkdir(parents=True, exist_ok=True)
     with output.open("wb") as file_handle:

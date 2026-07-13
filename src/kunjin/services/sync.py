@@ -36,8 +36,15 @@ def redact_payload(value: Any) -> Any:
     return value
 
 
-def snapshot_record(endpoint: str, payload: Any, retrieved_at: datetime) -> Tuple[str, str, str, datetime]:
-    serialized = json.dumps(redact_payload(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def snapshot_record(
+    endpoint: str, payload: Any, retrieved_at: datetime
+) -> Tuple[str, str, str, datetime]:
+    serialized = json.dumps(
+        redact_payload(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     checksum = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return endpoint, serialized, checksum, retrieved_at
 
@@ -80,4 +87,3 @@ class PortfolioSyncService:
             if isinstance(exc, YangjibaoError):
                 raise SyncError(exc.code, str(exc)) from exc
             raise SyncError(str(code), str(exc)) from exc
-

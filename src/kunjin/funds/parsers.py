@@ -22,8 +22,8 @@ from kunjin.funds.models import (
     AssetType,
     DocumentKind,
     FeeType,
-    FundBenchmark,
     FundAnnouncement,
+    FundBenchmark,
     FundFeeRule,
     FundHolding,
     FundIdentity,
@@ -34,7 +34,6 @@ from kunjin.funds.models import (
     SourceDocument,
 )
 from kunjin.funds.sources import TextResponse, classify_source
-
 
 FUND_CODE_PATTERN = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 SHARE_CLASS_PATTERN = re.compile(r"([AC])(?:类份额|类)?$", re.IGNORECASE)
@@ -288,7 +287,9 @@ def parse_basic_profile(response: TextResponse, fund_code: str) -> ParsedSection
     if established_text is None:
         established_text = _single_value(labeled, ("成立日期", "基金成立日"))
     if established_text is not None:
-        established_match = re.search(r"\d{4}(?:[-/]\d{2}[-/]\d{2}|年\d{2}月\d{2}日)", established_text)
+        established_match = re.search(
+            r"\d{4}(?:[-/]\d{2}[-/]\d{2}|年\d{2}月\d{2}日)", established_text
+        )
         established_text = None if established_match is None else established_match.group(0)
     identity = FundIdentity(
         fund_code=fund_code,
@@ -625,7 +626,9 @@ def parse_fee_schedule(response: TextResponse, fund_code: str) -> ParsedSection:
                         amount_min=bounds[0], amount_max=bounds[1],
                         holding_days_min=bounds[2], holding_days_max=bounds[3],
                         rule_order=len(records) + 1,
-                        raw_rule_text=" | ".join((caption, condition_text, value_label, value_text)),
+                        raw_rule_text=" | ".join(
+                            (caption, condition_text, value_label, value_text)
+                        ),
                     )
                     record.validate()
                     records.append(record)
@@ -831,7 +834,9 @@ def _quarter_end_from_title(title: str) -> date:
     if match is None:
         raise FundParseError("invalid_disclosure_date")
     quarter_values = {"一": 1, "二": 2, "三": 3, "四": 4}
-    quarter = quarter_values.get(match.group(2), int(match.group(2)) if match.group(2).isdigit() else 0)
+    quarter = quarter_values.get(
+        match.group(2), int(match.group(2)) if match.group(2).isdigit() else 0
+    )
     month_day = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}[quarter]
     return date(int(match.group(1)), *month_day)
 
@@ -924,8 +929,16 @@ def parse_quarterly_holdings(
                         weight=_parse_disclosure_weight(row[indexes["weight"]]),
                         disclosure_scope="top10",
                         source_document_id=None,
-                        shares=(None if not shares_text else _parse_decimal(shares_text) * Decimal("10000")),
-                        market_value=(None if not value_text else _parse_decimal(value_text) * Decimal("10000")),
+                        shares=(
+                            None
+                            if not shares_text
+                            else _parse_decimal(shares_text) * Decimal("10000")
+                        ),
+                        market_value=(
+                            None
+                            if not value_text
+                            else _parse_decimal(value_text) * Decimal("10000")
+                        ),
                     )
                     record.validate()
                 except (IndexError, InvalidOperation, ValueError) as exc:

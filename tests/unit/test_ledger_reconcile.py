@@ -12,7 +12,6 @@ from kunjin.ledger.models import (
 from kunjin.ledger.reconcile import reconcile_fund
 from kunjin.models import StoredPosition
 
-
 NOW = datetime(2026, 7, 11, tzinfo=timezone.utc)
 
 

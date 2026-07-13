@@ -148,7 +148,13 @@ class LedgerStore:
             if row["status"] == "deleted":
                 connection.execute(
                     DOCUMENT_RESTORE_SQL,
-                    (original_name, managed_path, document_type, imported_at.isoformat(), document_id),
+                    (
+                        original_name,
+                        managed_path,
+                        document_type,
+                        imported_at.isoformat(),
+                        document_id,
+                    ),
                 )
             return document_id
 
@@ -348,7 +354,9 @@ class LedgerStore:
                 created_at=confirmed_at,
             )
             self._validate_transaction(transaction)
-            cursor = connection.execute(TRANSACTION_INSERT_SQL, self._transaction_values(transaction))
+            cursor = connection.execute(
+                TRANSACTION_INSERT_SQL, self._transaction_values(transaction)
+            )
             update = connection.execute(DRAFT_CONFIRM_SQL, (confirmed_at.isoformat(), draft_id))
             if update.rowcount != 1:
                 raise LedgerStateError("draft is not pending")

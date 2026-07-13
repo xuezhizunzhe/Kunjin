@@ -10,7 +10,6 @@ from typing import List, Optional
 
 from kunjin.ledger.models import OcrBlock
 
-
 BLOCK_KEYS = frozenset({"text", "confidence", "x", "y", "width", "height"})
 
 

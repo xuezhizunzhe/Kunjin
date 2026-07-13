@@ -22,7 +22,6 @@ from kunjin.ledger.ocr import OcrError
 from kunjin.ledger.store import LedgerStateError, LedgerStore
 from kunjin.paths import RuntimePaths
 
-
 ALLOWED_FIELDS = {
     "fund_code",
     "fund_name",

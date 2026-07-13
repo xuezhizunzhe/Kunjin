@@ -1,18 +1,17 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
-import re
 from typing import Callable, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from kunjin.funds import parsers
+from kunjin.funds.html import FundParseError
 from kunjin.funds.models import DisclosureBundle, DocumentKind
 from kunjin.funds.parsers import ParsedSection
-from kunjin.funds.html import FundParseError
 from kunjin.funds.sources import FundTextClient, build_disclosure_url, build_f10_url
 from kunjin.funds.store import FundDisclosureStore
-
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 REFERER = "https://fundf10.eastmoney.com/"

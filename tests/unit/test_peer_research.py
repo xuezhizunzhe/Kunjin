@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from dataclasses import replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 from unittest.mock import patch
@@ -36,7 +36,6 @@ from kunjin.funds.peers.research import (
     comparison_fingerprint,
 )
 from kunjin.models import FundNavObservation, StoredPosition
-
 
 NOW = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
 

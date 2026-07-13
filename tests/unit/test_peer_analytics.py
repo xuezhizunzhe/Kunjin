@@ -26,7 +26,6 @@ from kunjin.funds.peers.analytics import (
 )
 from kunjin.models import FundNavObservation
 
-
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
 
 

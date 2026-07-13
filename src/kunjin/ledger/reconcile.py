@@ -12,7 +12,6 @@ from kunjin.ledger.models import (
 )
 from kunjin.models import StoredPosition
 
-
 _ACQUISITION_TYPES = {
     TransactionType.SUBSCRIPTION,
     TransactionType.RECURRING_SUBSCRIPTION,

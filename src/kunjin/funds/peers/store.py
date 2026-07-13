@@ -17,7 +17,6 @@ from kunjin.funds.peers.models import (
 )
 from kunjin.storage.repository import Repository
 
-
 _COMPARISON_KINDS = {"peer", "explicit", "portfolio_overlap"}
 _COMPARISON_STATUSES = {"success", "partial", "insufficient_data"}
 

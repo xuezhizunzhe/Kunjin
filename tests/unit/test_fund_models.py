@@ -20,7 +20,6 @@ from kunjin.funds.models import (
     SourceDocument,
 )
 
-
 NOW = datetime(2026, 7, 11, tzinfo=timezone.utc)
 
 
@@ -76,11 +75,35 @@ class NormalizedFactValidationTest(unittest.TestCase):
             FundShareClass("519755", "519755", "A", "示例基金A", 1),
             FundManagerTenure("519755", "张三", date(2024, 1, 1), None, 1),
             FundFeeRule("519755", FeeType.MANAGEMENT, 1, rate=Decimal("1.20"), rule_order=1),
-            FundSizeObservation("519755", date(2026, 6, 30), Decimal("100000000"), Decimal("50000000"), NOW, 1),
+            FundSizeObservation(
+                "519755", date(2026, 6, 30), Decimal("100000000"), Decimal("50000000"), NOW, 1
+            ),
             FundBenchmark("519755", "沪深300指数收益率*80%+中债指数收益率*20%", None, None, 1),
-            FundHolding("519755", date(2026, 6, 30), NOW, 1, "600000", "浦发银行", AssetType.STOCK, Decimal("5.4"), "top10", 1),
-            FundIndustryExposure("519755", date(2026, 6, 30), NOW, "申万一级", "银行", Decimal("12.5"), 1),
-            FundAnnouncement("519755", "季度报告", "定期报告", "示例公司", NOW, "https://example.com/report.pdf", 2, 1),
+            FundHolding(
+                "519755",
+                date(2026, 6, 30),
+                NOW,
+                1,
+                "600000",
+                "浦发银行",
+                AssetType.STOCK,
+                Decimal("5.4"),
+                "top10",
+                1,
+            ),
+            FundIndustryExposure(
+                "519755", date(2026, 6, 30), NOW, "申万一级", "银行", Decimal("12.5"), 1
+            ),
+            FundAnnouncement(
+                "519755",
+                "季度报告",
+                "定期报告",
+                "示例公司",
+                NOW,
+                "https://example.com/report.pdf",
+                2,
+                1,
+            ),
         )
 
         for record in records:

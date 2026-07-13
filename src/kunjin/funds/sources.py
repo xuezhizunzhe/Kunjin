@@ -19,7 +19,6 @@ from kunjin.funds.official_domains import (
     REGULATOR_AND_EXCHANGE_DOMAINS,
 )
 
-
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 FETCHABLE_HOSTS = frozenset(
     {"fund.eastmoney.com", "fundf10.eastmoney.com", "api.fund.eastmoney.com"}
@@ -243,7 +242,9 @@ class FundTextClient:
                         if parsed_length > MAX_RESPONSE_BYTES:
                             raise FundSourceError("fund source response exceeds size limit")
                     except ValueError as exc:
-                        raise FundSourceError("fund source returned invalid content length") from exc
+                        raise FundSourceError(
+                            "fund source returned invalid content length"
+                        ) from exc
                 payload = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(payload) > MAX_RESPONSE_BYTES:
                     raise FundSourceError("fund source response exceeds size limit")

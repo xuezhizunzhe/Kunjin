@@ -13,7 +13,6 @@ from kunjin.funds.peers.models import (
     PeerClassification,
 )
 
-
 PEER_MEMBER_LIMIT = 20
 DISCOVERY_VALIDATION_LIMIT = 40
 PEER_RULE_VERSION = "1"

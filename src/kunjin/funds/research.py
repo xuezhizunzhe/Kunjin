@@ -16,7 +16,6 @@ from kunjin.funds.models import (
     SourceDocument,
 )
 
-
 _REQUIRED_SECTIONS: Tuple[DocumentKind, ...] = (
     DocumentKind.BASIC_PROFILE,
     DocumentKind.MANAGER_HISTORY,
@@ -125,7 +124,15 @@ def _select_managers(
     current = [record for record in bundle.manager_tenures if _active_manager(record, as_of)]
     former = [record for record in bundle.manager_tenures if not _active_manager(record, as_of)]
     if not current:
-        return [], sorted(former, key=lambda item: (item.start_date, item.manager_name), reverse=True), []
+        return (
+            [],
+            sorted(
+                former,
+                key=lambda item: (item.start_date, item.manager_name),
+                reverse=True,
+            ),
+            [],
+        )
 
     primary_tier = min(_tier(bundle, record) for record in current)
     primary = [record for record in current if _tier(bundle, record) == primary_tier]
@@ -267,7 +274,9 @@ def _holdings_report(
     period_records = [record for record in bundle.holdings if record.report_period == report_period]
     primary_tier = min(_tier(bundle, record) for record in period_records)
     primary = [record for record in period_records if _tier(bundle, record) == primary_tier]
-    publication_dates = [record.published_at for record in primary if record.published_at is not None]
+    publication_dates = [
+        record.published_at for record in primary if record.published_at is not None
+    ]
     published_at = max(publication_dates) if publication_dates else None
     statutory_periods = [
         period
@@ -424,7 +433,10 @@ def build_disclosure_report(
                 "fund_name": item.fund_name,
                 "source_document_id": item.source_document_id,
             }
-            for item in sorted(bundle.share_classes, key=lambda item: (item.share_class, item.related_fund_code))
+            for item in sorted(
+                bundle.share_classes,
+                key=lambda item: (item.share_class, item.related_fund_code),
+            )
         ],
         "managers": {
             "evidence_level": "verified_fact" if current_managers else "insufficient_data",
@@ -504,7 +516,11 @@ def build_disclosure_report(
                     "source_tier": item.source_tier,
                     "source_document_id": item.source_document_id,
                 }
-                for item in sorted(bundle.announcements, key=lambda item: item.published_at, reverse=True)
+                for item in sorted(
+                    bundle.announcements,
+                    key=lambda item: item.published_at,
+                    reverse=True,
+                )
             ],
             "source_document_ids": _source_ids(bundle.announcements),
         },
@@ -524,7 +540,9 @@ def build_disclosure_report(
                 for section in _REQUIRED_SECTIONS
             },
         },
-        "warnings": _unique(tuple(bundle.warnings) + tuple(status_warnings) + tuple(generated_warnings)),
+        "warnings": _unique(
+            tuple(bundle.warnings) + tuple(status_warnings) + tuple(generated_warnings)
+        ),
         "conflicts": _unique(
             tuple(bundle.conflicts) + tuple(manager_conflicts) + tuple(benchmark_conflicts)
         ),

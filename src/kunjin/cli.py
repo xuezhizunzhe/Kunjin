@@ -7,7 +7,7 @@ import sys
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from kunjin import __version__
@@ -17,6 +17,20 @@ from kunjin.adapters.eastmoney import (
     PublicDataError,
 )
 from kunjin.adapters.yangjibao import YangjibaoClient, YangjibaoError
+from kunjin.allocation.crypto import AllocationCipher
+from kunjin.allocation.models import (
+    AllocationBlockCode,
+    AllocationConstraintCode,
+    AllocationProfileConflictCode,
+)
+from kunjin.allocation.policy import AllocationPolicyV1
+from kunjin.allocation.service import (
+    AllocationCalculationError,
+    AllocationPolicyError,
+    AllocationService,
+    EncryptedProfileUnavailableError,
+)
+from kunjin.allocation.store import AllocationAssessmentStore, AllocationPolicyStore
 from kunjin.analytics.portfolio import analyze_portfolio
 from kunjin.analytics.research import analyze_fund_history, analyze_sectors
 from kunjin.funds.peers.analytics import PEER_CALCULATION_VERSION
@@ -36,33 +50,86 @@ from kunjin.funds.service import (
 )
 from kunjin.funds.sources import FundTextClient
 from kunjin.funds.store import FundDisclosureStore
-from kunjin.logging import redact_secrets
 from kunjin.ledger.alipay import AlipayPaymentParser, requires_confirmation
 from kunjin.ledger.ocr import OcrError, VisionOcrClient
 from kunjin.ledger.reconcile import reconcile_fund
 from kunjin.ledger.service import LedgerImportError, LedgerService
 from kunjin.ledger.store import LedgerStateError, LedgerStore
+from kunjin.logging import redact_secrets
 from kunjin.models import InvestmentThesis
 from kunjin.paths import RuntimePaths
 from kunjin.security.keychain import CredentialStoreError, KeychainTokenStore
 from kunjin.services.research import ResearchSyncService
 from kunjin.services.sync import PortfolioSyncService, SyncError
 from kunjin.storage.repository import Repository
-
+from kunjin.suitability.crypto import (
+    AssessmentCipher,
+    ProfileCipher,
+    ProfileCryptoError,
+    ProfileKeyStore,
+)
+from kunjin.suitability.editor import ProfileEditor
+from kunjin.suitability.policy import SuitabilityPolicyV1
+from kunjin.suitability.service import (
+    ProfileService,
+    SuitabilityAssessmentError,
+    SuitabilityPolicyError,
+    SuitabilityService,
+)
+from kunjin.suitability.store import (
+    ProfileStore,
+    SuitabilityAssessmentStore,
+    SuitabilityPolicyStore,
+)
 
 _FUND_CODE = re.compile(r"^\d{6}$")
 _COMMAND_PART = re.compile(r"^[a-z][a-z0-9_-]*$")
 _TOP_LEVEL_COMMANDS = {
+    "allocation",
     "auth",
     "fund",
     "ledger",
     "market",
     "portfolio",
+    "profile",
     "report",
     "status",
+    "suitability",
     "sync",
     "thesis",
     "version",
+}
+_ALLOCATION_FORBIDDEN_TEXT = (
+    "exact",
+    "amount",
+    "cny",
+    "name",
+    "private",
+    "encrypted",
+    "nonce",
+    "ciphertext",
+    "fingerprint",
+    "target",
+    "recommended",
+    "purchase",
+    "selected",
+)
+_ALLOCATION_APPROVED_SENSITIVE_KEYS = {"loss_amount_equity_ceiling"}
+_ALLOCATION_INEQUALITIES = (
+    "E+B+C=1",
+    "E>=0",
+    "B>=0",
+    "C>=0",
+    "0.50E+0.10B<=D",
+    "I(0.50E+0.10B)<=L",
+    "E<=weighted_horizon_ceiling",
+    "E<=behavioral_willingness_ceiling",
+    "E<=financial_stability_ceiling",
+)
+_ALLOCATION_PUBLIC_ERROR_MESSAGES = {
+    "allocation_policy_unavailable": "allocation policy is unavailable",
+    "allocation_calculation_failed": "allocation calculation failed",
+    "encrypted_profile_unavailable": "encrypted profile is unavailable",
 }
 
 
@@ -96,6 +163,9 @@ class ApplicationContext:
     fund_disclosure_service: Optional[FundDisclosureService] = None
     peer_store: Optional[PeerStore] = None
     peer_service: Optional[PeerResearchService] = None
+    profile_service: Optional[ProfileService] = None
+    suitability_service: Optional[SuitabilityService] = None
+    allocation_service: Optional[AllocationService] = None
 
 
 def build_context() -> ApplicationContext:
@@ -112,10 +182,21 @@ def build_context() -> ApplicationContext:
     ledger_store = LedgerStore(repository)
     fund_disclosure_store = FundDisclosureStore(repository)
     fund_text_client = FundTextClient()
-    fund_disclosure_service = FundDisclosureService(
-        fund_text_client, fund_disclosure_store
-    )
+    fund_disclosure_service = FundDisclosureService(fund_text_client, fund_disclosure_store)
     peer_store = PeerStore(repository)
+    profile_store = ProfileStore(repository)
+    profile_key_store = ProfileKeyStore()
+    profile_service = ProfileService(
+        profile_store,
+        ProfileCipher(profile_key_store),
+    )
+    suitability_service = SuitabilityService(
+        profile_service,
+        SuitabilityPolicyStore(repository),
+        SuitabilityAssessmentStore(repository),
+        AssessmentCipher(profile_key_store),
+        SuitabilityPolicyV1(),
+    )
     return ApplicationContext(
         paths=paths,
         repository=repository,
@@ -139,6 +220,15 @@ def build_context() -> ApplicationContext:
             research_service,
             repository,
             peer_store,
+        ),
+        profile_service=profile_service,
+        suitability_service=suitability_service,
+        allocation_service=AllocationService(
+            suitability_service,
+            AllocationPolicyStore(repository),
+            AllocationAssessmentStore(repository),
+            AllocationCipher(profile_key_store),
+            AllocationPolicyV1(),
         ),
     )
 
@@ -197,13 +287,30 @@ def parse_field_overrides(values: Sequence[str]) -> Dict[str, str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = KunjinArgumentParser(
-        prog="kunjin", description="KunJin fund research CLI"
-    )
+    parser = KunjinArgumentParser(prog="kunjin", description="KunJin fund research CLI")
     parser.add_argument("--json", action="store_true", dest="json_output")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("version")
     subparsers.add_parser("status")
+
+    profile = subparsers.add_parser("profile")
+    profile_subparsers = profile.add_subparsers(dest="profile_command", required=True)
+    profile_subparsers.add_parser("edit")
+    profile_subparsers.add_parser("status")
+    profile_subparsers.add_parser("history")
+
+    suitability = subparsers.add_parser("suitability")
+    suitability_subparsers = suitability.add_subparsers(dest="suitability_command", required=True)
+    suitability_subparsers.add_parser("assess")
+    suitability_subparsers.add_parser("status")
+    suitability_subparsers.add_parser("history")
+
+    allocation = subparsers.add_parser("allocation")
+    allocation_subparsers = allocation.add_subparsers(dest="allocation_command", required=True)
+    allocation_subparsers.add_parser("ranges")
+    allocation_subparsers.add_parser("status")
+    allocation_subparsers.add_parser("history")
+    allocation_subparsers.add_parser("policy")
 
     auth = subparsers.add_parser("auth")
     auth_subparsers = auth.add_subparsers(dest="auth_command", required=True)
@@ -296,9 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     ledger_reconcile = ledger_subparsers.add_parser("reconcile")
     ledger_reconcile.add_argument("--fund-code", required=True)
     ledger_document = ledger_subparsers.add_parser("document")
-    document_subparsers = ledger_document.add_subparsers(
-        dest="document_command", required=True
-    )
+    document_subparsers = ledger_document.add_subparsers(dest="document_command", required=True)
     document_delete = document_subparsers.add_parser("delete")
     document_delete.add_argument("document_id", type=int)
     return parser
@@ -336,9 +441,7 @@ def _comparison_inputs(
     if context.fund_disclosure_store is None:
         raise ValueError("fund disclosure store is unavailable")
     codes = tuple(fund_codes)
-    bundles = {
-        code: context.fund_disclosure_store.load_bundle(code) for code in codes
-    }
+    bundles = {code: context.fund_disclosure_store.load_bundle(code) for code in codes}
     histories = {code: context.repository.fund_history(code) for code in codes}
     positions = context.repository.latest_positions()
     return bundles, histories, positions
@@ -351,9 +454,7 @@ def _comparison_status(report: Dict[str, Any]) -> str:
         return "insufficient_data"
     coverage = report.get("coverage", {})
     if report.get("comparison_kind") == "portfolio_overlap":
-        usable_weight = Decimal(
-            str(coverage.get("portfolio_weight_coverage") or "0")
-        )
+        usable_weight = Decimal(str(coverage.get("portfolio_weight_coverage") or "0"))
         if coverage.get("held_funds_total", 0) == 0 or usable_weight == 0:
             return "insufficient_data"
         return "partial" if warnings or data_gaps or report.get("errors") else "success"
@@ -411,13 +512,9 @@ def _disclosure_report(
         raise ValueError("fund disclosure store is unavailable")
     bundle = context.fund_disclosure_store.load_bundle(fund_code)
     if period is not None:
-        period_holdings = tuple(
-            item for item in bundle.holdings if item.report_period == period
-        )
+        period_holdings = tuple(item for item in bundle.holdings if item.report_period == period)
         period_industry = tuple(
-            item
-            for item in bundle.industry_exposure
-            if item.report_period == period
+            item for item in bundle.industry_exposure if item.report_period == period
         )
         warnings = bundle.warnings
         if not period_holdings and not period_industry:
@@ -458,9 +555,7 @@ def _report_metadata(
     }
 
 
-def _sync_disclosure(
-    context: ApplicationContext, fund_code: str, profile: bool
-) -> Dict[str, Any]:
+def _sync_disclosure(context: ApplicationContext, fund_code: str, profile: bool) -> Dict[str, Any]:
     _validate_fund_code(fund_code)
     if context.fund_disclosure_service is None:
         raise ValueError("fund disclosure service is unavailable")
@@ -491,18 +586,13 @@ def _sync_disclosure(
     return {"data": data, "successful": successful}
 
 
-def _sections_due(
-    service: FundDisclosureService, fund_code: str, sections: Sequence[str]
-) -> bool:
+def _sections_due(service: FundDisclosureService, fund_code: str, sections: Sequence[str]) -> bool:
     return any(
-        service.section_snapshot(fund_code, section).freshness != "fresh"
-        for section in sections
+        service.section_snapshot(fund_code, section).freshness != "fresh" for section in sections
     )
 
 
-def _append_section_sync_errors(
-    errors: List[Dict[str, str]], fund_code: str, result: Any
-) -> None:
+def _append_section_sync_errors(errors: List[Dict[str, str]], fund_code: str, result: Any) -> None:
     for section, item in result.sections.items():
         if item.error_code is not None or item.status == "source_unavailable":
             errors.append(
@@ -513,9 +603,7 @@ def _append_section_sync_errors(
             )
 
 
-def _append_peer_refresh_errors(
-    errors: List[Dict[str, str]], peer_results: Dict[str, Any]
-) -> None:
+def _append_peer_refresh_errors(errors: List[Dict[str, str]], peer_results: Dict[str, Any]) -> None:
     for anchor_code, result in peer_results.items():
         status = getattr(result.status, "value", result.status)
         if status != "source_unavailable":
@@ -536,12 +624,425 @@ def _append_peer_refresh_errors(
             )
 
 
+def _validate_allocation_json_response(command: str, value: object) -> Dict[str, Any]:
+    try:
+        _validate_amount_free_primitive(value)
+        if command == "ranges":
+            _validate_allocation_ranges(value)
+            return value
+        if command == "status":
+            _validate_allocation_status(value)
+            return value
+        if command == "history":
+            if type(value) is not tuple:
+                raise ValueError("history must be a tuple")
+            assessments = list(value)
+            for item in assessments:
+                _validate_allocation_history_item(item)
+            return {"assessments": assessments}
+        if command == "policy":
+            _validate_allocation_policy(value)
+            return value
+        raise ValueError("unsupported allocation command")
+    except (TypeError, ValueError):
+        raise AllocationCalculationError(
+            "allocation service returned an invalid response"
+        ) from None
+
+
+def _validate_amount_free_primitive(value: object, path: str = "root") -> None:
+    if value is None or type(value) in (bool, int):
+        return
+    if type(value) is str:
+        lowered = value.lower()
+        if any(forbidden in lowered for forbidden in _ALLOCATION_FORBIDDEN_TEXT):
+            raise ValueError(f"forbidden allocation text at {path}")
+        return
+    if type(value) is list or type(value) is tuple:
+        for index, item in enumerate(value):
+            _validate_amount_free_primitive(item, f"{path}[{index}]")
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError(f"non-string allocation key at {path}")
+            lowered = key.lower()
+            if lowered not in _ALLOCATION_APPROVED_SENSITIVE_KEYS and any(
+                forbidden in lowered for forbidden in _ALLOCATION_FORBIDDEN_TEXT
+            ):
+                raise ValueError(f"forbidden allocation key at {path}")
+            _validate_amount_free_primitive(item, f"{path}.{key}")
+        return
+    raise ValueError(f"unsupported allocation value at {path}")
+
+
+def _require_keys(value: object, expected: set, name: str) -> Dict[str, Any]:
+    if type(value) is not dict or set(value) != expected:
+        raise ValueError(f"invalid {name} schema")
+    return value
+
+
+def _positive_int(value: object, name: str, *, optional: bool = False) -> None:
+    if optional and value is None:
+        return
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"invalid {name}")
+
+
+def _non_negative_int(value: object, name: str) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"invalid {name}")
+
+
+def _percentage(value: object, name: str) -> None:
+    if type(value) is not str or not re.fullmatch(r"(?:0|1|0\.[0-9]+)", value):
+        raise ValueError(f"invalid {name}")
+    decimal = Decimal(value)
+    if not Decimal("0") <= decimal <= Decimal("1"):
+        raise ValueError(f"invalid {name}")
+
+
+def _percentage_text(value: Decimal) -> str:
+    return "0" if value == 0 else format(value.normalize(), "f")
+
+
+def _timestamp(value: object, name: str, *, optional: bool = False) -> None:
+    if optional and value is None:
+        return
+    if type(value) is not str:
+        raise ValueError(f"invalid {name}")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"invalid {name}") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.isoformat() != value:
+        raise ValueError(f"invalid {name}")
+
+
+def _code_list(value: object, allowed: set, name: str) -> None:
+    if type(value) is not list or len(value) != len(set(value)):
+        raise ValueError(f"invalid {name}")
+    if any(type(item) is not str or item not in allowed for item in value):
+        raise ValueError(f"invalid {name}")
+
+
+def _validate_safe_summary(value: object) -> None:
+    summary = _require_keys(
+        value,
+        {
+            "goal_count",
+            "obligation_count",
+            "fully_funded_now_count",
+            "fundable_without_return_count",
+            "funding_gap_without_return_count",
+            "horizon_equity_ceilings",
+        },
+        "safe summary",
+    )
+    for key in (
+        "goal_count",
+        "obligation_count",
+        "fully_funded_now_count",
+        "fundable_without_return_count",
+        "funding_gap_without_return_count",
+    ):
+        _non_negative_int(summary[key], key)
+    if type(summary["horizon_equity_ceilings"]) is not list:
+        raise ValueError("invalid horizon ceilings")
+    for item in summary["horizon_equity_ceilings"]:
+        _percentage(item, "horizon ceiling")
+
+
+def _validate_permitted_region(value: object) -> None:
+    if value is None:
+        return
+    region = _require_keys(
+        value,
+        {
+            "inequalities",
+            "maximum_equity",
+            "horizon_equity_ceiling",
+            "loss_amount_equity_ceiling",
+            "drawdown_equity_ceiling",
+            "willingness_equity_ceiling",
+            "stability_equity_ceiling",
+        },
+        "permitted region",
+    )
+    inequalities = region["inequalities"]
+    if type(inequalities) is not list or tuple(inequalities) != _ALLOCATION_INEQUALITIES:
+        raise ValueError("invalid inequalities")
+    for key in set(region) - {"inequalities"}:
+        _percentage(region[key], key)
+
+
+def _validate_allocation_ranges(value: object) -> None:
+    data = _require_keys(
+        value,
+        {
+            "assessment_id",
+            "profile_version",
+            "suitability_assessment_id",
+            "policy_version",
+            "status",
+            "blocks",
+            "binding_constraints",
+            "profile_conflicts",
+            "safe_summary",
+            "permitted_region",
+            "assessed_at",
+            "valid_until",
+            "freshness",
+            "capability",
+        },
+        "allocation ranges",
+    )
+    _positive_int(data["assessment_id"], "assessment id", optional=True)
+    _positive_int(data["profile_version"], "profile version")
+    _positive_int(data["suitability_assessment_id"], "suitability assessment id")
+    if data["policy_version"] != "1" or data["capability"] != "research_only":
+        raise ValueError("invalid allocation binding")
+    if data["status"] not in {"blocked", "range_available"}:
+        raise ValueError("invalid allocation status")
+    _code_list(data["blocks"], {item.value for item in AllocationBlockCode}, "blocks")
+    _code_list(
+        data["binding_constraints"],
+        {item.value for item in AllocationConstraintCode},
+        "constraints",
+    )
+    _code_list(
+        data["profile_conflicts"],
+        {item.value for item in AllocationProfileConflictCode},
+        "profile conflicts",
+    )
+    _validate_safe_summary(data["safe_summary"])
+    _validate_permitted_region(data["permitted_region"])
+    _timestamp(data["assessed_at"], "assessed_at")
+    _timestamp(data["valid_until"], "valid_until", optional=True)
+    if data["freshness"] not in {"fresh", "transient"}:
+        raise ValueError("invalid allocation freshness")
+    if data["status"] == "range_available" and (
+        data["assessment_id"] is None
+        or data["permitted_region"] is None
+        or data["valid_until"] is None
+        or data["freshness"] != "fresh"
+    ):
+        raise ValueError("invalid available allocation range")
+    if data["status"] == "blocked" and (
+        data["assessment_id"] is not None
+        or data["permitted_region"] is not None
+        or data["valid_until"] is not None
+        or data["freshness"] != "transient"
+    ):
+        raise ValueError("invalid blocked allocation range")
+
+
+def _validate_allocation_history_item(value: object, *, status: bool = False) -> None:
+    expected = {
+        "assessment_id",
+        "profile_version_id",
+        "suitability_assessment_id",
+        "policy_version",
+        "status",
+        "binding_constraints",
+        "safe_summary",
+        "permitted_region",
+        "assessed_at",
+        "valid_until",
+        "capability",
+    }
+    if status:
+        expected |= {"state", "freshness"}
+    data = _require_keys(value, expected, "allocation history item")
+    for key in ("assessment_id", "profile_version_id", "suitability_assessment_id"):
+        _positive_int(data[key], key)
+    if (
+        data["policy_version"] != "1"
+        or data["status"] != "range_available"
+        or data["capability"] != "research_only"
+    ):
+        raise ValueError("invalid allocation history binding")
+    _code_list(
+        data["binding_constraints"],
+        {item.value for item in AllocationConstraintCode},
+        "constraints",
+    )
+    _validate_safe_summary(data["safe_summary"])
+    _validate_permitted_region(data["permitted_region"])
+    _timestamp(data["assessed_at"], "assessed_at")
+    _timestamp(data["valid_until"], "valid_until")
+    if status and (data["state"] not in {"fresh", "stale"} or data["freshness"] != data["state"]):
+        raise ValueError("invalid allocation status freshness")
+
+
+def _validate_allocation_status(value: object) -> None:
+    if value == {
+        "state": "missing",
+        "freshness": "missing",
+        "capability": "research_only",
+    }:
+        return
+    _validate_allocation_history_item(value, status=True)
+
+
+def _validate_allocation_policy(value: object) -> None:
+    data = _require_keys(
+        value,
+        {
+            "version",
+            "checksum",
+            "effective_at",
+            "stress_loss_by_layer",
+            "horizon_equity_ceilings",
+            "willingness_equity_ceilings",
+            "stability_equity_ceilings",
+            "capability",
+        },
+        "allocation policy",
+    )
+    fixed = AllocationPolicyV1()
+    if data["version"] != fixed.version or data["capability"] != "research_only":
+        raise ValueError("invalid allocation policy identity")
+    if data["checksum"] != fixed.checksum():
+        raise ValueError("invalid allocation policy checksum")
+    _timestamp(data["effective_at"], "effective_at")
+    if data["effective_at"] != fixed.effective_at.isoformat():
+        raise ValueError("invalid allocation policy effective time")
+    stress = _require_keys(
+        data["stress_loss_by_layer"],
+        {"protected_cash", "high_quality_fixed_income", "diversified_equity"},
+        "stress policy",
+    )
+    expected_stress = {
+        layer.value: _percentage_text(item) for layer, item in fixed.stress_loss_by_layer
+    }
+    if stress != expected_stress:
+        raise ValueError("invalid stress policy")
+    horizons = data["horizon_equity_ceilings"]
+    if type(horizons) is not list or len(horizons) != 5:
+        raise ValueError("invalid horizon policy")
+    expected_horizons = [
+        {"maximum_years": years, "equity_ceiling": _percentage_text(ceiling)}
+        for years, ceiling in fixed.horizon_equity_ceilings
+    ]
+    if horizons != expected_horizons:
+        raise ValueError("invalid horizon policy")
+    for item in horizons:
+        row = _require_keys(item, {"maximum_years", "equity_ceiling"}, "horizon row")
+        if row["maximum_years"] is not None:
+            _positive_int(row["maximum_years"], "maximum years")
+        _percentage(row["equity_ceiling"], "equity ceiling")
+    expected_ceilings = {
+        "willingness_equity_ceilings": {
+            label: _percentage_text(item) for label, item in fixed.willingness_equity_ceilings
+        },
+        "stability_equity_ceilings": {
+            label: _percentage_text(item) for label, item in fixed.stability_equity_ceilings
+        },
+    }
+    for key in ("willingness_equity_ceilings", "stability_equity_ceilings"):
+        ceilings = data[key]
+        if type(ceilings) is not dict or ceilings != expected_ceilings[key]:
+            raise ValueError("invalid allocation policy ceilings")
+        for label, item in ceilings.items():
+            if type(label) is not str or not label:
+                raise ValueError("invalid allocation policy label")
+            _percentage(item, label)
+
+
+def _allocation_call(operation: Callable[[], Any]) -> Any:
+    try:
+        return operation()
+    except (
+        AllocationPolicyError,
+        AllocationCalculationError,
+        EncryptedProfileUnavailableError,
+        ProfileCryptoError,
+    ):
+        raise
+    except Exception:
+        raise AllocationCalculationError("allocation operation failed") from None
+
+
+def _allocation_ranges_response(service: AllocationService, json_output: bool) -> Dict[str, Any]:
+    def operation() -> Dict[str, Any]:
+        execution = service.ranges()
+        if json_output:
+            return _validate_allocation_json_response("ranges", execution.safe_json())
+        return execution.local_view()
+
+    return _allocation_call(operation)
+
+
+def _allocation_safe_response(operation: Callable[[], object], command: str) -> Dict[str, Any]:
+    return _allocation_call(lambda: _validate_allocation_json_response(command, operation()))
+
+
 def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, Any]:
     if args.command == "version":
         return envelope("version", {"version": __version__})
 
+    if args.command == "profile":
+        if args.profile_command == "edit" and args.json_output:
+            raise CliUsageError("profile edit is interactive and does not support JSON mode")
+        if context.profile_service is None:
+            raise CliUsageError("profile service is unavailable")
+        if args.profile_command == "edit":
+            result = ProfileEditor(context.profile_service).edit()
+            return envelope("profile.edit", result)
+        if args.profile_command == "status":
+            return envelope("profile.status", context.profile_service.status())
+        if args.profile_command == "history":
+            return envelope(
+                "profile.history",
+                {"profiles": context.profile_service.history()},
+            )
+
+    if args.command == "suitability":
+        if context.suitability_service is None:
+            raise CliUsageError("suitability service is unavailable")
+        if args.suitability_command == "assess":
+            execution = context.suitability_service.assess()
+            data = execution.safe_json() if args.json_output else execution.local_view()
+            return envelope("suitability.assess", data)
+        if args.suitability_command == "status":
+            return envelope(
+                "suitability.status",
+                context.suitability_service.status(),
+            )
+        return envelope(
+            "suitability.history",
+            {"assessments": context.suitability_service.history()},
+        )
+
+    if args.command == "allocation":
+        if context.allocation_service is None:
+            raise CliUsageError("allocation service is unavailable")
+        if args.allocation_command == "ranges":
+            return envelope(
+                "allocation.ranges",
+                _allocation_ranges_response(context.allocation_service, args.json_output),
+            )
+        if args.allocation_command == "status":
+            return envelope(
+                "allocation.status",
+                _allocation_safe_response(context.allocation_service.status, "status"),
+            )
+        if args.allocation_command == "history":
+            return envelope(
+                "allocation.history",
+                _allocation_safe_response(context.allocation_service.history, "history"),
+            )
+        return envelope(
+            "allocation.policy",
+            _allocation_safe_response(context.allocation_service.policy, "policy"),
+        )
+
     if args.command == "auth" and args.auth_command == "status":
-        return envelope("auth.status", {"yangjibao_authorized": context.token_store.load() is not None})
+        return envelope(
+            "auth.status",
+            {"yangjibao_authorized": context.token_store.load() is not None},
+        )
 
     if args.command == "auth" and args.auth_command == "revoke":
         context.token_store.delete()
@@ -567,12 +1068,8 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         return envelope("auth.login", {"provider": args.provider, "authorized": True})
 
     if args.command == "ledger" and args.ledger_command == "import":
-        draft = context.ledger_service.import_image(
-            args.image, fund_code_hint=args.fund_code
-        )
-        fields = context.ledger_service.store.list_ocr_fields(
-            draft.source_document_id
-        )
+        draft = context.ledger_service.import_image(args.image, fund_code_hint=args.fund_code)
+        fields = context.ledger_service.store.list_ocr_fields(draft.source_document_id)
         fields_by_name = {field.name: field for field in fields}
         public_fields = {
             field.name: {
@@ -600,9 +1097,7 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         transaction = context.ledger_service.confirm_draft(
             args.draft_id, parse_field_overrides(args.field)
         )
-        return envelope(
-            "ledger.confirm", {"transaction": serialize(transaction)}
-        )
+        return envelope("ledger.confirm", {"transaction": serialize(transaction)})
 
     if args.command == "ledger" and args.ledger_command == "add":
         transaction = context.ledger_service.add_manual_transaction(
@@ -619,18 +1114,12 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         return envelope("ledger.add", {"transaction": serialize(transaction)})
 
     if args.command == "ledger" and args.ledger_command == "transactions":
-        transactions = context.ledger_service.store.list_transactions(
-            args.fund_code
-        )
-        return envelope(
-            "ledger.transactions", {"transactions": serialize(transactions)}
-        )
+        transactions = context.ledger_service.store.list_transactions(args.fund_code)
+        return envelope("ledger.transactions", {"transactions": serialize(transactions)})
 
     if args.command == "ledger" and args.ledger_command == "reconcile":
         if not _FUND_CODE.fullmatch(args.fund_code):
-            raise LedgerImportError(
-                "invalid_fund_code", "fund code must contain six digits"
-            )
+            raise LedgerImportError("invalid_fund_code", "fund code must contain six digits")
         positions = [
             position
             for position in context.repository.latest_positions()
@@ -654,7 +1143,9 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                 errors=[
                     {
                         "code": "ambiguous_position_accounts",
-                        "message": "Multiple accounts hold this fund; account selection is required",
+                        "message": (
+                            "Multiple accounts hold this fund; account selection is required"
+                        ),
                     }
                 ],
             )
@@ -724,16 +1215,12 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             raise CliUsageError("candidate fund codes must be unique")
         if context.peer_service is None:
             raise ValueError("peer research service is unavailable")
-        result = context.peer_service.sync_peers(
-            args.fund_code, user_candidates=candidates
-        )
+        result = context.peer_service.sync_peers(args.fund_code, user_candidates=candidates)
         data = serialize(result)
         data["errors"] = serialize(result.errors)
         errors: List[Dict[str, str]] = []
         if result.status.value == "source_unavailable":
-            error_code = next(
-                reversed(result.warnings), "peer_sync_failed"
-            )
+            error_code = next(reversed(result.warnings), "peer_sync_failed")
             errors.append(
                 {
                     "code": error_code,
@@ -771,9 +1258,7 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         ):
             fund_result: Dict[str, Any] = {}
             try:
-                fund_result["nav"] = serialize(
-                    context.research_service.sync_fund(fund_code)
-                )
+                fund_result["nav"] = serialize(context.research_service.sync_fund(fund_code))
             except Exception as exc:
                 errors.append(
                     {
@@ -788,21 +1273,15 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                         fund_code,
                         PROFILE_SECTIONS,
                     ):
-                        disclosure_result = (
-                            context.fund_disclosure_service.sync_profile(fund_code)
-                        )
+                        disclosure_result = context.fund_disclosure_service.sync_profile(fund_code)
                         fund_result["profile"] = serialize(disclosure_result)
-                        _append_section_sync_errors(
-                            errors, fund_code, disclosure_result
-                        )
+                        _append_section_sync_errors(errors, fund_code, disclosure_result)
                     else:
                         fund_result["profile"] = {"status": "fresh"}
                 except Exception as exc:
                     errors.append(
                         {
-                            "code": str(
-                                getattr(exc, "code", "fund_profile_sync_failed")
-                            ),
+                            "code": str(getattr(exc, "code", "fund_profile_sync_failed")),
                             "message": f"{fund_code}: {redact_secrets(str(exc))}",
                         }
                     )
@@ -812,21 +1291,15 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                         fund_code,
                         HOLDING_SECTIONS,
                     ):
-                        disclosure_result = (
-                            context.fund_disclosure_service.sync_holdings(fund_code)
-                        )
+                        disclosure_result = context.fund_disclosure_service.sync_holdings(fund_code)
                         fund_result["holdings"] = serialize(disclosure_result)
-                        _append_section_sync_errors(
-                            errors, fund_code, disclosure_result
-                        )
+                        _append_section_sync_errors(errors, fund_code, disclosure_result)
                     else:
                         fund_result["holdings"] = {"status": "fresh"}
                 except Exception as exc:
                     errors.append(
                         {
-                            "code": str(
-                                getattr(exc, "code", "fund_holdings_sync_failed")
-                            ),
+                            "code": str(getattr(exc, "code", "fund_holdings_sync_failed")),
                             "message": f"{fund_code}: {redact_secrets(str(exc))}",
                         }
                     )
@@ -841,9 +1314,7 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                 results["peer_groups"] = {}
                 errors.append(
                     {
-                        "code": str(
-                            getattr(exc, "code", "peer_group_refresh_failed")
-                        ),
+                        "code": str(getattr(exc, "code", "peer_group_refresh_failed")),
                         "message": redact_secrets(str(exc)),
                     }
                 )
@@ -867,7 +1338,9 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                 "portfolio_freshness": data_freshness,
                 "latest_successful_sync": latest_sync,
             },
-            warnings=["freshness uses weekday boundaries and does not yet include exchange holidays"],
+            warnings=[
+                "freshness uses weekday boundaries and does not yet include exchange holidays"
+            ],
         )
 
     if args.command == "portfolio" and args.portfolio_command == "show":
@@ -891,14 +1364,10 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         peer_store, disclosure_store = _peer_components(context)
         positions = context.repository.latest_positions()
         fund_codes = tuple(sorted({position.fund_code for position in positions}))
-        bundles = {
-            code: disclosure_store.load_bundle(code) for code in fund_codes
-        }
+        bundles = {code: disclosure_store.load_bundle(code) for code in fund_codes}
         as_of = datetime.now(timezone.utc)
         report = build_portfolio_overlap_report(bundles, positions, as_of)
-        data = _save_comparison_report(
-            peer_store, "portfolio_overlap", report, as_of
-        )
+        data = _save_comparison_report(peer_store, "portfolio_overlap", report, as_of)
         errors = []
         if data["status"] == "insufficient_data":
             errors.append(
@@ -976,9 +1445,7 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         peer_store, _ = _peer_components(context)
         bundles, histories, positions = _comparison_inputs(context, fund_codes)
         as_of = datetime.now(timezone.utc)
-        report = build_explicit_compare_report(
-            fund_codes, bundles, histories, positions, as_of
-        )
+        report = build_explicit_compare_report(fund_codes, bundles, histories, positions, as_of)
         data = _save_comparison_report(
             peer_store,
             "explicit",
@@ -994,11 +1461,7 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         "holdings",
         "announcements",
     }:
-        period = (
-            _parse_report_period(args.period)
-            if args.fund_command == "holdings"
-            else None
-        )
+        period = _parse_report_period(args.period) if args.fund_command == "holdings" else None
         report = _disclosure_report(context, args.fund_code, period)
         errors = _disclosure_errors(context, args.fund_code)
         metadata = _report_metadata(report, errors)
@@ -1079,7 +1542,8 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         sectors = analyze_sectors(context.repository.latest_sector_snapshots())
         warnings = list(portfolio.warnings) + list(sectors.get("warnings", []))
         warnings.append(
-            "news and causal attribution are not persisted yet; verify relevant events from official sources"
+            "news and causal attribution are not persisted yet; verify relevant events "
+            "from official sources"
         )
         return envelope(
             "report.weekly",
@@ -1125,17 +1589,40 @@ def run(
         OcrError,
         LedgerImportError,
         LedgerStateError,
+        ProfileCryptoError,
+        SuitabilityPolicyError,
+        SuitabilityAssessmentError,
+        AllocationPolicyError,
+        AllocationCalculationError,
+        EncryptedProfileUnavailableError,
         CliUsageError,
         ValueError,
     ) as exc:
         code = getattr(exc, "code", "operation_failed")
-        payload = envelope(
+        message = redact_secrets(str(exc))
+        if isinstance(
+            exc,
             (
-                _command_name(args)
-                if args is not None
-                else _command_name_from_argv(raw_argv)
+                AllocationPolicyError,
+                AllocationCalculationError,
+                EncryptedProfileUnavailableError,
             ),
-            errors=[{"code": str(code), "message": redact_secrets(str(exc))}],
+        ) or (
+            args is not None
+            and args.command == "allocation"
+            and isinstance(exc, ProfileCryptoError)
+        ):
+            code = (
+                "encrypted_profile_unavailable"
+                if isinstance(exc, (EncryptedProfileUnavailableError, ProfileCryptoError))
+                else str(code)
+            )
+            message = _ALLOCATION_PUBLIC_ERROR_MESSAGES.get(
+                str(code), "allocation calculation failed"
+            )
+        payload = envelope(
+            (_command_name(args) if args is not None else _command_name_from_argv(raw_argv)),
+            errors=[{"code": str(code), "message": message}],
         )
         exit_code = 1
     return serialize(payload), exit_code, json_output
@@ -1161,11 +1648,14 @@ def _command_name_from_argv(argv: Sequence[str]) -> str:
     command = values[command_index]
     if command not in {
         "auth",
+        "allocation",
         "fund",
         "ledger",
         "market",
         "portfolio",
+        "profile",
         "report",
+        "suitability",
         "sync",
         "thesis",
     }:

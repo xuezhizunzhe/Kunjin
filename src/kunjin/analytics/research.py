@@ -4,7 +4,7 @@ import math
 import statistics
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from kunjin.models import FundNavObservation, SectorObservation
 
@@ -68,9 +68,21 @@ def analyze_fund_history(history: Sequence[FundNavObservation]) -> Dict[str, Any
         "observations": len(ordered),
         "latest_unit_nav": str(ordered[-1].unit_nav),
         "period_returns": {
-            "30d": None if _period_return(ordered, 30) is None else str(_period_return(ordered, 30)),
-            "90d": None if _period_return(ordered, 90) is None else str(_period_return(ordered, 90)),
-            "365d": None if _period_return(ordered, 365) is None else str(_period_return(ordered, 365)),
+            "30d": (
+                None
+                if _period_return(ordered, 30) is None
+                else str(_period_return(ordered, 30))
+            ),
+            "90d": (
+                None
+                if _period_return(ordered, 90) is None
+                else str(_period_return(ordered, 90))
+            ),
+            "365d": (
+                None
+                if _period_return(ordered, 365) is None
+                else str(_period_return(ordered, 365))
+            ),
         },
         "annualized_volatility": str(annualized_volatility),
         "max_drawdown": str(max_drawdown),
@@ -112,4 +124,3 @@ def analyze_sectors(observations: Sequence[SectorObservation], limit: int = 10) 
             "valuation, earnings, capital-flow persistence, catalysts, and crowding are incomplete",
         ],
     }
-

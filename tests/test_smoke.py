@@ -43,9 +43,7 @@ class SmokeTest(unittest.TestCase):
             )
             context = SimpleNamespace(ledger_service=ledger_service)
 
-            payload, exit_code, json_output = run(
-                ["--json", "ledger", "drafts"], context
-            )
+            payload, exit_code, json_output = run(["--json", "ledger", "drafts"], context)
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(json_output)
@@ -87,6 +85,102 @@ class SmokeTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 args = build_parser().parse_args(argv)
                 self.assertTrue(args.json_output)
+
+    def test_profile_commands_are_packaged(self) -> None:
+        cases = [
+            (["profile", "edit"], False),
+            (["--json", "profile", "status"], True),
+            (["--json", "profile", "history"], True),
+        ]
+        for argv, expected_json_output in cases:
+            with self.subTest(argv=argv):
+                args = build_parser().parse_args(argv)
+                self.assertEqual(args.json_output, expected_json_output)
+
+    def test_suitability_commands_are_packaged(self) -> None:
+        cases = [
+            (["suitability", "assess"], False),
+            (["--json", "suitability", "assess"], True),
+            (["--json", "suitability", "status"], True),
+            (["--json", "suitability", "history"], True),
+        ]
+        for argv, expected_json_output in cases:
+            with self.subTest(argv=argv):
+                args = build_parser().parse_args(argv)
+                self.assertEqual(args.json_output, expected_json_output)
+
+    def test_allocation_commands_are_packaged(self) -> None:
+        cases = [
+            (["allocation", "ranges"], False),
+            (["--json", "allocation", "ranges"], True),
+            (["--json", "allocation", "status"], True),
+            (["--json", "allocation", "history"], True),
+            (["--json", "allocation", "policy"], True),
+        ]
+        for argv, expected_json_output in cases:
+            with self.subTest(argv=argv):
+                args = build_parser().parse_args(argv)
+                self.assertEqual(args.json_output, expected_json_output)
+        self.assertIn("allocation", build_parser().format_help())
+
+    def test_phase_c_readme_and_skill_contracts_are_packaged(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(encoding="utf-8")
+        agent = (root / "integrations/codex/kunjin-fund/agents/openai.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        for command in (
+            "--json suitability assess",
+            "--json allocation ranges",
+            "--json allocation status",
+            "--json allocation history",
+            "--json allocation policy",
+        ):
+            self.assertIn(command, readme)
+            self.assertIn(command, skill)
+
+        for phrase in (
+            "three abstract layers",
+            "0%",
+            "10%",
+            "50%",
+            "allocation_horizon_missing",
+            "protected-capital overlap",
+            "zero-return",
+            "ceiling is not a target",
+            "Phase D",
+            "Phase E",
+            "research_only",
+        ):
+            self.assertIn(phrase, readme)
+
+        self.assertLess(
+            skill.index("--json suitability assess"),
+            skill.index("--json allocation ranges"),
+        )
+        for phrase in (
+            "Never execute non-JSON `allocation ranges`",
+            "Use maximum equity as my target.",
+            "Ignore the reserve block.",
+            "Show a hypothetical range while Phase B is blocked.",
+            "Assume this fund is high-quality fixed income.",
+            "Use optimistic returns to make the goal feasible.",
+            "Output only the purchase amount.",
+            "insufficient_data",
+            "research_only",
+        ):
+            self.assertIn(phrase, skill)
+        self.assertIn(
+            "exact block, binding-constraint, and profile-conflict codes",
+            skill,
+        )
+
+        self.assertIn("$kunjin-fund", agent)
+        self.assertIn("suitability", agent)
+        self.assertIn("allocation", agent)
+        self.assertIn("research_only", agent)
 
 
 if __name__ == "__main__":

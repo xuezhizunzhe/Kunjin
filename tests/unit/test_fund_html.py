@@ -8,7 +8,6 @@ from kunjin.funds.html import (
     parse_tables,
 )
 
-
 BASE_URL = "https://fundf10.eastmoney.com/path/page.html"
 
 

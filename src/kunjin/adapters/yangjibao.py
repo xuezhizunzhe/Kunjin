@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from kunjin.models import AccountObservation, PositionObservation
 from kunjin.security.keychain import KeychainTokenStore
 
-
 DEFAULT_BASE_URL = "https://browser-plug-api.yangjibao.com"
 YANGJIBAO_BROWSER_PLUGIN_SIGNING_SECRET = "YxmKSrQR4uoJ5lOoWIhcbd7SlUEh9OOc"
 EXACT_GET_PATHS = {

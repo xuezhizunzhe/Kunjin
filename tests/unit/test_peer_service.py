@@ -15,7 +15,6 @@ from kunjin.funds.peers.service import PeerResearchService
 from kunjin.funds.peers.sources import PEER_DIRECTORY_URL
 from kunjin.funds.sources import TextResponse
 
-
 NOW = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
 
 
@@ -252,8 +251,16 @@ class PeerResearchServiceTest(unittest.TestCase):
         current = type("StoredGroup", (), {
             "anchor_fund_code": "519755",
             "members": (
-                type("StoredMember", (), {"fund_code": "519755", "membership_kind": MembershipKind.ANCHOR})(),
-                type("StoredMember", (), {"fund_code": "000003", "membership_kind": MembershipKind.DISCOVERED})(),
+                type(
+                    "StoredMember",
+                    (),
+                    {"fund_code": "519755", "membership_kind": MembershipKind.ANCHOR},
+                )(),
+                type(
+                    "StoredMember",
+                    (),
+                    {"fund_code": "000003", "membership_kind": MembershipKind.DISCOVERED},
+                )(),
             ),
         })()
         peer_store = FakePeerStore(current=current)
@@ -268,7 +275,10 @@ class PeerResearchServiceTest(unittest.TestCase):
 
         self.assertEqual(result.status, PeerSyncState.PARTIAL)
         self.assertIn("candidate_discovery_unavailable", result.warnings)
-        self.assertEqual(disclosure.classification_calls[:4], ["519755", "000001", "000002", "000003"])
+        self.assertEqual(
+            disclosure.classification_calls[:4],
+            ["519755", "000001", "000002", "000003"],
+        )
         self.assertEqual(result.members, 4)
 
     def test_refresh_reads_only_stored_anchors(self) -> None:
@@ -285,8 +295,14 @@ class PeerResearchServiceTest(unittest.TestCase):
         service, directory, disclosure, _, _ = self.make_service(("519755", "000001"))
         original_classification = disclosure.sync_classification
         original_fetch = directory.fetch
-        disclosure.sync_classification = lambda code: (events.append(f"classify:{code}"), original_classification(code))[1]
-        directory.fetch = lambda url, referer: (events.append("directory"), original_fetch(url, referer))[1]
+        disclosure.sync_classification = lambda code: (
+            events.append(f"classify:{code}"),
+            original_classification(code),
+        )[1]
+        directory.fetch = lambda url, referer: (
+            events.append("directory"),
+            original_fetch(url, referer),
+        )[1]
 
         service.sync_peers("519755")
 
@@ -325,8 +341,19 @@ class PeerResearchServiceTest(unittest.TestCase):
         current = type("StoredGroup", (), {
             "anchor_fund_code": "519755",
             "members": (
-                type("StoredMember", (), {"fund_code": "519755", "membership_kind": MembershipKind.ANCHOR})(),
-                type("StoredMember", (), {"fund_code": "000001", "membership_kind": MembershipKind.USER_SUPPLIED})(),
+                type(
+                    "StoredMember",
+                    (),
+                    {"fund_code": "519755", "membership_kind": MembershipKind.ANCHOR},
+                )(),
+                type(
+                    "StoredMember",
+                    (),
+                    {
+                        "fund_code": "000001",
+                        "membership_kind": MembershipKind.USER_SUPPLIED,
+                    },
+                )(),
             ),
         })()
         peer_store = FakePeerStore(current=current)

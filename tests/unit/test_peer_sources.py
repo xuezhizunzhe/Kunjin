@@ -16,7 +16,6 @@ from kunjin.funds.peers.sources import (
 )
 from kunjin.funds.sources import FundSourceError, FundTextClient, TextResponse
 
-
 NOW = datetime(2026, 7, 11, 8, 0, tzinfo=timezone.utc)
 FIXTURE = (
     Path(__file__).parents[1] / "fixtures" / "funds" / "fundcode_search.js"

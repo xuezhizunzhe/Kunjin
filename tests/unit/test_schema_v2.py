@@ -23,7 +23,13 @@ class SchemaV2Test(unittest.TestCase):
     def test_fund_history_round_trip(self) -> None:
         now = datetime.now(timezone.utc)
         item = FundNavObservation(
-            "017811", date(2026, 7, 10), Decimal("1.2"), Decimal("1.2"), Decimal("0.5"), "eastmoney", now
+            "017811",
+            date(2026, 7, 10),
+            Decimal("1.2"),
+            Decimal("1.2"),
+            Decimal("0.5"),
+            "eastmoney",
+            now,
         )
         self.repository.save_fund_history("017811", "人工智能混合C", "混合型", "eastmoney", [item])
 
@@ -33,7 +39,17 @@ class SchemaV2Test(unittest.TestCase):
 
     def test_sector_snapshot_round_trip(self) -> None:
         now = datetime.now(timezone.utc)
-        item = SectorObservation("BK1", "半导体", "industry", Decimal("1.2"), Decimal("3.4"), 20, 10, "eastmoney", now)
+        item = SectorObservation(
+            "BK1",
+            "半导体",
+            "industry",
+            Decimal("1.2"),
+            Decimal("3.4"),
+            20,
+            10,
+            "eastmoney",
+            now,
+        )
         self.repository.save_sector_snapshots([item])
 
         self.assertEqual(self.repository.latest_sector_snapshots()[0].sector_name, "半导体")
