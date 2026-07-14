@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 import unicodedata
@@ -63,6 +64,7 @@ PRODUCTION_TAXONOMY_MAPPINGS: Tuple[IndustryTaxonomyMapping, ...] = ()
 
 _SUPPORTED_UNITS = ("percent",)
 _CHECKSUM_PATTERN = re.compile(r"[0-9a-f]{64}")
+_DNS_LABEL_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 _DEFAULT_IGNORABLE_RANGES = (
     (0x034F, 0x034F),
@@ -233,6 +235,11 @@ def _validate_mapping(mapping: IndustryTaxonomyMapping) -> None:
     )
     if normalized_source_url != mapping.source_url:
         raise ValueError("taxonomy source URL must be canonical")
+    if not mapping.source_url.isascii() or any(
+        character.isspace() or character == "\\"
+        for character in mapping.source_url
+    ):
+        raise ValueError("taxonomy source URL must use canonical ASCII URL syntax")
     try:
         parsed_url = urlsplit(mapping.source_url)
         parsed_url.port
@@ -244,6 +251,7 @@ def _validate_mapping(mapping: IndustryTaxonomyMapping) -> None:
         or parsed_url.username is not None
         or parsed_url.password is not None
         or parsed_url.fragment
+        or not _is_valid_source_hostname(parsed_url.hostname, parsed_url.netloc)
     ):
         raise ValueError("taxonomy source URL must be an authenticated HTTPS URL")
     if type(mapping.published_at) is not date:
@@ -372,9 +380,25 @@ def _require_exact_record_state(
 ) -> None:
     if type(value) is not expected_type:
         raise ValueError(f"{name} must be an exact record")
+    if type(vars(value)) is not dict:
+        raise ValueError(f"{name} must have exact record state")
     expected_fields = {field.name for field in fields(expected_type)}
     if set(vars(value)) != expected_fields:
         raise ValueError(f"{name} must have exact record state")
+
+
+def _is_valid_source_hostname(hostname: str, netloc: str) -> bool:
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        if ":" in hostname or re.fullmatch(r"[0-9.]+", hostname):
+            return False
+        if len(hostname) > 253 or hostname.startswith(".") or hostname.endswith("."):
+            return False
+        return all(_DNS_LABEL_PATTERN.fullmatch(label) for label in hostname.split("."))
+    if address.version == 6:
+        return netloc.startswith("[") and "]" in netloc
+    return ":" not in hostname
 
 
 def _mapping_for_standard(

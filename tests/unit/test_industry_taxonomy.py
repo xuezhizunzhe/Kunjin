@@ -325,6 +325,36 @@ def test_registry_rejects_injected_mapping_dataclass_state() -> None:
         )
 
 
+@pytest.mark.parametrize("record_kind", ("row", "mapping"))
+def test_records_reject_custom_dict_hiding_injected_state(record_kind: str) -> None:
+    class HidingState(dict[str, object]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return (
+                key
+                for key in super().__iter__()
+                if key != "unexpected_mutable_state"
+            )
+
+    record = replace(_rows()[0]) if record_kind == "row" else _mapping()
+    hidden_state = HidingState(vars(record))
+    hidden_state["unexpected_mutable_state"] = []
+    object.__setattr__(record, "__dict__", hidden_state)
+
+    with pytest.raises(ValueError, match="exact record state"):
+        if record_kind == "row":
+            validate_industry_distribution(
+                rows=(record,),  # type: ignore[arg-type]
+                complete_scope=True,
+                mappings=(_mapping(),),
+            )
+        else:
+            validate_industry_distribution(
+                rows=_rows(),
+                complete_scope=True,
+                mappings=(record,),  # type: ignore[arg-type]
+            )
+
+
 def test_validated_distribution_rejects_injected_dataclass_state() -> None:
     validated = validate_industry_distribution(
         rows=_rows(), complete_scope=True, mappings=(_mapping(),)
@@ -367,6 +397,12 @@ def test_invalid_registry_mapping_raises_value_error(
         "https://example.com/sw-level1-2021.json ",
         "https://example.com/ＳＷ-level1-2021.json",
         "https://example.com:invalid/sw-level1-2021.json",
+        "https://exa mple.com/sw.json",
+        "https://example.com\\evil/sw.json",
+        "https://user@example.com/sw.json",
+        "https://example.com/行业.json",
+        "https://example.com/\u0007sw.json",
+        "https://example.com /sw.json",
     ),
 )
 def test_registry_rejects_noncanonical_or_invalid_port_source_url(
