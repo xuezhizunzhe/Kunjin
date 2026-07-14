@@ -138,10 +138,14 @@ def legacy_parser_provenance(
 
 
 def candidate_fingerprint(candidate: OfficialDocumentCandidate) -> str:
+    return _canonical_fingerprint(canonical_candidate_payload(candidate))
+
+
+def canonical_candidate_payload(candidate: OfficialDocumentCandidate) -> dict[str, object]:
     candidate.validate()
     if candidate.published_at is not None and candidate.published_at.tzinfo is not timezone.utc:
         raise ValueError("official document candidate published_at must use canonical UTC")
-    payload = {
+    return {
         "document_kind": candidate.document_kind.value,
         "fund_code": candidate.fund_code,
         "published_at": (
@@ -152,7 +156,6 @@ def candidate_fingerprint(candidate: OfficialDocumentCandidate) -> str:
         "title": candidate.title,
         "url": candidate.url,
     }
-    return _canonical_fingerprint(payload)
 
 
 def canonical_fact_set_fingerprint(fact_fingerprints: Iterable[str]) -> str:

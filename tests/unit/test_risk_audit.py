@@ -14,6 +14,7 @@ from kunjin.funds.risk.audit import (
     ParseRunOutcome,
     RefreshOutcome,
     candidate_fingerprint,
+    canonical_candidate_payload,
     canonical_fact_set_fingerprint,
     legacy_parser_provenance,
     native_parser_provenance,
@@ -207,6 +208,34 @@ class RiskAuditTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             candidate_fingerprint(replace(original, source_tier=2))
+
+    def test_candidate_payload_is_exact_canonical_fingerprint_input(self) -> None:
+        original = candidate()
+
+        payload = canonical_candidate_payload(original)
+
+        self.assertEqual(
+            payload,
+            {
+                "document_kind": "quarterly_report",
+                "fund_code": "519755",
+                "published_at": "2026-07-13T12:00:00+00:00",
+                "publisher": "example fund manager",
+                "source_tier": 1,
+                "title": "example fund 2026 second-quarter report",
+                "url": "https://www.fund001.com/reports/519755-q2.doc",
+            },
+        )
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self.assertEqual(
+            candidate_fingerprint(original),
+            hashlib.sha256(canonical.encode("ascii")).hexdigest(),
+        )
 
     def test_candidate_fingerprint_rejects_non_utc_time_and_subclasses(self) -> None:
         non_utc = candidate(published_at=NOW.astimezone(timezone(timedelta(hours=8))))
