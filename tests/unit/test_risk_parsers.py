@@ -318,14 +318,23 @@ class RiskHtmlParserTest(unittest.TestCase):
             "June Asset Allocation",
             "截止日期资产配置",
             "As of reporting date",
+            "12月31日资产配置",
+            "年初资产配置",
+            "年末资产配置",
+            "二〇二五年末资产配置",
+            "上月末资产配置",
+            "上半年末资产配置",
+            "截至2026-06-30及年初资产配置",
         )
         allowed_sections = (
             "截至2026-06-30",
             "截至2026.06.30",
+            "截至2026年6月30日",
             "2026Q2 Asset Allocation",
             "June 30, 2026 Asset Allocation",
             "30 June 2026 Asset Allocation",
             "报告期末资产组合",
+            "本报告期末资产组合",
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

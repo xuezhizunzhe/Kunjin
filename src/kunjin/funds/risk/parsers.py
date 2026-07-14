@@ -2338,17 +2338,20 @@ _HISTORICAL_CONTEXT_PATTERN = re.compile(
     r"historical|prior period|previous period",
     flags=re.IGNORECASE,
 )
-_UNBOUND_PERIOD_CONTEXT_PATTERN = re.compile(
-    r"年度|半年度|中期|第?[一二三四1-4]季度|"
-    r"\b(?:annual|semi-annual|semiannual|half-year|q[1-4]|"
-    r"first quarter|second quarter|third quarter|fourth quarter)\b",
+_TEMPORAL_CONTEXT_CUE_PATTERN = re.compile(
+    r"(?<![0-9])[0-9]{4}(?![0-9])|[〇零一二三四五六七八九]{4}年|"
+    r"(?<![0-9])[0-9]{1,2}月(?:[0-9]{1,2}日)?|"
+    r"(?:上|下|本)?半年|(?:上)?(?:年|月|季)(?:初|末)|年度|半年度|中期|"
+    r"第?[一二三四1-4]季度|"
+    r"\b(?:january|february|march|april|may|june|july|august|september|"
+    r"october|november|december|q[1-4]|quarter|annual|semiannual|semi-annual|"
+    r"half-year|year[ -]?end|month[ -]?end|quarter[ -]?end)\b|"
+    r"截至|截止|as of|as at",
     flags=re.IGNORECASE,
 )
-_TEMPORAL_CONTEXT_CUE_PATTERN = re.compile(
-    r"(?<![0-9])(?:19|20)[0-9]{2}(?![0-9])|"
-    r"\b(?:january|february|march|april|may|june|july|august|september|"
-    r"october|november|december|q[1-4]|quarter|annual|semiannual|semi-annual)\b|"
-    r"截至|截止|as of|as at|期初|同期|上年末|往期",
+_GENERIC_CURRENT_CONTEXT_PATTERN = re.compile(
+    r"(?:(?:截至|截止)\s*)?(?:(?:本)?报告期末|本期末|期末)|"
+    r"(?:(?:as of|as at)\s+)?(?:the\s+)?end of (?:the\s+)?reporting period",
     flags=re.IGNORECASE,
 )
 _CONTEXT_QUARTERS = {
@@ -2377,65 +2380,54 @@ _CONTEXT_MONTHS = {
 }
 
 
-def _observation_context_matches_period(
-    observation: CurrentReportObservation,
-    period_end: date,
-) -> bool:
-    section = observation.section_name
-    if section is None:
-        return True
-    normalized = " ".join(unicodedata.normalize("NFKC", section).split())
-    if _HISTORICAL_CONTEXT_PATTERN.search(normalized):
-        return False
-    periods = set()
+def _context_periods_and_residual(normalized: str) -> Tuple[set[date], str]:
+    periods: set[date] = set()
+    spans: List[Tuple[int, int]] = []
+
+    def add_span(match: re.Match[str], value: date) -> None:
+        periods.add(value)
+        spans.append(match.span())
+
+    chinese_prefix = r"(?:(?:截至|截止)\s*)?"
+    english_prefix = r"(?:(?:as of|as at)\s+)?"
     try:
-        reported_period = report_period_end(normalized)
-        if reported_period is not None:
-            periods.add(reported_period)
         for match in re.finditer(
-            r"(?<![0-9])([0-9]{4})年([0-9]{1,2})月([0-9]{1,2})日",
+            chinese_prefix
+            + r"(?<![0-9])([0-9]{4})年([0-9]{1,2})月([0-9]{1,2})日",
             normalized,
         ):
-            periods.add(date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
+            add_span(match, date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
         for match in re.finditer(
-            r"(?<![0-9])([0-9]{4})[-/.]([0-9]{1,2})[-/.]([0-9]{1,2})(?![0-9])",
+            chinese_prefix
+            + r"(?<![0-9])([0-9]{4})[-/.]([0-9]{1,2})[-/.]([0-9]{1,2})(?![0-9])",
             normalized,
         ):
-            periods.add(date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
-        periods.update(
-            date(int(match.group(1)), 12, 31)
-            for match in re.finditer(r"(?<![0-9])([0-9]{4})年末", normalized)
-        )
-        periods.update(
-            date(int(match.group(1)), 12, 31)
-            for match in re.finditer(r"(?<![0-9])([0-9]{4})年年度", normalized)
-        )
-        periods.update(
-            date(int(match.group(1)), 6, 30)
-            for match in re.finditer(r"(?<![0-9])([0-9]{4})年(?:半年度|中期)", normalized)
-        )
+            add_span(match, date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
         for match in re.finditer(
-            r"(?<![0-9])([0-9]{4})年第?([一二三四1-4])季度",
+            chinese_prefix + r"(?<![0-9])([0-9]{4})年(?:末|年度)",
+            normalized,
+        ):
+            add_span(match, date(int(match.group(1)), 12, 31))
+        for match in re.finditer(
+            chinese_prefix + r"(?<![0-9])([0-9]{4})年(?:半年度|中期)",
+            normalized,
+        ):
+            add_span(match, date(int(match.group(1)), 6, 30))
+        for match in re.finditer(
+            chinese_prefix + r"(?<![0-9])([0-9]{4})年第?([一二三四1-4])季度",
             normalized,
         ):
             month, day = _CONTEXT_QUARTERS[match.group(2)]
-            periods.add(date(int(match.group(1)), month, day))
-        periods.update(
-            date(int(match.group(1)), 12, 31)
-            for match in re.finditer(
-                r"(?<![0-9])([0-9]{4})\s+annual\b",
-                normalized,
-                flags=re.IGNORECASE,
-            )
-        )
-        periods.update(
-            date(int(match.group(1)), 6, 30)
-            for match in re.finditer(
-                r"(?<![0-9])([0-9]{4})\s+(?:semi-annual|semiannual|half-year)\b",
-                normalized,
-                flags=re.IGNORECASE,
-            )
-        )
+            add_span(match, date(int(match.group(1)), month, day))
+
+        for match in re.finditer(
+            english_prefix
+            + r"(?<![0-9])([0-9]{4})\s+(annual|semi-annual|semiannual|half-year)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        ):
+            month, day = (12, 31) if match.group(2).casefold() == "annual" else (6, 30)
+            add_span(match, date(int(match.group(1)), month, day))
         english_quarters = {
             "q1": (3, 31),
             "first quarter": (3, 31),
@@ -2447,53 +2439,69 @@ def _observation_context_matches_period(
             "fourth quarter": (12, 31),
         }
         for match in re.finditer(
-            r"(?<![0-9])([0-9]{4})\s+"
-            r"(q[1-4]|first quarter|second quarter|third quarter|fourth quarter)\b",
+            english_prefix
+            + r"(?<![0-9])([0-9]{4})\s*"
+            + r"(q[1-4]|first quarter|second quarter|third quarter|fourth quarter)\b",
             normalized,
             flags=re.IGNORECASE,
         ):
             month, day = english_quarters[match.group(2).casefold()]
-            periods.add(date(int(match.group(1)), month, day))
+            add_span(match, date(int(match.group(1)), month, day))
         for match in re.finditer(
-            r"(?<![0-9])([0-9]{4})\s*[qQ]([1-4])(?![0-9])",
-            normalized,
-        ):
-            month, day = _CONTEXT_QUARTERS[match.group(2)]
-            periods.add(date(int(match.group(1)), month, day))
-        for match in re.finditer(
-            r"\b(" + "|".join(_CONTEXT_MONTHS) + r")\s+([0-9]{1,2}),?\s+([0-9]{4})\b",
+            english_prefix
+            + r"\b("
+            + "|".join(_CONTEXT_MONTHS)
+            + r")\s+([0-9]{1,2}),?\s+([0-9]{4})\b",
             normalized,
             flags=re.IGNORECASE,
         ):
-            periods.add(
+            add_span(
+                match,
                 date(
                     int(match.group(3)),
                     _CONTEXT_MONTHS[match.group(1).casefold()],
                     int(match.group(2)),
-                )
+                ),
             )
         for match in re.finditer(
-            r"\b([0-9]{1,2})\s+("
+            english_prefix
+            + r"\b([0-9]{1,2})\s+("
             + "|".join(_CONTEXT_MONTHS)
             + r")\s+([0-9]{4})\b",
             normalized,
             flags=re.IGNORECASE,
         ):
-            periods.add(
+            add_span(
+                match,
                 date(
                     int(match.group(3)),
                     _CONTEXT_MONTHS[match.group(2).casefold()],
                     int(match.group(1)),
-                )
+                ),
             )
     except ValueError:
+        return set(), normalized
+
+    spans.extend(match.span() for match in _GENERIC_CURRENT_CONTEXT_PATTERN.finditer(normalized))
+    residual = list(normalized)
+    for start, end in spans:
+        residual[start:end] = " " * (end - start)
+    return periods, "".join(residual)
+
+
+def _observation_context_matches_period(
+    observation: CurrentReportObservation,
+    period_end: date,
+) -> bool:
+    section = observation.section_name
+    if section is None:
+        return True
+    normalized = " ".join(unicodedata.normalize("NFKC", section).split())
+    if _HISTORICAL_CONTEXT_PATTERN.search(normalized):
         return False
-    if periods:
-        return periods == {period_end}
-    return (
-        _UNBOUND_PERIOD_CONTEXT_PATTERN.search(normalized) is None
-        and _TEMPORAL_CONTEXT_CUE_PATTERN.search(normalized) is None
-    )
+    periods, residual = _context_periods_and_residual(normalized)
+    period_matches = not periods or periods == {period_end}
+    return period_matches and _TEMPORAL_CONTEXT_CUE_PATTERN.search(residual) is None
 
 
 def _ambiguous_current_fact(fact: ParsedMandateFact) -> ParsedMandateFact:

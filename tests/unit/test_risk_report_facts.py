@@ -681,11 +681,21 @@ class CommonReportFactExtractionTest(unittest.TestCase):
         unknown_names = (
             "其他行业",
             "其他行业合计",
+            "其他行业（未分类）",
+            "其他类别合计",
+            "其他及未分类",
+            "其他合计",
+            "其他行业总计",
             "未分类",
+            "未分类行业",
             "Other industries",
+            "Other Industries (Unclassified)",
             "Other-Unclassified",
             "Others-Unclassified",
             "Other（Unclassified）",
+            "Other and Unclassified",
+            "Other/Unclassified Total",
+            "Others/Unclassified",
         )
         legitimate_names = ("其他制造业", "其他金融业", "Other Consumer Services")
 

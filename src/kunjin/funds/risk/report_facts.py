@@ -93,22 +93,20 @@ _DEFAULT_IGNORABLE_PATTERN = re.compile(
     "\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3"
     "\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
 )
-_UNKNOWN_INDUSTRY_LABELS = frozenset(
+_UNKNOWN_INDUSTRY_CN_AGGREGATE_PATTERN = re.compile(
+    r"^(?:其他|其它)(?:行业|类别)?(?:合计|总计)?$"
+)
+_UNKNOWN_INDUSTRY_EN_AGGREGATE_TOKENS = frozenset(
     {
-        "其他",
-        "其它",
-        "未分类",
-        "其他行业",
-        "其它行业",
-        "其他行业合计",
-        "其它行业合计",
+        "and",
+        "category",
+        "categories",
+        "industry",
+        "industries",
         "other",
         "others",
+        "total",
         "unclassified",
-        "otherindustry",
-        "otherindustries",
-        "otherunclassified",
-        "othersunclassified",
     }
 )
 
@@ -335,8 +333,28 @@ def _has_unsafe_name_characters(value: str) -> bool:
 
 def _is_unknown_industry_name(value: str) -> bool:
     normalized = unicodedata.normalize("NFKC", value).casefold()
-    canonical = "".join(character for character in normalized if character.isalnum())
-    return canonical in _UNKNOWN_INDUSTRY_LABELS
+    chinese = "".join(character for character in normalized if character.isalnum())
+    if "未分类" in chinese:
+        return True
+    if _UNKNOWN_INDUSTRY_CN_AGGREGATE_PATTERN.fullmatch(chinese) is not None:
+        return True
+
+    tokens = re.findall(r"[a-z]+", normalized)
+    if "unclassified" in tokens:
+        return True
+    if not tokens or any(
+        token not in _UNKNOWN_INDUSTRY_EN_AGGREGATE_TOKENS for token in tokens
+    ):
+        return False
+    return tokens[0] in {"other", "others", "unclassified"} and (
+        len(tokens) == 1
+        or "total" in tokens
+        or all(
+            token
+            in {"other", "others", "industry", "industries", "category", "categories"}
+            for token in tokens
+        )
+    )
 
 
 def _percent_value(value: str) -> Optional[Decimal]:
