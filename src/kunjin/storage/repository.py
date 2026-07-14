@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+from kunjin.funds.models import DocumentKind
+from kunjin.funds.risk.audit import (
+    canonical_fact_set_fingerprint,
+    native_parser_provenance,
+)
+from kunjin.funds.risk.models import FactConfidence, MandateFact, decode_fact_value_json
 from kunjin.models import (
     AccountObservation,
     FundNavObservation,
@@ -28,6 +35,9 @@ from kunjin.storage.schema import (
     SCHEMA_V7,
     SCHEMA_V8,
     SCHEMA_V9,
+    SCHEMA_V10,
+    SCHEMA_V11,
+    SCHEMA_V12,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -37,8 +47,47 @@ _SUITABILITY_TABLES = {
     "suitability_policy_versions",
     "suitability_assessments",
 }
+_D1_TABLES = {
+    "fund_document_artifacts",
+    "fund_mandate_facts",
+    "fund_classification_policy_versions",
+    "fund_risk_classifications",
+    "fund_document_refresh_runs",
+    "fund_document_refresh_completions",
+    "fund_document_candidate_runs",
+    "fund_document_parser_provenance",
+    "fund_document_parse_results",
+    "fund_document_parse_runs",
+}
+_D1_OBJECT_PREFIXES = (
+    "fund_document_artifact",
+    "fund_document_refresh",
+    "fund_document_candidate",
+    "fund_document_parser",
+    "fund_document_parse",
+    "fund_document_fact_result",
+    "fund_mandate_fact",
+    "fund_classification_policy",
+    "fund_risk_classification",
+)
 _LEGACY_V8_POLICY_TABLE = "__kunjin_legacy_v8_policy_versions"
 _LEGACY_V8_ASSESSMENT_TABLE = "__kunjin_legacy_v8_assessments"
+_WAL_RETRY_TIMEOUT_SECONDS = 5.0
+_WAL_RETRY_INTERVAL_SECONDS = 0.01
+
+
+def _enable_wal(connection: sqlite3.Connection) -> None:
+    deadline = time.monotonic() + _WAL_RETRY_TIMEOUT_SECONDS
+    while True:
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if exc.args != ("database is locked",):
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_WAL_RETRY_INTERVAL_SECONDS)
 
 
 def _utc_now() -> datetime:
@@ -85,6 +134,9 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (7, SCHEMA_V7),
         (8, SCHEMA_V8),
         (9, SCHEMA_V9),
+        (10, SCHEMA_V10),
+        (11, SCHEMA_V11),
+        (12, SCHEMA_V12),
     )
 
 
@@ -127,6 +179,18 @@ def _owned_suitability_objects(
         for name, value in objects.items()
         if _ascii_identifier(name).startswith("suitability_")
         or _ascii_identifier(value[1]) in _SUITABILITY_TABLES
+    }
+
+
+def _owned_d1_objects(
+    objects: Dict[str, Tuple[str, str, str]],
+) -> Dict[str, Tuple[str, str, str]]:
+    return {
+        name: value
+        for name, value in objects.items()
+        if _ascii_identifier(value[1]) in _D1_TABLES
+        or _ascii_identifier(name).startswith(_D1_OBJECT_PREFIXES)
+        or any(table in _ascii_identifier(value[2]) for table in _D1_TABLES)
     }
 
 
@@ -523,8 +587,11 @@ def _validate_applied_schema(
     expected_before_v9 = _expected_schema_objects(
         tuple(schema for version, schema in migrations if version < 9)
     )
+    expected_through_v9 = _expected_schema_objects(
+        tuple(schema for version, schema in migrations if version <= 9)
+    )
     expected_v9 = {
-        name: value for name, value in expected.items() if name not in expected_before_v9
+        name: value for name, value in expected_through_v9.items() if name not in expected_before_v9
     }
     allocation_tables = {"allocation_policy_versions", "allocation_assessments"}
     actual_v9 = {
@@ -534,6 +601,242 @@ def _validate_applied_schema(
     }
     if actual_v9 != expected_v9:
         raise sqlite3.DatabaseError("allocation schema does not match V9")
+
+    if 10 not in applied_versions:
+        return
+    expected_before_v10 = _expected_schema_objects(
+        tuple(schema for version, schema in migrations if version < 10)
+    )
+    expected_v10 = {
+        name: value for name, value in expected.items() if name not in expected_before_v10
+    }
+    if _owned_d1_objects(actual) != expected_v10:
+        raise sqlite3.DatabaseError("fund risk schema does not match the current D1 schema")
+
+
+_FUND_MANDATE_FACT_NO_UPDATE = """
+CREATE TRIGGER fund_mandate_fact_no_update
+BEFORE UPDATE ON fund_mandate_facts
+BEGIN
+    SELECT RAISE(ABORT, 'fund mandate facts are immutable');
+END;
+"""
+
+_V11_PARSE_ERROR_CODES = frozenset(
+    {
+        "official_document_parse_failed",
+        "official_document_resource_limit",
+    }
+)
+
+
+def _v11_optional_text(value: object, name: str, *, maximum: int) -> Optional[str]:
+    if value is None:
+        return None
+    text = _legacy_text(value, name)
+    if len(text) > maximum:
+        raise sqlite3.DatabaseError(f"invalid legacy V11 {name}")
+    return text
+
+
+def _v11_date(value: object, name: str) -> Optional[date]:
+    if value is None:
+        return None
+    text = _legacy_text(value, name)
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError:
+        raise sqlite3.DatabaseError(f"invalid legacy V11 {name}") from None
+    if parsed.isoformat() != text:
+        raise sqlite3.DatabaseError(f"invalid legacy V11 {name}")
+    return parsed
+
+
+def _decode_v11_fact(row: sqlite3.Row, artifact: sqlite3.Row) -> MandateFact:
+    try:
+        fact_id = row["id"]
+        source_document_id = row["source_document_id"]
+        if type(fact_id) is not int or fact_id <= 0:
+            raise ValueError("fact id must be positive")
+        if type(source_document_id) is not int or source_document_id != artifact["id"]:
+            raise ValueError("fact source document does not match artifact")
+        normalized_json = _legacy_text(row["normalized_value_json"], "normalized_value_json")
+        normalized_value = decode_fact_value_json(normalized_json)
+        confidence = FactConfidence(_legacy_text(row["confidence_state"], "confidence_state"))
+        fact = MandateFact(
+            fund_code=_legacy_text(row["fund_code"], "fact fund_code"),
+            fact_kind=_legacy_text(row["fact_kind"], "fact_kind"),
+            normalized_value=normalized_value,
+            unit=_v11_optional_text(row["unit"], "unit", maximum=64),
+            source_document_id=source_document_id,
+            page_number=row["page_number"],
+            section_name=_v11_optional_text(row["section_name"], "section_name", maximum=256),
+            source_excerpt=_legacy_text(row["source_excerpt"], "source_excerpt"),
+            effective_from=_v11_date(row["effective_from"], "effective_from"),
+            effective_to=_v11_date(row["effective_to"], "effective_to"),
+            confidence_state=confidence,
+            parser_version=_legacy_text(row["parser_version"], "fact parser_version"),
+            fact_fingerprint=_legacy_digest(row["fact_fingerprint"], "fact_fingerprint"),
+        )
+        fact.validate()
+    except (KeyError, TypeError, ValueError):
+        raise sqlite3.DatabaseError("invalid legacy V11 mandate fact") from None
+    if fact.fund_code != artifact["fund_code"]:
+        raise sqlite3.DatabaseError("invalid legacy V11 fact fund binding")
+    return fact
+
+
+def _backfill_v11_document_audit(connection: sqlite3.Connection) -> None:
+    provenance = native_parser_provenance()
+    artifact_rows = connection.execute(
+        "SELECT * FROM fund_document_artifacts ORDER BY id"
+    ).fetchall()
+    if not artifact_rows:
+        return
+
+    timestamps = []
+    for artifact in artifact_rows:
+        artifact_id = artifact["id"]
+        if type(artifact_id) is not int or artifact_id <= 0:
+            raise sqlite3.DatabaseError("invalid legacy V11 artifact id")
+        fund_code = _legacy_text(artifact["fund_code"], "artifact fund_code")
+        if len(fund_code) != 6 or not fund_code.isascii() or not fund_code.isdigit():
+            raise sqlite3.DatabaseError("invalid legacy V11 artifact fund code")
+        _legacy_digest(artifact["sha256"], "artifact sha256")
+        try:
+            document_kind = DocumentKind(
+                _legacy_text(artifact["document_kind"], "artifact document_kind")
+            )
+        except ValueError:
+            raise sqlite3.DatabaseError("invalid legacy V11 artifact document kind") from None
+        if document_kind not in {
+            DocumentKind.FUND_CONTRACT,
+            DocumentKind.PROSPECTUS,
+            DocumentKind.PROSPECTUS_UPDATE,
+            DocumentKind.PRODUCT_SUMMARY,
+            DocumentKind.ANNUAL_REPORT,
+            DocumentKind.SEMIANNUAL_REPORT,
+            DocumentKind.QUARTERLY_REPORT,
+            DocumentKind.INDEX_METHODOLOGY,
+            DocumentKind.CLASSIFICATION_ANNOUNCEMENT,
+        }:
+            raise sqlite3.DatabaseError("invalid legacy V11 artifact document kind")
+        for column in (
+            "url",
+            "landing_url",
+            "publisher",
+            "title",
+            "content_type",
+            "managed_path",
+        ):
+            _legacy_text(artifact[column], f"artifact {column}")
+        published_at = artifact["published_at"]
+        if published_at is not None:
+            parsed_published_at = _legacy_datetime(published_at, "artifact published_at")
+            if parsed_published_at.tzinfo is not timezone.utc:
+                raise sqlite3.DatabaseError("invalid legacy V11 artifact published_at")
+        byte_size = artifact["byte_size"]
+        if type(byte_size) is not int or not 0 < byte_size <= 33554432:
+            raise sqlite3.DatabaseError("invalid legacy V11 artifact byte size")
+        retrieved_at = _legacy_datetime(artifact["retrieved_at"], "artifact retrieved_at")
+        if retrieved_at.tzinfo is not timezone.utc:
+            raise sqlite3.DatabaseError("invalid legacy V11 artifact retrieved_at")
+        timestamps.append(str(artifact["retrieved_at"]))
+        if _legacy_text(artifact["parser_version"], "artifact parser_version") != (
+            provenance.parser_version
+        ):
+            raise sqlite3.DatabaseError("unsupported legacy V11 parser provenance")
+        parse_status = _legacy_text(artifact["parse_status"], "artifact parse_status")
+        if parse_status not in {"parsed", "failed"}:
+            raise sqlite3.DatabaseError("invalid legacy V11 artifact parse status")
+
+    connection.execute(
+        """
+        INSERT INTO fund_document_parser_provenance(
+            parser_version, converter_kind, canonical_json,
+            provenance_checksum, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            provenance.parser_version,
+            provenance.converter_kind,
+            provenance.canonical_json,
+            provenance.provenance_checksum,
+            min(timestamps),
+        ),
+    )
+    provenance_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+    for artifact in artifact_rows:
+        artifact_id = int(artifact["id"])
+        fact_rows = connection.execute(
+            "SELECT * FROM fund_mandate_facts WHERE source_document_id = ? ORDER BY id",
+            (artifact_id,),
+        ).fetchall()
+        facts = tuple(_decode_v11_fact(row, artifact) for row in fact_rows)
+        if any(fact.parser_version != provenance.parser_version for fact in facts):
+            raise sqlite3.DatabaseError("invalid legacy V11 fact parser provenance")
+        parse_status = str(artifact["parse_status"])
+        if parse_status == "failed":
+            if facts:
+                raise sqlite3.DatabaseError("failed legacy V11 artifact has mandate facts")
+            error_code = artifact["parse_error_code"]
+            if type(error_code) is not str or error_code not in _V11_PARSE_ERROR_CODES:
+                raise sqlite3.DatabaseError("invalid legacy V11 parse error code")
+            connection.execute(
+                """
+                INSERT INTO fund_document_parse_runs(
+                    source_document_id, provenance_id, run_kind, outcome,
+                    parse_result_id, public_error_code, failure_stage,
+                    failure_reason, attempted_at
+                ) VALUES (?, ?, 'legacy_backfill', 'failed', NULL, ?, NULL, NULL, ?)
+                """,
+                (artifact_id, provenance_id, error_code, artifact["retrieved_at"]),
+            )
+            continue
+
+        if artifact["parse_error_code"] is not None:
+            raise sqlite3.DatabaseError("parsed legacy V11 artifact has a parse error")
+        fact_set_fingerprint = canonical_fact_set_fingerprint(
+            tuple(fact.fact_fingerprint for fact in facts)
+        )
+        connection.execute(
+            """
+            INSERT INTO fund_document_parse_results(
+                source_document_id, provenance_id, parser_input_sha256,
+                fact_set_fingerprint, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                artifact_id,
+                provenance_id,
+                artifact["sha256"],
+                fact_set_fingerprint,
+                artifact["retrieved_at"],
+            ),
+        )
+        result_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+        connection.execute(
+            "UPDATE fund_mandate_facts SET parse_result_id = ? WHERE source_document_id = ?",
+            (result_id, artifact_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO fund_document_parse_runs(
+                source_document_id, provenance_id, run_kind, outcome,
+                parse_result_id, public_error_code, failure_stage,
+                failure_reason, attempted_at
+            ) VALUES (?, ?, 'legacy_backfill', 'success', ?, NULL, NULL, NULL, ?)
+            """,
+            (artifact_id, provenance_id, result_id, artifact["retrieved_at"]),
+        )
+
+
+def _migrate_v12(connection: sqlite3.Connection) -> None:
+    _execute_schema(connection, SCHEMA_V12)
+    connection.execute("DROP TRIGGER fund_mandate_fact_no_update")
+    _backfill_v11_document_audit(connection)
+    _execute_schema(connection, _FUND_MANDATE_FACT_NO_UPDATE)
 
 
 class Repository:
@@ -553,7 +856,7 @@ class Repository:
 
     def migrate(self) -> None:
         with self.connect() as connection:
-            connection.execute("PRAGMA journal_mode = WAL")
+            _enable_wal(connection)
             migrations = _migration_definitions()
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -584,7 +887,10 @@ class Repository:
                 for version, schema in migrations:
                     if version in applied_versions:
                         continue
-                    _execute_schema(connection, schema)
+                    if version == 12:
+                        _migrate_v12(connection)
+                    else:
+                        _execute_schema(connection, schema)
                     connection.execute(
                         """
                         INSERT INTO schema_migrations(version, applied_at)

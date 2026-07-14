@@ -25,10 +25,12 @@ class RuntimePathsTest(unittest.TestCase):
             self.assertEqual(paths.database, root / "data" / "kunjin.db")
             self.assertEqual(paths.snapshots, root / "data" / "snapshots")
             self.assertEqual(paths.imports, root / "data" / "imports")
+            self.assertEqual(paths.fund_documents, root / "data" / "fund-documents")
             self.assertEqual(paths.logs, root / "state" / "logs")
             mode = stat.S_IMODE(paths.database.parent.stat().st_mode)
             self.assertEqual(mode, 0o700)
             self.assertEqual(stat.S_IMODE(paths.imports.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(paths.fund_documents.stat().st_mode), 0o700)
 
 
 if __name__ == "__main__":

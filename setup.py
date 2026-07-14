@@ -7,6 +7,6 @@ setup(
     packages=find_packages("src"),
     package_data={"kunjin": ["ledger/*.swift"]},
     include_package_data=True,
-    install_requires=["cryptography>=43,<46"],
+    install_requires=["cryptography>=43,<46", "pypdf>=5,<6"],
     entry_points={"console_scripts": ["kunjin=kunjin.cli:main"]},
 )

@@ -30,8 +30,23 @@ class RuntimePaths:
     def imports(self) -> Path:
         return self.database.parent / "imports"
 
+    @property
+    def fund_documents(self) -> Path:
+        return self.database.parent / "fund-documents"
+
+    @property
+    def legacy_doc_runtime(self) -> Path:
+        return self.logs.parent / "legacy-doc-runtime"
+
     def ensure(self) -> "RuntimePaths":
-        for directory in (self.database.parent, self.snapshots, self.imports, self.logs):
+        for directory in (
+            self.database.parent,
+            self.snapshots,
+            self.imports,
+            self.fund_documents,
+            self.logs,
+            self.legacy_doc_runtime,
+        ):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             directory.chmod(0o700)
         return self

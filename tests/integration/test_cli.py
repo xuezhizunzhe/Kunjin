@@ -1,10 +1,14 @@
+import hashlib
 import json
+import os
+import re
 import tempfile
 import unittest
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from kunjin.adapters.eastmoney import EastmoneyFundClient, EastmoneyMarketClient
@@ -19,7 +23,7 @@ from kunjin.allocation.service import (
 )
 from kunjin.allocation.store import AllocationAssessmentStore, AllocationPolicyStore
 from kunjin.cli import ApplicationContext, build_context, run
-from kunjin.funds.models import DisclosureBundle
+from kunjin.funds.models import DisclosureBundle, DocumentKind
 from kunjin.funds.peers.models import (
     MembershipKind,
     PeerGroup,
@@ -28,6 +32,19 @@ from kunjin.funds.peers.models import (
     PeerSyncState,
 )
 from kunjin.funds.peers.service import PeerSyncResult
+from kunjin.funds.risk.audit import RefreshOutcome, native_parser_provenance
+from kunjin.funds.risk.documents import OfficialDocumentCandidate, RetrievedArtifact
+from kunjin.funds.risk.engine import classification_input_manifest_v1
+from kunjin.funds.risk.legacy_doc import ConverterStatus
+from kunjin.funds.risk.parsers import ParsedRiskDocument
+from kunjin.funds.risk.policy import ClassificationPolicyV1
+from kunjin.funds.risk.service import (
+    DocumentSyncItem,
+    DocumentSyncResult,
+    FundRiskService,
+    RiskServiceError,
+)
+from kunjin.funds.risk.store import FundRiskStore
 from kunjin.funds.service import FundDisclosureSyncResult, SectionSyncResult
 from kunjin.funds.store import FundDisclosureStore
 from kunjin.ledger.alipay import AlipayPaymentParser
@@ -181,6 +198,105 @@ class FakePeerStore:
     def save_comparison(self, *args, **kwargs):
         self.saved.append((args, kwargs))
         return 7
+
+
+class FakeRiskService:
+    def __init__(self) -> None:
+        self.sync_result = None
+        self.classification_result = SimpleNamespace(input_fingerprint="a" * 64)
+        self.history = (
+            SimpleNamespace(id=11, input_fingerprint="a" * 64),
+            SimpleNamespace(id=10, input_fingerprint="b" * 64),
+        )
+        self.evidence_by_id = {
+            11: SimpleNamespace(report_status="partial", fingerprint="a" * 64),
+            10: SimpleNamespace(report_status="stale", fingerprint="b" * 64),
+        }
+        self.calls = []
+        self.error = None
+        self.converter_status_result = ConverterStatus(
+            capability="research_only",
+            status="unavailable",
+            reason_code="legacy_converter_unavailable",
+            parser_version=None,
+            provenance_checksum=None,
+        )
+
+    def converter_status(self):
+        self.calls.append(("converter_status",))
+        return self.converter_status_result
+
+    def sync_documents(self, fund_code):
+        self.calls.append(("sync_documents", fund_code))
+        if self.error is not None:
+            raise self.error
+        return self.sync_result
+
+    def classify(self, fund_code):
+        self.calls.append(("classify", fund_code))
+        if self.error is not None:
+            raise self.error
+        return self.classification_result
+
+    def classification_history(self, fund_code):
+        self.calls.append(("classification_history", fund_code))
+        if self.error is not None:
+            raise self.error
+        return self.history
+
+    def classification_evidence(self, fund_code, classification_id=None):
+        self.calls.append(("classification_evidence", fund_code, classification_id))
+        if self.error is not None:
+            raise self.error
+        if classification_id is None:
+            return self.evidence_by_id.get(11)
+        return self.evidence_by_id.get(classification_id)
+
+
+def fake_risk_report(record):
+    status = record.report_status
+    reason_code = {
+        "partial": "classification_partial",
+        "stale": "classification_stale",
+        "conflicted": "classification_conflicted",
+        "unsupported": "unsupported_product_family",
+        "unclassified": "classification_unclassified",
+    }.get(status, "classification_verified")
+    evidence_status = "unclassified" if status == "unsupported" else status
+    return {
+        "capability": "research_only",
+        "fund_code": "519755",
+        "verified_facts": [],
+        "non_verified_evidence": [],
+        "classification": {
+            "policy_version": "1",
+            "input_fingerprint": record.fingerprint,
+            "product_family": "unsupported" if status == "unsupported" else "unclassified",
+            "risk_bucket": "unclassified",
+            "portfolio_role": "not_eligible",
+            "reason_codes": [reason_code],
+            "classified_at": "2026-07-13T08:00:00+00:00",
+            "valid_until": "2026-07-14T08:00:00+00:00",
+        },
+        "evidence_status": evidence_status,
+        "evidence_tags": [],
+        "missing_evidence": ["critical_evidence_missing"],
+        "conflicts": [] if status != "conflicted" else ["source_version_conflict"],
+        "freshness": [],
+        "sources": [
+            {
+                "url": "https://www.fund001.com/public.pdf",
+                "title": "official public title",
+                "checksum": "c" * 64,
+                "published_at": "2026-07-13T00:00:00+00:00",
+            }
+        ],
+        "limitations": [
+            "cash_like_is_not_protected_cash",
+            "classification_is_not_recommendation",
+            "d2_d3_not_evaluated",
+        ],
+    }
 
 
 def peer_group(*codes):
@@ -723,6 +839,67 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertIs(context.profile_service._cipher._key_store, key_store)
         self.assertIs(context.suitability_service._assessment_cipher._key_store, key_store)
         self.assertIs(context.allocation_service._cipher._key_store, key_store)
+        self.assertIsNotNone(context.fund_risk_store)
+        self.assertIs(context.fund_risk_service._risk_store, context.fund_risk_store)
+        self.assertIs(
+            context.fund_risk_service._disclosure_store,
+            context.fund_disclosure_store,
+        )
+        self.assertIs(context.fund_risk_service._repository, context.repository)
+        for forbidden_dependency in (
+            "_profile_service",
+            "_suitability_service",
+            "_allocation_service",
+        ):
+            self.assertFalse(hasattr(context.fund_risk_service, forbidden_dependency))
+
+    def test_build_context_lazily_injects_converter_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = RuntimePaths(root / "kunjin.db", root / "snapshots", root / "logs")
+            converter = SimpleNamespace(status=lambda: None)
+            image_id = "sha256:" + "d" * 64
+            with (
+                patch("kunjin.cli.RuntimePaths.from_environment", return_value=paths),
+                patch(
+                    "kunjin.cli.DockerLegacyDocConverter",
+                    return_value=converter,
+                ) as converter_factory,
+                patch.object(converter, "status", wraps=converter.status) as status,
+                patch.dict(os.environ, {"KUNJIN_LEGACY_DOC_IMAGE_ID": image_id}),
+            ):
+                context = build_context()
+
+        converter_factory.assert_called_once_with(
+            image_id=image_id,
+            runtime_paths=paths,
+        )
+        status.assert_not_called()
+        self.assertIs(context.fund_risk_service._legacy_converter, converter)
+
+    def test_build_context_unset_or_invalid_converter_id_does_not_query_docker(self) -> None:
+        for image_id in (None, "latest-or-private-host-path"):
+            with self.subTest(image_id=image_id), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                paths = RuntimePaths(root / "kunjin.db", root / "snapshots", root / "logs")
+                environment = dict(os.environ)
+                if image_id is None:
+                    environment.pop("KUNJIN_LEGACY_DOC_IMAGE_ID", None)
+                else:
+                    environment["KUNJIN_LEGACY_DOC_IMAGE_ID"] = image_id
+                with (
+                    patch("kunjin.cli.RuntimePaths.from_environment", return_value=paths),
+                    patch.dict(os.environ, environment, clear=True),
+                    patch(
+                        "kunjin.funds.risk.legacy_doc.SubprocessDockerCommandRunner.run"
+                    ) as docker_run,
+                ):
+                    context = build_context()
+                    payload, exit_code, _ = run(["--json", "version"], context)
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(payload["data"]["version"], "0.1.0")
+                docker_run.assert_not_called()
 
     def test_allocation_ranges_returns_financial_blocks_with_exit_zero(self) -> None:
         blocked_profile = replace(valid_profile(), emergency_reserve=Decimal("0.00"))
@@ -1095,6 +1272,781 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["data"]["profile"]["fund_code"], "017811")
         self.assertEqual(payload["data"]["analysis"]["evidence_level"], "deterministic_calculation")
+
+    def test_fund_risk_financial_states_use_authenticated_reports_and_exit_zero(self) -> None:
+        service = FakeRiskService()
+        self.context.fund_risk_service = service
+
+        for status in ("partial", "stale", "conflicted", "unsupported", "unclassified"):
+            with self.subTest(status=status):
+                service.evidence_by_id[11] = SimpleNamespace(
+                    report_status=status,
+                    fingerprint="a" * 64,
+                )
+                with patch(
+                    "kunjin.cli.build_authenticated_risk_research_report",
+                    side_effect=fake_risk_report,
+                ):
+                    payload, exit_code, json_output = run(
+                        ["--json", "fund", "classify", "519755"],
+                        self.context,
+                    )
+
+                self.assertEqual(exit_code, 0)
+                self.assertTrue(json_output)
+                self.assert_envelope(payload, "fund.classify")
+                self.assertEqual(payload["errors"], [])
+                self.assertEqual(payload["data"]["capability"], "research_only")
+                self.assertEqual(
+                    payload["data"]["classification"]["input_fingerprint"],
+                    "a" * 64,
+                )
+                self.assertIn(
+                    payload["data"]["classification"]["reason_codes"][0],
+                    {
+                        "classification_partial",
+                        "classification_stale",
+                        "classification_conflicted",
+                        "unsupported_product_family",
+                        "classification_unclassified",
+                    },
+                )
+
+        self.assertIn(("classification_evidence", "519755", 11), service.calls)
+
+    def test_v1_history_and_v2_current_evidence_both_authenticate_through_cli(self) -> None:
+        risk_store = FundRiskStore(self.context.repository)
+        self.context.fund_risk_store = risk_store
+        now = datetime(2026, 7, 13, 8, tzinfo=timezone.utc)
+        document_path = self.context.paths.fund_documents / "public-summary.html"
+        document_path.parent.mkdir(parents=True, exist_ok=True)
+        document_path.write_text(
+            "<html><body><p>公开产品资料概要</p></body></html>",
+            encoding="utf-8",
+        )
+        payload = document_path.read_bytes()
+        candidate = OfficialDocumentCandidate(
+            fund_code="519755",
+            document_kind=DocumentKind.PRODUCT_SUMMARY,
+            title="公开产品资料概要",
+            url="https://www.fund001.com/public-summary.html",
+            publisher="交银施罗德基金管理有限公司",
+            published_at=now,
+            source_tier=1,
+        )
+        artifact = RetrievedArtifact(
+            candidate=candidate,
+            final_url=candidate.url,
+            retrieved_at=now,
+            content_type="text/html; charset=utf-8",
+            byte_size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            managed_path=document_path,
+        )
+        parsed = ParsedRiskDocument(artifact=artifact, facts=(), warnings=(), conflicts=())
+        refresh_id = risk_store.begin_document_refresh("519755", now)
+        risk_store.publish_candidate_success(
+            refresh_id=refresh_id,
+            candidate=candidate,
+            parsed=parsed,
+            provenance=native_parser_provenance(),
+            parser_input_sha256=artifact.sha256,
+            attempted_at=now,
+        )
+        risk_store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.SUCCESS,
+            now,
+        )
+        self.context.fund_risk_service = FundRiskService(
+            risk_store=risk_store,
+            disclosure_store=self.context.fund_disclosure_store,
+            repository=self.context.repository,
+            discovery=object(),
+            document_client=object(),
+            clock=lambda: now,
+        )
+
+        historical, historical_exit, _ = run(
+            ["--json", "fund", "classify", "519755"],
+            self.context,
+        )
+        self.assertEqual(historical_exit, 0)
+        historical_id = risk_store.classification_history("519755")[0].id
+        bound = risk_store.classification_evidence("519755", historical_id)
+        self.assertIsNotNone(bound)
+        manifest_v1 = classification_input_manifest_v1(
+            bound.evidence,
+            ClassificationPolicyV1(),
+            bound.classification.classified_at,
+        )
+        manifest_json = json.dumps(
+            manifest_v1,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        fingerprint = hashlib.sha256(manifest_json.encode("ascii")).hexdigest()
+        with self.context.repository.connect() as connection, connection:
+            connection.execute("DROP TRIGGER fund_risk_classification_no_update")
+            connection.execute(
+                "UPDATE fund_risk_classifications "
+                "SET input_manifest_json = ?, input_fingerprint = ? WHERE id = ?",
+                (manifest_json, fingerprint, historical_id),
+            )
+
+        current_time = datetime(2026, 7, 13, 8, 1, tzinfo=timezone.utc)
+        self.context.fund_risk_service = FundRiskService(
+            risk_store=risk_store,
+            disclosure_store=self.context.fund_disclosure_store,
+            repository=self.context.repository,
+            discovery=object(),
+            document_client=object(),
+            clock=lambda: current_time,
+        )
+        classified, classify_exit, _ = run(
+            ["--json", "fund", "classify", "519755"],
+            self.context,
+        )
+        current, current_exit, _ = run(
+            ["--json", "fund", "classification-evidence", "519755"],
+            self.context,
+        )
+        history, history_exit, _ = run(
+            ["--json", "fund", "classification-history", "519755"],
+            self.context,
+        )
+
+        self.assertEqual((classify_exit, current_exit, history_exit), (0, 0, 0))
+        self.assertEqual(classified["errors"], [])
+        self.assertEqual(classified["data"]["evidence_status"], "unclassified")
+        self.assertEqual(
+            classified["data"]["classification"]["input_fingerprint"],
+            current["data"]["classification"]["input_fingerprint"],
+        )
+        self.assertEqual(len(history["data"]["classifications"]), 2)
+        self.assertEqual(
+            history["data"]["classifications"][1]["classification"]["input_fingerprint"],
+            fingerprint,
+        )
+        self.assertEqual(
+            history["data"]["classifications"][0]["classification"]["input_fingerprint"],
+            classified["data"]["classification"]["input_fingerprint"],
+        )
+
+    def test_converter_status_json_exposes_only_safe_metadata(self) -> None:
+        service = FakeRiskService()
+        service.converter_status_result = ConverterStatus(
+            capability="research_only",
+            status="ready",
+            reason_code=None,
+            parser_version="2-docker-libreoffice-v1",
+            provenance_checksum="e" * 64,
+        )
+        self.context.fund_risk_service = service
+
+        payload, exit_code, _ = run(
+            ["--json", "fund", "converter-status"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(payload, "fund.converter-status")
+        self.assertEqual(
+            payload["data"],
+            {
+                "capability": "research_only",
+                "status": "ready",
+                "reason_code": None,
+                "parser_version": "2-docker-libreoffice-v1",
+                "provenance_checksum": "e" * 64,
+            },
+        )
+        rendered = json.dumps(payload, ensure_ascii=False)
+        for forbidden in (
+            "sha256:",
+            "container",
+            "/Users/",
+            "/private/",
+            "argv",
+            "package",
+            "stderr",
+            "<html",
+        ):
+            self.assertNotIn(forbidden, rendered.casefold())
+
+    def test_sync_json_never_contains_converter_internal_fields(self) -> None:
+        service = FakeRiskService()
+        item = DocumentSyncItem(
+            document_kind="annual_report",
+            title="公开年度报告",
+            url="https://www.fund001.com/report.doc",
+            published_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
+            status="failed",
+            artifact_id=None,
+            fact_count=0,
+            warnings=(),
+            conflicts=(),
+            error_code="official_document_parse_failed",
+            failure_stage="conversion",
+            failure_reason="legacy_converter_failed",
+        )
+        object.__setattr__(item, "docker_path", "/Applications/Docker.app/private-cli")
+        object.__setattr__(item, "argv", ("docker", "run", "private-container-name"))
+        object.__setattr__(item, "stderr", "private daemon stderr")
+        object.__setattr__(item, "normalized_html", "<html>private converted output</html>")
+        service.sync_result = DocumentSyncResult(
+            fund_code="519755",
+            status="failed",
+            documents=(item,),
+            attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+        )
+        self.context.fund_risk_service = service
+
+        payload, exit_code, _ = run(
+            ["--json", "sync", "fund-documents", "519755"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["data"], {})
+        rendered = json.dumps(payload, ensure_ascii=False).casefold()
+        for forbidden in (
+            "/applications/docker.app",
+            "private-container-name",
+            "private daemon stderr",
+            "private converted output",
+            "sha256:" + "f" * 64,
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_fund_risk_current_and_evidence_are_authenticated_read_only_views(self) -> None:
+        service = FakeRiskService()
+        self.context.fund_risk_service = service
+
+        with patch(
+            "kunjin.cli.build_authenticated_risk_research_report",
+            side_effect=fake_risk_report,
+        ) as builder:
+            current, current_exit, _ = run(
+                ["--json", "fund", "classification", "519755"],
+                self.context,
+            )
+            evidence, evidence_exit, _ = run(
+                ["--json", "fund", "classification-evidence", "519755"],
+                self.context,
+            )
+
+        self.assertEqual(current_exit, 0)
+        self.assertEqual(evidence_exit, 0)
+        self.assert_envelope(current, "fund.classification")
+        self.assert_envelope(evidence, "fund.classification-evidence")
+        self.assertEqual(current["data"], evidence["data"])
+        self.assertEqual(builder.call_count, 2)
+        self.assertEqual(
+            service.calls,
+            [
+                ("classification_evidence", "519755", None),
+                ("classification_evidence", "519755", None),
+            ],
+        )
+
+    def test_fund_risk_history_authenticates_every_record(self) -> None:
+        service = FakeRiskService()
+        self.context.fund_risk_service = service
+
+        with patch(
+            "kunjin.cli.build_authenticated_risk_research_report",
+            side_effect=fake_risk_report,
+        ):
+            payload, exit_code, _ = run(
+                ["--json", "fund", "classification-history", "519755"],
+                self.context,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(payload, "fund.classification-history")
+        self.assertEqual(payload["data"]["fund_code"], "519755")
+        self.assertEqual(
+            [item["classification_id"] for item in payload["data"]["classifications"]],
+            [11, 10],
+        )
+        self.assertEqual(
+            service.calls,
+            [
+                ("classification_history", "519755"),
+                ("classification_evidence", "519755", 11),
+                ("classification_evidence", "519755", 10),
+            ],
+        )
+
+    def test_fund_risk_missing_current_and_empty_history_are_financially_empty(self) -> None:
+        service = FakeRiskService()
+        service.history = ()
+        service.evidence_by_id = {}
+        self.context.fund_risk_service = service
+
+        cases = (
+            (["--json", "fund", "classification", "519755"], "fund.classification"),
+            (
+                ["--json", "fund", "classification-evidence", "519755"],
+                "fund.classification-evidence",
+            ),
+            (
+                ["--json", "fund", "classification-history", "519755"],
+                "fund.classification-history",
+            ),
+        )
+        for argv, command in cases:
+            with self.subTest(command=command):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 0)
+                self.assert_envelope(payload, command)
+                self.assertEqual(payload["errors"], [])
+                self.assertEqual(payload["data"]["capability"], "research_only")
+
+    def test_fund_risk_document_sync_partial_and_empty_exit_zero(self) -> None:
+        service = FakeRiskService()
+        self.context.fund_risk_service = service
+        successful = DocumentSyncItem(
+            document_kind="prospectus_update",
+            title="official prospectus",
+            url="https://www.fund001.com/prospectus.html",
+            published_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+            status="success",
+            artifact_id=1,
+            fact_count=3,
+            warnings=(),
+            conflicts=(),
+            error_code=None,
+        )
+        failed = DocumentSyncItem(
+            document_kind="annual_report",
+            title="official annual report",
+            url="https://www.fund001.com/report.html",
+            published_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
+            status="failed",
+            artifact_id=None,
+            fact_count=0,
+            warnings=(),
+            conflicts=(),
+            error_code="official_document_parse_failed",
+            failure_stage="parser",
+            failure_reason="parser_format_invalid",
+        )
+
+        for status, documents in (("partial", (successful, failed)), ("empty", ())):
+            with self.subTest(status=status):
+                service.sync_result = DocumentSyncResult(
+                    fund_code="519755",
+                    status=status,
+                    documents=documents,
+                    attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+                    capability="research_only",
+                )
+                payload, exit_code, _ = run(
+                    ["--json", "sync", "fund-documents", "519755"],
+                    self.context,
+                )
+                self.assertEqual(exit_code, 0)
+                self.assert_envelope(payload, "sync.fund-documents")
+                self.assertEqual(payload["errors"], [])
+                self.assertEqual(payload["data"]["status"], status)
+                if status == "partial":
+                    self.assertEqual(
+                        payload["data"]["documents"],
+                        [
+                            {
+                                "document_kind": "prospectus_update",
+                                "title": "official prospectus",
+                                "url": "https://www.fund001.com/prospectus.html",
+                                "published_at": "2026-07-13T00:00:00+00:00",
+                                "status": "success",
+                                "artifact_id": 1,
+                                "fact_count": 3,
+                                "warnings": [],
+                                "conflicts": [],
+                                "error_code": None,
+                                "failure_stage": None,
+                                "failure_reason": None,
+                            },
+                            {
+                                "document_kind": "annual_report",
+                                "title": "official annual report",
+                                "url": "https://www.fund001.com/report.html",
+                                "published_at": "2026-07-12T00:00:00+00:00",
+                                "status": "failed",
+                                "artifact_id": None,
+                                "fact_count": 0,
+                                "warnings": [],
+                                "conflicts": [],
+                                "error_code": "official_document_parse_failed",
+                                "failure_stage": "parser",
+                                "failure_reason": "parser_format_invalid",
+                            },
+                        ],
+                    )
+                    rendered = json.dumps(payload, ensure_ascii=False)
+                    self.assertEqual(
+                        set(re.findall(r"https?://[^\"\s]+", rendered)),
+                        {
+                            "https://www.fund001.com/prospectus.html",
+                            "https://www.fund001.com/report.html",
+                        },
+                    )
+                    for private_value in (
+                        "private-exception-sentinel",
+                        "/private/tmp/managed-document.doc",
+                        "https://private.invalid/document?token=secret",
+                        "raw response body sentinel",
+                        "monthly_net_income",
+                        "private_name",
+                    ):
+                        self.assertNotIn(private_value, rendered)
+                else:
+                    self.assertEqual(payload["data"]["documents"], [])
+
+    def test_fund_risk_document_sync_all_technical_failures_exit_nonzero(self) -> None:
+        service = FakeRiskService()
+        service.sync_result = DocumentSyncResult(
+            fund_code="519755",
+            status="failed",
+            documents=(
+                DocumentSyncItem(
+                    document_kind="annual_report",
+                    title="official annual report",
+                    url="https://www.fund001.com/report.html",
+                    published_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
+                    status="failed",
+                    artifact_id=None,
+                    fact_count=0,
+                    warnings=(),
+                    conflicts=(),
+                    error_code="official_document_parse_failed",
+                    failure_stage="parser",
+                    failure_reason="parser_format_invalid",
+                ),
+            ),
+            attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+            capability="research_only",
+        )
+        self.context.fund_risk_service = service
+
+        payload, exit_code, _ = run(
+            ["--json", "sync", "fund-documents", "519755"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "sync.fund-documents")
+        self.assertEqual(
+            payload["errors"],
+            [
+                {
+                    "code": "official_document_parse_failed",
+                    "message": "official fund document parsing failed",
+                }
+            ],
+        )
+        self.assertEqual(
+            payload["data"]["documents"][0]["failure_stage"],
+            "parser",
+        )
+        self.assertEqual(
+            payload["data"]["documents"][0]["failure_reason"],
+            "parser_format_invalid",
+        )
+
+    def test_fund_risk_document_sync_rejects_exact_dataclass_private_diagnostics(self) -> None:
+        service = FakeRiskService()
+        self.context.fund_risk_service = service
+        valid = DocumentSyncItem(
+            document_kind="prospectus_update",
+            title="official prospectus",
+            url="https://www.fund001.com/prospectus.html",
+            published_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+            status="success",
+            artifact_id=1,
+            fact_count=3,
+            warnings=(),
+            conflicts=(),
+            error_code=None,
+        )
+        unsafe_items = (
+            replace(valid, title="/Applications/Docker.app/private-sentinel"),
+            replace(valid, title="<html>private-sentinel</html>"),
+            replace(valid, title="docker run private-sentinel"),
+            replace(valid, url="https://www.fund001.com/#private-sentinel"),
+            replace(valid, warnings=("stderr_private_sentinel",)),
+            replace(valid, conflicts=("raw_diagnostic_private_sentinel",)),
+        )
+
+        for item in unsafe_items:
+            with self.subTest(item=item):
+                service.sync_result = DocumentSyncResult(
+                    fund_code="519755",
+                    status="success",
+                    documents=(item,),
+                    attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+                )
+
+                payload, exit_code, _ = run(
+                    ["--json", "sync", "fund-documents", "519755"],
+                    self.context,
+                )
+
+                self.assertEqual(exit_code, 1)
+                self.assertNotIn("private-sentinel", json.dumps(payload, ensure_ascii=False))
+
+    def test_fund_risk_public_payload_scan_rejects_decoded_private_strings(self) -> None:
+        service = FakeRiskService()
+        self.context.fund_risk_service = service
+        valid = DocumentSyncItem(
+            document_kind="prospectus_update",
+            title="公开基金招募说明书（更新）",
+            url="https://www.fund001.com/prospectus.html",
+            published_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+            status="success",
+            artifact_id=1,
+            fact_count=3,
+            warnings=(),
+            conflicts=(),
+            error_code=None,
+        )
+        unsafe_items = (
+            replace(valid, title="公开报告 stderr_private_diagnostic-private-sentinel"),
+            replace(
+                valid,
+                url=("https://www.fund001.com/report?path=%2Fprivate%2Ftmp%2Fprivate-sentinel.doc"),
+            ),
+            replace(
+                valid,
+                url=(
+                    "https://www.fund001.com/report?payload=%3Chtml%3Eprivate-sentinel%3C%2Fhtml%3E"
+                ),
+            ),
+            replace(
+                valid,
+                url=(
+                    "https://www.fund001.com/report?"
+                    "path=%252Fprivate%252Ftmp%252Fprivate-sentinel.doc"
+                ),
+            ),
+            replace(
+                valid,
+                url=(
+                    "https://www.fund001.com/report?"
+                    "path=%252FUsers%252Fowner%252Fprivate-sentinel.doc"
+                ),
+            ),
+            replace(
+                valid,
+                url=(
+                    "https://www.fund001.com/report?"
+                    "payload=%253Chtml%253Eprivate-sentinel%253C%252Fhtml%253E"
+                ),
+            ),
+            replace(
+                valid,
+                url=("https://www.fund001.com/report?diagnostic=%2573tderr_private-sentinel"),
+            ),
+            replace(
+                valid,
+                url=("https://www.fund001.com/report?diagnostic=%2573tdout_private-sentinel"),
+            ),
+            replace(
+                valid,
+                url=("https://www.fund001.com/report?diagnostic=%2574raceback_private-sentinel"),
+            ),
+        )
+
+        for item in unsafe_items:
+            with self.subTest(item=item):
+                service.sync_result = DocumentSyncResult(
+                    fund_code="519755",
+                    status="success",
+                    documents=(item,),
+                    attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+                )
+                with (
+                    patch.object(DocumentSyncResult, "validate"),
+                    patch.object(
+                        DocumentSyncItem,
+                        "validate",
+                    ),
+                ):
+                    payload, exit_code, _ = run(
+                        ["--json", "sync", "fund-documents", "519755"],
+                        self.context,
+                    )
+
+                self.assertEqual(exit_code, 1)
+                self.assertNotIn("private-sentinel", json.dumps(payload, ensure_ascii=False))
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("classification_unclassified", rendered)
+        self.assertNotIn("private-exception-sentinel", rendered)
+        self.assertNotIn("/private/tmp/managed-document.doc", rendered)
+        self.assertNotIn("raw response body sentinel", rendered)
+
+    def test_fund_risk_technical_errors_use_only_public_messages(self) -> None:
+        service = FakeRiskService()
+        self.context.fund_risk_service = service
+        cases = {
+            "official_document_unavailable": "official fund document is unavailable",
+            "official_document_invalid": "official fund document is invalid",
+            "official_document_resource_limit": ("official fund document exceeded resource limits"),
+            "official_document_parse_failed": ("official fund document parsing failed"),
+            "classification_policy_unavailable": "classification policy is unavailable",
+            "classification_calculation_failed": ("fund classification calculation failed"),
+            "classification_storage_failed": "fund classification storage failed",
+        }
+        for code, public_message in cases.items():
+            with self.subTest(code=code):
+                service.error = RiskServiceError(code, reason="public_reason")
+                payload, exit_code, _ = run(
+                    ["--json", "fund", "classify", "519755"],
+                    self.context,
+                )
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, "fund.classify")
+                self.assertEqual(payload["errors"][0]["code"], code)
+                self.assertEqual(
+                    payload["errors"][0]["message"],
+                    f"{public_message}: public_reason",
+                )
+                self.assertNotIn("Traceback", json.dumps(payload))
+        service.error = None
+
+    def test_fund_risk_policy_is_fixed_public_and_amount_free(self) -> None:
+        payload, exit_code, _ = run(
+            ["--json", "fund", "classification-policy"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(payload, "fund.classification-policy")
+        self.assertEqual(payload["errors"], [])
+        self.assertEqual(payload["data"]["capability"], "research_only")
+        self.assertEqual(payload["data"]["policy"]["version"], "1")
+        self.assertEqual(len(payload["data"]["policy_checksum"]), 64)
+        self.assertEqual(
+            payload["data"]["policy"]["effective_at"],
+            "2026-07-13T00:00:00+00:00",
+        )
+        rendered = json.dumps(payload, ensure_ascii=False)
+        for forbidden in ("monthly_net_income", "target_amount", "private_name"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_fund_risk_commands_reuse_six_digit_code_validation(self) -> None:
+        self.context.fund_risk_service = FakeRiskService()
+        for argv in (
+            ["--json", "sync", "fund-documents", "123"],
+            ["--json", "fund", "classify", "abc123"],
+            ["--json", "fund", "classification", "123"],
+            ["--json", "fund", "classification-history", "123"],
+            ["--json", "fund", "classification-evidence", "123"],
+        ):
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(payload["errors"][0]["code"], "invalid_fund_code")
+
+        for argv, command in (
+            (["--json", "sync", "fund-documents"], "sync.fund-documents"),
+            (["--json", "fund", "classify"], "fund.classify"),
+            (["--json", "fund", "classification"], "fund.classification"),
+            (
+                ["--json", "fund", "classification-history"],
+                "fund.classification-history",
+            ),
+            (
+                ["--json", "fund", "classification-evidence"],
+                "fund.classification-evidence",
+            ),
+        ):
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, command)
+                self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
+    def test_fund_risk_output_contains_no_personal_or_local_document_fields(self) -> None:
+        service = FakeRiskService()
+        self.context.fund_risk_service = service
+        with patch(
+            "kunjin.cli.build_authenticated_risk_research_report",
+            side_effect=fake_risk_report,
+        ):
+            payload, exit_code, _ = run(
+                ["--json", "fund", "classification-evidence", "519755"],
+                self.context,
+            )
+
+        self.assertEqual(exit_code, 0)
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertIn("https://www.fund001.com/public.pdf", rendered)
+        self.assertIn("official public title", rendered)
+        self.assertIn("a" * 64, rendered)
+        for forbidden in (
+            "managed_path",
+            str(self.context.paths.database),
+            "/Users/",
+            "raw_body",
+            "response_body",
+            "parser_exception",
+            "monthly_net_income",
+            "target_amount",
+            "学习账户",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_fund_risk_report_rejects_direction_amount_target_and_score_keys(self) -> None:
+        service = FakeRiskService()
+        self.context.fund_risk_service = service
+        forbidden_keys = (
+            "amount",
+            "purchase_amount",
+            "target",
+            "target_weight",
+            "direction",
+            "trade_direction",
+            "recommendation",
+            "buy",
+            "sell",
+            "score",
+            "universal_score",
+        )
+
+        for index, key in enumerate(forbidden_keys):
+            sentinel = f"forbidden-d1-decision-{index}"
+
+            def malicious_report(record, key=key, sentinel=sentinel):
+                return {**fake_risk_report(record), key: sentinel}
+
+            with (
+                self.subTest(key=key),
+                patch(
+                    "kunjin.cli.build_authenticated_risk_research_report",
+                    side_effect=malicious_report,
+                ),
+            ):
+                payload, exit_code, _ = run(
+                    ["--json", "fund", "classification-evidence", "519755"],
+                    self.context,
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assert_envelope(payload, "fund.classification-evidence")
+            self.assertEqual(
+                payload["errors"],
+                [
+                    {
+                        "code": "classification_storage_failed",
+                        "message": "fund classification storage failed",
+                    }
+                ],
+            )
+            self.assertNotIn(sentinel, json.dumps(payload, ensure_ascii=False))
 
     def test_market_sectors_state_scope(self) -> None:
         payload, exit_code, _ = run(["--json", "market", "sectors"], self.context)

@@ -1,4 +1,4 @@
 interface:
   display_name: "KunJin Fund Research"
-  short_description: "Sync and analyze personal funds with evidence"
-  default_prompt: "Use $kunjin-fund to research my funds with evidence; for directional or position-size requests run amount-free suitability first, then amount-free allocation only when permitted, preserve exact codes, and keep every result research_only."
+  short_description: "Research personal funds with gated evidence"
+  default_prompt: "Use $kunjin-fund for amount-free fund research and classification evidence; keep every result research_only and run suitability, allocation, and current D1 gates before any directional or position-size discussion."

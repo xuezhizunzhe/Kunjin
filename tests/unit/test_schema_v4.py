@@ -43,9 +43,7 @@ class SchemaV4Test(unittest.TestCase):
                 connection.execute("DELETE FROM transactions WHERE id = 1")
 
     def test_migration_upgrades_version_three_database(self) -> None:
-        repository = Repository(
-            Path(self.temporary_directory.name) / "kunjin-version-three.db"
-        )
+        repository = Repository(Path(self.temporary_directory.name) / "kunjin-version-three.db")
         with repository.connect() as connection, connection:
             connection.executescript(SCHEMA_V1)
             connection.executescript(SCHEMA_V2)
@@ -65,7 +63,7 @@ class SchemaV4Test(unittest.TestCase):
             rows = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([int(row["version"]) for row in rows], list(range(1, 10)))
+        self.assertEqual([int(row["version"]) for row in rows], list(range(1, 13)))
         self.assertTrue(
             {
                 "imported_documents",

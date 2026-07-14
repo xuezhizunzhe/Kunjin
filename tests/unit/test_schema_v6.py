@@ -32,10 +32,7 @@ class SchemaV6Test(unittest.TestCase):
                 connection.executescript(schema)
             connection.executemany(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                [
-                    (version, f"2026-07-0{version}T00:00:00+00:00")
-                    for version in range(1, 6)
-                ],
+                [(version, f"2026-07-0{version}T00:00:00+00:00") for version in range(1, 6)],
             )
             connection.execute(
                 """
@@ -121,7 +118,7 @@ class SchemaV6Test(unittest.TestCase):
                 "SELECT nav_date, unit_nav FROM fund_nav WHERE fund_code = '519755'"
             ).fetchone()
 
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 10)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 13)))
         self.assertEqual(
             dict(identity),
             {"fund_name": "交银多策略回报灵活配置混合A", "fund_type": "混合型-灵活"},

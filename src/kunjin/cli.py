@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass, is_dataclass, replace
@@ -43,6 +44,22 @@ from kunjin.funds.peers.research import (
 from kunjin.funds.peers.service import PeerResearchService
 from kunjin.funds.peers.store import PeerStore
 from kunjin.funds.research import build_disclosure_report
+from kunjin.funds.risk.documents import (
+    OfficialDocumentClient,
+    OfficialDocumentDiscovery,
+    OfficialHtmlIndexClient,
+)
+from kunjin.funds.risk.legacy_doc import ConverterStatus, DockerLegacyDocConverter
+from kunjin.funds.risk.policy import ClassificationPolicyV1
+from kunjin.funds.risk.research import build_authenticated_risk_research_report
+from kunjin.funds.risk.service import (
+    DocumentSyncItem,
+    DocumentSyncResult,
+    FundRiskService,
+    RiskServiceError,
+    validate_public_risk_string,
+)
+from kunjin.funds.risk.store import FundRiskStore
 from kunjin.funds.service import (
     HOLDING_SECTIONS,
     PROFILE_SECTIONS,
@@ -131,6 +148,64 @@ _ALLOCATION_PUBLIC_ERROR_MESSAGES = {
     "allocation_calculation_failed": "allocation calculation failed",
     "encrypted_profile_unavailable": "encrypted profile is unavailable",
 }
+_RISK_TECHNICAL_CODES = frozenset(
+    {
+        "official_document_unavailable",
+        "official_document_invalid",
+        "official_document_resource_limit",
+        "official_document_parse_failed",
+        "classification_policy_unavailable",
+        "classification_calculation_failed",
+        "classification_storage_failed",
+    }
+)
+_RISK_PUBLIC_ERROR_MESSAGES = {
+    "official_document_unavailable": "official fund document is unavailable",
+    "official_document_invalid": "official fund document is invalid",
+    "official_document_resource_limit": "official fund document exceeded resource limits",
+    "official_document_parse_failed": "official fund document parsing failed",
+    "classification_policy_unavailable": "classification policy is unavailable",
+    "classification_calculation_failed": "fund classification calculation failed",
+    "classification_storage_failed": "fund classification storage failed",
+}
+_RISK_PRIVATE_OUTPUT_KEYS = frozenset(
+    {
+        "managed_path",
+        "managed_artifact_path",
+        "artifact_path",
+        "local_path",
+        "raw_body",
+        "raw_response_body",
+        "response_body",
+        "parser_exception",
+        "parser_exception_chain",
+        "exception_chain",
+        "embedded_file_metadata",
+        "embedded_metadata",
+        "monthly_net_income",
+        "monthly_essential_expenses",
+        "monthly_required_debt_service",
+        "emergency_reserve",
+        "maximum_tolerable_loss",
+        "goal_amount",
+        "target_amount",
+        "amount",
+        "purchase_amount",
+        "target",
+        "target_weight",
+        "direction",
+        "trade_direction",
+        "recommendation",
+        "buy",
+        "sell",
+        "score",
+        "universal_score",
+        "obligation_amount",
+        "profile_key",
+        "ciphertext",
+        "nonce",
+    }
+)
 
 
 class CliUsageError(ValueError):
@@ -166,6 +241,8 @@ class ApplicationContext:
     profile_service: Optional[ProfileService] = None
     suitability_service: Optional[SuitabilityService] = None
     allocation_service: Optional[AllocationService] = None
+    fund_risk_store: Optional[FundRiskStore] = None
+    fund_risk_service: Optional[FundRiskService] = None
 
 
 def build_context() -> ApplicationContext:
@@ -183,6 +260,12 @@ def build_context() -> ApplicationContext:
     fund_disclosure_store = FundDisclosureStore(repository)
     fund_text_client = FundTextClient()
     fund_disclosure_service = FundDisclosureService(fund_text_client, fund_disclosure_store)
+    fund_risk_store = FundRiskStore(repository)
+    legacy_converter = DockerLegacyDocConverter(
+        image_id=os.environ.get("KUNJIN_LEGACY_DOC_IMAGE_ID"),
+        runtime_paths=paths,
+    )
+    official_index_client = OfficialHtmlIndexClient()
     peer_store = PeerStore(repository)
     profile_store = ProfileStore(repository)
     profile_key_store = ProfileKeyStore()
@@ -229,6 +312,16 @@ def build_context() -> ApplicationContext:
             AllocationAssessmentStore(repository),
             AllocationCipher(profile_key_store),
             AllocationPolicyV1(),
+        ),
+        fund_risk_store=fund_risk_store,
+        fund_risk_service=FundRiskService(
+            risk_store=fund_risk_store,
+            disclosure_store=fund_disclosure_store,
+            repository=repository,
+            discovery=OfficialDocumentDiscovery(client=official_index_client),
+            document_client=OfficialDocumentClient(paths=paths),
+            legacy_converter=legacy_converter,
+            policy=ClassificationPolicyV1(),
         ),
     )
 
@@ -332,6 +425,8 @@ def build_parser() -> argparse.ArgumentParser:
     sync_fund_peers = sync_subparsers.add_parser("fund-peers")
     sync_fund_peers.add_argument("fund_code")
     sync_fund_peers.add_argument("--candidate", action="append", default=[])
+    sync_fund_documents = sync_subparsers.add_parser("fund-documents")
+    sync_fund_documents.add_argument("fund_code")
     sync_subparsers.add_parser("market")
     sync_subparsers.add_parser("daily")
 
@@ -358,6 +453,16 @@ def build_parser() -> argparse.ArgumentParser:
     fund_peers.add_argument("fund_code")
     fund_compare = fund_subparsers.add_parser("compare")
     fund_compare.add_argument("fund_codes", nargs="+")
+    fund_classify = fund_subparsers.add_parser("classify")
+    fund_classify.add_argument("fund_code")
+    fund_classification = fund_subparsers.add_parser("classification")
+    fund_classification.add_argument("fund_code")
+    fund_classification_history = fund_subparsers.add_parser("classification-history")
+    fund_classification_history.add_argument("fund_code")
+    fund_classification_evidence = fund_subparsers.add_parser("classification-evidence")
+    fund_classification_evidence.add_argument("fund_code")
+    fund_subparsers.add_parser("classification-policy")
+    fund_subparsers.add_parser("converter-status")
 
     market = subparsers.add_parser("market")
     market_subparsers = market.add_subparsers(dest="market_command", required=True)
@@ -978,6 +1083,237 @@ def _allocation_safe_response(operation: Callable[[], object], command: str) -> 
     return _allocation_call(lambda: _validate_allocation_json_response(command, operation()))
 
 
+def _fund_risk_service(context: ApplicationContext) -> FundRiskService:
+    service = context.fund_risk_service
+    if service is None:
+        raise CliUsageError("fund risk service is unavailable")
+    return service
+
+
+def _risk_call(operation: Callable[[], Any], fallback_code: str) -> Any:
+    try:
+        return operation()
+    except RiskServiceError:
+        raise
+    except Exception:
+        raise RiskServiceError(fallback_code) from None
+
+
+def _risk_authenticated_report(record: object) -> Dict[str, Any]:
+    try:
+        report = build_authenticated_risk_research_report(record)
+        _validate_public_risk_payload(report)
+    except RiskServiceError:
+        raise
+    except Exception:
+        raise RiskServiceError("classification_storage_failed") from None
+    if report.get("capability") != "research_only":
+        raise RiskServiceError("classification_storage_failed")
+    return report
+
+
+def _risk_classify_report(service: FundRiskService, fund_code: str) -> Dict[str, Any]:
+    classification = _risk_call(
+        lambda: service.classify(fund_code),
+        "classification_calculation_failed",
+    )
+    history = _risk_call(
+        lambda: service.classification_history(fund_code),
+        "classification_storage_failed",
+    )
+    fingerprint = getattr(classification, "input_fingerprint", None)
+    match = next(
+        (item for item in history if getattr(item, "input_fingerprint", None) == fingerprint),
+        None,
+    )
+    if match is None:
+        raise RiskServiceError("classification_storage_failed")
+    record = _risk_call(
+        lambda: service.classification_evidence(
+            fund_code,
+            classification_id=getattr(match, "id", None),
+        ),
+        "classification_storage_failed",
+    )
+    if record is None:
+        raise RiskServiceError("classification_storage_failed")
+    report = _risk_authenticated_report(record)
+    if report.get("classification", {}).get("input_fingerprint") != fingerprint:
+        raise RiskServiceError("classification_storage_failed")
+    return report
+
+
+def _risk_current_report(
+    service: FundRiskService,
+    fund_code: str,
+) -> Optional[Dict[str, Any]]:
+    record = _risk_call(
+        lambda: service.classification_evidence(fund_code),
+        "classification_storage_failed",
+    )
+    if record is None:
+        return None
+    return _risk_authenticated_report(record)
+
+
+def _risk_history_report(service: FundRiskService, fund_code: str) -> Dict[str, Any]:
+    history = _risk_call(
+        lambda: service.classification_history(fund_code),
+        "classification_storage_failed",
+    )
+    reports = []
+    for item in history:
+        classification_id = getattr(item, "id", None)
+        if type(classification_id) is not int or classification_id <= 0:
+            raise RiskServiceError("classification_storage_failed")
+        record = _risk_call(
+            lambda classification_id=classification_id: service.classification_evidence(
+                fund_code,
+                classification_id=classification_id,
+            ),
+            "classification_storage_failed",
+        )
+        if record is None:
+            raise RiskServiceError("classification_storage_failed")
+        report = _risk_authenticated_report(record)
+        if report.get("classification", {}).get("input_fingerprint") != getattr(
+            item,
+            "input_fingerprint",
+            None,
+        ):
+            raise RiskServiceError("classification_storage_failed")
+        reports.append({"classification_id": classification_id, **report})
+    return {
+        "capability": "research_only",
+        "fund_code": fund_code,
+        "classifications": reports,
+    }
+
+
+def _missing_risk_report(fund_code: str) -> Dict[str, Any]:
+    return {
+        "capability": "research_only",
+        "fund_code": fund_code,
+        "status": "missing",
+        "classification": None,
+    }
+
+
+def _risk_policy_report() -> Dict[str, Any]:
+    try:
+        policy = ClassificationPolicyV1()
+        policy.validate()
+        canonical = json.loads(policy.canonical_json().decode("ascii"))
+        checksum = policy.checksum()
+    except Exception:
+        raise RiskServiceError("classification_policy_unavailable") from None
+    return {
+        "capability": "research_only",
+        "policy": canonical,
+        "policy_checksum": checksum,
+    }
+
+
+def _risk_converter_status_report(service: FundRiskService) -> Dict[str, Any]:
+    try:
+        status = service.converter_status()
+        if type(status) is not ConverterStatus:
+            raise ValueError("converter status must be exact")
+        status.validate()
+        report = {
+            "capability": status.capability,
+            "status": status.status,
+            "reason_code": status.reason_code,
+            "parser_version": status.parser_version,
+            "provenance_checksum": status.provenance_checksum,
+        }
+        _validate_public_risk_payload(report)
+        return report
+    except Exception:
+        return {
+            "capability": "research_only",
+            "status": "unavailable",
+            "reason_code": "legacy_converter_unavailable",
+            "parser_version": None,
+            "provenance_checksum": None,
+        }
+
+
+def _risk_sync_report(result: object) -> Dict[str, Any]:
+    if type(result) is not DocumentSyncResult:
+        raise ValueError("fund document synchronization returned an invalid result")
+    result.validate()
+    documents = []
+    for item in result.documents:
+        if type(item) is not DocumentSyncItem:
+            raise ValueError("fund document synchronization returned an invalid item")
+        item.validate()
+        documents.append(
+            {
+                "document_kind": item.document_kind,
+                "title": item.title,
+                "url": item.url,
+                "published_at": item.published_at,
+                "status": item.status,
+                "artifact_id": item.artifact_id,
+                "fact_count": item.fact_count,
+                "warnings": item.warnings,
+                "conflicts": item.conflicts,
+                "error_code": item.error_code,
+                "failure_stage": item.failure_stage,
+                "failure_reason": item.failure_reason,
+            }
+        )
+    report = serialize(
+        {
+            "fund_code": result.fund_code,
+            "status": result.status,
+            "documents": documents,
+            "attempted_at": result.attempted_at,
+            "capability": result.capability,
+        }
+    )
+    _validate_public_risk_payload(report)
+    return report
+
+
+def _risk_sync_errors(result: object) -> List[Dict[str, str]]:
+    if type(result) is not DocumentSyncResult:
+        raise ValueError("fund document synchronization returned an invalid result")
+    result.validate()
+    successful = any(item.status == "success" for item in result.documents)
+    if result.status != "failed" or successful:
+        return []
+    codes = sorted(
+        {
+            str(item.error_code)
+            for item in result.documents
+            if item.error_code in _RISK_TECHNICAL_CODES
+        }
+    )
+    if not codes:
+        codes = ["official_document_unavailable"]
+    return [{"code": code, "message": _RISK_PUBLIC_ERROR_MESSAGES[code]} for code in codes]
+
+
+def _validate_public_risk_payload(value: object) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and key.casefold() in _RISK_PRIVATE_OUTPUT_KEYS:
+                raise ValueError("risk report contains a private field")
+            _validate_public_risk_payload(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_public_risk_payload(item)
+        return
+    if isinstance(value, str):
+        try:
+            validate_public_risk_string(value)
+        except ValueError:
+            raise ValueError("risk report contains local implementation details") from None
+
+
 def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, Any]:
     if args.command == "version":
         return envelope("version", {"version": __version__})
@@ -1175,6 +1511,60 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             "ledger.document.delete",
             {"document_id": args.document_id, "deleted": deleted},
             warnings=warnings,
+        )
+
+    if args.command == "sync" and args.sync_command == "fund-documents":
+        _validate_fund_code(args.fund_code)
+        service = _fund_risk_service(context)
+        result = _risk_call(
+            lambda: service.sync_documents(args.fund_code),
+            "official_document_invalid",
+        )
+        return envelope(
+            "sync.fund-documents",
+            _risk_sync_report(result),
+            errors=_risk_sync_errors(result),
+        )
+
+    if args.command == "fund" and args.fund_command == "classify":
+        _validate_fund_code(args.fund_code)
+        service = _fund_risk_service(context)
+        return envelope(
+            "fund.classify",
+            _risk_classify_report(service, args.fund_code),
+        )
+
+    if args.command == "fund" and args.fund_command in {
+        "classification",
+        "classification-evidence",
+    }:
+        _validate_fund_code(args.fund_code)
+        service = _fund_risk_service(context)
+        report = _risk_current_report(service, args.fund_code)
+        return envelope(
+            f"fund.{args.fund_command}",
+            _missing_risk_report(args.fund_code) if report is None else report,
+        )
+
+    if args.command == "fund" and args.fund_command == "classification-history":
+        _validate_fund_code(args.fund_code)
+        service = _fund_risk_service(context)
+        return envelope(
+            "fund.classification-history",
+            _risk_history_report(service, args.fund_code),
+        )
+
+    if args.command == "fund" and args.fund_command == "classification-policy":
+        return envelope(
+            "fund.classification-policy",
+            _risk_policy_report(),
+        )
+
+    if args.command == "fund" and args.fund_command == "converter-status":
+        service = _fund_risk_service(context)
+        return envelope(
+            "fund.converter-status",
+            _risk_converter_status_report(service),
         )
 
     latest_sync = context.repository.latest_successful_sync("yangjibao")
@@ -1595,6 +1985,7 @@ def run(
         AllocationPolicyError,
         AllocationCalculationError,
         EncryptedProfileUnavailableError,
+        RiskServiceError,
         CliUsageError,
         ValueError,
     ) as exc:
@@ -1620,6 +2011,11 @@ def run(
             message = _ALLOCATION_PUBLIC_ERROR_MESSAGES.get(
                 str(code), "allocation calculation failed"
             )
+        if isinstance(exc, RiskServiceError):
+            code = exc.code
+            message = _RISK_PUBLIC_ERROR_MESSAGES[code]
+            if exc.reason is not None:
+                message = f"{message}: {exc.reason}"
         payload = envelope(
             (_command_name(args) if args is not None else _command_name_from_argv(raw_argv)),
             errors=[{"code": str(code), "message": message}],

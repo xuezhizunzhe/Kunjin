@@ -80,10 +80,7 @@ class SchemaV8Test(unittest.TestCase):
                 connection.executescript(schema)
             connection.executemany(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                [
-                    (version, f"2026-07-{version:02d}T00:00:00+00:00")
-                    for version in range(1, 8)
-                ],
+                [(version, f"2026-07-{version:02d}T00:00:00+00:00") for version in range(1, 8)],
             )
             connection.execute(
                 """
@@ -168,7 +165,7 @@ class SchemaV8Test(unittest.TestCase):
                 "PRAGMA table_info(suitability_assessments)"
             ).fetchall()
 
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 10)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 13)))
         self.assertEqual(
             [str(row["name"]) for row in policy_columns],
             [
@@ -223,7 +220,7 @@ class SchemaV8Test(unittest.TestCase):
                 ).fetchall()
             }
 
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 10)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 13)))
         self.assertEqual(
             dict(profile),
             {"version": 1, "encrypted_payload": "profile-ciphertext"},
@@ -272,7 +269,7 @@ class SchemaV8Test(unittest.TestCase):
             versions = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 10)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 13)))
         self.assertIn("suitability_assessments", repository.table_names())
 
     def test_assessment_foreign_keys_restrict_profile_and_policy_deletion(self) -> None:
@@ -360,9 +357,7 @@ class SchemaV8Test(unittest.TestCase):
             "suitability policies are immutable",
         ):
             with repository.connect() as connection, connection:
-                connection.execute(
-                    "DELETE FROM suitability_policy_versions WHERE version = '1'"
-                )
+                connection.execute("DELETE FROM suitability_policy_versions WHERE version = '1'")
 
     def test_assessment_rows_are_immutable(self) -> None:
         repository = self.prepared_repository()
@@ -520,9 +515,7 @@ class SchemaV8Test(unittest.TestCase):
         )
         for case_number, (index, replacement) in enumerate(cases):
             with self.subTest(index=index, replacement=replacement):
-                repository = self.prepared_repository(
-                    f"assessment-integrity-{case_number}.db"
-                )
+                repository = self.prepared_repository(f"assessment-integrity-{case_number}.db")
                 values = list(ASSESSMENT_VALUES)
                 values[index] = replacement
                 with self.assertRaises(sqlite3.IntegrityError):
@@ -627,9 +620,7 @@ class SchemaV8Test(unittest.TestCase):
 
         for case_number, index in enumerate((12, 13, 14)):
             with self.subTest(table="assessment", index=index):
-                repository = self.prepared_repository(
-                    f"invalid-assessment-time-{case_number}.db"
-                )
+                repository = self.prepared_repository(f"invalid-assessment-time-{case_number}.db")
                 values = list(ASSESSMENT_VALUES)
                 values[index] = "not-a-timestamp"
                 with self.assertRaises(sqlite3.IntegrityError):
@@ -647,6 +638,7 @@ class SchemaV8Test(unittest.TestCase):
                             """,
                             values,
                         )
+
 
 if __name__ == "__main__":
     unittest.main()

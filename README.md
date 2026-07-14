@@ -20,11 +20,14 @@ orders, or produce automatic trading instructions.
 - Python 3.9 or newer
 - Yangjibao app for QR authorization
 - Apple Vision and `/usr/bin/swift` for local screenshot OCR
+- Docker Desktop only when the optional isolated legacy Word converter is
+  explicitly provisioned
 
-The runtime has one bounded non-standard-library security dependency:
-`cryptography>=43,<46`. It provides AES-256-GCM encryption for the personal
-financial profile. The optional `qrcode` package improves terminal QR rendering
-but is not required by the storage or analytics code.
+The runtime has two bounded non-standard-library security dependencies:
+`cryptography>=43,<46` provides AES-256-GCM encryption for the personal
+financial profile, and `pypdf>=5,<6` parses official PDF disclosures without
+OCR or script execution. The optional `qrcode` package improves terminal QR
+rendering but is not required by the storage or analytics code.
 
 ## Offline Installation
 
@@ -34,7 +37,7 @@ offline-compatible setup is:
 ```bash
 cd /Users/yanzihao/KunJin
 python3 -m venv .venv
-.venv/bin/pip install 'cryptography>=43,<46'
+.venv/bin/pip install 'cryptography>=43,<46' 'pypdf>=5,<6'
 .venv/bin/python setup.py develop
 .venv/bin/kunjin --json version
 ```
@@ -78,6 +81,12 @@ When PyPI access is available, install terminal QR rendering with:
 .venv/bin/kunjin --json fund holdings 017811
 .venv/bin/kunjin --json fund holdings 017811 --period 2026-06-30
 .venv/bin/kunjin --json fund announcements 017811
+.venv/bin/kunjin --json sync fund-documents 017811
+.venv/bin/kunjin --json fund classify 017811
+.venv/bin/kunjin --json fund classification 017811
+.venv/bin/kunjin --json fund classification-history 017811
+.venv/bin/kunjin --json fund classification-evidence 017811
+.venv/bin/kunjin --json fund classification-policy
 .venv/bin/kunjin --json sync fund-peers 519755
 .venv/bin/kunjin --json sync fund-peers 519755 --candidate 000001
 .venv/bin/kunjin --json fund peers 519755
@@ -221,6 +230,101 @@ funds, compare current holdings with the region, choose a target point, or issue
 a trade or purchase amount. Those portfolio-construction and pre-purchase
 controls remain Phase D and Phase E, so Phase C does not complete 90% of the
 beginner purchase workflow.
+
+## Real Fund Risk Classification (Phase D1)
+
+Phase D1 turns current, source-traceable public-product evidence into a
+deterministic product family, risk bucket, and portfolio-role eligibility. Its
+six commands are fact-only, amount-free, and may run without a Phase B or Phase
+C success state:
+
+```bash
+.venv/bin/kunjin --json sync fund-documents 017811
+.venv/bin/kunjin --json fund classify 017811
+.venv/bin/kunjin --json fund classification 017811
+.venv/bin/kunjin --json fund classification-history 017811
+.venv/bin/kunjin --json fund classification-evidence 017811
+.venv/bin/kunjin --json fund classification-policy
+```
+
+Every result has capability `research_only`. Evidence status has these narrow
+meanings:
+
+- `verified`: all critical evidence required by Policy V1 is current,
+  authenticated, and internally consistent.
+- `partial`: some useful evidence exists, but required coverage is incomplete.
+- `conflicted`: current evidence contains a material unresolved contradiction.
+- `stale`: critical evidence exists but is no longer current.
+- `unclassified`: the available evidence cannot support a Policy V1 class.
+
+Unsupported and missing are deliberately different outcomes.
+`unsupported_product_family` means current official evidence identifies a
+product family outside D1 Policy V1; it is a successful factual result with an
+`unclassified` evidence status. `critical_evidence_missing` means the product
+may be supported, but evidence required to classify it is unavailable. A
+technical download, parse, policy, or storage failure is neither outcome and
+returns a nonzero error instead.
+
+Failed `sync fund-documents` items retain the existing `error_code` and may add
+allowlisted `failure_stage` and `failure_reason`. These values explain the
+technical boundary only. They do not prove a product family, risk bucket,
+portfolio role, suitability result, allocation, or purchase direction, and are
+not a buy signal.
+
+The labels do not cross phase boundaries. `cash_like_candidate` is a public
+product risk classification and is not the owner's Phase C `protected_cash`.
+Likewise, `core_eligible` means only that the fund passed D1's product-evidence
+rules; it is not a recommendation. Never place a real fund into a Phase C layer
+from its name, platform label, historical volatility, or a D1 label alone.
+
+A D1 `verified` result is not suitability, not an allocation, not a buy signal,
+and not a 90% beginner-help claim. It does not evaluate the owner's portfolio or
+authorize buy, hold, add, reduce, sell, rebalance, or position-size output. D2
+portfolio correlation, overlap, and construction controls are not implemented;
+D3 product-selection and pre-purchase checks are also not implemented.
+
+The official-domain coverage is audited and finite. A missing manager/index-provider
+adapter can leave an otherwise common supported fund `partial` or `unclassified`;
+platform mirrors cannot be promoted to official evidence to avoid that result.
+For stale or missing evidence, refresh `sync fund-profile`, `sync fund-holdings`,
+and `sync fund-documents` as applicable, rerun `fund classify`, then inspect
+`fund classification-evidence`. If the official publisher is not registered,
+add and test the exact manager/index-provider adapter before relying on a new
+classification. This is an evidence-correction workflow, not a suggestion to
+buy or sell.
+
+### Optional legacy Word conversion (D1.1-B)
+
+Some official periodic reports use the legacy OLE Word container. KunJin can
+parse those reports only through the separately reviewed personal-use Docker
+image documented in `containers/legacy-doc/README.md`. Explicit setup may use
+the network to build a pinned `linux/arm64` image. Normal synchronization never
+pulls or builds an image: it invokes only the allowlisted local SHA-256 image ID
+with `--pull=never` and `--network=none`.
+
+The setup script must be invoked directly rather than through a symlink. It
+resolves parent-directory symlinks to the physical repository and authenticates
+the reviewed, non-symlink Dockerfile by its fixed SHA-256 before each build. The
+safe setup JSON records that checksum as `dockerfile_sha256`.
+
+There is no host `textutil` fallback and no host LibreOffice fallback. The
+Dockerfile's `USER 65532:65532` is deliberately overridden at runtime by
+`--user=<host-uid>:<host-gid>` so the non-root converter can create a
+bind-mounted output owned by the current host user. The conversion stdout and stderr are never captured or exposed; only private bounded metadata queries may
+be captured to verify the exact image and cleanup state.
+
+After reviewed provisioning, export the exact image ID printed by the build
+script and inspect only safe readiness metadata:
+
+```bash
+.venv/bin/kunjin --json fund converter-status
+```
+
+Conversion success is not financial evidence. Converted HTML must still pass
+the normal official identity, document-kind, report-period, active-content,
+ambiguity, and fact checks. D1.1-C is still required for current report facts;
+D2, D3, and Phase E remain unimplemented, and the result remains
+`research_only`.
 
 ## Personal Transaction Ledger
 

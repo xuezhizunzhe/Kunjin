@@ -19,6 +19,7 @@ from kunjin.funds.models import (
     FundSizeObservation,
     SourceDocument,
 )
+from kunjin.funds.sources import build_f10_url
 
 NOW = datetime(2026, 7, 11, tzinfo=timezone.utc)
 
@@ -42,6 +43,36 @@ def source_document(**overrides) -> SourceDocument:
 
 
 class SourceDocumentTest(unittest.TestCase):
+    def test_d1_document_kinds_are_stable_and_not_f10_kinds(self) -> None:
+        expected = (
+            DocumentKind.FUND_CONTRACT,
+            DocumentKind.PROSPECTUS,
+            DocumentKind.PROSPECTUS_UPDATE,
+            DocumentKind.PRODUCT_SUMMARY,
+            DocumentKind.ANNUAL_REPORT,
+            DocumentKind.SEMIANNUAL_REPORT,
+            DocumentKind.QUARTERLY_REPORT,
+            DocumentKind.INDEX_METHODOLOGY,
+            DocumentKind.CLASSIFICATION_ANNOUNCEMENT,
+        )
+        self.assertEqual(
+            tuple(kind.value for kind in expected),
+            (
+                "fund_contract",
+                "prospectus",
+                "prospectus_update",
+                "product_summary",
+                "annual_report",
+                "semiannual_report",
+                "quarterly_report",
+                "index_methodology",
+                "classification_announcement",
+            ),
+        )
+        for kind in expected:
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "unsupported"):
+                build_f10_url(kind, "519755")
+
     def test_valid_source_document_is_accepted(self) -> None:
         source_document().validate()
 
@@ -156,8 +187,16 @@ class NormalizedFactValidationTest(unittest.TestCase):
 
     def test_holding_weight_must_be_between_zero_and_one_hundred(self) -> None:
         base = FundHolding(
-            "519755", date(2026, 6, 30), NOW, 1, "600000", "浦发银行",
-            AssetType.STOCK, Decimal("5"), "top10", 1,
+            "519755",
+            date(2026, 6, 30),
+            NOW,
+            1,
+            "600000",
+            "浦发银行",
+            AssetType.STOCK,
+            Decimal("5"),
+            "top10",
+            1,
         )
         for weight in (Decimal("-0.01"), Decimal("100.01")):
             with self.subTest(weight=weight):
@@ -172,16 +211,22 @@ class NormalizedFactValidationTest(unittest.TestCase):
             record.validate()
 
     def test_manager_end_date_cannot_precede_start_date(self) -> None:
-        tenure = FundManagerTenure(
-            "519755", "张三", date(2026, 1, 2), date(2026, 1, 1), 1
-        )
+        tenure = FundManagerTenure("519755", "张三", date(2026, 1, 2), date(2026, 1, 1), 1)
         with self.assertRaisesRegex(ValueError, "end date"):
             tenure.validate()
 
     def test_fact_publication_times_must_be_aware(self) -> None:
         holding = FundHolding(
-            "519755", date(2026, 6, 30), datetime(2026, 7, 1), 1,
-            "600000", "浦发银行", AssetType.STOCK, Decimal("5"), "top10", 1,
+            "519755",
+            date(2026, 6, 30),
+            datetime(2026, 7, 1),
+            1,
+            "600000",
+            "浦发银行",
+            AssetType.STOCK,
+            Decimal("5"),
+            "top10",
+            1,
         )
         with self.assertRaisesRegex(ValueError, "published_at"):
             holding.validate()

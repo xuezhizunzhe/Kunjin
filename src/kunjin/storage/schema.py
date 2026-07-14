@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 12
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -910,5 +910,1237 @@ CREATE TRIGGER allocation_assessment_no_delete
 BEFORE DELETE ON allocation_assessments
 BEGIN
     SELECT RAISE(ABORT, 'allocation assessments are immutable');
+END;
+"""
+
+SCHEMA_V10 = """
+CREATE TABLE fund_document_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id > 0),
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code) = 'text'
+        AND length(fund_code) = 6
+        AND fund_code NOT GLOB '*[^0-9]*'
+    ),
+    document_kind TEXT NOT NULL CHECK(
+        typeof(document_kind) = 'text'
+        AND instr(document_kind, char(0)) = 0
+        AND document_kind IN (
+            'fund_contract', 'prospectus', 'prospectus_update', 'product_summary',
+            'annual_report', 'semiannual_report', 'quarterly_report',
+            'index_methodology', 'classification_announcement'
+        )
+    ),
+    url TEXT NOT NULL CHECK(
+        typeof(url) = 'text'
+        AND instr(url, char(0)) = 0
+        AND length(trim(url)) > 0
+    ),
+    publisher TEXT NOT NULL CHECK(
+        typeof(publisher) = 'text'
+        AND instr(publisher, char(0)) = 0
+        AND length(trim(publisher)) > 0
+    ),
+    title TEXT NOT NULL CHECK(
+        typeof(title) = 'text'
+        AND instr(title, char(0)) = 0
+        AND length(trim(title)) > 0
+    ),
+    published_at TEXT CHECK(
+        published_at IS NULL OR (
+            typeof(published_at) = 'text'
+            AND instr(published_at, char(0)) = 0
+            AND julianday(published_at) IS NOT NULL
+            AND substr(published_at, -6) = '+00:00'
+            AND substr(published_at, 11, 1) = 'T'
+            AND substr(published_at, 1, 4) NOT GLOB '*[^0-9]*'
+            AND substr(published_at, 1, 4) BETWEEN '0001' AND '9999'
+            AND substr(published_at, 12, 2) NOT GLOB '*[^0-9]*'
+            AND CAST(substr(published_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+            AND substr(published_at, 15, 2) NOT GLOB '*[^0-9]*'
+            AND CAST(substr(published_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
+            AND substr(published_at, 18, 2) NOT GLOB '*[^0-9]*'
+            AND CAST(substr(published_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
+            AND strftime('%Y-%m-%dT%H:%M:%S', published_at) = substr(published_at, 1, 19)
+            AND (
+                length(published_at) = 25 OR (
+                    length(published_at) = 32
+                    AND substr(published_at, 20, 1) = '.'
+                    AND substr(published_at, 21, 6) NOT GLOB '*[^0-9]*'
+                    AND substr(published_at, 21, 6) != '000000'
+                )
+            )
+        )
+    ),
+    retrieved_at TEXT NOT NULL CHECK(
+        typeof(retrieved_at) = 'text'
+        AND instr(retrieved_at, char(0)) = 0
+        AND julianday(retrieved_at) IS NOT NULL
+        AND substr(retrieved_at, -6) = '+00:00'
+        AND substr(retrieved_at, 11, 1) = 'T'
+        AND substr(retrieved_at, 1, 4) NOT GLOB '*[^0-9]*'
+        AND substr(retrieved_at, 1, 4) BETWEEN '0001' AND '9999'
+        AND substr(retrieved_at, 12, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(retrieved_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+        AND substr(retrieved_at, 15, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(retrieved_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND substr(retrieved_at, 18, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(retrieved_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND strftime('%Y-%m-%dT%H:%M:%S', retrieved_at) = substr(retrieved_at, 1, 19)
+        AND (
+            length(retrieved_at) = 25 OR (
+                length(retrieved_at) = 32
+                AND substr(retrieved_at, 20, 1) = '.'
+                AND substr(retrieved_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(retrieved_at, 21, 6) != '000000'
+            )
+        )
+    ),
+    content_type TEXT NOT NULL CHECK(
+        typeof(content_type) = 'text'
+        AND instr(content_type, char(0)) = 0
+        AND length(trim(content_type)) > 0
+    ),
+    byte_size INTEGER NOT NULL CHECK(
+        typeof(byte_size) = 'integer'
+        AND byte_size > 0
+        AND byte_size <= 33554432
+    ),
+    sha256 TEXT NOT NULL CHECK(
+        typeof(sha256) = 'text'
+        AND instr(sha256, char(0)) = 0
+        AND length(CAST(sha256 AS BLOB)) = 64
+        AND sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    managed_path TEXT NOT NULL CHECK(
+        typeof(managed_path) = 'text'
+        AND instr(managed_path, char(0)) = 0
+        AND length(trim(managed_path)) > 0
+    ),
+    parse_status TEXT NOT NULL CHECK(
+        typeof(parse_status) = 'text'
+        AND parse_status IN ('parsed', 'failed')
+    ),
+    parser_version TEXT NOT NULL CHECK(
+        typeof(parser_version) = 'text'
+        AND instr(parser_version, char(0)) = 0
+        AND length(parser_version) > 0
+        AND substr(parser_version, 1, 1) GLOB '[a-z0-9]'
+        AND parser_version NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    parse_error_code TEXT CHECK(
+        parse_error_code IS NULL OR (
+            typeof(parse_error_code) = 'text'
+            AND instr(parse_error_code, char(0)) = 0
+            AND length(parse_error_code) > 0
+            AND substr(parse_error_code, 1, 1) GLOB '[a-z]'
+            AND parse_error_code NOT GLOB '*[^a-z0-9_]*'
+        )
+    ),
+    CHECK(
+        (parse_status = 'parsed' AND parse_error_code IS NULL)
+        OR (parse_status = 'failed' AND parse_error_code IS NOT NULL)
+    ),
+    UNIQUE(fund_code, document_kind, url, sha256)
+);
+
+CREATE TABLE fund_mandate_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id > 0),
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code) = 'text'
+        AND length(fund_code) = 6
+        AND fund_code NOT GLOB '*[^0-9]*'
+    ),
+    source_document_id INTEGER NOT NULL CHECK(
+        typeof(source_document_id) = 'integer' AND source_document_id > 0
+    )
+        REFERENCES fund_document_artifacts(id) ON DELETE RESTRICT,
+    fact_kind TEXT NOT NULL CHECK(
+        typeof(fact_kind) = 'text'
+        AND instr(fact_kind, char(0)) = 0
+        AND length(fact_kind) > 0
+        AND substr(fact_kind, 1, 1) GLOB '[a-z]'
+        AND fact_kind NOT GLOB '*[^a-z0-9_]*'
+    ),
+    normalized_value_json TEXT NOT NULL CHECK(
+        typeof(normalized_value_json) = 'text'
+        AND instr(normalized_value_json, char(0)) = 0
+        AND json_valid(normalized_value_json)
+    ),
+    unit TEXT CHECK(
+        unit IS NULL OR (
+            typeof(unit) = 'text'
+            AND instr(unit, char(0)) = 0
+            AND length(trim(unit)) BETWEEN 1 AND 64
+        )
+    ),
+    page_number INTEGER CHECK(
+        page_number IS NULL OR (
+            typeof(page_number) = 'integer' AND page_number > 0
+        )
+    ),
+    section_name TEXT CHECK(
+        section_name IS NULL OR (
+            typeof(section_name) = 'text'
+            AND instr(section_name, char(0)) = 0
+            AND length(trim(section_name)) BETWEEN 1 AND 256
+        )
+    ),
+    source_excerpt TEXT NOT NULL CHECK(
+        typeof(source_excerpt) = 'text'
+        AND instr(source_excerpt, char(0)) = 0
+        AND length(trim(source_excerpt)) BETWEEN 1 AND 4096
+    ),
+    effective_from TEXT CHECK(
+        effective_from IS NULL OR (
+            typeof(effective_from) = 'text'
+            AND instr(effective_from, char(0)) = 0
+            AND length(effective_from) = 10
+            AND strftime('%Y-%m-%d', effective_from) = effective_from
+        )
+    ),
+    effective_to TEXT CHECK(
+        effective_to IS NULL OR (
+            typeof(effective_to) = 'text'
+            AND instr(effective_to, char(0)) = 0
+            AND length(effective_to) = 10
+            AND strftime('%Y-%m-%d', effective_to) = effective_to
+        )
+    ),
+    confidence_state TEXT NOT NULL CHECK(
+        typeof(confidence_state) = 'text'
+        AND confidence_state IN ('exact', 'bounded_range', 'present', 'absent', 'ambiguous')
+    ),
+    parser_version TEXT NOT NULL CHECK(
+        typeof(parser_version) = 'text'
+        AND instr(parser_version, char(0)) = 0
+        AND length(parser_version) > 0
+        AND substr(parser_version, 1, 1) GLOB '[a-z0-9]'
+        AND parser_version NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    fact_fingerprint TEXT NOT NULL CHECK(
+        typeof(fact_fingerprint) = 'text'
+        AND instr(fact_fingerprint, char(0)) = 0
+        AND length(CAST(fact_fingerprint AS BLOB)) = 64
+        AND fact_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    CHECK(
+        effective_from IS NULL OR effective_to IS NULL
+        OR (effective_to COLLATE BINARY) >= (effective_from COLLATE BINARY)
+    ),
+    UNIQUE(source_document_id, parser_version, fact_fingerprint)
+);
+
+CREATE TABLE fund_classification_policy_versions (
+    version TEXT PRIMARY KEY CHECK(
+        typeof(version) = 'text'
+        AND instr(version, char(0)) = 0
+        AND length(version) > 0
+        AND substr(version, 1, 1) GLOB '[a-z0-9]'
+        AND version NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    canonical_policy_json TEXT NOT NULL CHECK(
+        typeof(canonical_policy_json) = 'text'
+        AND instr(canonical_policy_json, char(0)) = 0
+        AND json_valid(canonical_policy_json)
+        AND json_type(canonical_policy_json) = 'object'
+    ),
+    policy_checksum TEXT NOT NULL CHECK(
+        typeof(policy_checksum) = 'text'
+        AND instr(policy_checksum, char(0)) = 0
+        AND length(CAST(policy_checksum AS BLOB)) = 64
+        AND policy_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    effective_at TEXT NOT NULL CHECK(
+        typeof(effective_at) = 'text'
+        AND instr(effective_at, char(0)) = 0
+        AND julianday(effective_at) IS NOT NULL
+        AND substr(effective_at, -6) = '+00:00'
+        AND substr(effective_at, 11, 1) = 'T'
+        AND substr(effective_at, 1, 4) NOT GLOB '*[^0-9]*'
+        AND substr(effective_at, 1, 4) BETWEEN '0001' AND '9999'
+        AND substr(effective_at, 12, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(effective_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+        AND substr(effective_at, 15, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(effective_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND substr(effective_at, 18, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(effective_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND strftime('%Y-%m-%dT%H:%M:%S', effective_at) = substr(effective_at, 1, 19)
+        AND (
+            length(effective_at) = 25 OR (
+                length(effective_at) = 32
+                AND substr(effective_at, 20, 1) = '.'
+                AND substr(effective_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(effective_at, 21, 6) != '000000'
+            )
+        )
+    ),
+    created_at TEXT NOT NULL CHECK(
+        typeof(created_at) = 'text'
+        AND instr(created_at, char(0)) = 0
+        AND julianday(created_at) IS NOT NULL
+        AND substr(created_at, -6) = '+00:00'
+        AND substr(created_at, 11, 1) = 'T'
+        AND substr(created_at, 1, 4) NOT GLOB '*[^0-9]*'
+        AND substr(created_at, 1, 4) BETWEEN '0001' AND '9999'
+        AND substr(created_at, 12, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(created_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+        AND substr(created_at, 15, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(created_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND substr(created_at, 18, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(created_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND strftime('%Y-%m-%dT%H:%M:%S', created_at) = substr(created_at, 1, 19)
+        AND (
+            length(created_at) = 25 OR (
+                length(created_at) = 32
+                AND substr(created_at, 20, 1) = '.'
+                AND substr(created_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(created_at, 21, 6) != '000000'
+            )
+        )
+    )
+);
+
+CREATE TABLE fund_risk_classifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id > 0),
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code) = 'text'
+        AND length(fund_code) = 6
+        AND fund_code NOT GLOB '*[^0-9]*'
+    ),
+    policy_version TEXT NOT NULL CHECK(
+        typeof(policy_version) = 'text'
+        AND instr(policy_version, char(0)) = 0
+        AND length(policy_version) > 0
+        AND substr(policy_version, 1, 1) GLOB '[a-z0-9]'
+        AND policy_version NOT GLOB '*[^a-z0-9._-]*'
+    )
+        REFERENCES fund_classification_policy_versions(version) ON DELETE RESTRICT,
+    input_fingerprint TEXT NOT NULL CHECK(
+        typeof(input_fingerprint) = 'text'
+        AND instr(input_fingerprint, char(0)) = 0
+        AND length(CAST(input_fingerprint AS BLOB)) = 64
+        AND input_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    input_manifest_json TEXT NOT NULL CHECK(
+        typeof(input_manifest_json) = 'text'
+        AND instr(input_manifest_json, char(0)) = 0
+        AND json_valid(input_manifest_json)
+        AND json_type(input_manifest_json) = 'object'
+    ),
+    product_family TEXT NOT NULL CHECK(
+        typeof(product_family) = 'text'
+        AND product_family IN (
+            'money_market', 'short_bond', 'intermediate_bond', 'ordinary_bond',
+            'long_bond', 'credit_bond', 'convertible_bond', 'fixed_income_plus',
+            'bond_mixed', 'broad_index', 'index_enhanced', 'sector_theme',
+            'active_equity', 'equity_mixed', 'qdii_broad_equity',
+            'qdii_sector_theme', 'unsupported', 'unclassified'
+        )
+    ),
+    risk_bucket TEXT NOT NULL CHECK(
+        typeof(risk_bucket) = 'text'
+        AND risk_bucket IN (
+            'cash_like_candidate', 'high_quality_fixed_income',
+            'diversified_equity', 'concentrated_equity', 'hybrid_risk',
+            'unclassified'
+        )
+    ),
+    portfolio_role TEXT NOT NULL CHECK(
+        typeof(portfolio_role) = 'text'
+        AND portfolio_role IN (
+            'cash_management_candidate', 'core_eligible',
+            'active_diversifier_eligible', 'satellite_only', 'not_eligible'
+        )
+    ),
+    evidence_status TEXT NOT NULL CHECK(
+        typeof(evidence_status) = 'text'
+        AND evidence_status IN ('verified', 'partial', 'conflicted', 'stale', 'unclassified')
+    ),
+    evidence_tags_json TEXT NOT NULL CHECK(
+        typeof(evidence_tags_json) = 'text'
+        AND instr(evidence_tags_json, char(0)) = 0
+        AND json_valid(evidence_tags_json)
+        AND json_type(evidence_tags_json) = 'array'
+    ),
+    reason_codes_json TEXT NOT NULL CHECK(
+        typeof(reason_codes_json) = 'text'
+        AND instr(reason_codes_json, char(0)) = 0
+        AND json_valid(reason_codes_json)
+        AND json_type(reason_codes_json) = 'array'
+    ),
+    missing_evidence_json TEXT NOT NULL CHECK(
+        typeof(missing_evidence_json) = 'text'
+        AND instr(missing_evidence_json, char(0)) = 0
+        AND json_valid(missing_evidence_json)
+        AND json_type(missing_evidence_json) = 'array'
+    ),
+    conflicts_json TEXT NOT NULL CHECK(
+        typeof(conflicts_json) = 'text'
+        AND instr(conflicts_json, char(0)) = 0
+        AND json_valid(conflicts_json)
+        AND json_type(conflicts_json) = 'array'
+    ),
+    evidence_document_ids_json TEXT NOT NULL CHECK(
+        typeof(evidence_document_ids_json) = 'text'
+        AND instr(evidence_document_ids_json, char(0)) = 0
+        AND json_valid(evidence_document_ids_json)
+        AND json_type(evidence_document_ids_json) = 'array'
+    ),
+    evidence_fact_ids_json TEXT NOT NULL CHECK(
+        typeof(evidence_fact_ids_json) = 'text'
+        AND instr(evidence_fact_ids_json, char(0)) = 0
+        AND json_valid(evidence_fact_ids_json)
+        AND json_type(evidence_fact_ids_json) = 'array'
+    ),
+    freshness_json TEXT NOT NULL CHECK(
+        typeof(freshness_json) = 'text'
+        AND instr(freshness_json, char(0)) = 0
+        AND json_valid(freshness_json)
+        AND json_type(freshness_json) = 'array'
+    ),
+    classified_at TEXT NOT NULL CHECK(
+        typeof(classified_at) = 'text'
+        AND instr(classified_at, char(0)) = 0
+        AND julianday(classified_at) IS NOT NULL
+        AND substr(classified_at, -6) = '+00:00'
+        AND substr(classified_at, 11, 1) = 'T'
+        AND substr(classified_at, 1, 4) NOT GLOB '*[^0-9]*'
+        AND substr(classified_at, 1, 4) BETWEEN '0001' AND '9999'
+        AND substr(classified_at, 12, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(classified_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+        AND substr(classified_at, 15, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(classified_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND substr(classified_at, 18, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(classified_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND strftime('%Y-%m-%dT%H:%M:%S', classified_at) = substr(classified_at, 1, 19)
+        AND (
+            length(classified_at) = 25 OR (
+                length(classified_at) = 32
+                AND substr(classified_at, 20, 1) = '.'
+                AND substr(classified_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(classified_at, 21, 6) != '000000'
+            )
+        )
+    ),
+    valid_until TEXT NOT NULL CHECK(
+        typeof(valid_until) = 'text'
+        AND instr(valid_until, char(0)) = 0
+        AND julianday(valid_until) IS NOT NULL
+        AND substr(valid_until, -6) = '+00:00'
+        AND substr(valid_until, 11, 1) = 'T'
+        AND substr(valid_until, 1, 4) NOT GLOB '*[^0-9]*'
+        AND substr(valid_until, 1, 4) BETWEEN '0001' AND '9999'
+        AND substr(valid_until, 12, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(valid_until, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+        AND substr(valid_until, 15, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(valid_until, 15, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND substr(valid_until, 18, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(valid_until, 18, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND strftime('%Y-%m-%dT%H:%M:%S', valid_until) = substr(valid_until, 1, 19)
+        AND (
+            length(valid_until) = 25 OR (
+                length(valid_until) = 32
+                AND substr(valid_until, 20, 1) = '.'
+                AND substr(valid_until, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(valid_until, 21, 6) != '000000'
+            )
+        )
+        AND (valid_until COLLATE BINARY) > (classified_at COLLATE BINARY)
+    ),
+    created_at TEXT NOT NULL CHECK(
+        typeof(created_at) = 'text'
+        AND instr(created_at, char(0)) = 0
+        AND julianday(created_at) IS NOT NULL
+        AND substr(created_at, -6) = '+00:00'
+        AND substr(created_at, 11, 1) = 'T'
+        AND substr(created_at, 1, 4) NOT GLOB '*[^0-9]*'
+        AND substr(created_at, 1, 4) BETWEEN '0001' AND '9999'
+        AND substr(created_at, 12, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(created_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+        AND substr(created_at, 15, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(created_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND substr(created_at, 18, 2) NOT GLOB '*[^0-9]*'
+        AND CAST(substr(created_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND strftime('%Y-%m-%dT%H:%M:%S', created_at) = substr(created_at, 1, 19)
+        AND (
+            length(created_at) = 25 OR (
+                length(created_at) = 32
+                AND substr(created_at, 20, 1) = '.'
+                AND substr(created_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(created_at, 21, 6) != '000000'
+            )
+        )
+    ),
+    UNIQUE(fund_code, policy_version, input_fingerprint)
+);
+
+CREATE INDEX fund_document_artifacts_lookup
+ON fund_document_artifacts(fund_code, document_kind, retrieved_at DESC, id DESC);
+
+CREATE INDEX fund_mandate_facts_lookup
+ON fund_mandate_facts(fund_code, fact_kind, source_document_id, id);
+
+CREATE INDEX fund_risk_classifications_binding
+ON fund_risk_classifications(fund_code, policy_version, input_fingerprint);
+
+CREATE INDEX fund_risk_classifications_history
+ON fund_risk_classifications(fund_code, classified_at DESC, id DESC);
+
+CREATE TRIGGER fund_document_artifact_no_replace
+BEFORE INSERT ON fund_document_artifacts
+WHEN EXISTS (
+    SELECT 1 FROM fund_document_artifacts
+    WHERE id = NEW.id
+       OR (
+           fund_code = NEW.fund_code
+           AND document_kind = NEW.document_kind
+           AND url = NEW.url
+           AND sha256 = NEW.sha256
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document artifacts are immutable');
+END;
+
+CREATE TRIGGER fund_document_artifact_no_update
+BEFORE UPDATE ON fund_document_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'fund document artifacts are immutable');
+END;
+
+CREATE TRIGGER fund_document_artifact_no_delete
+BEFORE DELETE ON fund_document_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'fund document artifacts are immutable');
+END;
+
+CREATE TRIGGER fund_mandate_fact_no_replace
+BEFORE INSERT ON fund_mandate_facts
+WHEN EXISTS (
+    SELECT 1 FROM fund_mandate_facts
+    WHERE id = NEW.id
+       OR (
+           source_document_id = NEW.source_document_id
+           AND parser_version = NEW.parser_version
+           AND fact_fingerprint = NEW.fact_fingerprint
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund mandate facts are immutable');
+END;
+
+CREATE TRIGGER fund_mandate_fact_no_update
+BEFORE UPDATE ON fund_mandate_facts
+BEGIN
+    SELECT RAISE(ABORT, 'fund mandate facts are immutable');
+END;
+
+CREATE TRIGGER fund_mandate_fact_no_delete
+BEFORE DELETE ON fund_mandate_facts
+BEGIN
+    SELECT RAISE(ABORT, 'fund mandate facts are immutable');
+END;
+
+CREATE TRIGGER fund_classification_policy_no_replace
+BEFORE INSERT ON fund_classification_policy_versions
+WHEN EXISTS (
+    SELECT 1 FROM fund_classification_policy_versions WHERE version = NEW.version
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund classification policies are immutable');
+END;
+
+CREATE TRIGGER fund_classification_policy_no_update
+BEFORE UPDATE ON fund_classification_policy_versions
+BEGIN
+    SELECT RAISE(ABORT, 'fund classification policies are immutable');
+END;
+
+CREATE TRIGGER fund_classification_policy_no_delete
+BEFORE DELETE ON fund_classification_policy_versions
+BEGIN
+    SELECT RAISE(ABORT, 'fund classification policies are immutable');
+END;
+
+CREATE TRIGGER fund_risk_classification_no_replace
+BEFORE INSERT ON fund_risk_classifications
+WHEN EXISTS (
+    SELECT 1 FROM fund_risk_classifications
+    WHERE id = NEW.id
+       OR (
+           fund_code = NEW.fund_code
+           AND policy_version = NEW.policy_version
+           AND input_fingerprint = NEW.input_fingerprint
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund risk classifications are immutable');
+END;
+
+CREATE TRIGGER fund_risk_classification_no_update
+BEFORE UPDATE ON fund_risk_classifications
+BEGIN
+    SELECT RAISE(ABORT, 'fund risk classifications are immutable');
+END;
+
+CREATE TRIGGER fund_risk_classification_no_delete
+BEFORE DELETE ON fund_risk_classifications
+BEGIN
+    SELECT RAISE(ABORT, 'fund risk classifications are immutable');
+END;
+"""
+
+SCHEMA_V11 = """
+DROP TRIGGER fund_document_artifact_no_update;
+
+ALTER TABLE fund_document_artifacts ADD COLUMN landing_url TEXT CHECK(
+    landing_url IS NULL OR (
+        typeof(landing_url) = 'text'
+        AND instr(landing_url, char(0)) = 0
+        AND length(trim(landing_url)) > 0
+    )
+);
+
+UPDATE fund_document_artifacts SET landing_url = url;
+
+CREATE TRIGGER fund_document_artifact_landing_url_required
+BEFORE INSERT ON fund_document_artifacts
+WHEN NEW.landing_url IS NULL
+     OR typeof(NEW.landing_url) != 'text'
+     OR instr(NEW.landing_url, char(0)) != 0
+     OR length(trim(NEW.landing_url)) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'fund document artifact landing URL is required');
+END;
+
+CREATE TRIGGER fund_document_artifact_no_update
+BEFORE UPDATE ON fund_document_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'fund document artifacts are immutable');
+END;
+"""
+
+SCHEMA_V12 = """
+CREATE TABLE fund_document_parser_provenance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    parser_version TEXT NOT NULL CHECK(
+        typeof(parser_version) = 'text'
+        AND length(parser_version) > 0
+        AND substr(parser_version, 1, 1) GLOB '[a-z0-9]'
+        AND parser_version NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    converter_kind TEXT NOT NULL CHECK(
+        typeof(converter_kind) = 'text'
+        AND converter_kind IN ('none', 'docker_libreoffice')
+    ),
+    canonical_json TEXT NOT NULL UNIQUE CHECK(
+        typeof(canonical_json) = 'text'
+        AND instr(canonical_json, char(0)) = 0
+        AND json_valid(canonical_json)
+        AND json_type(canonical_json) = 'object'
+    ),
+    provenance_checksum TEXT NOT NULL UNIQUE CHECK(
+        typeof(provenance_checksum) = 'text'
+        AND length(CAST(provenance_checksum AS BLOB)) = 64
+        AND provenance_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL CHECK(
+        typeof(created_at) = 'text'
+        AND julianday(created_at) IS NOT NULL
+        AND substr(created_at, -6) = '+00:00'
+        AND substr(created_at, 11, 1) = 'T'
+    )
+);
+
+CREATE TABLE fund_document_parse_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    source_document_id INTEGER NOT NULL CHECK(
+        typeof(source_document_id) = 'integer' AND source_document_id > 0
+    ) REFERENCES fund_document_artifacts(id) ON DELETE RESTRICT,
+    provenance_id INTEGER NOT NULL CHECK(
+        typeof(provenance_id) = 'integer' AND provenance_id > 0
+    ) REFERENCES fund_document_parser_provenance(id) ON DELETE RESTRICT,
+    parser_input_sha256 TEXT NOT NULL CHECK(
+        typeof(parser_input_sha256) = 'text'
+        AND length(CAST(parser_input_sha256 AS BLOB)) = 64
+        AND parser_input_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    fact_set_fingerprint TEXT NOT NULL CHECK(
+        typeof(fact_set_fingerprint) = 'text'
+        AND length(CAST(fact_set_fingerprint AS BLOB)) = 64
+        AND fact_set_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL CHECK(
+        typeof(created_at) = 'text'
+        AND julianday(created_at) IS NOT NULL
+        AND substr(created_at, -6) = '+00:00'
+        AND substr(created_at, 11, 1) = 'T'
+    ),
+    UNIQUE(source_document_id, provenance_id)
+);
+
+CREATE TABLE __kunjin_fund_mandate_facts_v12_sequence (
+    seq INTEGER
+);
+INSERT INTO __kunjin_fund_mandate_facts_v12_sequence(seq)
+SELECT seq FROM sqlite_sequence WHERE name = 'fund_mandate_facts';
+
+DROP INDEX fund_mandate_facts_lookup;
+DROP TRIGGER fund_mandate_fact_no_replace;
+DROP TRIGGER fund_mandate_fact_no_update;
+DROP TRIGGER fund_mandate_fact_no_delete;
+ALTER TABLE fund_mandate_facts RENAME TO __kunjin_v11_fund_mandate_facts;
+
+CREATE TABLE fund_mandate_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id > 0),
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code) = 'text'
+        AND length(fund_code) = 6
+        AND fund_code NOT GLOB '*[^0-9]*'
+    ),
+    source_document_id INTEGER NOT NULL CHECK(
+        typeof(source_document_id) = 'integer' AND source_document_id > 0
+    ) REFERENCES fund_document_artifacts(id) ON DELETE RESTRICT,
+    fact_kind TEXT NOT NULL CHECK(
+        typeof(fact_kind) = 'text'
+        AND instr(fact_kind, char(0)) = 0
+        AND length(fact_kind) > 0
+        AND substr(fact_kind, 1, 1) GLOB '[a-z]'
+        AND fact_kind NOT GLOB '*[^a-z0-9_]*'
+    ),
+    normalized_value_json TEXT NOT NULL CHECK(
+        typeof(normalized_value_json) = 'text'
+        AND instr(normalized_value_json, char(0)) = 0
+        AND json_valid(normalized_value_json)
+    ),
+    unit TEXT CHECK(
+        unit IS NULL OR (
+            typeof(unit) = 'text'
+            AND instr(unit, char(0)) = 0
+            AND length(trim(unit)) BETWEEN 1 AND 64
+        )
+    ),
+    page_number INTEGER CHECK(
+        page_number IS NULL OR (
+            typeof(page_number) = 'integer' AND page_number > 0
+        )
+    ),
+    section_name TEXT CHECK(
+        section_name IS NULL OR (
+            typeof(section_name) = 'text'
+            AND instr(section_name, char(0)) = 0
+            AND length(trim(section_name)) BETWEEN 1 AND 256
+        )
+    ),
+    source_excerpt TEXT NOT NULL CHECK(
+        typeof(source_excerpt) = 'text'
+        AND instr(source_excerpt, char(0)) = 0
+        AND length(trim(source_excerpt)) BETWEEN 1 AND 4096
+    ),
+    effective_from TEXT CHECK(
+        effective_from IS NULL OR (
+            typeof(effective_from) = 'text'
+            AND instr(effective_from, char(0)) = 0
+            AND length(effective_from) = 10
+            AND strftime('%Y-%m-%d', effective_from) = effective_from
+        )
+    ),
+    effective_to TEXT CHECK(
+        effective_to IS NULL OR (
+            typeof(effective_to) = 'text'
+            AND instr(effective_to, char(0)) = 0
+            AND length(effective_to) = 10
+            AND strftime('%Y-%m-%d', effective_to) = effective_to
+        )
+    ),
+    confidence_state TEXT NOT NULL CHECK(
+        typeof(confidence_state) = 'text'
+        AND confidence_state IN ('exact', 'bounded_range', 'present', 'absent', 'ambiguous')
+    ),
+    parser_version TEXT NOT NULL CHECK(
+        typeof(parser_version) = 'text'
+        AND instr(parser_version, char(0)) = 0
+        AND length(parser_version) > 0
+        AND substr(parser_version, 1, 1) GLOB '[a-z0-9]'
+        AND parser_version NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    fact_fingerprint TEXT NOT NULL CHECK(
+        typeof(fact_fingerprint) = 'text'
+        AND instr(fact_fingerprint, char(0)) = 0
+        AND length(CAST(fact_fingerprint AS BLOB)) = 64
+        AND fact_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    parse_result_id INTEGER
+        REFERENCES fund_document_parse_results(id) ON DELETE RESTRICT,
+    CHECK(
+        effective_from IS NULL OR effective_to IS NULL
+        OR (effective_to COLLATE BINARY) >= (effective_from COLLATE BINARY)
+    ),
+    UNIQUE(parse_result_id, fact_fingerprint)
+);
+
+INSERT INTO fund_mandate_facts(
+    id, fund_code, source_document_id, parse_result_id, fact_kind,
+    normalized_value_json, unit, page_number, section_name, source_excerpt,
+    effective_from, effective_to, confidence_state, parser_version,
+    fact_fingerprint
+)
+SELECT
+    id, fund_code, source_document_id, NULL, fact_kind,
+    normalized_value_json, unit, page_number, section_name, source_excerpt,
+    effective_from, effective_to, confidence_state, parser_version,
+    fact_fingerprint
+FROM __kunjin_v11_fund_mandate_facts
+ORDER BY id;
+
+UPDATE sqlite_sequence
+SET seq = (SELECT seq FROM __kunjin_fund_mandate_facts_v12_sequence)
+WHERE name = 'fund_mandate_facts'
+  AND EXISTS (SELECT 1 FROM __kunjin_fund_mandate_facts_v12_sequence);
+
+DROP TABLE __kunjin_v11_fund_mandate_facts;
+DROP TABLE __kunjin_fund_mandate_facts_v12_sequence;
+
+CREATE INDEX fund_mandate_facts_lookup
+ON fund_mandate_facts(fund_code, fact_kind, source_document_id, id);
+
+CREATE TRIGGER fund_mandate_fact_no_replace
+BEFORE INSERT ON fund_mandate_facts
+WHEN EXISTS (
+    SELECT 1 FROM fund_mandate_facts
+    WHERE id = NEW.id
+       OR (
+           parse_result_id = NEW.parse_result_id
+           AND fact_fingerprint = NEW.fact_fingerprint
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund mandate facts are immutable');
+END;
+
+CREATE TRIGGER fund_mandate_fact_no_update
+BEFORE UPDATE ON fund_mandate_facts
+BEGIN
+    SELECT RAISE(ABORT, 'fund mandate facts are immutable');
+END;
+
+CREATE TRIGGER fund_mandate_fact_no_delete
+BEFORE DELETE ON fund_mandate_facts
+BEGIN
+    SELECT RAISE(ABORT, 'fund mandate facts are immutable');
+END;
+
+CREATE TABLE fund_document_parse_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    source_document_id INTEGER NOT NULL CHECK(
+        typeof(source_document_id) = 'integer' AND source_document_id > 0
+    ) REFERENCES fund_document_artifacts(id) ON DELETE RESTRICT,
+    provenance_id INTEGER NOT NULL CHECK(
+        typeof(provenance_id) = 'integer' AND provenance_id > 0
+    ) REFERENCES fund_document_parser_provenance(id) ON DELETE RESTRICT,
+    run_kind TEXT NOT NULL CHECK(run_kind IN ('live', 'legacy_backfill')),
+    outcome TEXT NOT NULL CHECK(outcome IN ('success', 'failed')),
+    parse_result_id INTEGER REFERENCES fund_document_parse_results(id) ON DELETE RESTRICT,
+    public_error_code TEXT CHECK(
+        public_error_code IS NULL OR public_error_code IN (
+            'official_document_unavailable', 'official_document_invalid',
+            'official_document_resource_limit', 'official_document_parse_failed',
+            'classification_storage_failed'
+        )
+    ),
+    failure_stage TEXT CHECK(
+        failure_stage IS NULL OR failure_stage IN (
+            'discovery', 'landing_validation', 'retrieval', 'identity_validation',
+            'container_validation', 'conversion', 'parser', 'persistence', 'unspecified'
+        )
+    ),
+    failure_reason TEXT CHECK(
+        failure_reason IS NULL OR failure_reason IN (
+            'dns_unavailable', 'network_unavailable', 'http_unavailable',
+            'source_unregistered', 'redirect_rejected', 'discovery_format_invalid',
+            'identity_mismatch', 'publication_date_missing', 'landing_format_invalid',
+            'landing_title_mismatch', 'landing_date_mismatch', 'attachment_missing',
+            'attachment_ambiguous', 'attachment_host_rejected', 'authentication_shell',
+            'empty_or_script_only_html', 'declared_mime_unsupported',
+            'detected_container_unknown', 'declared_detected_mismatch',
+            'legacy_ole_container_unsupported', 'legacy_converter_unavailable',
+            'legacy_converter_timeout', 'legacy_converter_resource_limit',
+            'legacy_converter_failed', 'legacy_converter_output_invalid',
+            'resource_limit', 'parser_format_invalid', 'parser_identity_mismatch',
+            'parser_effective_date_invalid', 'parser_ambiguous_fact', 'clock_invalid',
+            'managed_artifact_invalid', 'storage_failure', 'unspecified_failure'
+        )
+    ),
+    attempted_at TEXT NOT NULL CHECK(
+        typeof(attempted_at) = 'text'
+        AND julianday(attempted_at) IS NOT NULL
+        AND substr(attempted_at, -6) = '+00:00'
+        AND substr(attempted_at, 11, 1) = 'T'
+    ),
+    CHECK(
+        (outcome = 'success' AND parse_result_id IS NOT NULL
+         AND public_error_code IS NULL AND failure_stage IS NULL AND failure_reason IS NULL)
+        OR
+        (outcome = 'failed' AND parse_result_id IS NULL AND public_error_code IS NOT NULL
+         AND (
+             (run_kind = 'live' AND failure_stage IS NOT NULL AND failure_reason IS NOT NULL)
+             OR
+             (run_kind = 'legacy_backfill' AND failure_stage IS NULL AND failure_reason IS NULL
+              AND public_error_code IN (
+                  'official_document_parse_failed', 'official_document_resource_limit'
+              ))
+         ))
+    )
+);
+
+CREATE TABLE fund_document_refresh_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code) = 'text'
+        AND length(fund_code) = 6
+        AND fund_code NOT GLOB '*[^0-9]*'
+    ),
+    started_at TEXT NOT NULL CHECK(
+        typeof(started_at) = 'text'
+        AND julianday(started_at) IS NOT NULL
+        AND substr(started_at, -6) = '+00:00'
+        AND substr(started_at, 11, 1) = 'T'
+    )
+);
+
+CREATE TABLE fund_document_refresh_completions (
+    refresh_run_id INTEGER PRIMARY KEY CHECK(
+        typeof(refresh_run_id) = 'integer' AND refresh_run_id > 0
+    ) REFERENCES fund_document_refresh_runs(id) ON DELETE RESTRICT,
+    outcome TEXT NOT NULL CHECK(outcome IN ('success', 'partial', 'failed', 'empty')),
+    public_error_code TEXT CHECK(
+        public_error_code IS NULL OR public_error_code IN (
+            'official_document_unavailable', 'official_document_invalid',
+            'official_document_resource_limit', 'official_document_parse_failed',
+            'classification_storage_failed'
+        )
+    ),
+    failure_stage TEXT CHECK(
+        failure_stage IS NULL OR failure_stage IN (
+            'discovery', 'landing_validation', 'retrieval', 'identity_validation',
+            'container_validation', 'conversion', 'parser', 'persistence', 'unspecified'
+        )
+    ),
+    failure_reason TEXT CHECK(
+        failure_reason IS NULL OR failure_reason IN (
+            'dns_unavailable', 'network_unavailable', 'http_unavailable',
+            'source_unregistered', 'redirect_rejected', 'discovery_format_invalid',
+            'identity_mismatch', 'publication_date_missing', 'landing_format_invalid',
+            'landing_title_mismatch', 'landing_date_mismatch', 'attachment_missing',
+            'attachment_ambiguous', 'attachment_host_rejected', 'authentication_shell',
+            'empty_or_script_only_html', 'declared_mime_unsupported',
+            'detected_container_unknown', 'declared_detected_mismatch',
+            'legacy_ole_container_unsupported', 'legacy_converter_unavailable',
+            'legacy_converter_timeout', 'legacy_converter_resource_limit',
+            'legacy_converter_failed', 'legacy_converter_output_invalid',
+            'resource_limit', 'parser_format_invalid', 'parser_identity_mismatch',
+            'parser_effective_date_invalid', 'parser_ambiguous_fact', 'clock_invalid',
+            'managed_artifact_invalid', 'storage_failure', 'unspecified_failure'
+        )
+    ),
+    completed_at TEXT NOT NULL CHECK(
+        typeof(completed_at) = 'text'
+        AND julianday(completed_at) IS NOT NULL
+        AND substr(completed_at, -6) = '+00:00'
+        AND substr(completed_at, 11, 1) = 'T'
+    ),
+    CHECK(
+        (outcome IN ('success', 'partial', 'empty') AND public_error_code IS NULL
+         AND failure_stage IS NULL AND failure_reason IS NULL)
+        OR
+        (outcome = 'failed' AND public_error_code IS NOT NULL
+         AND failure_stage IS NOT NULL AND failure_reason IS NOT NULL)
+    )
+);
+
+CREATE TABLE fund_document_candidate_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    refresh_run_id INTEGER NOT NULL CHECK(
+        typeof(refresh_run_id) = 'integer' AND refresh_run_id > 0
+    ) REFERENCES fund_document_refresh_runs(id) ON DELETE RESTRICT,
+    candidate_fingerprint TEXT NOT NULL CHECK(
+        typeof(candidate_fingerprint) = 'text'
+        AND length(CAST(candidate_fingerprint AS BLOB)) = 64
+        AND candidate_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code) = 'text'
+        AND length(fund_code) = 6
+        AND fund_code NOT GLOB '*[^0-9]*'
+    ),
+    document_kind TEXT NOT NULL CHECK(document_kind IN (
+        'fund_contract', 'prospectus', 'prospectus_update', 'product_summary',
+        'annual_report', 'semiannual_report', 'quarterly_report',
+        'index_methodology', 'classification_announcement'
+    )),
+    url TEXT NOT NULL CHECK(
+        typeof(url) = 'text' AND instr(url, char(0)) = 0 AND length(trim(url)) > 0
+    ),
+    published_at TEXT CHECK(
+        published_at IS NULL OR (
+            typeof(published_at) = 'text'
+            AND julianday(published_at) IS NOT NULL
+            AND substr(published_at, -6) = '+00:00'
+            AND substr(published_at, 11, 1) = 'T'
+        )
+    ),
+    outcome TEXT NOT NULL CHECK(outcome IN ('success', 'failed')),
+    source_document_id INTEGER REFERENCES fund_document_artifacts(id) ON DELETE RESTRICT,
+    parse_run_id INTEGER REFERENCES fund_document_parse_runs(id) ON DELETE RESTRICT,
+    public_error_code TEXT CHECK(
+        public_error_code IS NULL OR public_error_code IN (
+            'official_document_unavailable', 'official_document_invalid',
+            'official_document_resource_limit', 'official_document_parse_failed',
+            'classification_storage_failed'
+        )
+    ),
+    failure_stage TEXT CHECK(
+        failure_stage IS NULL OR failure_stage IN (
+            'discovery', 'landing_validation', 'retrieval', 'identity_validation',
+            'container_validation', 'conversion', 'parser', 'persistence', 'unspecified'
+        )
+    ),
+    failure_reason TEXT CHECK(
+        failure_reason IS NULL OR failure_reason IN (
+            'dns_unavailable', 'network_unavailable', 'http_unavailable',
+            'source_unregistered', 'redirect_rejected', 'discovery_format_invalid',
+            'identity_mismatch', 'publication_date_missing', 'landing_format_invalid',
+            'landing_title_mismatch', 'landing_date_mismatch', 'attachment_missing',
+            'attachment_ambiguous', 'attachment_host_rejected', 'authentication_shell',
+            'empty_or_script_only_html', 'declared_mime_unsupported',
+            'detected_container_unknown', 'declared_detected_mismatch',
+            'legacy_ole_container_unsupported', 'legacy_converter_unavailable',
+            'legacy_converter_timeout', 'legacy_converter_resource_limit',
+            'legacy_converter_failed', 'legacy_converter_output_invalid',
+            'resource_limit', 'parser_format_invalid', 'parser_identity_mismatch',
+            'parser_effective_date_invalid', 'parser_ambiguous_fact', 'clock_invalid',
+            'managed_artifact_invalid', 'storage_failure', 'unspecified_failure'
+        )
+    ),
+    created_at TEXT NOT NULL CHECK(
+        typeof(created_at) = 'text'
+        AND julianday(created_at) IS NOT NULL
+        AND substr(created_at, -6) = '+00:00'
+        AND substr(created_at, 11, 1) = 'T'
+    ),
+    CHECK(
+        (outcome = 'success' AND source_document_id IS NOT NULL AND parse_run_id IS NOT NULL
+         AND public_error_code IS NULL AND failure_stage IS NULL AND failure_reason IS NULL)
+        OR
+        (outcome = 'failed' AND public_error_code IS NOT NULL
+         AND failure_stage IS NOT NULL AND failure_reason IS NOT NULL
+         AND ((source_document_id IS NULL AND parse_run_id IS NULL)
+              OR (source_document_id IS NOT NULL AND parse_run_id IS NOT NULL)))
+    ),
+    UNIQUE(refresh_run_id, candidate_fingerprint)
+);
+
+CREATE INDEX fund_document_refresh_runs_fund
+ON fund_document_refresh_runs(fund_code, started_at DESC, id DESC);
+CREATE INDEX fund_document_candidate_runs_refresh
+ON fund_document_candidate_runs(refresh_run_id, id);
+CREATE INDEX fund_document_parse_results_source
+ON fund_document_parse_results(source_document_id, provenance_id, id);
+CREATE INDEX fund_document_parse_runs_source
+ON fund_document_parse_runs(source_document_id, provenance_id, attempted_at DESC, id DESC);
+
+CREATE TRIGGER fund_document_parse_result_binding
+BEFORE INSERT ON fund_document_parse_results
+WHEN NOT EXISTS (
+    SELECT 1 FROM fund_document_artifacts AS artifact
+    JOIN fund_document_parser_provenance AS provenance ON provenance.id = NEW.provenance_id
+    WHERE artifact.id = NEW.source_document_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document parse result binding is invalid');
+END;
+
+CREATE TRIGGER fund_document_parse_run_binding
+BEFORE INSERT ON fund_document_parse_runs
+WHEN NEW.parse_result_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM fund_document_parse_results AS result
+    WHERE result.id = NEW.parse_result_id
+      AND result.source_document_id = NEW.source_document_id
+      AND result.provenance_id = NEW.provenance_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document parse run binding is invalid');
+END;
+
+CREATE TRIGGER fund_document_candidate_run_binding
+BEFORE INSERT ON fund_document_candidate_runs
+WHEN NOT EXISTS (
+    SELECT 1 FROM fund_document_refresh_runs AS refresh
+    WHERE refresh.id = NEW.refresh_run_id AND refresh.fund_code = NEW.fund_code
+)
+OR (
+    NEW.source_document_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM fund_document_artifacts AS artifact
+        WHERE artifact.id = NEW.source_document_id
+          AND artifact.fund_code = NEW.fund_code
+          AND artifact.document_kind = NEW.document_kind
+          AND artifact.landing_url = NEW.url
+          AND artifact.published_at IS NEW.published_at
+    )
+)
+OR (
+    NEW.parse_run_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM fund_document_parse_runs AS run
+        WHERE run.id = NEW.parse_run_id
+          AND run.source_document_id = NEW.source_document_id
+          AND run.outcome = NEW.outcome
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document candidate run binding is invalid');
+END;
+
+CREATE TRIGGER fund_document_fact_result_required
+BEFORE INSERT ON fund_mandate_facts
+WHEN NEW.parse_result_id IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'fund mandate fact parse result is required');
+END;
+
+CREATE TRIGGER fund_document_fact_result_binding_insert
+BEFORE INSERT ON fund_mandate_facts
+WHEN NEW.parse_result_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM fund_document_parse_results AS result
+    JOIN fund_document_parser_provenance AS provenance
+      ON provenance.id = result.provenance_id
+    JOIN fund_document_artifacts AS artifact
+      ON artifact.id = result.source_document_id
+    WHERE result.id = NEW.parse_result_id
+      AND result.source_document_id = NEW.source_document_id
+      AND provenance.parser_version = NEW.parser_version
+      AND artifact.fund_code = NEW.fund_code
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund mandate fact parse result binding is invalid');
+END;
+
+CREATE TRIGGER fund_document_fact_result_binding_update
+BEFORE UPDATE OF parse_result_id ON fund_mandate_facts
+WHEN NEW.parse_result_id IS NULL OR NOT EXISTS (
+    SELECT 1 FROM fund_document_parse_results AS result
+    JOIN fund_document_parser_provenance AS provenance
+      ON provenance.id = result.provenance_id
+    JOIN fund_document_artifacts AS artifact
+      ON artifact.id = result.source_document_id
+    WHERE result.id = NEW.parse_result_id
+      AND result.source_document_id = NEW.source_document_id
+      AND provenance.parser_version = NEW.parser_version
+      AND artifact.fund_code = NEW.fund_code
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund mandate fact parse result binding is invalid');
+END;
+
+CREATE TRIGGER fund_document_parser_provenance_no_replace
+BEFORE INSERT ON fund_document_parser_provenance
+WHEN EXISTS (
+    SELECT 1 FROM fund_document_parser_provenance
+    WHERE id = NEW.id OR provenance_checksum = NEW.provenance_checksum
+       OR canonical_json = NEW.canonical_json
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document parser provenance is immutable');
+END;
+CREATE TRIGGER fund_document_parser_provenance_no_update
+BEFORE UPDATE ON fund_document_parser_provenance BEGIN
+    SELECT RAISE(ABORT, 'fund document parser provenance is immutable');
+END;
+CREATE TRIGGER fund_document_parser_provenance_no_delete
+BEFORE DELETE ON fund_document_parser_provenance BEGIN
+    SELECT RAISE(ABORT, 'fund document parser provenance is immutable');
+END;
+CREATE TRIGGER fund_document_parse_result_no_replace
+BEFORE INSERT ON fund_document_parse_results
+WHEN EXISTS (
+    SELECT 1 FROM fund_document_parse_results
+    WHERE id = NEW.id OR (
+        source_document_id = NEW.source_document_id AND provenance_id = NEW.provenance_id
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document parse results are immutable');
+END;
+CREATE TRIGGER fund_document_parse_result_no_update
+BEFORE UPDATE ON fund_document_parse_results BEGIN
+    SELECT RAISE(ABORT, 'fund document parse results are immutable');
+END;
+CREATE TRIGGER fund_document_parse_result_no_delete
+BEFORE DELETE ON fund_document_parse_results BEGIN
+    SELECT RAISE(ABORT, 'fund document parse results are immutable');
+END;
+CREATE TRIGGER fund_document_parse_run_no_replace
+BEFORE INSERT ON fund_document_parse_runs
+WHEN EXISTS (SELECT 1 FROM fund_document_parse_runs WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document parse runs are immutable');
+END;
+CREATE TRIGGER fund_document_parse_run_no_update
+BEFORE UPDATE ON fund_document_parse_runs BEGIN
+    SELECT RAISE(ABORT, 'fund document parse runs are immutable');
+END;
+CREATE TRIGGER fund_document_parse_run_no_delete
+BEFORE DELETE ON fund_document_parse_runs BEGIN
+    SELECT RAISE(ABORT, 'fund document parse runs are immutable');
+END;
+CREATE TRIGGER fund_document_refresh_run_no_replace
+BEFORE INSERT ON fund_document_refresh_runs
+WHEN EXISTS (SELECT 1 FROM fund_document_refresh_runs WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document refresh runs are immutable');
+END;
+CREATE TRIGGER fund_document_refresh_run_no_update
+BEFORE UPDATE ON fund_document_refresh_runs BEGIN
+    SELECT RAISE(ABORT, 'fund document refresh runs are immutable');
+END;
+CREATE TRIGGER fund_document_refresh_run_no_delete
+BEFORE DELETE ON fund_document_refresh_runs BEGIN
+    SELECT RAISE(ABORT, 'fund document refresh runs are immutable');
+END;
+CREATE TRIGGER fund_document_refresh_completion_no_replace
+BEFORE INSERT ON fund_document_refresh_completions
+WHEN EXISTS (
+    SELECT 1 FROM fund_document_refresh_completions
+    WHERE refresh_run_id = NEW.refresh_run_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document refresh completions are immutable');
+END;
+CREATE TRIGGER fund_document_refresh_completion_no_update
+BEFORE UPDATE ON fund_document_refresh_completions BEGIN
+    SELECT RAISE(ABORT, 'fund document refresh completions are immutable');
+END;
+CREATE TRIGGER fund_document_refresh_completion_no_delete
+BEFORE DELETE ON fund_document_refresh_completions BEGIN
+    SELECT RAISE(ABORT, 'fund document refresh completions are immutable');
+END;
+CREATE TRIGGER fund_document_candidate_run_no_replace
+BEFORE INSERT ON fund_document_candidate_runs
+WHEN EXISTS (
+    SELECT 1 FROM fund_document_candidate_runs
+    WHERE id = NEW.id OR (
+        refresh_run_id = NEW.refresh_run_id
+        AND candidate_fingerprint = NEW.candidate_fingerprint
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document candidate runs are immutable');
+END;
+CREATE TRIGGER fund_document_candidate_run_no_update
+BEFORE UPDATE ON fund_document_candidate_runs BEGIN
+    SELECT RAISE(ABORT, 'fund document candidate runs are immutable');
+END;
+CREATE TRIGGER fund_document_candidate_run_no_delete
+BEFORE DELETE ON fund_document_candidate_runs BEGIN
+    SELECT RAISE(ABORT, 'fund document candidate runs are immutable');
 END;
 """

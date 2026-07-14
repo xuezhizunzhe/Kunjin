@@ -21,6 +21,15 @@ class DocumentKind(str, Enum):
     QUARTERLY_HOLDINGS = "quarterly_holdings"
     INDUSTRY_EXPOSURE = "industry_exposure"
     ANNOUNCEMENT = "announcement"
+    FUND_CONTRACT = "fund_contract"
+    PROSPECTUS = "prospectus"
+    PROSPECTUS_UPDATE = "prospectus_update"
+    PRODUCT_SUMMARY = "product_summary"
+    ANNUAL_REPORT = "annual_report"
+    SEMIANNUAL_REPORT = "semiannual_report"
+    QUARTERLY_REPORT = "quarterly_report"
+    INDEX_METHODOLOGY = "index_methodology"
+    CLASSIFICATION_ANNOUNCEMENT = "classification_announcement"
 
 
 class FeeType(str, Enum):
@@ -350,10 +359,7 @@ class DisclosureBundle:
                 raise ValueError("bundle facts must match the bundle fund code")
             fact.validate()
             source_document_id = fact.source_document_id
-            if (
-                source_document_id is not None
-                and source_document_id not in self.source_documents
-            ):
+            if source_document_id is not None and source_document_id not in self.source_documents:
                 raise ValueError("bundle fact references a missing source document")
         for source_id, source in self.source_documents.items():
             if source.id != source_id:

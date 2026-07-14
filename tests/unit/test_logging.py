@@ -533,6 +533,142 @@ class LoggingTest(unittest.TestCase):
         self.assertIn("weighted_horizon_equity_ceiling=Decimal('0.47')", record.getMessage())
         self.assertIn("equity_stress_loss=Decimal('0.50')", record.getMessage())
 
+    def test_d1_internal_document_and_parser_fields_are_redacted(self) -> None:
+        value = {
+            "managed_artifact_path": "/Users/private/fund-documents/a.pdf",
+            "artifact_path": "/private/tmp/a.pdf",
+            "local_path": "/Users/private/source.pdf",
+            "raw_body": "raw-body-sentinel",
+            "raw_response_body": "raw-response-sentinel",
+            "response_body": "response-sentinel",
+            "parser_exception": "parser-exception-sentinel",
+            "parser_exception_chain": "parser-chain-sentinel",
+            "embedded_file_metadata": {"name": "secret-attachment.bin"},
+        }
+
+        redacted = redact_secrets(value)
+        rendered = json.dumps(redacted, ensure_ascii=False)
+
+        for sentinel in (
+            "/Users/private/fund-documents/a.pdf",
+            "/private/tmp/a.pdf",
+            "/Users/private/source.pdf",
+            "raw-body-sentinel",
+            "raw-response-sentinel",
+            "response-sentinel",
+            "parser-exception-sentinel",
+            "parser-chain-sentinel",
+            "secret-attachment.bin",
+        ):
+            self.assertNotIn(sentinel, rendered)
+
+    def test_d1_public_audit_fields_remain_visible_but_input_fingerprint_is_redacted(
+        self,
+    ) -> None:
+        fingerprint = "a" * 64
+        report = {
+            "capability": "research_only",
+            "fund_code": "519755",
+            "classification": {
+                "input_fingerprint": fingerprint,
+                "policy_version": "1",
+                "product_family": "broad_index_equity",
+                "risk_bucket": "diversified_equity",
+                "portfolio_role": "core_eligible",
+            },
+            "evidence_status": "verified",
+            "sources": [
+                {
+                    "url": "https://www.fund001.com/public.pdf",
+                    "title": "official title",
+                    "checksum": "b" * 64,
+                    "published_at": "2026-07-13T00:00:00+00:00",
+                }
+            ],
+            "verified_facts": [{"source_excerpt": "bounded public excerpt"}],
+        }
+
+        redacted = redact_secrets(report)
+
+        self.assertEqual(redacted["classification"]["input_fingerprint"], "[REDACTED]")
+        rendered = json.dumps(redacted, ensure_ascii=False)
+        for public_value in (
+            "https://www.fund001.com/public.pdf",
+            "official title",
+            "bounded public excerpt",
+            "b" * 64,
+            "2026-07-13T00:00:00+00:00",
+        ):
+            self.assertIn(public_value, rendered)
+
+        record = logging.LogRecord(
+            "x",
+            logging.INFO,
+            __file__,
+            1,
+            "risk report: %r",
+            (report,),
+            None,
+        )
+        record.context = report
+        SecretRedactionFilter().filter(record)
+        self.assertEqual(record.context["classification"]["input_fingerprint"], "[REDACTED]")
+        self.assertNotIn(fingerprint, record.getMessage())
+        self.assertIn("[REDACTED]", record.getMessage())
+        self.assertIn("https://www.fund001.com/public.pdf", record.getMessage())
+
+    def test_disguised_d1_free_text_cannot_expose_input_fingerprint(self) -> None:
+        fingerprint = "d" * 64
+        value = (
+            "research_only classification product_family evidence_status "
+            f"input_fingerprint={fingerprint}"
+        )
+        record = logging.LogRecord(
+            "x",
+            logging.ERROR,
+            __file__,
+            1,
+            "risk failure: %s",
+            (RuntimeError(value),),
+            None,
+        )
+
+        redacted = redact_secrets(value)
+        SecretRedactionFilter().filter(record)
+
+        self.assertNotIn(fingerprint, redacted)
+        self.assertIn("input_fingerprint=[REDACTED]", redacted)
+        self.assertNotIn(fingerprint, record.getMessage())
+        self.assertIn("input_fingerprint=[REDACTED]", record.getMessage())
+
+    def test_disguised_d1_mapping_cannot_expose_input_fingerprint(self) -> None:
+        fingerprint = "e" * 64
+        value = {
+            "capability": "research_only",
+            "fund_code": "519755",
+            "evidence_status": "verified",
+            "classification": {
+                "input_fingerprint": fingerprint,
+                "policy_version": "1",
+                "product_family": "broad_index",
+                "risk_bucket": "diversified_equity",
+                "portfolio_role": "core_eligible",
+            },
+        }
+        record = logging.LogRecord("x", logging.INFO, __file__, 1, "risk audit", (), None)
+        record.context = value
+
+        redacted = redact_secrets(value)
+        SecretRedactionFilter().filter(record)
+
+        self.assertEqual(redacted["classification"]["input_fingerprint"], "[REDACTED]")
+        self.assertEqual(record.context["classification"]["input_fingerprint"], "[REDACTED]")
+
+    def test_non_d1_input_fingerprint_remains_redacted(self) -> None:
+        value = {"input_fingerprint": "c" * 64, "status": "range_available"}
+
+        self.assertEqual(redact_secrets(value)["input_fingerprint"], "[REDACTED]")
+
 
 if __name__ == "__main__":
     unittest.main()

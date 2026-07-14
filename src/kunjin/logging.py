@@ -16,6 +16,19 @@ _SECRET_KEYS = (
     "card_number",
     "phone",
     "managed_path",
+    "managed_artifact_path",
+    "artifact_path",
+    "local_path",
+    "raw_body",
+    "raw_response_body",
+    "response_body",
+    "parser_exception",
+    "parser_exception_chain",
+    "exception_chain",
+    "embedded_file",
+    "embedded_files",
+    "embedded_file_metadata",
+    "embedded_metadata",
     "monthly_net_income",
     "monthly_essential_expenses",
     "monthly_required_debt_service",
@@ -127,6 +140,10 @@ _SECRET_PATTERN = re.compile(
 
 
 def redact_secrets(value: Any) -> Any:
+    return _redact_value(value)
+
+
+def _redact_value(value: Any) -> Any:
     if type(value).__name__ in _SECRET_TYPE_NAMES:
         return "[REDACTED]"
     if isinstance(value, (bytes, bytearray)):
@@ -144,18 +161,18 @@ def redact_secrets(value: Any) -> Any:
             key: (
                 "[REDACTED]"
                 if isinstance(key, str) and key.casefold() in _SECRET_KEY_SET
-                else redact_secrets(item)
+                else _redact_value(item)
             )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [redact_secrets(item) for item in value]
+        return [_redact_value(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(redact_secrets(item) for item in value)
+        return tuple(_redact_value(item) for item in value)
     if isinstance(value, set):
-        return {redact_secrets(item) for item in value}
+        return {_redact_value(item) for item in value}
     if isinstance(value, frozenset):
-        return frozenset(redact_secrets(item) for item in value)
+        return frozenset(_redact_value(item) for item in value)
     if not isinstance(value, str):
         return value
 
