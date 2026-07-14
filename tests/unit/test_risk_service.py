@@ -62,6 +62,7 @@ from kunjin.funds.risk.parsers import (
 from kunjin.funds.risk.policy import ClassificationPolicyV1
 from kunjin.funds.risk.research import build_authenticated_risk_research_report
 from kunjin.funds.risk.service import (
+    DocumentSelectionItem,
     DocumentSyncItem,
     FundRiskService,
     RiskServiceError,
@@ -612,6 +613,7 @@ class FakeRiskStore:
         self.failed_artifacts: list[tuple[RetrievedArtifact, str, str]] = []
         self.failed_parser_state: list[object] = []
         self.candidate_outcomes: list[tuple[str, int, OfficialDocumentCandidate]] = []
+        self.published_selections: list[object] = []
         self.events = [] if events is None else events
         self.refreshes: dict[int, dict[str, object]] = {}
         self.records = (
@@ -640,6 +642,12 @@ class FakeRiskStore:
             "completion": None,
         }
         return refresh_id
+
+    def publish_document_selection(self, plan: object, created_at: datetime) -> object:
+        del created_at
+        self.events.append("publish_selection")
+        self.published_selections.append(plan)
+        return plan
 
     def complete_document_refresh(
         self,
@@ -1429,12 +1437,230 @@ class RiskServiceBoundaryTest(unittest.TestCase):
             clock=lambda: NOW,
         ).sync_documents("519755")
 
-        self.assertEqual(events, ["begin_refresh", "discover", "complete_refresh"])
+        self.assertEqual(
+            events,
+            ["begin_refresh", "discover", "publish_selection", "complete_refresh"],
+        )
         self.assertEqual(result.status, "empty")
         self.assertEqual(
             store.refreshes[1]["completion"][0],
             RefreshOutcome.EMPTY,
         )
+
+    def test_sync_persists_selection_before_fetch_and_attempts_only_selected_candidates(
+        self,
+    ) -> None:
+        events: list[object] = []
+        old_quarter = replace(
+            candidate(DocumentKind.QUARTERLY_REPORT, "old-quarter"),
+            published_at=NOW - timedelta(days=2),
+        )
+        new_quarter = replace(
+            candidate(DocumentKind.QUARTERLY_REPORT, "new-quarter"),
+            published_at=NOW - timedelta(days=1),
+        )
+        annual = replace(
+            candidate(DocumentKind.ANNUAL_REPORT, "new-annual"),
+            published_at=NOW - timedelta(days=1),
+        )
+        summary = candidate(DocumentKind.PRODUCT_SUMMARY, "summary")
+
+        class RecordingDiscovery(FakeDiscovery):
+            def discover(self, fund_code: str, **kwargs: object):
+                events.append("discover")
+                return super().discover(fund_code, **kwargs)
+
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def fetch(self, value: OfficialDocumentCandidate) -> RetrievedArtifact:
+                events.append(("fetch", value.url))
+                self.urls.append(value.url)
+                raise OfficialDocumentUnavailableError(
+                    DocumentFailureStage.RETRIEVAL,
+                    DocumentFailureReason.NETWORK_UNAVAILABLE,
+                    "private network detail",
+                )
+
+        store = FakeRiskStore(events=events)
+        client = RecordingClient()
+        result = FundRiskService(
+            risk_store=store,
+            disclosure_store=FakeDisclosureStore(),
+            repository=SimpleNamespace(),
+            discovery=RecordingDiscovery((old_quarter, new_quarter, annual, summary)),
+            document_client=client,
+            clock=lambda: NOW,
+        ).sync_documents("519755")
+
+        self.assertEqual(events[:3], ["begin_refresh", "discover", "publish_selection"])
+        self.assertEqual(
+            client.urls,
+            [new_quarter.url, annual.url, summary.url],
+        )
+        self.assertNotIn(old_quarter.url, client.urls)
+        self.assertEqual(
+            tuple(item.document_kind for item in result.selections),
+            ("annual_report", "quarterly_report", "semiannual_report"),
+        )
+        self.assertEqual(result.selections[0].selected_url, annual.url)
+        self.assertEqual(result.selections[1].selected_url, new_quarter.url)
+        self.assertEqual(
+            result.selections[2].reason_code,
+            "current_periodic_candidate_missing",
+        )
+        self.assertEqual(
+            result.selection_checksum,
+            store.published_selections[0].selection_checksum,
+        )
+
+    def test_newest_failure_does_not_fallback_to_an_older_periodic_report(self) -> None:
+        old = replace(
+            candidate(DocumentKind.ANNUAL_REPORT, "old-annual"),
+            published_at=NOW - timedelta(days=2),
+        )
+        newest = replace(
+            candidate(DocumentKind.ANNUAL_REPORT, "newest-annual"),
+            published_at=NOW - timedelta(days=1),
+        )
+
+        class RecordingClient(RaisingDocumentClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    OfficialDocumentUnavailableError(
+                        DocumentFailureStage.RETRIEVAL,
+                        DocumentFailureReason.NETWORK_UNAVAILABLE,
+                        "private network detail",
+                    )
+                )
+                self.urls: list[str] = []
+
+            def fetch(self, value: OfficialDocumentCandidate) -> RetrievedArtifact:
+                self.urls.append(value.url)
+                return super().fetch(value)
+
+        client = RecordingClient()
+        result = FundRiskService(
+            risk_store=FakeRiskStore(),
+            disclosure_store=FakeDisclosureStore(),
+            repository=SimpleNamespace(),
+            discovery=FakeDiscovery((old, newest)),
+            document_client=client,
+            clock=lambda: NOW,
+        ).sync_documents("519755")
+
+        self.assertEqual(client.urls, [newest.url])
+        self.assertEqual(result.documents[0].url, newest.url)
+        self.assertEqual(result.documents[0].failure_stage, "retrieval")
+        self.assertEqual(result.documents[0].failure_reason, "network_unavailable")
+        with self.assertRaises(ValueError):
+            replace(
+                result,
+                documents=(replace(result.documents[0], url=old.url),),
+            ).validate()
+        with self.assertRaises(ValueError):
+            replace(result, selection_checksum="A" * 64).validate()
+
+    def test_newest_time_tie_is_persisted_and_downloads_neither_candidate(self) -> None:
+        first = candidate(DocumentKind.QUARTERLY_REPORT, "quarter-a")
+        second = candidate(DocumentKind.QUARTERLY_REPORT, "quarter-b")
+
+        class RejectingClient:
+            def fetch(self, value: OfficialDocumentCandidate) -> RetrievedArtifact:
+                raise AssertionError(f"conflicted candidate must not be fetched: {value.url}")
+
+        store = FakeRiskStore()
+        result = FundRiskService(
+            risk_store=store,
+            disclosure_store=FakeDisclosureStore(),
+            repository=SimpleNamespace(),
+            discovery=FakeDiscovery((first, second)),
+            document_client=RejectingClient(),
+            clock=lambda: NOW,
+        ).sync_documents("519755")
+
+        self.assertEqual(result.status, "empty")
+        self.assertEqual(result.documents, ())
+        quarterly = next(
+            item for item in result.selections if item.document_kind == "quarterly_report"
+        )
+        self.assertEqual(quarterly.status, "conflicted")
+        self.assertEqual(quarterly.candidate_count, 2)
+        self.assertIsNone(quarterly.selected_url)
+        self.assertEqual(
+            quarterly.reason_code,
+            "current_periodic_candidate_conflict",
+        )
+        self.assertEqual(store.candidate_outcomes, [])
+
+    def test_published_selection_is_not_mixed_when_upstream_candidates_change(self) -> None:
+        selected = replace(
+            candidate(DocumentKind.ANNUAL_REPORT, "selected-annual"),
+            published_at=NOW - timedelta(days=1),
+        )
+        later = candidate(DocumentKind.ANNUAL_REPORT, "later-annual")
+        discovery = FakeDiscovery((selected,))
+
+        class SwitchingStore(FakeRiskStore):
+            def publish_document_selection(self, plan: object, created_at: datetime) -> object:
+                stored = super().publish_document_selection(plan, created_at)
+                discovery.candidates = (later,)
+                return stored
+
+        class RecordingClient(RaisingDocumentClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    OfficialDocumentUnavailableError(
+                        DocumentFailureStage.RETRIEVAL,
+                        DocumentFailureReason.NETWORK_UNAVAILABLE,
+                        "private network detail",
+                    )
+                )
+                self.urls: list[str] = []
+
+            def fetch(self, value: OfficialDocumentCandidate) -> RetrievedArtifact:
+                self.urls.append(value.url)
+                return super().fetch(value)
+
+        client = RecordingClient()
+        result = FundRiskService(
+            risk_store=SwitchingStore(),
+            disclosure_store=FakeDisclosureStore(),
+            repository=SimpleNamespace(),
+            discovery=discovery,
+            document_client=client,
+            clock=lambda: NOW,
+        ).sync_documents("519755")
+
+        self.assertEqual(client.urls, [selected.url])
+        annual = next(
+            item for item in result.selections if item.document_kind == "annual_report"
+        )
+        self.assertEqual(annual.selected_url, selected.url)
+        self.assertNotEqual(annual.selected_url, later.url)
+
+    def test_document_selection_item_rejects_unknown_or_private_state(self) -> None:
+        valid = DocumentSelectionItem(
+            document_kind="annual_report",
+            status="selected",
+            selected_url="https://www.fund001.com/annual.html",
+            candidate_count=1,
+            reason_code=None,
+        )
+        valid.validate()
+        invalid = (
+            replace(valid, status="unknown"),
+            replace(valid, reason_code="current_periodic_candidate_missing"),
+            replace(valid, selected_url=None),
+            replace(valid, candidate_count=0),
+        )
+        for item in invalid:
+            with self.subTest(item=item), self.assertRaises(ValueError):
+                item.validate()
+        object.__setattr__(valid, "candidate_fingerprints", ("a" * 64,))
+        with self.assertRaises(ValueError):
+            valid.validate()
 
     def test_discovery_failure_completes_refresh_failed_without_reusing_history(self) -> None:
         historical = stored_document(

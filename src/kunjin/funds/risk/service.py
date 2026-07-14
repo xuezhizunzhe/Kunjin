@@ -57,6 +57,12 @@ from kunjin.funds.risk.policy import (
     CLASSIFICATION_CONFLICT_CODES,
     ClassificationPolicyV1,
 )
+from kunjin.funds.risk.selection import (
+    PERIODIC_DOCUMENT_KINDS,
+    SELECTION_STATES,
+    DocumentSelectionPlan,
+    select_current_candidates,
+)
 from kunjin.funds.risk.store import RiskStoreError, StoredParserProvenance
 from kunjin.funds.service import expected_report_period
 
@@ -166,6 +172,7 @@ _UNSAFE_PUBLIC_TEXT = re.compile(
 )
 _ABSOLUTE_URL = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 _PUBLIC_TEXT_DECODE_PASSES = 2
+_LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class RiskServiceError(RuntimeError):
@@ -223,6 +230,49 @@ class _TrackingLegacyConverter:
             and parsed.provenance == self.provenance
             and parsed.parser_input_sha256 == self.parser_input_sha256
         )
+
+
+@dataclass(frozen=True)
+class DocumentSelectionItem:
+    document_kind: str
+    status: str
+    selected_url: Optional[str]
+    candidate_count: int
+    reason_code: Optional[str]
+
+    def validate(self) -> None:
+        _require_exact_record(self, DocumentSelectionItem, "document selection item")
+        try:
+            document_kind = DocumentKind(self.document_kind)
+        except (TypeError, ValueError):
+            raise ValueError("document selection kind is invalid") from None
+        if document_kind not in PERIODIC_DOCUMENT_KINDS:
+            raise ValueError("document selection kind must be periodic")
+        if type(self.status) is not str or self.status not in SELECTION_STATES:
+            raise ValueError("document selection status is invalid")
+        if type(self.candidate_count) is not int or self.candidate_count < 0:
+            raise ValueError("document selection candidate count is invalid")
+        if self.status == "selected":
+            if self.selected_url is None:
+                raise ValueError("selected document selection requires a URL")
+            validate_public_risk_url(self.selected_url)
+            if self.candidate_count < 1 or self.reason_code is not None:
+                raise ValueError("selected document selection state is inconsistent")
+            return
+        if self.selected_url is not None:
+            raise ValueError("unselected document selection cannot expose a URL")
+        if self.status == "missing":
+            if (
+                self.candidate_count != 0
+                or self.reason_code != "current_periodic_candidate_missing"
+            ):
+                raise ValueError("missing document selection state is inconsistent")
+            return
+        if (
+            self.candidate_count < 2
+            or self.reason_code != "current_periodic_candidate_conflict"
+        ):
+            raise ValueError("conflicted document selection state is inconsistent")
 
 
 @dataclass(frozen=True)
@@ -289,6 +339,8 @@ class DocumentSyncResult:
     fund_code: str
     status: str
     documents: Tuple[DocumentSyncItem, ...]
+    selections: Tuple[DocumentSelectionItem, ...]
+    selection_checksum: str
     attempted_at: datetime
     capability: str = "research_only"
 
@@ -308,6 +360,43 @@ class DocumentSyncResult:
             if type(item) is not DocumentSyncItem:
                 raise ValueError("document sync documents must use exact items")
             item.validate()
+        if type(self.selections) is not tuple:
+            raise ValueError("document sync selections must be an immutable tuple")
+        for item in self.selections:
+            if type(item) is not DocumentSelectionItem:
+                raise ValueError("document sync selections must use exact items")
+            item.validate()
+        expected_kinds = tuple(sorted(kind.value for kind in PERIODIC_DOCUMENT_KINDS))
+        if tuple(item.document_kind for item in self.selections) != expected_kinds:
+            raise ValueError("document sync selections must cover every periodic kind")
+        selection_by_kind = {item.document_kind: item for item in self.selections}
+        periodic_documents = tuple(
+            item
+            for item in self.documents
+            if DocumentKind(item.document_kind) in PERIODIC_DOCUMENT_KINDS
+        )
+        periodic_document_urls = {
+            (item.document_kind, item.url) for item in periodic_documents
+        }
+        if len(periodic_documents) != len(periodic_document_urls):
+            raise ValueError("document sync contains duplicate periodic documents")
+        selected_urls = {
+            (item.document_kind, item.selected_url)
+            for item in self.selections
+            if item.status == "selected"
+        }
+        if periodic_document_urls != selected_urls:
+            raise ValueError("document sync periodic documents do not match selections")
+        if any(
+            selection_by_kind[item.document_kind].status != "selected"
+            for item in periodic_documents
+        ):
+            raise ValueError("document sync contains an unselected periodic document")
+        if (
+            type(self.selection_checksum) is not str
+            or _LOWERCASE_SHA256.fullmatch(self.selection_checksum) is None
+        ):
+            raise ValueError("document sync selection checksum is invalid")
         _validate_canonical_utc(self.attempted_at, "document sync attempted_at")
         if type(self.capability) is not str or self.capability != "research_only":
             raise ValueError("document sync capability is invalid")
@@ -399,6 +488,11 @@ class FundRiskService:
                 manager_name=manager_name,
                 announcements=getattr(bundle, "announcements", ()),
             )
+            selection = select_current_candidates(
+                fund_code,
+                refresh_run_id=refresh_id,
+                candidates=candidates,
+            )
         except Exception as exc:
             failure = _safe_failure(exc)
             error = _service_error(exc)
@@ -416,7 +510,15 @@ class FundRiskService:
                 raise
             raise error from exc
 
-        items = tuple(self._sync_candidate(refresh_id, candidate) for candidate in candidates)
+        try:
+            self._risk_store.publish_document_selection(selection, attempted_at)
+        except Exception as exc:
+            self._raise_storage_failure(exc)
+
+        items = tuple(
+            self._sync_candidate(refresh_id, candidate)
+            for candidate in selection.attempted_candidates
+        )
         statuses = {item.status for item in items}
         if not items:
             status = "empty"
@@ -445,6 +547,8 @@ class FundRiskService:
             fund_code=fund_code,
             status=status,
             documents=items,
+            selections=_public_selection_items(selection),
+            selection_checksum=selection.selection_checksum,
             attempted_at=attempted_at,
         )
         result.validate()
@@ -1574,6 +1678,32 @@ def _item_failure(item: DocumentSyncItem) -> SafeDocumentFailure:
     return failure
 
 
+def _public_selection_items(
+    selection: DocumentSelectionPlan,
+) -> Tuple[DocumentSelectionItem, ...]:
+    selection.validate()
+    candidates = {
+        item.candidate_fingerprint: item for item in selection.periodic_candidates
+    }
+    items = []
+    for state in selection.periodic_states:
+        selected = (
+            None
+            if state.selected_fingerprint is None
+            else candidates[state.selected_fingerprint]
+        )
+        item = DocumentSelectionItem(
+            document_kind=state.document_kind.value,
+            status=state.state,
+            selected_url=None if selected is None else selected.url,
+            candidate_count=len(state.candidate_fingerprints),
+            reason_code=state.reason_code,
+        )
+        item.validate()
+        items.append(item)
+    return tuple(sorted(items, key=lambda item: item.document_kind))
+
+
 def _require_exact_record(value: object, expected_type: type, label: str) -> None:
     if type(value) is not expected_type:
         raise ValueError(f"{label} subclasses are not accepted")
@@ -1672,6 +1802,7 @@ def _canonical_optional_utc(value: object) -> Optional[datetime]:
 
 
 __all__ = [
+    "DocumentSelectionItem",
     "DocumentSyncItem",
     "DocumentSyncResult",
     "FundRiskService",

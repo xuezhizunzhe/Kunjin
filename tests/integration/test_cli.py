@@ -39,6 +39,7 @@ from kunjin.funds.risk.legacy_doc import ConverterStatus
 from kunjin.funds.risk.parsers import ParsedRiskDocument
 from kunjin.funds.risk.policy import ClassificationPolicyV1
 from kunjin.funds.risk.service import (
+    DocumentSelectionItem,
     DocumentSyncItem,
     DocumentSyncResult,
     FundRiskService,
@@ -92,6 +93,45 @@ class FakeTokenStore:
     def delete(self):
         self.token = None
 
+
+def document_selections(
+    *,
+    annual_url="https://www.fund001.com/report.html",
+) -> tuple[DocumentSelectionItem, ...]:
+    annual = (
+        DocumentSelectionItem(
+            document_kind="annual_report",
+            status="missing",
+            selected_url=None,
+            candidate_count=0,
+            reason_code="current_periodic_candidate_missing",
+        )
+        if annual_url is None
+        else DocumentSelectionItem(
+            document_kind="annual_report",
+            status="selected",
+            selected_url=annual_url,
+            candidate_count=1,
+            reason_code=None,
+        )
+    )
+    return (
+        annual,
+        DocumentSelectionItem(
+            document_kind="quarterly_report",
+            status="missing",
+            selected_url=None,
+            candidate_count=0,
+            reason_code="current_periodic_candidate_missing",
+        ),
+        DocumentSelectionItem(
+            document_kind="semiannual_report",
+            status="missing",
+            selected_url=None,
+            candidate_count=0,
+            reason_code="current_periodic_candidate_missing",
+        ),
+    )
 
 class FakeProfileKeyStore:
     def __init__(self) -> None:
@@ -1499,6 +1539,10 @@ class CliIntegrationTest(unittest.TestCase):
             fund_code="519755",
             status="failed",
             documents=(item,),
+            selections=document_selections(
+                annual_url="https://www.fund001.com/report.doc"
+            ),
+            selection_checksum="a" * 64,
             attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
         )
         self.context.fund_risk_service = service
@@ -1641,6 +1685,10 @@ class CliIntegrationTest(unittest.TestCase):
                     fund_code="519755",
                     status=status,
                     documents=documents,
+                    selections=document_selections(
+                        annual_url=None if status == "empty" else failed.url
+                    ),
+                    selection_checksum="a" * 64,
                     attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
                     capability="research_only",
                 )
@@ -1652,7 +1700,34 @@ class CliIntegrationTest(unittest.TestCase):
                 self.assert_envelope(payload, "sync.fund-documents")
                 self.assertEqual(payload["errors"], [])
                 self.assertEqual(payload["data"]["status"], status)
+                self.assertEqual(payload["data"]["selection_checksum"], "a" * 64)
                 if status == "partial":
+                    self.assertEqual(
+                        payload["data"]["selections"],
+                        [
+                            {
+                                "document_kind": "annual_report",
+                                "status": "selected",
+                                "selected_url": "https://www.fund001.com/report.html",
+                                "candidate_count": 1,
+                                "reason_code": None,
+                            },
+                            {
+                                "document_kind": "quarterly_report",
+                                "status": "missing",
+                                "selected_url": None,
+                                "candidate_count": 0,
+                                "reason_code": "current_periodic_candidate_missing",
+                            },
+                            {
+                                "document_kind": "semiannual_report",
+                                "status": "missing",
+                                "selected_url": None,
+                                "candidate_count": 0,
+                                "reason_code": "current_periodic_candidate_missing",
+                            },
+                        ],
+                    )
                     self.assertEqual(
                         payload["data"]["documents"],
                         [
@@ -1705,6 +1780,13 @@ class CliIntegrationTest(unittest.TestCase):
                         self.assertNotIn(private_value, rendered)
                 else:
                     self.assertEqual(payload["data"]["documents"], [])
+                    self.assertTrue(
+                        all(
+                            item["status"] == "missing"
+                            and item["selected_url"] is None
+                            for item in payload["data"]["selections"]
+                        )
+                    )
 
     def test_fund_risk_document_sync_all_technical_failures_exit_nonzero(self) -> None:
         service = FakeRiskService()
@@ -1727,6 +1809,8 @@ class CliIntegrationTest(unittest.TestCase):
                     failure_reason="parser_format_invalid",
                 ),
             ),
+            selections=document_selections(),
+            selection_checksum="a" * 64,
             attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
             capability="research_only",
         )
@@ -1787,6 +1871,8 @@ class CliIntegrationTest(unittest.TestCase):
                     fund_code="519755",
                     status="success",
                     documents=(item,),
+                    selections=document_selections(annual_url=None),
+                    selection_checksum="a" * 64,
                     attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
                 )
 
@@ -1866,6 +1952,8 @@ class CliIntegrationTest(unittest.TestCase):
                     fund_code="519755",
                     status="success",
                     documents=(item,),
+                    selections=document_selections(annual_url=None),
+                    selection_checksum="a" * 64,
                     attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
                 )
                 with (
@@ -1887,6 +1975,47 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertNotIn("private-exception-sentinel", rendered)
         self.assertNotIn("/private/tmp/managed-document.doc", rendered)
         self.assertNotIn("raw response body sentinel", rendered)
+
+    def test_fund_risk_selection_json_uses_an_explicit_public_allowlist(self) -> None:
+        service = FakeRiskService()
+        selections = document_selections(annual_url=None)
+        object.__setattr__(selections[0], "candidate_fingerprints", ("b" * 64,))
+        object.__setattr__(
+            selections[0],
+            "unselected_urls",
+            ("https://private.invalid/report?token=private-selection-sentinel",),
+        )
+        object.__setattr__(
+            selections[0],
+            "canonical_json",
+            "private-selection-manifest-sentinel",
+        )
+        service.sync_result = DocumentSyncResult(
+            fund_code="519755",
+            status="empty",
+            documents=(),
+            selections=selections,
+            selection_checksum="a" * 64,
+            attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+        )
+        self.context.fund_risk_service = service
+
+        with (
+            patch.object(DocumentSyncResult, "validate"),
+            patch.object(DocumentSelectionItem, "validate"),
+        ):
+            payload, exit_code, _ = run(
+                ["--json", "sync", "fund-documents", "519755"],
+                self.context,
+            )
+
+        self.assertEqual(exit_code, 0)
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("candidate_fingerprints", rendered)
+        self.assertNotIn("unselected_urls", rendered)
+        self.assertNotIn("canonical_json", rendered)
+        self.assertNotIn("private-selection-sentinel", rendered)
+        self.assertNotIn("private-selection-manifest-sentinel", rendered)
 
     def test_fund_risk_technical_errors_use_only_public_messages(self) -> None:
         service = FakeRiskService()

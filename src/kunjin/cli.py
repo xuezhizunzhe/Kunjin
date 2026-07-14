@@ -53,6 +53,7 @@ from kunjin.funds.risk.legacy_doc import ConverterStatus, DockerLegacyDocConvert
 from kunjin.funds.risk.policy import ClassificationPolicyV1
 from kunjin.funds.risk.research import build_authenticated_risk_research_report
 from kunjin.funds.risk.service import (
+    DocumentSelectionItem,
     DocumentSyncItem,
     DocumentSyncResult,
     FundRiskService,
@@ -1243,6 +1244,20 @@ def _risk_sync_report(result: object) -> Dict[str, Any]:
     if type(result) is not DocumentSyncResult:
         raise ValueError("fund document synchronization returned an invalid result")
     result.validate()
+    selections = []
+    for item in result.selections:
+        if type(item) is not DocumentSelectionItem:
+            raise ValueError("fund document synchronization returned an invalid selection")
+        item.validate()
+        selections.append(
+            {
+                "document_kind": item.document_kind,
+                "status": item.status,
+                "selected_url": item.selected_url,
+                "candidate_count": item.candidate_count,
+                "reason_code": item.reason_code,
+            }
+        )
     documents = []
     for item in result.documents:
         if type(item) is not DocumentSyncItem:
@@ -1268,6 +1283,8 @@ def _risk_sync_report(result: object) -> Dict[str, Any]:
         {
             "fund_code": result.fund_code,
             "status": result.status,
+            "selections": selections,
+            "selection_checksum": result.selection_checksum,
             "documents": documents,
             "attempted_at": result.attempted_at,
             "capability": result.capability,
