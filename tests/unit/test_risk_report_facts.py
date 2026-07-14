@@ -51,7 +51,7 @@ def report_table() -> ReportTable:
     )
 
 
-def docx_with_table() -> bytes:
+def docx_with_table(*, table_count: int = 1) -> bytes:
     content_types = (
         b'<?xml version="1.0" encoding="UTF-8"?>\n'
         b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
@@ -60,11 +60,7 @@ def docx_with_table() -> bytes:
         b'application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>\n'
         b"</Types>"
     )
-    document = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:body>
-    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>资产组合报告</w:t></w:r></w:p>
-    <w:tbl>
+    table = """<w:tbl>
       <w:tr><w:trPr><w:tblHeader/></w:trPr>
         <w:tc><w:p><w:r><w:t>指标</w:t></w:r></w:p></w:tc>
         <w:tc><w:p><w:r><w:t>单位</w:t></w:r></w:p></w:tc>
@@ -75,14 +71,33 @@ def docx_with_table() -> bytes:
         <w:tc><w:p><w:r><w:t>%</w:t></w:r></w:p></w:tc>
         <w:tc><w:p><w:r><w:t>35.2</w:t></w:r></w:p></w:tc>
       </w:tr>
-    </w:tbl>
+    </w:tbl>"""
+    document = (
+        """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>资产组合报告</w:t></w:r></w:p>"""
+        + table * table_count
+        + """
   </w:body>
-</w:document>""".encode()
+</w:document>"""
+    ).encode()
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", content_types)
         archive.writestr("word/document.xml", document)
     return payload.getvalue()
+
+
+def replace_docx_document(payload: bytes, old: bytes, new: bytes) -> bytes:
+    source = io.BytesIO(payload)
+    target = io.BytesIO()
+    with zipfile.ZipFile(source) as archive:
+        entries = tuple((item.filename, archive.read(item.filename)) for item in archive.infolist())
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, value in entries:
+            archive.writestr(name, value.replace(old, new, 1))
+    return target.getvalue()
 
 
 class CurrentReportRecordTest(unittest.TestCase):
@@ -173,6 +188,13 @@ class CurrentReportRecordTest(unittest.TestCase):
                 (
                     ReportCell("单位", True),
                     ReportCell("单位", True),
+                )
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "duplicate headers"):
+            ReportRow(
+                (
+                    ReportCell("Value", True),
+                    ReportCell("value", True),
                 )
             ).validate()
         with self.assertRaisesRegex(ValueError, "same number of cells"):
@@ -290,6 +312,43 @@ class CurrentReportAdapterTest(unittest.TestCase):
             caught.exception.failure.reason_code,
             DocumentFailureReason.RESOURCE_LIMIT,
         )
+
+    def test_docx_table_row_limit_fails_closed_instead_of_dropping_the_table(self) -> None:
+        with patch("kunjin.funds.risk.parsers.MAX_REPORT_ROWS", 1):
+            with patch("kunjin.funds.risk.report_facts.MAX_REPORT_ROWS", 1):
+                with self.assertRaises(RiskDocumentParseError) as caught:
+                    _docx_content(docx_with_table())
+
+        self.assertEqual(
+            caught.exception.failure.reason_code,
+            DocumentFailureReason.RESOURCE_LIMIT,
+        )
+
+    def test_docx_table_row_limit_is_cumulative_across_tables(self) -> None:
+        with patch("kunjin.funds.risk.parsers.MAX_REPORT_ROWS", 3):
+            with patch("kunjin.funds.risk.report_facts.MAX_REPORT_ROWS", 3):
+                with self.assertRaises(RiskDocumentParseError) as caught:
+                    _docx_content(docx_with_table(table_count=2))
+
+        self.assertEqual(
+            caught.exception.failure.reason_code,
+            DocumentFailureReason.RESOURCE_LIMIT,
+        )
+
+    def test_docx_legacy_horizontal_merge_is_not_retained_as_structured_evidence(self) -> None:
+        for merge_value in (b"restart", b"continue"):
+            with self.subTest(merge_value=merge_value):
+                merged = replace_docx_document(
+                    docx_with_table(),
+                    b"<w:tc><w:p><w:r><w:t>\xe6\x8c\x87\xe6\xa0\x87</w:t>",
+                    b'<w:tc><w:tcPr><w:hMerge w:val="'
+                    + merge_value
+                    + b'"/></w:tcPr><w:p><w:r><w:t>\xe6\x8c\x87\xe6\xa0\x87</w:t>',
+                )
+
+                _, tables = _docx_content(merged)
+
+                self.assertEqual(tables, ())
 
     def test_observation_adapter_authenticates_every_source_field(self) -> None:
         observation = CurrentReportObservation(

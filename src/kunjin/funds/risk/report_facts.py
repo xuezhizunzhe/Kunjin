@@ -105,7 +105,11 @@ class ReportRow:
             if type(cell) is not ReportCell:
                 raise ValueError("report row cells must use exact ReportCell records")
             cell.validate()
-        headers = [cell.text for cell in self.cells if cell.is_header]
+        headers = [
+            " ".join(unicodedata.normalize("NFKC", cell.text).split()).casefold()
+            for cell in self.cells
+            if cell.is_header
+        ]
         if len(headers) != len(set(headers)):
             raise ValueError("report row contains duplicate headers")
 

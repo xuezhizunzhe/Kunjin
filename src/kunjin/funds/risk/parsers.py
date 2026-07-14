@@ -2032,17 +2032,21 @@ def _docx_is_heading(paragraph: ElementTree.Element, text: str) -> bool:
 def _docx_report_table(
     table_element: ElementTree.Element,
     section: Optional[str],
+    remaining_row_capacity: int,
 ) -> Optional[ReportTable]:
     word = "{" + _WORD_NAMESPACE + "}"
     if table_element.findall(".//" + word + "tbl"):
         return None
     raw_rows = []
     for row_index, row in enumerate(table_element.findall("./" + word + "tr")):
+        if row_index >= remaining_row_capacity:
+            raise _resource_limit()
         cells = []
         for cell in row.findall("./" + word + "tc"):
             grid_span = cell.find("./" + word + "tcPr/" + word + "gridSpan")
+            horizontal_merge = cell.find("./" + word + "tcPr/" + word + "hMerge")
             vertical_merge = cell.find("./" + word + "tcPr/" + word + "vMerge")
-            if vertical_merge is not None or (
+            if horizontal_merge is not None or vertical_merge is not None or (
                 grid_span is not None
                 and grid_span.attrib.get(word + "val", "").strip() != "1"
             ):
@@ -2136,7 +2140,11 @@ def _docx_content(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable
             table_count += 1
             if table_count > MAX_REPORT_TABLES:
                 raise _resource_limit()
-            table = _docx_report_table(child, section)
+            table = _docx_report_table(
+                child,
+                section,
+                MAX_REPORT_ROWS - total_table_rows,
+            )
             if table is not None:
                 total_table_rows += len(table.rows)
                 if total_table_rows > MAX_REPORT_ROWS:
