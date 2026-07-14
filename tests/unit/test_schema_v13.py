@@ -177,8 +177,8 @@ class SchemaV13Test(unittest.TestCase):
                     )
 
         blob_digests = (
-            (6, "000001", 1, sqlite3.Binary(b"a" * 64), canonical, "g" * 64, UTC),
-            (7, "000001", 1, "a" * 64, canonical, sqlite3.Binary(b"h" * 64), UTC),
+            (6, "000001", 1, sqlite3.Binary(b"a" * 64), canonical, "b" * 64, UTC),
+            (7, "000001", 1, "a" * 64, canonical, sqlite3.Binary(b"b" * 64), UTC),
         )
         for values in blob_digests:
             with self.subTest(blob_column=values), repository.connect() as connection:
