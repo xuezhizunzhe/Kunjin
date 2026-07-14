@@ -678,13 +678,41 @@ class CommonReportFactExtractionTest(unittest.TestCase):
                 section_name="报告期末全部行业分布",
             ),
         )
-        unknown_names = ("其他行业", "其他行业合计", "Other industries")
+        unknown_names = (
+            "其他行业",
+            "其他行业合计",
+            "未分类",
+            "Other industries",
+            "Other-Unclassified",
+            "Others-Unclassified",
+            "Other（Unclassified）",
+        )
+        legitimate_names = ("其他制造业", "其他金融业", "Other Consumer Services")
 
         for table in invisible_tables:
             with self.subTest(name=table.rows[1].cells[1].text):
                 self.assertEqual(
                     extract_common_report_observations(text_blocks=(), tables=(table,)),
                     (),
+                )
+        for legitimate_name in legitimate_names:
+            table = common_table(
+                ("排名", "行业名称", "占基金资产净值比例(%)"),
+                (("1", legitimate_name, "25"), ("2", "科技", "20")),
+                section_name="报告期末全部行业分布",
+            )
+            with self.subTest(name=legitimate_name):
+                observations = extract_common_report_observations(
+                    text_blocks=(),
+                    tables=(table,),
+                )
+                self.assertEqual(
+                    next(
+                        item.normalized_value
+                        for item in observations
+                        if item.fact_kind == "current_largest_industry_name"
+                    ),
+                    legitimate_name,
                 )
         for unknown_name in unknown_names:
             table = common_table(

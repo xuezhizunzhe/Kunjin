@@ -1442,7 +1442,7 @@ def _external_facts(
                     max(item.weight for item in stock_holdings),
                     source_id,
                     "holdings",
-                    unit="percent",
+                    unit="percent_of_net_assets",
                     effective_from=latest_period,
                     effective_to=latest_period,
                 )
@@ -1456,7 +1456,7 @@ def _external_facts(
                     sum((item.weight for item in top_ten), Decimal("0")),
                     source_id,
                     "holdings",
-                    unit="percent",
+                    unit="percent_of_net_assets",
                     effective_from=latest_period,
                     effective_to=latest_period,
                 )
@@ -1473,7 +1473,7 @@ def _external_facts(
                     stock_weight,
                     source_id,
                     "holdings",
-                    unit="percent",
+                    unit="percent_of_net_assets",
                     effective_from=latest_period,
                     effective_to=latest_period,
                 )
@@ -1499,7 +1499,7 @@ def _external_facts(
                     max(item.weight for item in current_industries),
                     source_id,
                     "industry",
-                    unit="percent",
+                    unit="percent_of_net_assets",
                     effective_from=latest_period,
                     effective_to=latest_period,
                 ),

@@ -2344,6 +2344,13 @@ _UNBOUND_PERIOD_CONTEXT_PATTERN = re.compile(
     r"first quarter|second quarter|third quarter|fourth quarter)\b",
     flags=re.IGNORECASE,
 )
+_TEMPORAL_CONTEXT_CUE_PATTERN = re.compile(
+    r"(?<![0-9])(?:19|20)[0-9]{2}(?![0-9])|"
+    r"\b(?:january|february|march|april|may|june|july|august|september|"
+    r"october|november|december|q[1-4]|quarter|annual|semiannual|semi-annual)\b|"
+    r"截至|截止|as of|as at|期初|同期|上年末|往期",
+    flags=re.IGNORECASE,
+)
 _CONTEXT_QUARTERS = {
     "1": (3, 31),
     "一": (3, 31),
@@ -2353,6 +2360,20 @@ _CONTEXT_QUARTERS = {
     "三": (9, 30),
     "4": (12, 31),
     "四": (12, 31),
+}
+_CONTEXT_MONTHS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
 }
 
 
@@ -2377,10 +2398,14 @@ def _observation_context_matches_period(
         ):
             periods.add(date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
         for match in re.finditer(
-            r"(?<![0-9])([0-9]{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})(?![0-9])",
+            r"(?<![0-9])([0-9]{4})[-/.]([0-9]{1,2})[-/.]([0-9]{1,2})(?![0-9])",
             normalized,
         ):
             periods.add(date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
+        periods.update(
+            date(int(match.group(1)), 12, 31)
+            for match in re.finditer(r"(?<![0-9])([0-9]{4})年末", normalized)
+        )
         periods.update(
             date(int(match.group(1)), 12, 31)
             for match in re.finditer(r"(?<![0-9])([0-9]{4})年年度", normalized)
@@ -2429,11 +2454,46 @@ def _observation_context_matches_period(
         ):
             month, day = english_quarters[match.group(2).casefold()]
             periods.add(date(int(match.group(1)), month, day))
+        for match in re.finditer(
+            r"(?<![0-9])([0-9]{4})\s*[qQ]([1-4])(?![0-9])",
+            normalized,
+        ):
+            month, day = _CONTEXT_QUARTERS[match.group(2)]
+            periods.add(date(int(match.group(1)), month, day))
+        for match in re.finditer(
+            r"\b(" + "|".join(_CONTEXT_MONTHS) + r")\s+([0-9]{1,2}),?\s+([0-9]{4})\b",
+            normalized,
+            flags=re.IGNORECASE,
+        ):
+            periods.add(
+                date(
+                    int(match.group(3)),
+                    _CONTEXT_MONTHS[match.group(1).casefold()],
+                    int(match.group(2)),
+                )
+            )
+        for match in re.finditer(
+            r"\b([0-9]{1,2})\s+("
+            + "|".join(_CONTEXT_MONTHS)
+            + r")\s+([0-9]{4})\b",
+            normalized,
+            flags=re.IGNORECASE,
+        ):
+            periods.add(
+                date(
+                    int(match.group(3)),
+                    _CONTEXT_MONTHS[match.group(2).casefold()],
+                    int(match.group(1)),
+                )
+            )
     except ValueError:
         return False
     if periods:
         return periods == {period_end}
-    return _UNBOUND_PERIOD_CONTEXT_PATTERN.search(normalized) is None
+    return (
+        _UNBOUND_PERIOD_CONTEXT_PATTERN.search(normalized) is None
+        and _TEMPORAL_CONTEXT_CUE_PATTERN.search(normalized) is None
+    )
 
 
 def _ambiguous_current_fact(fact: ParsedMandateFact) -> ParsedMandateFact:

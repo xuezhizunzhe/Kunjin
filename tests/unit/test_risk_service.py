@@ -1918,7 +1918,7 @@ class RiskServiceBoundaryTest(unittest.TestCase):
                     ParsedMandateFact(
                         fact_kind="current_stock_asset_allocation_percent",
                         normalized_value=Decimal("20"),
-                        unit="percent",
+                        unit="percent_of_net_assets",
                         page_number=1,
                         section_name="资产配置",
                         source_excerpt="股票资产占基金资产净值比例为20%。",
@@ -1928,7 +1928,7 @@ class RiskServiceBoundaryTest(unittest.TestCase):
                         fact_fingerprint=fact_fingerprint(
                             fact_kind="current_stock_asset_allocation_percent",
                             normalized_value=Decimal("20"),
-                            unit="percent",
+                            unit="percent_of_net_assets",
                             page_number=1,
                             section_name="资产配置",
                             source_excerpt="股票资产占基金资产净值比例为20%。",
@@ -2693,14 +2693,14 @@ class RiskServiceBoundaryTest(unittest.TestCase):
             document_id=2,
             fact_kind="current_stock_asset_allocation_percent",
             value=Decimal("10"),
-            unit="percent",
+            unit="percent_of_net_assets",
         )
         semiannual_value = stored_fact(
             fact_id=3,
             document_id=3,
             fact_kind="current_stock_asset_allocation_percent",
             value=Decimal("20"),
-            unit="percent",
+            unit="percent_of_net_assets",
         )
         records = (
             stored_document(
@@ -2966,12 +2966,25 @@ class RiskServiceBoundaryTest(unittest.TestCase):
             fact.fact_kind: fact.normalized_value
             for fact in store.saved_evidence.existing_disclosure_facts
         }
+        units = {
+            fact.fact_kind: fact.unit
+            for fact in store.saved_evidence.existing_disclosure_facts
+        }
         self.assertEqual(facts["share_class_evidence_present"], True)
         self.assertEqual(facts["fee_evidence_present"], True)
         self.assertEqual(facts["size_evidence_present"], True)
         self.assertEqual(facts["holdings_evidence_complete"], False)
         self.assertEqual(facts["current_largest_security_weight_percent"], Decimal("8"))
         self.assertEqual(facts["current_largest_industry_weight_percent"], Decimal("20"))
+        self.assertEqual(
+            units["current_largest_security_weight_percent"],
+            "percent_of_net_assets",
+        )
+        self.assertEqual(
+            units["current_largest_industry_weight_percent"],
+            "percent_of_net_assets",
+        )
+        self.assertNotIn("source_version_conflict", result.conflicts)
         self.assertEqual(facts["current_industry_count"], 2)
         self.assertNotIn("current_top_ten_holdings_weight_percent", facts)
         self.assertNotIn("current_stock_asset_allocation_percent", facts)
@@ -2992,6 +3005,104 @@ class RiskServiceBoundaryTest(unittest.TestCase):
         }
         self.assertIn(("d1_artifact", 1, None), source_keys)
         self.assertIn(("fund_disclosure", 99, "holdings"), source_keys)
+
+    def test_complete_sourced_holdings_use_explicit_net_asset_denominators(self) -> None:
+        bundle = sourced_disclosure_bundle()
+        holdings = tuple(
+            FundHolding(
+                fund_code="519755",
+                report_period=date(2026, 3, 31),
+                published_at=NOW,
+                rank=rank,
+                security_code=f"600{rank:03d}",
+                security_name=f"公开证券{rank}",
+                asset_type=AssetType.STOCK,
+                weight=Decimal(str(11 - rank)),
+                disclosure_scope="complete",
+                source_document_id=99,
+            )
+            for rank in range(1, 11)
+        )
+        legal = stored_fact(
+            fact_id=1,
+            document_id=1,
+            fact_kind="legal_product_type",
+            value="fof",
+        )
+        record = stored_document(
+            DocumentKind.PROSPECTUS_UPDATE,
+            artifact_id=1,
+            title="2026年更新招募说明书",
+            published_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            facts=(legal,),
+        )
+        store = FakeRiskStore((record,))
+
+        result = FundRiskService(
+            risk_store=store,
+            disclosure_store=FakeDisclosureStore(replace(bundle, holdings=holdings)),
+            repository=FakeRepository(),
+            discovery=SimpleNamespace(),
+            document_client=SimpleNamespace(),
+            clock=lambda: NOW,
+        ).classify("519755")
+        units = {
+            fact.fact_kind: fact.unit
+            for fact in store.saved_evidence.existing_disclosure_facts
+        }
+
+        for fact_kind in (
+            "current_largest_security_weight_percent",
+            "current_top_ten_holdings_weight_percent",
+            "current_stock_asset_allocation_percent",
+            "current_largest_industry_weight_percent",
+        ):
+            with self.subTest(fact_kind=fact_kind):
+                self.assertEqual(units[fact_kind], "percent_of_net_assets")
+        self.assertNotIn("source_version_conflict", result.conflicts)
+
+    def test_legacy_generic_percent_current_fact_fails_closed_on_recompute(self) -> None:
+        legal = stored_fact(
+            fact_id=1,
+            document_id=1,
+            fact_kind="legal_product_family",
+            value="ordinary_bond",
+        )
+        legacy_current = stored_fact(
+            fact_id=2,
+            document_id=2,
+            fact_kind="current_stock_asset_allocation_percent",
+            value=Decimal("0"),
+            unit="percent",
+        )
+        records = (
+            stored_document(
+                DocumentKind.PROSPECTUS_UPDATE,
+                artifact_id=1,
+                title="2026年更新招募说明书",
+                published_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                facts=(legal,),
+            ),
+            stored_document(
+                DocumentKind.SEMIANNUAL_REPORT,
+                artifact_id=2,
+                title="2026年半年度报告",
+                published_at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+                facts=(legacy_current,),
+            ),
+        )
+
+        result = FundRiskService(
+            risk_store=FakeRiskStore(records),
+            disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+            repository=FakeRepository(),
+            discovery=SimpleNamespace(),
+            document_client=SimpleNamespace(),
+            clock=lambda: NOW,
+        ).classify("519755")
+
+        self.assertIn("source_version_conflict", result.conflicts)
+        self.assertNotEqual(result.evidence_status.value, "verified")
 
     def test_real_store_parser_and_authenticated_readback_integration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

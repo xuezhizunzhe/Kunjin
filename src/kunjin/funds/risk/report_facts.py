@@ -93,6 +93,24 @@ _DEFAULT_IGNORABLE_PATTERN = re.compile(
     "\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3"
     "\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
 )
+_UNKNOWN_INDUSTRY_LABELS = frozenset(
+    {
+        "其他",
+        "其它",
+        "未分类",
+        "其他行业",
+        "其它行业",
+        "其他行业合计",
+        "其它行业合计",
+        "other",
+        "others",
+        "unclassified",
+        "otherindustry",
+        "otherindustries",
+        "otherunclassified",
+        "othersunclassified",
+    }
+)
 
 _DECIMAL_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
 _ASSET_ROW_PATTERN = re.compile(
@@ -316,13 +334,9 @@ def _has_unsafe_name_characters(value: str) -> bool:
 
 
 def _is_unknown_industry_name(value: str) -> bool:
-    normalized = _normalized(value)
-    compact = normalized.replace(" ", "")
-    if compact.startswith(("其他", "其它")):
-        return True
-    return normalized in {"other", "others"} or normalized.startswith(
-        ("other ", "others ")
-    )
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    canonical = "".join(character for character in normalized if character.isalnum())
+    return canonical in _UNKNOWN_INDUSTRY_LABELS
 
 
 def _percent_value(value: str) -> Optional[Decimal]:
