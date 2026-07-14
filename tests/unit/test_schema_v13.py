@@ -143,7 +143,7 @@ class SchemaV13Test(unittest.TestCase):
             connection.executemany(
                 "INSERT INTO fund_document_refresh_runs(id, fund_code, started_at) "
                 "VALUES (?, '000001', ?)",
-                [(item, UTC) for item in range(1, 6)],
+                [(item, UTC) for item in range(1, 8)],
             )
             connection.execute(
                 "INSERT INTO fund_document_selection_manifests VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -169,6 +169,19 @@ class SchemaV13Test(unittest.TestCase):
         )
         for values in invalid:
             with self.subTest(values=values), repository.connect() as connection:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO fund_document_selection_manifests "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        values,
+                    )
+
+        blob_digests = (
+            (6, "000001", 1, sqlite3.Binary(b"a" * 64), canonical, "g" * 64, UTC),
+            (7, "000001", 1, "a" * 64, canonical, sqlite3.Binary(b"h" * 64), UTC),
+        )
+        for values in blob_digests:
+            with self.subTest(blob_column=values), repository.connect() as connection:
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute(
                         "INSERT INTO fund_document_selection_manifests "

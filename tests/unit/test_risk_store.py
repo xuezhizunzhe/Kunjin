@@ -649,6 +649,12 @@ class FundRiskStoreTest(unittest.TestCase):
         self.assertEqual(stored.canonical_json, plan.canonical_json)
         self.assertEqual(stored.selection_checksum, plan.selection_checksum)
         self.assertEqual(self.store.document_selection_for_refresh(refresh_id), stored)
+        self.assertIsNone(self.store.current_document_selection("000001"))
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.EMPTY,
+            NOW + timedelta(seconds=1),
+        )
         self.assertEqual(self.store.current_document_selection("000001"), stored)
 
         later = self.store.begin_document_refresh("000001", NOW + timedelta(minutes=1))
@@ -657,6 +663,12 @@ class FundRiskStoreTest(unittest.TestCase):
         later_stored = self.store.publish_document_selection(
             later_plan,
             NOW + timedelta(minutes=1),
+        )
+        self.assertIsNone(self.store.current_document_selection("000001"))
+        self.store.complete_document_refresh(
+            later,
+            RefreshOutcome.EMPTY,
+            NOW + timedelta(minutes=1, seconds=1),
         )
         self.assertEqual(self.store.current_document_selection("000001"), later_stored)
         self.assertIsNone(self.store.document_selection_for_refresh(999999))

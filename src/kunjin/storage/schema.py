@@ -2155,7 +2155,8 @@ CREATE TABLE fund_document_selection_manifests (
     ),
     manifest_version INTEGER NOT NULL CHECK(manifest_version = 1),
     selection_policy_checksum TEXT NOT NULL CHECK(
-        length(CAST(selection_policy_checksum AS BLOB)) = 64
+        typeof(selection_policy_checksum) = 'text'
+        AND length(CAST(selection_policy_checksum AS BLOB)) = 64
         AND selection_policy_checksum NOT GLOB '*[^0-9a-f]*'
     ),
     canonical_json TEXT NOT NULL CHECK(
@@ -2163,7 +2164,8 @@ CREATE TABLE fund_document_selection_manifests (
         AND json_valid(canonical_json) AND json_type(canonical_json) = 'object'
     ),
     selection_checksum TEXT NOT NULL UNIQUE CHECK(
-        length(CAST(selection_checksum AS BLOB)) = 64
+        typeof(selection_checksum) = 'text'
+        AND length(CAST(selection_checksum AS BLOB)) = 64
         AND selection_checksum NOT GLOB '*[^0-9a-f]*'
     ),
     created_at TEXT NOT NULL CHECK(

@@ -407,6 +407,8 @@ class FundRiskStore:
                 "SELECT manifest.* FROM fund_document_refresh_runs AS refresh "
                 "JOIN fund_document_selection_manifests AS manifest "
                 "ON manifest.refresh_run_id = refresh.id "
+                "JOIN fund_document_refresh_completions AS completion "
+                "ON completion.refresh_run_id = refresh.id "
                 "WHERE refresh.fund_code = ? AND refresh.id = ("
                 "SELECT MAX(latest.id) FROM fund_document_refresh_runs AS latest "
                 "WHERE latest.fund_code = ?)",
