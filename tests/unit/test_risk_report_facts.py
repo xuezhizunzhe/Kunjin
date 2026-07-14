@@ -19,11 +19,13 @@ from kunjin.funds.risk.parsers import (
     parsed_fact_from_current_observation,
 )
 from kunjin.funds.risk.report_facts import (
+    COMMON_FACTS,
     MAX_REPORT_CELL_CHARACTERS,
     CurrentReportObservation,
     ReportCell,
     ReportRow,
     ReportTable,
+    extract_common_report_observations,
 )
 
 
@@ -48,6 +50,23 @@ def report_table() -> ReportTable:
         page_number=None,
         section_name="资产组合报告",
         source_excerpt="指标 | 单位 | 数值；报告期末股票资产占基金总资产的 | % | 35.2",
+    )
+
+
+def common_table(
+    headers: tuple[str, ...],
+    rows: tuple[tuple[str, ...], ...],
+    *,
+    section_name: str,
+) -> ReportTable:
+    return ReportTable(
+        rows=(
+            ReportRow(tuple(ReportCell(value, True) for value in headers)),
+            *(ReportRow(tuple(ReportCell(value, False) for value in row)) for row in rows),
+        ),
+        page_number=3,
+        section_name=section_name,
+        source_excerpt="；".join(" | ".join(row) for row in (headers, *rows)),
     )
 
 
@@ -417,6 +436,212 @@ class CurrentReportAdapterTest(unittest.TestCase):
                     effective_to=effective_to,
                 )
                 self.assertNotEqual(changed.fact_fingerprint, fact.fact_fingerprint)
+
+
+class CommonReportFactExtractionTest(unittest.TestCase):
+    def test_common_fact_allowlist_accepts_only_explicit_supported_rows_and_sentences(self) -> None:
+        allocation = common_table(
+            ("指标", "单位", "数值"),
+            (
+                ("报告期末股票资产占基金总资产的", "%", "35.2"),
+                ("报告期末债券资产占基金总资产的", "%", "60"),
+                ("报告期末现金资产占基金总资产的", "%", "4.8"),
+            ),
+            section_name="报告期末资产组合",
+        )
+        hong_kong = common_table(
+            ("指标", "单位", "数值"),
+            (("报告期末港股资产占基金资产净值的", "%", "8"),),
+            section_name="报告期末资产组合",
+        )
+
+        observations = extract_common_report_observations(
+            text_blocks=(
+                "报告期末最大单一证券占基金资产净值8.5%。",
+                "报告期末前十大持仓合计占基金资产净值40%。",
+                "报告期末最大行业为科技，占基金资产净值25%。",
+            ),
+            tables=(allocation, hong_kong),
+        )
+        values = {item.fact_kind: item.normalized_value for item in observations}
+
+        self.assertEqual(
+            set(values),
+            COMMON_FACTS - {"current_industry_count", "holdings_evidence_complete"},
+        )
+        self.assertEqual(values["current_stock_asset_allocation_percent"], D("35.2"))
+        self.assertEqual(values["current_hong_kong_asset_allocation_percent"], D("8"))
+        self.assertEqual(values["current_largest_industry_name"], "科技")
+        self.assertTrue(all(item.confidence_state is FactConfidence.EXACT for item in observations))
+
+    def test_common_security_tables_require_exact_ranks_and_explicit_scope(self) -> None:
+        rows = tuple((str(rank), f"证券{rank}", str(11 - rank)) for rank in range(1, 11))
+        top_ten = common_table(
+            ("排名", "证券名称", "占基金资产净值比例(%)"),
+            rows,
+            section_name="报告期末前十大持仓",
+        )
+        complete = common_table(
+            ("排名", "证券名称", "占基金资产净值比例(%)"),
+            rows[:3],
+            section_name="报告期末全部证券持仓明细",
+        )
+
+        observations = extract_common_report_observations(
+            text_blocks=(),
+            tables=(top_ten, complete),
+        )
+        values = [(item.fact_kind, item.normalized_value) for item in observations]
+
+        self.assertIn(("current_top_ten_holdings_weight_percent", D("55")), values)
+        self.assertIn(("current_largest_security_weight_percent", D("10")), values)
+        self.assertIn(("holdings_evidence_complete", True), values)
+
+    def test_common_industry_table_requires_complete_parse_for_count(self) -> None:
+        complete = common_table(
+            ("排名", "行业名称", "占基金资产净值比例(%)"),
+            (("1", "科技", "25"), ("2", "金融", "20"), ("3", "医药", "15")),
+            section_name="报告期末全部行业分布",
+        )
+
+        observations = extract_common_report_observations(text_blocks=(), tables=(complete,))
+        values = {item.fact_kind: item.normalized_value for item in observations}
+
+        self.assertEqual(values["current_largest_industry_name"], "科技")
+        self.assertEqual(values["current_largest_industry_weight_percent"], D("25"))
+        self.assertEqual(values["current_industry_count"], 3)
+
+    def test_common_rejects_missing_headers_mixed_denominators_and_ranges(self) -> None:
+        missing_header = common_table(
+            ("项目", "单位", "数值"),
+            (("报告期末股票资产占基金总资产的", "%", "35"),),
+            section_name="报告期末资产组合",
+        )
+        ranged = common_table(
+            ("指标", "单位", "数值"),
+            (
+                ("报告期末股票资产占基金总资产的", "%", "约35"),
+                ("报告期末债券资产占基金总资产的", "%", "30-35"),
+            ),
+            section_name="报告期末资产组合",
+        )
+        mixed = replace(
+            report_table(),
+            rows=report_table().rows
+            + (
+                ReportRow(
+                    (
+                        ReportCell("报告期末债券资产占基金资产净值的", False),
+                        ReportCell("%", False),
+                        ReportCell("60", False),
+                    )
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            extract_common_report_observations(text_blocks=(), tables=(missing_header, ranged)),
+            (),
+        )
+        with self.assertRaisesRegex(ValueError, "mixed denominators"):
+            extract_common_report_observations(text_blocks=(), tables=(mixed,))
+        self.assertEqual(
+            extract_common_report_observations(
+                text_blocks=(
+                    "报告期末股票资产约占基金总资产35%。",
+                    "报告期末债券资产占基金总资产30%-35%。",
+                ),
+                tables=(),
+            ),
+            (),
+        )
+
+    def test_common_rejects_partial_unknown_duplicate_and_incomplete_scopes(self) -> None:
+        partial_industries = common_table(
+            ("排名", "行业名称", "占基金资产净值比例(%)"),
+            (("1", "科技", "25"), ("2", "金融", "20")),
+            section_name="报告期末前两大行业",
+        )
+        unknown_other = common_table(
+            ("排名", "行业名称", "占基金资产净值比例(%)"),
+            (("1", "科技", "25"), ("2", "其他", "20")),
+            section_name="报告期末全部行业分布",
+        )
+        duplicate_rank = common_table(
+            ("排名", "证券名称", "占基金资产净值比例(%)"),
+            tuple(("1" if rank == 2 else str(rank), f"证券{rank}", "5") for rank in range(1, 11)),
+            section_name="报告期末前十大持仓",
+        )
+        fewer_than_ten = common_table(
+            ("排名", "证券名称", "占基金资产净值比例(%)"),
+            tuple((str(rank), f"证券{rank}", "5") for rank in range(1, 10)),
+            section_name="报告期末前十大持仓",
+        )
+        incomplete_appendix = common_table(
+            ("排名", "证券名称", "占基金资产净值比例(%)"),
+            (("1", "证券1", "10"), ("2", "证券2", "5")),
+            section_name="报告期末全部证券持仓明细（附录不完整）",
+        )
+        out_of_order = common_table(
+            ("排名", "证券名称", "占基金资产净值比例(%)"),
+            tuple(
+                (str(rank), f"证券{rank}", "4" if rank == 1 else "5")
+                for rank in range(1, 11)
+            ),
+            section_name="报告期末前十大持仓",
+        )
+
+        partial = extract_common_report_observations(text_blocks=(), tables=(partial_industries,))
+        unknown = extract_common_report_observations(text_blocks=(), tables=(unknown_other,))
+        duplicate = extract_common_report_observations(text_blocks=(), tables=(duplicate_rank,))
+        fewer = extract_common_report_observations(text_blocks=(), tables=(fewer_than_ten,))
+        incomplete = extract_common_report_observations(
+            text_blocks=(),
+            tables=(incomplete_appendix,),
+        )
+        unordered = extract_common_report_observations(text_blocks=(), tables=(out_of_order,))
+
+        self.assertFalse(any(item.fact_kind == "current_industry_count" for item in partial))
+        self.assertFalse(any(item.fact_kind == "current_industry_count" for item in unknown))
+        self.assertFalse(any(item.fact_kind.startswith("current_top_ten") for item in duplicate))
+        self.assertFalse(any(item.fact_kind.startswith("current_top_ten") for item in fewer))
+        self.assertFalse(any(item.fact_kind == "holdings_evidence_complete" for item in incomplete))
+        self.assertFalse(
+            any(item.fact_kind.startswith("current_largest_security") for item in incomplete)
+        )
+        self.assertFalse(any(item.fact_kind.startswith("current_top_ten") for item in unordered))
+
+    def test_common_rejects_mandate_wording_and_never_infers_remainders(self) -> None:
+        observations = extract_common_report_observations(
+            text_blocks=(
+                "本基金股票资产占基金资产的比例为0%-95%。",
+                "本基金投资港股资产的比例不超过基金资产净值的50%。",
+                "基金合同约定前十大持仓集中度不得超过60%。",
+            ),
+            tables=(
+                common_table(
+                    ("指标", "单位", "数值"),
+                    (
+                        ("报告期末股票资产占基金总资产的", "%", "35"),
+                        ("报告期末债券资产占基金总资产的", "%", "60"),
+                    ),
+                    section_name="报告期末资产组合",
+                ),
+                common_table(
+                    ("排名", "行业名称", "占基金资产净值比例(%)"),
+                    (("1", "科技", "25"), ("2", "金融", "20")),
+                    section_name="基金投资策略行业排序",
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            {item.fact_kind for item in observations},
+            {
+                "current_stock_asset_allocation_percent",
+                "current_bond_asset_allocation_percent",
+            },
+        )
 
 
 if __name__ == "__main__":

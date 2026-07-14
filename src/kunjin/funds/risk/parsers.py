@@ -9,7 +9,7 @@ import stat
 import unicodedata
 import zipfile
 from dataclasses import dataclass, fields, replace
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from email.message import Message
 from html.parser import HTMLParser
@@ -55,11 +55,13 @@ from kunjin.funds.risk.report_facts import (
     ReportCell,
     ReportRow,
     ReportTable,
+    extract_common_report_observations,
 )
 from kunjin.funds.risk.reports import (
     ConvertedDocumentContractError,
     TextBlockView,
     has_exact_leading_cover_title,
+    report_period_end,
     validate_converted_document_contract,
 )
 
@@ -1621,88 +1623,6 @@ def _extract_facts(
                 FactConfidence.ABSENT,
             )
 
-        if not block.current_observation_eligible:
-            continue
-
-        current_allocation = re.search(
-            r"报告期末\s*(股票|债券|现金)\s*资产\s*占\s*基金总资产\s*的\s*"
-            r"(\d+(?:\.\d+)?)%"
-            r"|(stocks?|bonds?|cash) represent\s*(\d+(?:\.\d+)?)% of total assets",
-            block.text,
-            flags=re.IGNORECASE,
-        )
-        if current_allocation is not None:
-            asset = (current_allocation.group(1) or current_allocation.group(3)).casefold()
-            asset_map = {
-                "股票": "stock",
-                "债券": "bond",
-                "现金": "cash",
-                "stock": "stock",
-                "stocks": "stock",
-                "bond": "bond",
-                "bonds": "bond",
-                "cash": "cash",
-            }
-            add(
-                block,
-                current_allocation,
-                "current_" + asset_map[asset] + "_asset_allocation_percent",
-                _decimal(current_allocation.group(2) or current_allocation.group(4)),
-                "percent_of_total_assets",
-            )
-
-        largest_industry = re.search(
-            r"报告期末\s*最大行业\s*为\s*([^,，。]+)[,，]\s*占\s*基金资产\s*"
-            r"(\d+(?:\.\d+)?)%"
-            r"|largest industry\s*[:：]\s*([^,;]+)[,;]\s*(\d+(?:\.\d+)?)% of fund assets",
-            block.text,
-            flags=re.IGNORECASE,
-        )
-        if largest_industry is not None:
-            name = _normalized_fact_text(
-                block,
-                largest_industry.group(1) or largest_industry.group(3),
-            )
-            weight = _decimal(largest_industry.group(2) or largest_industry.group(4))
-            add(block, largest_industry, "current_largest_industry_name", name, None)
-            add(
-                block,
-                largest_industry,
-                "current_largest_industry_weight_percent",
-                weight,
-                "percent_of_fund_assets",
-            )
-
-        top_ten_holdings = re.search(
-            r"报告期末\s*前十大持仓\s*合计\s*占\s*基金资产\s*(\d+(?:\.\d+)?)%"
-            r"|top ten holdings represent\s*(\d+(?:\.\d+)?)% of fund assets",
-            block.text,
-            flags=re.IGNORECASE,
-        )
-        if top_ten_holdings is not None:
-            add(
-                block,
-                top_ten_holdings,
-                "current_top_ten_holdings_weight_percent",
-                _decimal(top_ten_holdings.group(1) or top_ten_holdings.group(2)),
-                "percent_of_fund_assets",
-            )
-
-        largest_security = re.search(
-            r"报告期末\s*最大单一证券\s*占\s*基金资产\s*(\d+(?:\.\d+)?)%"
-            r"|largest security represents\s*(\d+(?:\.\d+)?)% of fund assets",
-            block.text,
-            flags=re.IGNORECASE,
-        )
-        if largest_security is not None:
-            add(
-                block,
-                largest_security,
-                "current_largest_security_weight_percent",
-                _decimal(largest_security.group(1) or largest_security.group(2)),
-                "percent_of_fund_assets",
-            )
-
     legal_types = {
         fact.normalized_value for fact in facts if fact.fact_kind == "legal_product_type"
     }
@@ -2406,6 +2326,108 @@ def _legacy_conversion_failure(reason: DocumentFailureReason) -> LegacyDocConver
     return LegacyDocConversionError(failure)
 
 
+_PERIODIC_DOCUMENT_KINDS = frozenset(
+    {
+        DocumentKind.ANNUAL_REPORT,
+        DocumentKind.SEMIANNUAL_REPORT,
+        DocumentKind.QUARTERLY_REPORT,
+    }
+)
+
+
+def _ambiguous_current_fact(fact: ParsedMandateFact) -> ParsedMandateFact:
+    ambiguous = replace(fact, confidence_state=FactConfidence.AMBIGUOUS)
+    ambiguous = replace(
+        ambiguous,
+        fact_fingerprint=fact_fingerprint(
+            fact_kind=ambiguous.fact_kind,
+            normalized_value=ambiguous.normalized_value,
+            unit=ambiguous.unit,
+            page_number=ambiguous.page_number,
+            section_name=ambiguous.section_name,
+            source_excerpt=ambiguous.source_excerpt,
+            effective_from=ambiguous.effective_from,
+            effective_to=ambiguous.effective_to,
+            confidence_state=ambiguous.confidence_state,
+        ),
+    )
+    ambiguous.validate()
+    return ambiguous
+
+
+def _current_common_facts(
+    artifact: RetrievedArtifact,
+    blocks: Tuple[_TextBlock, ...],
+    tables: Tuple[ReportTable, ...],
+) -> Tuple[Tuple[ParsedMandateFact, ...], Tuple[str, ...]]:
+    if artifact.candidate.document_kind not in _PERIODIC_DOCUMENT_KINDS:
+        return (), ()
+    observations = list(extract_common_report_observations(text_blocks=(), tables=tables))
+    for block in blocks:
+        if not block.current_observation_eligible or block.nfc_only:
+            continue
+        block_observations = extract_common_report_observations(
+            text_blocks=(block.text,),
+            tables=(),
+        )
+        for observation in block_observations:
+            bound = replace(
+                observation,
+                page_number=block.page_number,
+                section_name=block.section_name,
+            )
+            bound.validate()
+            observations.append(bound)
+    if not observations:
+        return (), ()
+
+    period_end = report_period_end(artifact.candidate.title)
+    publication_date = artifact.candidate.published_at.astimezone(timezone.utc).date()
+    if period_end is None or period_end > publication_date:
+        raise _fail(DocumentFailureReason.PARSER_EFFECTIVE_DATE_INVALID)
+
+    facts = []
+    fingerprints = set()
+    for observation in observations:
+        fact = parsed_fact_from_current_observation(
+            observation,
+            effective_from=period_end,
+            effective_to=period_end,
+        )
+        if fact.fact_fingerprint not in fingerprints:
+            facts.append(fact)
+            fingerprints.add(fact.fact_fingerprint)
+        if len(facts) > MAX_FACTS:
+            raise _resource_limit()
+
+    conflicts = set()
+    grouped = {}
+    for fact in facts:
+        grouped.setdefault(fact.fact_kind, []).append(fact)
+    conflicting_kinds = {
+        kind
+        for kind, same_kind in grouped.items()
+        if len(
+            {
+                json.dumps(
+                    canonical_fact_value(fact.normalized_value),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                for fact in same_kind
+            }
+        )
+        > 1
+    }
+    if conflicting_kinds:
+        conflicts.add("duplicate_conflicting_clause")
+        facts = [
+            _ambiguous_current_fact(fact) if fact.fact_kind in conflicting_kinds else fact
+            for fact in facts
+        ]
+    return tuple(facts), tuple(sorted(conflicts))
+
+
 def _parsed_document(
     artifact: RetrievedArtifact,
     blocks: Tuple[_TextBlock, ...],
@@ -2427,11 +2449,15 @@ def _parsed_document(
         effective_to,
         artifact.candidate.document_kind,
     )
+    current_facts, current_conflicts = _current_common_facts(artifact, blocks, tables)
+    facts = facts + current_facts
+    if len(facts) > MAX_FACTS:
+        raise _resource_limit()
     result = ParsedRiskDocument(
         artifact=artifact,
         facts=facts,
         warnings=warnings,
-        conflicts=conflicts,
+        conflicts=tuple(sorted(set(conflicts) | set(current_conflicts))),
     )
     result.validate()
     return result

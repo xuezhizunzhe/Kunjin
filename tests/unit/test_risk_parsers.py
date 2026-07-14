@@ -47,11 +47,16 @@ def artifact_for(
     kind: DocumentKind = DocumentKind.PROSPECTUS,
 ) -> RetrievedArtifact:
     raw = path.read_bytes()
+    periodic_titles = {
+        DocumentKind.ANNUAL_REPORT: "Public synthetic fund 2025年年度报告",
+        DocumentKind.SEMIANNUAL_REPORT: "Public synthetic fund 2026年半年度报告",
+        DocumentKind.QUARTERLY_REPORT: "Public synthetic fund 2026年第2季度报告",
+    }
     return RetrievedArtifact(
         candidate=OfficialDocumentCandidate(
             fund_code="519755",
             document_kind=kind,
-            title="Public synthetic official document",
+            title=periodic_titles.get(kind, "Public synthetic official document"),
             url="https://www.efunds.com.cn/synthetic/document",
             publisher="Public synthetic publisher",
             published_at=NOW,
@@ -161,6 +166,85 @@ class RiskHtmlParserTest(unittest.TestCase):
                 one(parse_artifact(artifact), "stock_exposure_max_percent").normalized_value,
                 D("0"),
             )
+
+    def test_common_current_sentence_binds_only_to_candidate_report_period(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.html"
+            path.write_text(
+                "<p>报告期末股票资产占基金总资产35.2%。</p>",
+                encoding="utf-8",
+            )
+            artifact = artifact_for(
+                path,
+                content_type="text/html",
+                kind=DocumentKind.QUARTERLY_REPORT,
+            )
+            artifact = replace(
+                artifact,
+                candidate=replace(
+                    artifact.candidate,
+                    title="公开合成基金2026年第2季度报告",
+                ),
+            )
+
+            fact = one(parse_artifact(artifact), "current_stock_asset_allocation_percent")
+
+        self.assertEqual(fact.effective_from, date(2026, 6, 30))
+        self.assertEqual(fact.effective_to, date(2026, 6, 30))
+
+    def test_common_current_fact_rejects_missing_candidate_report_period(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.html"
+            path.write_text(
+                "<p>报告期末股票资产占基金总资产35.2%。</p>",
+                encoding="utf-8",
+            )
+            artifact = artifact_for(
+                path,
+                content_type="text/html",
+                kind=DocumentKind.QUARTERLY_REPORT,
+            )
+            artifact = replace(
+                artifact,
+                candidate=replace(
+                    artifact.candidate,
+                    title="Public synthetic official document",
+                ),
+            )
+
+            with self.assertRaises(RiskDocumentParseError) as caught:
+                parse_artifact(artifact)
+
+        self.assertEqual(
+            caught.exception.failure.reason_code,
+            DocumentFailureReason.PARSER_EFFECTIVE_DATE_INVALID,
+        )
+
+    def test_common_mixed_denominator_table_does_not_promote_or_block_a_valid_table(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.html"
+            path.write_text(
+                """<h2>报告期末资产组合</h2>
+<table><tr><th>指标</th><th>单位</th><th>数值</th></tr>
+<tr><td>报告期末股票资产占基金总资产的</td><td>%</td><td>35</td></tr>
+<tr><td>报告期末债券资产占基金资产净值的</td><td>%</td><td>60</td></tr></table>
+<table><tr><th>指标</th><th>单位</th><th>数值</th></tr>
+<tr><td>报告期末现金资产占基金总资产的</td><td>%</td><td>5</td></tr></table>""",
+                encoding="utf-8",
+            )
+            artifact = artifact_for(
+                path,
+                content_type="text/html",
+                kind=DocumentKind.QUARTERLY_REPORT,
+            )
+            parsed = parse_artifact(artifact)
+
+        self.assertFalse(any(fact.fact_kind.startswith("current_stock") for fact in parsed.facts))
+        self.assertFalse(any(fact.fact_kind.startswith("current_bond") for fact in parsed.facts))
+        self.assertEqual(
+            one(parsed, "current_cash_asset_allocation_percent").normalized_value,
+            D("5"),
+        )
 
     def test_parser_errors_keep_public_codes_and_allowlisted_reasons(self) -> None:
         unsupported = replace(
@@ -956,6 +1040,8 @@ class RiskLegacyConvertedParserTest(unittest.TestCase):
         )
         self.assertEqual(parsed.provenance, LEGACY_PROVENANCE)
         self.assertEqual(parsed.document.artifact.sha256, legacy_artifact(self.ole_path).sha256)
+        self.assertEqual(stock.effective_from, date(2026, 6, 30))
+        self.assertEqual(stock.effective_to, date(2026, 6, 30))
 
     def test_converted_current_observations_require_unambiguous_bound_table_rows(self) -> None:
         html = self.fixture_html.replace(
