@@ -1840,6 +1840,10 @@ def _validate_converted_fund_identity(
     blocks: Tuple[TextBlockView, ...],
     candidate: OfficialDocumentCandidate,
 ) -> None:
+    has_trusted_fund_contract_cover = (
+        candidate.document_kind is DocumentKind.FUND_CONTRACT
+        and has_exact_leading_cover_title(blocks, candidate.title)
+    )
     codes = {
         match.group(1)
         for block in blocks
@@ -1850,6 +1854,8 @@ def _validate_converted_fund_identity(
     explicit_names = set()
     for block in blocks:
         if _is_target_fund_identity_context(block):
+            continue
+        if block.is_title and has_trusted_fund_contract_cover:
             continue
         name_match = re.fullmatch(r"基金名称\s*[:：]\s*(.+)", block.text)
         if name_match is not None:

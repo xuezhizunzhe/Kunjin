@@ -631,6 +631,18 @@ class LegacyDocConverterTests(unittest.TestCase):
         result = self._converter().convert(self.artifact)
         self.assertIn("<span><font><span><font>value</span>", result.normalized_html)
 
+    def test_html_accepts_realistic_report_between_two_and_three_mib_characters(self) -> None:
+        payload = (
+            b"<!DOCTYPE html><html><body><p>"
+            + b"x" * (2 * 1024 * 1024 + 256 * 1024)
+            + b"</p></body></html>"
+        )
+        self.runner.on_run = self._successful_run(payload)
+
+        result = self._converter().convert(self.artifact)
+
+        self.assertEqual(len(result.normalized_html.encode("utf-8")), len(payload))
+
     def test_html_rejects_multiple_roots_or_content_after_root(self) -> None:
         invalid_outputs = (
             b"<html><body>one</body></html><html><body>two</body></html>",

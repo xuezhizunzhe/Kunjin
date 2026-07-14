@@ -138,10 +138,19 @@ def has_exact_leading_cover_title(
     if type(blocks) is not tuple or type(candidate_title) is not str or not candidate_title.strip():
         return False
     normalized_candidate_title = _normalized_converted_text(candidate_title)
-    return any(
+    leading_blocks = blocks[:_MAX_LEADING_COVER_BLOCKS]
+    if any(
         type(block) is TextBlockView
         and _normalized_converted_text(block.text) == normalized_candidate_title
-        for block in blocks[:_MAX_LEADING_COVER_BLOCKS]
+        for block in leading_blocks
+    ):
+        return True
+    return any(
+        not first.is_title
+        and not second.is_title
+        and _normalized_converted_text(first.text) + _normalized_converted_text(second.text)
+        == normalized_candidate_title
+        for first, second in zip(leading_blocks, leading_blocks[1:])
     )
 
 
@@ -176,7 +185,9 @@ def validate_converted_document_contract(
         raise ConvertedDocumentContractError(DocumentFailureReason.PARSER_EFFECTIVE_DATE_INVALID)
     if heading_kinds and heading_kinds != {candidate.document_kind}:
         raise ConvertedDocumentContractError(DocumentFailureReason.PARSER_EFFECTIVE_DATE_INVALID)
-    if title_kinds and title_kinds != {candidate.document_kind}:
+    if title_kinds and title_kinds != {candidate.document_kind} and not (
+        candidate.document_kind is DocumentKind.FUND_CONTRACT and has_leading_cover_title
+    ):
         raise ConvertedDocumentContractError(DocumentFailureReason.PARSER_EFFECTIVE_DATE_INVALID)
     if not heading_kinds and not title_kinds and not has_leading_cover_title:
         raise ConvertedDocumentContractError(DocumentFailureReason.PARSER_EFFECTIVE_DATE_INVALID)

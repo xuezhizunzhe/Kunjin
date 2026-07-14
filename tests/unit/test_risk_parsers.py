@@ -772,6 +772,33 @@ class RiskLegacyConvertedParserTest(unittest.TestCase):
             DocumentFailureReason.PARSER_EFFECTIVE_DATE_INVALID,
         )
 
+    def test_fund_contract_accepts_exact_split_cover_over_stale_template_title(self) -> None:
+        html = (
+            "<!DOCTYPE html><html><head>"
+            "<title>___证券投资基金招募说明书1</title>"
+            "</head><body>"
+            "<p>XXXX证券投资基金 募集申请材料－基金合同（草案）</p>"
+            "<p>交银示例混合型证券投资基金</p>"
+            "<p>基金合同</p>"
+            "<p>基金代码：519755</p>"
+            "</body></html>"
+        )
+        artifact = legacy_artifact(
+            self.ole_path,
+            title="交银示例混合型证券投资基金基金合同",
+            kind=DocumentKind.FUND_CONTRACT,
+        )
+
+        parsed = parse_artifact_with_provenance(
+            artifact,
+            legacy_converter=FakeLegacyConverter(html),
+        )
+
+        self.assertEqual(
+            parsed.document.artifact.candidate.document_kind,
+            DocumentKind.FUND_CONTRACT,
+        )
+
     def test_periodic_converted_html_requires_exact_report_period_match(self) -> None:
         wrong_period = self.fixture_html.replace("2026年第2季度报告", "2026年第1季度报告")
 
