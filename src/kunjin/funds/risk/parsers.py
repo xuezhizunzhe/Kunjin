@@ -46,6 +46,16 @@ from kunjin.funds.risk.legacy_doc import (
     _validate_normalized_html,
 )
 from kunjin.funds.risk.models import FactConfidence, canonical_fact_value
+from kunjin.funds.risk.report_facts import (
+    MAX_REPORT_CELL_CHARACTERS,
+    MAX_REPORT_CELLS_PER_ROW,
+    MAX_REPORT_ROWS,
+    MAX_REPORT_TABLES,
+    CurrentReportObservation,
+    ReportCell,
+    ReportRow,
+    ReportTable,
+)
 from kunjin.funds.risk.reports import (
     ConvertedDocumentContractError,
     TextBlockView,
@@ -180,6 +190,55 @@ def fact_fingerprint(
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def parsed_fact_from_current_observation(
+    observation: CurrentReportObservation,
+    *,
+    effective_from: Optional[date],
+    effective_to: Optional[date],
+) -> ParsedMandateFact:
+    """Convert one exact current observation into the persisted fact contract."""
+
+    if type(observation) is not CurrentReportObservation:
+        raise ValueError("current report observation must be exact")
+    observation.validate()
+    if type(effective_from) not in {date, type(None)} or type(effective_to) not in {
+        date,
+        type(None),
+    }:
+        raise ValueError("current report effective dates must be exact dates")
+    if (
+        effective_from is not None
+        and effective_to is not None
+        and effective_to < effective_from
+    ):
+        raise ValueError("current report effective end date cannot precede its start")
+    fingerprint = fact_fingerprint(
+        fact_kind=observation.fact_kind,
+        normalized_value=observation.normalized_value,
+        unit=observation.unit,
+        page_number=observation.page_number,
+        section_name=observation.section_name,
+        source_excerpt=observation.source_excerpt,
+        effective_from=effective_from,
+        effective_to=effective_to,
+        confidence_state=observation.confidence_state,
+    )
+    fact = ParsedMandateFact(
+        fact_kind=observation.fact_kind,
+        normalized_value=observation.normalized_value,
+        unit=observation.unit,
+        page_number=observation.page_number,
+        section_name=observation.section_name,
+        source_excerpt=observation.source_excerpt,
+        effective_from=effective_from,
+        effective_to=effective_to,
+        confidence_state=observation.confidence_state,
+        fact_fingerprint=fingerprint,
+    )
+    fact.validate()
+    return fact
 
 
 @dataclass(frozen=True)
@@ -611,6 +670,247 @@ class _ConvertedEvidenceHtmlParser(HTMLParser):
         block = _TextBlock(text, None, self._section, current_observation_eligible, True)
         self.blocks.append(block)
         self.views.append(TextBlockView(text, None, self._section, False, False))
+
+
+_TABLE_CELL_WRAPPERS = frozenset(
+    {
+        "a",
+        "b",
+        "em",
+        "font",
+        "i",
+        "p",
+        "s",
+        "small",
+        "span",
+        "strong",
+        "sub",
+        "sup",
+        "u",
+    }
+)
+_KNOWN_TABLE_HEADERS = frozenset(
+    {
+        "代码",
+        "占比",
+        "名称",
+        "单位",
+        "序号",
+        "指标",
+        "数值",
+        "比例",
+        "项目",
+        "证券代码",
+        "证券名称",
+        "asset",
+        "code",
+        "indicator",
+        "item",
+        "name",
+        "rank",
+        "unit",
+        "value",
+        "weight",
+    }
+)
+
+
+def _row_looks_like_header(values: Tuple[str, ...]) -> bool:
+    known_headers = sum(value.casefold() in _KNOWN_TABLE_HEADERS for value in values)
+    return len(values) >= 2 and known_headers >= 2
+
+
+def _report_table_excerpt(rows: Tuple[ReportRow, ...]) -> str:
+    excerpt = "；".join(" | ".join(cell.text for cell in row.cells) for row in rows)
+    if len(excerpt) <= MAX_EXCERPT_CHARACTERS:
+        return excerpt
+    return excerpt[: MAX_EXCERPT_CHARACTERS - 3] + "..."
+
+
+class _StructuredHtmlTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: List[ReportTable] = []
+        self._ignored_tag: Optional[str] = None
+        self._ignored_depth = 0
+        self._heading_tag: Optional[str] = None
+        self._heading_parts: List[str] = []
+        self._section: Optional[str] = None
+        self._table_depth = 0
+        self._table_count = 0
+        self._total_rows = 0
+        self._table_invalid = False
+        self._rows: List[Tuple[Tuple[str, bool], ...]] = []
+        self._row: Optional[List[Tuple[str, bool]]] = None
+        self._cell_tag: Optional[str] = None
+        self._cell_parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        tag = tag.casefold()
+        if self._ignored_tag is not None:
+            if tag == self._ignored_tag:
+                self._ignored_depth += 1
+            return
+        if tag in IGNORED_ELEMENTS:
+            self._ignored_tag = tag
+            self._ignored_depth = 1
+            return
+        if tag == "table":
+            if self._table_depth == 0:
+                self._table_count += 1
+                if self._table_count > MAX_REPORT_TABLES:
+                    raise _resource_limit()
+                self._table_invalid = False
+                self._rows = []
+                self._row = None
+                self._cell_tag = None
+                self._cell_parts = []
+            else:
+                self._table_invalid = True
+            self._table_depth += 1
+            return
+        if self._table_depth:
+            self._handle_table_start(tag, attrs)
+            return
+        if tag in HEADING_ELEMENTS:
+            self._heading_tag = tag
+            self._heading_parts = []
+
+    def _handle_table_start(
+        self,
+        tag: str,
+        attrs: List[Tuple[str, Optional[str]]],
+    ) -> None:
+        if self._table_depth != 1:
+            return
+        if self._cell_tag is not None:
+            if tag == "br":
+                self._cell_parts.append(" ")
+            elif tag not in _TABLE_CELL_WRAPPERS:
+                self._table_invalid = True
+            return
+        if tag == "tr":
+            if self._row is not None:
+                self._table_invalid = True
+            else:
+                self._row = []
+            return
+        if tag not in {"td", "th"}:
+            return
+        if self._row is None or self._cell_tag is not None:
+            self._table_invalid = True
+            return
+        attribute_names = tuple(name.casefold() for name, _ in attrs)
+        if len(attribute_names) != len(set(attribute_names)):
+            self._table_invalid = True
+        for name, value in attrs:
+            if name.casefold() in {"rowspan", "colspan"} and (value or "").strip() != "1":
+                self._table_invalid = True
+        self._cell_tag = tag
+        self._cell_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if self._ignored_tag is not None:
+            if tag == self._ignored_tag:
+                self._ignored_depth -= 1
+                if self._ignored_depth == 0:
+                    self._ignored_tag = None
+            return
+        if self._table_depth:
+            self._handle_table_end(tag)
+            return
+        if self._heading_tag == tag:
+            heading = _normalized_text("".join(self._heading_parts))
+            self._section = heading[:MAX_SECTION_CHARACTERS] if heading else None
+            self._heading_tag = None
+            self._heading_parts = []
+
+    def _handle_table_end(self, tag: str) -> None:
+        if self._table_depth > 1:
+            if tag == "table":
+                self._table_depth -= 1
+            return
+        if self._cell_tag == tag:
+            text = _normalized_text("".join(self._cell_parts))
+            if len(text) > MAX_REPORT_CELL_CHARACTERS:
+                raise _resource_limit()
+            if not text or self._row is None:
+                self._table_invalid = True
+            elif len(self._row) >= MAX_REPORT_CELLS_PER_ROW:
+                raise _resource_limit()
+            else:
+                self._row.append((text, tag == "th"))
+            self._cell_tag = None
+            self._cell_parts = []
+            return
+        if tag == "tr":
+            self._finish_row()
+            return
+        if tag == "table":
+            if self._cell_tag is not None or self._row is not None:
+                self._table_invalid = True
+            self._finish_table()
+            self._table_depth = 0
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_tag is not None:
+            return
+        if self._cell_tag is not None:
+            self._cell_parts.append(data)
+        elif self._heading_tag is not None and self._table_depth == 0:
+            self._heading_parts.append(data)
+
+    def finish(self) -> None:
+        self.close()
+        if self._table_depth:
+            self._table_invalid = True
+            self._finish_table()
+            self._table_depth = 0
+
+    def _finish_row(self) -> None:
+        if self._cell_tag is not None or self._row is None or not self._row:
+            self._table_invalid = True
+        else:
+            self._total_rows += 1
+            if self._total_rows > MAX_REPORT_ROWS:
+                raise _resource_limit()
+            self._rows.append(tuple(self._row))
+        self._row = None
+        self._cell_tag = None
+        self._cell_parts = []
+
+    def _finish_table(self) -> None:
+        if not self._table_invalid and self._rows:
+            rows = []
+            for index, raw_row in enumerate(self._rows):
+                values = tuple(text for text, _ in raw_row)
+                inferred_header = index == 0 and _row_looks_like_header(values)
+                rows.append(
+                    ReportRow(
+                        tuple(
+                            ReportCell(text, is_header or inferred_header)
+                            for text, is_header in raw_row
+                        )
+                    )
+                )
+            table = ReportTable(
+                rows=tuple(rows),
+                page_number=None,
+                section_name=self._section,
+                source_excerpt=_report_table_excerpt(tuple(rows)),
+            )
+            try:
+                table.validate()
+            except ValueError:
+                pass
+            else:
+                self.tables.append(table)
+        self._table_invalid = False
+        self._rows = []
+        self._row = None
+        self._cell_tag = None
+        self._cell_parts = []
 
 
 def _normalized_text(value: str) -> str:
@@ -1536,7 +1836,10 @@ def _parse_content_type(content_type: str) -> Tuple[str, Optional[str]]:
     return media_type, charset.casefold() if charset else None
 
 
-def _html_blocks(raw: bytes, declared_charset: Optional[str]) -> Tuple[_TextBlock, ...]:
+def _html_content(
+    raw: bytes,
+    declared_charset: Optional[str],
+) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable, ...]]:
     charset = _HTML_CHARSETS.get(declared_charset or "utf-8")
     if charset is None:
         raise _fail(
@@ -1548,20 +1851,32 @@ def _html_blocks(raw: bytes, declared_charset: Optional[str]) -> Tuple[_TextBloc
         parser = _EvidenceHtmlParser()
         parser.feed(text)
         parser.finish()
+        table_parser = _StructuredHtmlTableParser()
+        table_parser.feed(text)
+        table_parser.finish()
     except (UnicodeError, ValueError) as exc:
         raise _fail(DocumentFailureReason.PARSER_FORMAT_INVALID) from exc
     blocks = tuple(parser.blocks)
     if sum(len(block.text) for block in blocks) > MAX_EXTRACTED_CHARACTERS:
         raise _resource_limit()
-    return blocks
+    return blocks, tuple(table_parser.tables)
 
 
-def _converted_html_blocks(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[TextBlockView, ...]]:
+def _html_blocks(raw: bytes, declared_charset: Optional[str]) -> Tuple[_TextBlock, ...]:
+    return _html_content(raw, declared_charset)[0]
+
+
+def _converted_html_content(
+    raw: bytes,
+) -> Tuple[Tuple[_TextBlock, ...], Tuple[TextBlockView, ...], Tuple[ReportTable, ...]]:
     try:
         text = raw.decode("utf-8", errors="strict")
         parser = _ConvertedEvidenceHtmlParser()
         parser.feed(text)
         parser.finish()
+        table_parser = _StructuredHtmlTableParser()
+        table_parser.feed(text)
+        table_parser.finish()
     except (UnicodeError, ValueError) as exc:
         raise _fail(DocumentFailureReason.PARSER_FORMAT_INVALID) from exc
     blocks = tuple(parser.blocks)
@@ -1575,6 +1890,11 @@ def _converted_html_blocks(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[Te
         if blocks and views:
             raise _resource_limit()
         raise _fail(DocumentFailureReason.PARSER_FORMAT_INVALID)
+    return blocks, views, tuple(table_parser.tables)
+
+
+def _converted_html_blocks(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[TextBlockView, ...]]:
+    blocks, views, _ = _converted_html_content(raw)
     return blocks, views
 
 
@@ -1709,7 +2029,66 @@ def _docx_is_heading(paragraph: ElementTree.Element, text: str) -> bool:
     )
 
 
-def _docx_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
+def _docx_report_table(
+    table_element: ElementTree.Element,
+    section: Optional[str],
+) -> Optional[ReportTable]:
+    word = "{" + _WORD_NAMESPACE + "}"
+    if table_element.findall(".//" + word + "tbl"):
+        return None
+    raw_rows = []
+    for row_index, row in enumerate(table_element.findall("./" + word + "tr")):
+        cells = []
+        for cell in row.findall("./" + word + "tc"):
+            grid_span = cell.find("./" + word + "tcPr/" + word + "gridSpan")
+            vertical_merge = cell.find("./" + word + "tcPr/" + word + "vMerge")
+            if vertical_merge is not None or (
+                grid_span is not None
+                and grid_span.attrib.get(word + "val", "").strip() != "1"
+            ):
+                return None
+            text = _normalized_text(
+                " ".join(
+                    _docx_paragraph_text(paragraph)
+                    for paragraph in cell.findall(".//" + word + "p")
+                )
+            )
+            if not text:
+                return None
+            if len(text) > MAX_REPORT_CELL_CHARACTERS:
+                raise _resource_limit()
+            if len(cells) >= MAX_REPORT_CELLS_PER_ROW:
+                raise _resource_limit()
+            cells.append(text)
+        if not cells:
+            return None
+        explicit_header = row.find("./" + word + "trPr/" + word + "tblHeader") is not None
+        inferred_header = row_index == 0 and _row_looks_like_header(tuple(cells))
+        raw_rows.append(
+            ReportRow(
+                tuple(
+                    ReportCell(text, explicit_header or inferred_header)
+                    for text in cells
+                )
+            )
+        )
+    if not raw_rows:
+        return None
+    rows = tuple(raw_rows)
+    table = ReportTable(
+        rows=rows,
+        page_number=None,
+        section_name=section,
+        source_excerpt=_report_table_excerpt(rows),
+    )
+    try:
+        table.validate()
+    except ValueError:
+        return None
+    return table
+
+
+def _docx_content(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable, ...]]:
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             names = _docx_member_names(archive)
@@ -1738,8 +2117,11 @@ def _docx_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
             "official DOCX has no document body",
         )
     blocks = []
+    tables = []
     section = None
     total_characters = 0
+    total_table_rows = 0
+    table_count = 0
     for child in body:
         local_name = child.tag.rsplit("}", 1)[-1]
         texts = []
@@ -1751,6 +2133,15 @@ def _docx_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
             if text:
                 texts.append(text)
         elif local_name == "tbl":
+            table_count += 1
+            if table_count > MAX_REPORT_TABLES:
+                raise _resource_limit()
+            table = _docx_report_table(child, section)
+            if table is not None:
+                total_table_rows += len(table.rows)
+                if total_table_rows > MAX_REPORT_ROWS:
+                    raise _resource_limit()
+                tables.append(table)
             for row in child.findall(".//" + word + "tr"):
                 cells = []
                 for cell in row.findall("./" + word + "tc"):
@@ -1779,7 +2170,11 @@ def _docx_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
             DocumentFailureReason.PARSER_FORMAT_INVALID,
             "official DOCX has no reliable extractable text",
         )
-    return tuple(blocks)
+    return tuple(blocks), tuple(tables)
+
+
+def _docx_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
+    return _docx_content(raw)[0]
 
 
 def _legal_name_from_document_title(title: str) -> Optional[str]:
@@ -1995,6 +2390,10 @@ def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
         raise _fail(DocumentFailureReason.PARSER_FORMAT_INVALID) from exc
 
 
+def _pdf_content(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable, ...]]:
+    return _pdf_blocks(raw), ()
+
+
 def _legacy_conversion_failure(reason: DocumentFailureReason) -> LegacyDocConversionError:
     failure = SafeDocumentFailure(
         public_code="official_document_parse_failed",
@@ -2008,7 +2407,17 @@ def _legacy_conversion_failure(reason: DocumentFailureReason) -> LegacyDocConver
 def _parsed_document(
     artifact: RetrievedArtifact,
     blocks: Tuple[_TextBlock, ...],
+    tables: Tuple[ReportTable, ...],
 ) -> ParsedRiskDocument:
+    if type(tables) is not tuple or len(tables) > MAX_REPORT_TABLES:
+        raise _fail(DocumentFailureReason.PARSER_FORMAT_INVALID)
+    for table in tables:
+        if type(table) is not ReportTable:
+            raise _fail(DocumentFailureReason.PARSER_FORMAT_INVALID)
+        try:
+            table.validate()
+        except ValueError as exc:
+            raise _fail(DocumentFailureReason.PARSER_FORMAT_INVALID) from exc
     effective_from, effective_to = _effective_dates(blocks)
     facts, warnings, conflicts = _extract_facts(
         blocks,
@@ -2057,29 +2466,31 @@ def parse_artifact_with_provenance(
                 DocumentFailureReason.LEGACY_CONVERTER_OUTPUT_INVALID
             ) from None
         _validate_normalized_html(conversion.normalized_html)
-        blocks, block_views = _converted_html_blocks(conversion.normalized_html.encode("utf-8"))
+        blocks, block_views, tables = _converted_html_content(
+            conversion.normalized_html.encode("utf-8")
+        )
         try:
             validate_converted_document_contract(block_views, artifact.candidate)
         except ConvertedDocumentContractError as exc:
             raise _fail(exc.reason_code) from None
         _validate_converted_fund_identity(block_views, artifact.candidate)
-        document = _parsed_document(artifact, blocks)
+        document = _parsed_document(artifact, blocks, tables)
         parser_input_sha256 = conversion.parser_input_sha256
         provenance = conversion.provenance
     else:
         if media_type in _HTML_MEDIA_TYPES:
-            blocks = _html_blocks(raw, charset)
+            blocks, tables = _html_content(raw, charset)
         elif media_type == "application/pdf" and charset is None:
-            blocks = _pdf_blocks(raw)
+            blocks, tables = _pdf_content(raw)
         elif media_type in _DOCX_MEDIA_TYPES and charset is None:
-            blocks = _docx_blocks(raw)
+            blocks, tables = _docx_content(raw)
             _validate_document_fund_identity(blocks, artifact.candidate)
         else:
             raise _fail(
                 DocumentFailureReason.PARSER_FORMAT_INVALID,
                 "official fund document has an unsupported content type",
             )
-        document = _parsed_document(artifact, blocks)
+        document = _parsed_document(artifact, blocks, tables)
         parser_input_sha256 = artifact.sha256
         provenance = native_parser_provenance()
 

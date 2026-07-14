@@ -24,6 +24,7 @@ from kunjin.funds.risk.parsers import (
     ParsedArtifactResult,
     ParsedMandateFact,
     RiskDocumentParseError,
+    _html_content,
     parse_artifact,
     parse_artifact_with_provenance,
 )
@@ -139,6 +140,28 @@ def write_docx(
 
 
 class RiskHtmlParserTest(unittest.TestCase):
+    def test_structured_table_channel_preserves_existing_legal_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.html"
+            path.write_text(
+                """<html><body>
+<h2>投资范围</h2><p>本基金不投资于股票。</p>
+<h2>资产组合报告</h2>
+<table><tr><th>指标</th><th>单位</th><th>数值</th></tr>
+<tr><td>报告期末债券资产占基金总资产的</td><td>%</td><td>95</td></tr></table>
+</body></html>""",
+                encoding="utf-8",
+            )
+            artifact = artifact_for(path, content_type="text/html")
+            blocks, tables = _html_content(path.read_bytes(), "utf-8")
+
+            self.assertTrue(blocks)
+            self.assertEqual(len(tables), 1)
+            self.assertEqual(
+                one(parse_artifact(artifact), "stock_exposure_max_percent").normalized_value,
+                D("0"),
+            )
+
     def test_parser_errors_keep_public_codes_and_allowlisted_reasons(self) -> None:
         unsupported = replace(
             artifact_for(
