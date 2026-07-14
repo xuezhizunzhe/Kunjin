@@ -335,6 +335,22 @@ class CurrentReportAdapterTest(unittest.TestCase):
             DocumentFailureReason.RESOURCE_LIMIT,
         )
 
+    def test_invalid_docx_table_rows_still_consume_the_shared_row_budget(self) -> None:
+        invalid_then_valid = replace_docx_document(
+            docx_with_table(table_count=2),
+            b"<w:tc><w:p><w:r><w:t>\xe6\x95\xb0\xe5\x80\xbc</w:t>",
+            b"<w:tc><w:p><w:r><w:t>\xe5\x8d\x95\xe4\xbd\x8d</w:t>",
+        )
+        with patch("kunjin.funds.risk.parsers.MAX_REPORT_ROWS", 3):
+            with patch("kunjin.funds.risk.report_facts.MAX_REPORT_ROWS", 3):
+                with self.assertRaises(RiskDocumentParseError) as caught:
+                    _docx_content(invalid_then_valid)
+
+        self.assertEqual(
+            caught.exception.failure.reason_code,
+            DocumentFailureReason.RESOURCE_LIMIT,
+        )
+
     def test_docx_legacy_horizontal_merge_is_not_retained_as_structured_evidence(self) -> None:
         for merge_value in (b"restart", b"continue"):
             with self.subTest(merge_value=merge_value):

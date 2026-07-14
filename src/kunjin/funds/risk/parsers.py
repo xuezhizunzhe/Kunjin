@@ -2032,15 +2032,12 @@ def _docx_is_heading(paragraph: ElementTree.Element, text: str) -> bool:
 def _docx_report_table(
     table_element: ElementTree.Element,
     section: Optional[str],
-    remaining_row_capacity: int,
 ) -> Optional[ReportTable]:
     word = "{" + _WORD_NAMESPACE + "}"
     if table_element.findall(".//" + word + "tbl"):
         return None
     raw_rows = []
     for row_index, row in enumerate(table_element.findall("./" + word + "tr")):
-        if row_index >= remaining_row_capacity:
-            raise _resource_limit()
         cells = []
         for cell in row.findall("./" + word + "tc"):
             grid_span = cell.find("./" + word + "tcPr/" + word + "gridSpan")
@@ -2140,15 +2137,12 @@ def _docx_content(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable
             table_count += 1
             if table_count > MAX_REPORT_TABLES:
                 raise _resource_limit()
-            table = _docx_report_table(
-                child,
-                section,
-                MAX_REPORT_ROWS - total_table_rows,
-            )
+            candidate_row_count = len(child.findall("./" + word + "tr"))
+            if candidate_row_count > MAX_REPORT_ROWS - total_table_rows:
+                raise _resource_limit()
+            total_table_rows += candidate_row_count
+            table = _docx_report_table(child, section)
             if table is not None:
-                total_table_rows += len(table.rows)
-                if total_table_rows > MAX_REPORT_ROWS:
-                    raise _resource_limit()
                 tables.append(table)
             for row in child.findall(".//" + word + "tr"):
                 cells = []
