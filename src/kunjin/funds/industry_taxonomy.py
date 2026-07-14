@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import date
 from decimal import Decimal
 from typing import Optional, Tuple
@@ -152,11 +152,13 @@ def validate_industry_distribution(
         seen_codes.add(code)
         seen_names.add(name_key)
 
-    return ValidatedIndustryDistribution(
+    validated = ValidatedIndustryDistribution(
         taxonomy_id=mapping.metadata.taxonomy_id,
         mapping_checksum=mapping.checksum,
         rows=rows,
     )
+    _validate_validated_distribution(validated)
+    return validated
 
 
 def _validate_caller_records(
@@ -168,8 +170,7 @@ def _validate_caller_records(
     if type(complete_scope) is not bool:
         raise ValueError("complete scope must be an exact bool")
     for row in rows:
-        if type(row) is not IndustryDistributionRow:
-            raise ValueError("industry rows must contain exact IndustryDistributionRow records")
+        _require_exact_record_state(row, IndustryDistributionRow, "industry row")
         for field_name, value in (
             ("classification standard", row.classification_standard),
             ("industry code", row.industry_code),
@@ -196,8 +197,11 @@ def _validate_registry(mappings: object) -> None:
     seen_taxonomies: set[tuple[str, str]] = set()
     seen_source_aliases: set[str] = set()
     for mapping in mappings:
-        if type(mapping) is not IndustryTaxonomyMapping:
-            raise ValueError("taxonomy registry contains an invalid mapping record")
+        _require_exact_record_state(
+            mapping,
+            IndustryTaxonomyMapping,
+            "taxonomy mapping",
+        )
         _validate_mapping(mapping)
         identity = (mapping.metadata.taxonomy_id, mapping.metadata.version)
         if identity in seen_taxonomies:
@@ -213,13 +217,27 @@ def _validate_registry(mappings: object) -> None:
 
 
 def _validate_mapping(mapping: IndustryTaxonomyMapping) -> None:
+    _require_exact_record_state(
+        mapping,
+        IndustryTaxonomyMapping,
+        "taxonomy mapping",
+    )
     _validate_metadata(mapping.metadata)
     if mapping.metadata not in RECOGNIZED_INDUSTRY_TAXONOMIES:
         raise ValueError("taxonomy mapping metadata is not recognized")
     if type(mapping.source_url) is not str:
         raise ValueError("taxonomy source URL must be an exact string")
-    _normalize_safe_text(mapping.source_url, "taxonomy source URL")
-    parsed_url = urlsplit(mapping.source_url)
+    normalized_source_url = _normalize_safe_text(
+        mapping.source_url,
+        "taxonomy source URL",
+    )
+    if normalized_source_url != mapping.source_url:
+        raise ValueError("taxonomy source URL must be canonical")
+    try:
+        parsed_url = urlsplit(mapping.source_url)
+        parsed_url.port
+    except ValueError as exc:
+        raise ValueError("taxonomy source URL is invalid") from exc
     if (
         parsed_url.scheme != "https"
         or not parsed_url.hostname
@@ -304,8 +322,11 @@ def _validate_mapping(mapping: IndustryTaxonomyMapping) -> None:
 
 
 def _validate_metadata(metadata: object) -> None:
-    if type(metadata) is not RecognizedIndustryTaxonomy:
-        raise ValueError("taxonomy metadata must be an exact record")
+    _require_exact_record_state(
+        metadata,
+        RecognizedIndustryTaxonomy,
+        "taxonomy metadata",
+    )
     for field_name, value in (
         ("taxonomy id", metadata.taxonomy_id),
         ("taxonomy version", metadata.version),
@@ -334,6 +355,26 @@ def _validate_metadata(metadata: object) -> None:
         re.compile(metadata.expected_code_pattern)
     except re.error as exc:
         raise ValueError("taxonomy code pattern is invalid") from exc
+
+
+def _validate_validated_distribution(distribution: object) -> None:
+    _require_exact_record_state(
+        distribution,
+        ValidatedIndustryDistribution,
+        "validated industry distribution",
+    )
+
+
+def _require_exact_record_state(
+    value: object,
+    expected_type: type[object],
+    name: str,
+) -> None:
+    if type(value) is not expected_type:
+        raise ValueError(f"{name} must be an exact record")
+    expected_fields = {field.name for field in fields(expected_type)}
+    if set(vars(value)) != expected_fields:
+        raise ValueError(f"{name} must have exact record state")
 
 
 def _mapping_for_standard(

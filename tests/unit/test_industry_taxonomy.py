@@ -8,6 +8,7 @@ from decimal import Decimal
 
 import pytest
 
+import kunjin.funds.industry_taxonomy as industry_taxonomy
 from kunjin.funds.industry_taxonomy import (
     PRODUCTION_TAXONOMY_MAPPINGS,
     SW_LEVEL1_2021,
@@ -292,6 +293,49 @@ def test_mutable_or_subclassed_caller_records_are_rejected() -> None:
         )
 
 
+def test_caller_row_rejects_injected_dataclass_state() -> None:
+    row = replace(_rows()[0])
+    object.__setattr__(row, "unexpected_mutable_state", [])
+
+    with pytest.raises(ValueError, match="exact record state"):
+        validate_industry_distribution(
+            rows=(row,), complete_scope=True, mappings=(_mapping(),)
+        )
+
+
+def test_registry_rejects_injected_metadata_dataclass_state() -> None:
+    metadata = replace(SW_LEVEL1_2021)
+    object.__setattr__(metadata, "unexpected_mutable_state", [])
+
+    with pytest.raises(ValueError, match="exact record state"):
+        validate_industry_distribution(
+            rows=_rows(),
+            complete_scope=True,
+            mappings=(_mapping(metadata=metadata),),
+        )
+
+
+def test_registry_rejects_injected_mapping_dataclass_state() -> None:
+    mapping = _mapping()
+    object.__setattr__(mapping, "unexpected_mutable_state", [])
+
+    with pytest.raises(ValueError, match="exact record state"):
+        validate_industry_distribution(
+            rows=_rows(), complete_scope=True, mappings=(mapping,)
+        )
+
+
+def test_validated_distribution_rejects_injected_dataclass_state() -> None:
+    validated = validate_industry_distribution(
+        rows=_rows(), complete_scope=True, mappings=(_mapping(),)
+    )
+    assert validated is not None
+    object.__setattr__(validated, "unexpected_mutable_state", [])
+
+    with pytest.raises(ValueError, match="exact record state"):
+        industry_taxonomy._validate_validated_distribution(validated)
+
+
 @pytest.mark.parametrize(
     "mapping",
     (
@@ -313,6 +357,26 @@ def test_invalid_registry_mapping_raises_value_error(
     with pytest.raises(ValueError):
         validate_industry_distribution(
             rows=_rows(), complete_scope=True, mappings=(mapping,)
+        )
+
+
+@pytest.mark.parametrize(
+    "source_url",
+    (
+        " https://example.com/sw-level1-2021.json",
+        "https://example.com/sw-level1-2021.json ",
+        "https://example.com/ＳＷ-level1-2021.json",
+        "https://example.com:invalid/sw-level1-2021.json",
+    ),
+)
+def test_registry_rejects_noncanonical_or_invalid_port_source_url(
+    source_url: str,
+) -> None:
+    with pytest.raises(ValueError, match="source URL"):
+        validate_industry_distribution(
+            rows=_rows(),
+            complete_scope=True,
+            mappings=(_mapping(source_url=source_url),),
         )
 
 
