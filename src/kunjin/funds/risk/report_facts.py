@@ -80,7 +80,6 @@ _COMPLETE_INDUSTRY_SCOPES = {
     "报告期末全部行业分布",
     "complete industry distribution at the end of the reporting period",
 }
-_UNKNOWN_INDUSTRY_NAMES = {"其他", "其它", "other", "others"}
 _RANKED_WEIGHT_HEADERS = {
     "占基金资产净值比例(%)": "percent_of_net_assets",
     "占基金净资产比例(%)": "percent_of_net_assets",
@@ -88,6 +87,12 @@ _RANKED_WEIGHT_HEADERS = {
     "weight (% of net assets)": "percent_of_net_assets",
     "weight (% of total assets)": "percent_of_total_assets",
 }
+_DEFAULT_IGNORABLE_PATTERN = re.compile(
+    "[\u00ad\u034f\u061c\u115f-\u1160\u17b4-\u17b5\u180b-\u180f"
+    "\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f"
+    "\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3"
+    "\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+)
 
 _DECIMAL_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
 _ASSET_ROW_PATTERN = re.compile(
@@ -304,6 +309,22 @@ def _normalized_label(value: str) -> str:
     return normalized
 
 
+def _has_unsafe_name_characters(value: str) -> bool:
+    return _DEFAULT_IGNORABLE_PATTERN.search(value) is not None or any(
+        unicodedata.category(character) == "Cf" for character in value
+    )
+
+
+def _is_unknown_industry_name(value: str) -> bool:
+    normalized = _normalized(value)
+    compact = normalized.replace(" ", "")
+    if compact.startswith(("其他", "其它")):
+        return True
+    return normalized in {"other", "others"} or normalized.startswith(
+        ("other ", "others ")
+    )
+
+
 def _percent_value(value: str) -> Optional[Decimal]:
     normalized = _normalized(value)
     if _DECIMAL_PATTERN.fullmatch(normalized) is None:
@@ -475,7 +496,13 @@ def _ranked_table_rows(
             return None
         rank = int(normalized_rank)
         weight = _percent_value(weight_text)
-        if rank <= 0 or str(rank) != normalized_rank or weight is None or not name.strip():
+        if (
+            rank <= 0
+            or str(rank) != normalized_rank
+            or weight is None
+            or not name.strip()
+            or _has_unsafe_name_characters(name)
+        ):
             return None
         parsed.append((rank, " ".join(name.split()), weight))
     ranks = tuple(item[0] for item in parsed)
@@ -563,9 +590,7 @@ def _industry_observations(
         complete_scope = section in {
             _normalized(value) for value in _COMPLETE_INDUSTRY_SCOPES
         }
-        if not complete_scope or any(
-            _normalized(item[1]) in _UNKNOWN_INDUSTRY_NAMES for item in parsed
-        ):
+        if not complete_scope or any(_is_unknown_industry_name(item[1]) for item in parsed):
             continue
         headers = _headers(table)
         if headers is None:

@@ -297,6 +297,48 @@ class RiskHtmlParserTest(unittest.TestCase):
             any(fact.fact_kind == "current_stock_asset_allocation_percent" for fact in parsed.facts)
         )
 
+    def test_common_explicit_section_time_context_must_match_candidate_period(self) -> None:
+        rejected_sections = (
+            "截至2025年12月31日",
+            "截至2025-12-31",
+            "截至2025/12/31",
+            "2025 Annual Asset Allocation",
+            "上年末资产配置",
+            "往期资产配置",
+            "同期资产配置",
+            "期初资产配置",
+            "第二季度资产配置",
+        )
+        allowed_sections = (
+            "截至2026-06-30",
+            "报告期末资产组合",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, section in enumerate(rejected_sections + allowed_sections):
+                path = root / f"report-{index}.html"
+                path.write_text(
+                    f"<h2>{section}</h2><p>报告期末股票资产占基金总资产35.2%。</p>",
+                    encoding="utf-8",
+                )
+                artifact = artifact_for(
+                    path,
+                    content_type="text/html",
+                    kind=DocumentKind.QUARTERLY_REPORT,
+                )
+                parsed = parse_artifact(artifact)
+                matches = [
+                    fact
+                    for fact in parsed.facts
+                    if fact.fact_kind == "current_stock_asset_allocation_percent"
+                ]
+                with self.subTest(section=section):
+                    if section in rejected_sections:
+                        self.assertEqual(matches, [])
+                    else:
+                        self.assertEqual(len(matches), 1)
+                        self.assertEqual(matches[0].effective_from, date(2026, 6, 30))
+
     def test_parser_errors_keep_public_codes_and_allowlisted_reasons(self) -> None:
         unsupported = replace(
             artifact_for(

@@ -42,13 +42,27 @@ def D(value: object) -> Decimal:
     return Decimal(str(value))
 
 
+_DEFAULT_FACT_UNIT = object()
+
+
 def fact(
     kind: str,
     value: object,
     *,
     document_id: int = 1,
-    unit: Optional[str] = None,
+    unit: object = _DEFAULT_FACT_UNIT,
 ) -> MandateFact:
+    if unit is _DEFAULT_FACT_UNIT:
+        if kind == "current_effective_duration":
+            unit = "years"
+        elif kind == "current_weighted_average_maturity_days":
+            unit = "days"
+        elif kind.startswith("current_") and type(value) is Decimal:
+            unit = "percent_of_net_assets"
+        else:
+            unit = None
+    if type(unit) not in {str, type(None)}:
+        raise AssertionError("synthetic fact unit must resolve to text or None")
     fingerprint_fields = [kind, str(value), document_id]
     if unit is not None:
         fingerprint_fields.append(unit)
@@ -1190,6 +1204,24 @@ class DowngradeAndConflictTest(unittest.TestCase):
         result = classify(conflicted)
 
         self.assertIn("source_version_conflict", result.conflicts)
+        self.assertEqual(result.evidence_status, EvidenceStatus.CONFLICTED)
+
+    def test_single_current_report_fact_with_invalid_unit_fails_closed(self) -> None:
+        base = evidence(
+            legal=strict_bond_legal(),
+            report=strict_bond_report(),
+        )
+        invalid_report_facts = tuple(
+            replace(item, unit="days")
+            if item.fact_kind == "current_stock_asset_allocation_percent"
+            else item
+            for item in base.report_facts
+        )
+
+        result = classify(replace(base, report_facts=invalid_report_facts))
+
+        self.assertIn("source_version_conflict", result.conflicts)
+        self.assertIn("stock_observation_evidence_missing", result.missing_evidence)
         self.assertEqual(result.evidence_status, EvidenceStatus.CONFLICTED)
 
     def test_observed_mandate_breaches_add_stable_conflict_codes(self) -> None:

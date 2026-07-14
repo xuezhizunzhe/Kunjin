@@ -663,6 +663,41 @@ class CommonReportFactExtractionTest(unittest.TestCase):
                     (),
                 )
 
+    def test_common_ranked_tables_reject_invisible_names_and_unknown_industry_prefixes(
+        self,
+    ) -> None:
+        invisible_tables = (
+            common_table(
+                ("排名", "证券名称", "占基金资产净值比例(%)"),
+                (("1", "证券\u200bA", "10"), ("2", "证券B", "5")),
+                section_name="报告期末全部证券持仓明细",
+            ),
+            common_table(
+                ("排名", "行业名称", "占基金资产净值比例(%)"),
+                (("1", "科技\ufe0f", "25"), ("2", "金融", "20")),
+                section_name="报告期末全部行业分布",
+            ),
+        )
+        unknown_names = ("其他行业", "其他行业合计", "Other industries")
+
+        for table in invisible_tables:
+            with self.subTest(name=table.rows[1].cells[1].text):
+                self.assertEqual(
+                    extract_common_report_observations(text_blocks=(), tables=(table,)),
+                    (),
+                )
+        for unknown_name in unknown_names:
+            table = common_table(
+                ("排名", "行业名称", "占基金资产净值比例(%)"),
+                (("1", "科技", "25"), ("2", unknown_name, "20")),
+                section_name="报告期末全部行业分布",
+            )
+            with self.subTest(name=unknown_name):
+                self.assertEqual(
+                    extract_common_report_observations(text_blocks=(), tables=(table,)),
+                    (),
+                )
+
     def test_common_rejects_mandate_wording_and_never_infers_remainders(self) -> None:
         observations = extract_common_report_observations(
             text_blocks=(

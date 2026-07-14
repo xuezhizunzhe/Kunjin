@@ -2334,7 +2334,14 @@ _PERIODIC_DOCUMENT_KINDS = frozenset(
     }
 )
 _HISTORICAL_CONTEXT_PATTERN = re.compile(
-    r"历史|上期|上一期|前期|去年|上年度|上季度|historical|prior period|previous period",
+    r"历史|上期|上一期|前期|去年|上年度|上季度|上年末|往期|同期|期初|"
+    r"historical|prior period|previous period",
+    flags=re.IGNORECASE,
+)
+_UNBOUND_PERIOD_CONTEXT_PATTERN = re.compile(
+    r"年度|半年度|中期|第?[一二三四1-4]季度|"
+    r"\b(?:annual|semi-annual|semiannual|half-year|q[1-4]|"
+    r"first quarter|second quarter|third quarter|fourth quarter)\b",
     flags=re.IGNORECASE,
 )
 _CONTEXT_QUARTERS = {
@@ -2361,6 +2368,19 @@ def _observation_context_matches_period(
         return False
     periods = set()
     try:
+        reported_period = report_period_end(normalized)
+        if reported_period is not None:
+            periods.add(reported_period)
+        for match in re.finditer(
+            r"(?<![0-9])([0-9]{4})年([0-9]{1,2})月([0-9]{1,2})日",
+            normalized,
+        ):
+            periods.add(date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
+        for match in re.finditer(
+            r"(?<![0-9])([0-9]{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})(?![0-9])",
+            normalized,
+        ):
+            periods.add(date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
         periods.update(
             date(int(match.group(1)), 12, 31)
             for match in re.finditer(r"(?<![0-9])([0-9]{4})年年度", normalized)
@@ -2375,9 +2395,45 @@ def _observation_context_matches_period(
         ):
             month, day = _CONTEXT_QUARTERS[match.group(2)]
             periods.add(date(int(match.group(1)), month, day))
+        periods.update(
+            date(int(match.group(1)), 12, 31)
+            for match in re.finditer(
+                r"(?<![0-9])([0-9]{4})\s+annual\b",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+        )
+        periods.update(
+            date(int(match.group(1)), 6, 30)
+            for match in re.finditer(
+                r"(?<![0-9])([0-9]{4})\s+(?:semi-annual|semiannual|half-year)\b",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+        )
+        english_quarters = {
+            "q1": (3, 31),
+            "first quarter": (3, 31),
+            "q2": (6, 30),
+            "second quarter": (6, 30),
+            "q3": (9, 30),
+            "third quarter": (9, 30),
+            "q4": (12, 31),
+            "fourth quarter": (12, 31),
+        }
+        for match in re.finditer(
+            r"(?<![0-9])([0-9]{4})\s+"
+            r"(q[1-4]|first quarter|second quarter|third quarter|fourth quarter)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        ):
+            month, day = english_quarters[match.group(2).casefold()]
+            periods.add(date(int(match.group(1)), month, day))
     except ValueError:
         return False
-    return not periods or periods == {period_end}
+    if periods:
+        return periods == {period_end}
+    return _UNBOUND_PERIOD_CONTEXT_PATTERN.search(normalized) is None
 
 
 def _ambiguous_current_fact(fact: ParsedMandateFact) -> ParsedMandateFact:

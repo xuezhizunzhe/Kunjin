@@ -428,6 +428,51 @@ def _input_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+_ASSET_ALLOCATION_UNITS = frozenset(
+    {"percent_of_total_assets", "percent_of_net_assets"}
+)
+_CONCENTRATION_UNITS = frozenset(
+    {"percent_of_total_assets", "percent_of_net_assets", "percent_of_fund_assets"}
+)
+_CREDIT_DISTRIBUTION_UNITS = frozenset(
+    {
+        "percent_of_net_assets",
+        "percent_of_bond_assets",
+        "percent_of_fixed_income_assets",
+    }
+)
+_CURRENT_REPORT_FACT_UNITS = {
+    "current_stock_asset_allocation_percent": _ASSET_ALLOCATION_UNITS,
+    "current_bond_asset_allocation_percent": _ASSET_ALLOCATION_UNITS,
+    "current_cash_asset_allocation_percent": _ASSET_ALLOCATION_UNITS,
+    "current_hong_kong_asset_allocation_percent": _ASSET_ALLOCATION_UNITS,
+    "current_largest_security_weight_percent": _CONCENTRATION_UNITS,
+    "current_top_ten_holdings_weight_percent": _CONCENTRATION_UNITS,
+    "current_largest_industry_name": frozenset({None}),
+    "current_largest_industry_weight_percent": _CONCENTRATION_UNITS,
+    "current_industry_count": frozenset({None}),
+    "holdings_evidence_complete": frozenset({None}),
+    "current_effective_duration": frozenset({"years"}),
+    "current_weighted_average_maturity_days": frozenset({"days"}),
+    "current_convertible_bond_asset_allocation_percent": _ASSET_ALLOCATION_UNITS,
+    "current_exchangeable_bond_asset_allocation_percent": _ASSET_ALLOCATION_UNITS,
+    "current_high_quality_fixed_income_percent": _CREDIT_DISTRIBUTION_UNITS,
+    "current_below_aa_plus_exposure_percent": _CREDIT_DISTRIBUTION_UNITS,
+    "current_unrated_non_sovereign_exposure_percent": _CREDIT_DISTRIBUTION_UNITS,
+    "current_gross_leverage_percent": frozenset({"percent_of_net_assets"}),
+    "current_largest_non_sovereign_issuer_percent": frozenset(
+        {"percent_of_net_assets", "percent_of_fund_assets"}
+    ),
+}
+
+
+def _current_report_unit_is_allowed(item: MandateFact) -> bool:
+    allowed_units = _CURRENT_REPORT_FACT_UNITS.get(item.fact_kind)
+    if allowed_units is None:
+        return not item.fact_kind.startswith("current_")
+    return item.unit in allowed_units
+
+
 class _Facts:
     def __init__(self, groups: Sequence[Tuple[MandateFact, ...]]) -> None:
         self._values: Dict[str, List[object]] = {}
@@ -437,6 +482,10 @@ class _Facts:
         for group in groups:
             for item in group:
                 if item.confidence_state is FactConfidence.AMBIGUOUS:
+                    continue
+                if not _current_report_unit_is_allowed(item):
+                    self.conflicts.add("source_version_conflict")
+                    self._conflicted_kinds.add(item.fact_kind)
                     continue
                 self._values.setdefault(item.fact_kind, []).append(item.normalized_value)
                 bindings.setdefault(item.fact_kind, []).append(
