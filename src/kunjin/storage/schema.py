@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -2142,5 +2142,66 @@ END;
 CREATE TRIGGER fund_document_candidate_run_no_delete
 BEFORE DELETE ON fund_document_candidate_runs BEGIN
     SELECT RAISE(ABORT, 'fund document candidate runs are immutable');
+END;
+"""
+
+SCHEMA_V13 = """
+CREATE TABLE fund_document_selection_manifests (
+    refresh_run_id INTEGER PRIMARY KEY
+        REFERENCES fund_document_refresh_runs(id) ON DELETE RESTRICT,
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code) = 'text' AND length(fund_code) = 6
+        AND fund_code NOT GLOB '*[^0-9]*'
+    ),
+    manifest_version INTEGER NOT NULL CHECK(manifest_version = 1),
+    selection_policy_checksum TEXT NOT NULL CHECK(
+        length(CAST(selection_policy_checksum AS BLOB)) = 64
+        AND selection_policy_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    canonical_json TEXT NOT NULL CHECK(
+        typeof(canonical_json) = 'text' AND instr(canonical_json, char(0)) = 0
+        AND json_valid(canonical_json) AND json_type(canonical_json) = 'object'
+    ),
+    selection_checksum TEXT NOT NULL UNIQUE CHECK(
+        length(CAST(selection_checksum AS BLOB)) = 64
+        AND selection_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL CHECK(
+        julianday(created_at) IS NOT NULL AND substr(created_at, -6) = '+00:00'
+        AND substr(created_at, 11, 1) = 'T'
+    )
+);
+
+CREATE TRIGGER fund_document_selection_manifest_refresh_binding
+BEFORE INSERT ON fund_document_selection_manifests
+WHEN NOT EXISTS (
+    SELECT 1 FROM fund_document_refresh_runs
+    WHERE id = NEW.refresh_run_id AND fund_code = NEW.fund_code
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document selection refresh binding is invalid');
+END;
+
+CREATE TRIGGER fund_document_selection_manifest_no_replace
+BEFORE INSERT ON fund_document_selection_manifests
+WHEN EXISTS (
+    SELECT 1 FROM fund_document_selection_manifests
+    WHERE refresh_run_id = NEW.refresh_run_id
+       OR selection_checksum = NEW.selection_checksum
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fund document selection manifests are immutable');
+END;
+
+CREATE TRIGGER fund_document_selection_manifest_no_update
+BEFORE UPDATE ON fund_document_selection_manifests
+BEGIN
+    SELECT RAISE(ABORT, 'fund document selection manifests are immutable');
+END;
+
+CREATE TRIGGER fund_document_selection_manifest_no_delete
+BEFORE DELETE ON fund_document_selection_manifests
+BEGIN
+    SELECT RAISE(ABORT, 'fund document selection manifests are immutable');
 END;
 """

@@ -38,6 +38,7 @@ from kunjin.storage.schema import (
     SCHEMA_V10,
     SCHEMA_V11,
     SCHEMA_V12,
+    SCHEMA_V13,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -58,6 +59,7 @@ _D1_TABLES = {
     "fund_document_parser_provenance",
     "fund_document_parse_results",
     "fund_document_parse_runs",
+    "fund_document_selection_manifests",
 }
 _D1_OBJECT_PREFIXES = (
     "fund_document_artifact",
@@ -65,6 +67,7 @@ _D1_OBJECT_PREFIXES = (
     "fund_document_candidate",
     "fund_document_parser",
     "fund_document_parse",
+    "fund_document_selection",
     "fund_document_fact_result",
     "fund_mandate_fact",
     "fund_classification_policy",
@@ -137,6 +140,7 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (10, SCHEMA_V10),
         (11, SCHEMA_V11),
         (12, SCHEMA_V12),
+        (13, SCHEMA_V13),
     )
 
 

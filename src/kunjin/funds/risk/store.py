@@ -64,6 +64,13 @@ from kunjin.funds.risk.policy import (
     CLASSIFICATION_POLICY_V1_CHECKSUM,
     ClassificationPolicyV1,
 )
+from kunjin.funds.risk.selection import (
+    PERIODIC_DOCUMENT_KINDS,
+    SELECTION_POLICY_V1_CHECKSUM,
+    DocumentSelectionPlan,
+    PeriodicSelectionState,
+    SelectionCandidate,
+)
 from kunjin.storage.repository import Repository
 
 
@@ -99,6 +106,28 @@ _MANIFEST_V2_KEYS = _MANIFEST_V1_KEYS | frozenset(
         "manifest_version",
         "parse_result_ids",
         "parser_provenance_checksums",
+    }
+)
+_SELECTION_MANIFEST_KEYS = frozenset(
+    {
+        "fund_code",
+        "manifest_version",
+        "periodic_candidates",
+        "periodic_states",
+        "refresh_run_id",
+        "selection_policy_checksum",
+    }
+)
+_SELECTION_CANDIDATE_KEYS = frozenset(
+    {"candidate_fingerprint", "document_kind", "published_at", "url"}
+)
+_SELECTION_STATE_KEYS = frozenset(
+    {
+        "candidate_fingerprints",
+        "document_kind",
+        "reason_code",
+        "selected_fingerprint",
+        "state",
     }
 )
 
@@ -196,6 +225,19 @@ class StoredClassificationPolicy:
     policy_checksum: str
     effective_at: datetime
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class StoredDocumentSelectionManifest:
+    refresh_run_id: int
+    fund_code: str
+    manifest_version: int
+    selection_policy_checksum: str
+    canonical_json: str
+    selection_checksum: str
+    created_at: datetime
+    periodic_candidates: Tuple[SelectionCandidate, ...]
+    periodic_states: Tuple[PeriodicSelectionState, ...]
 
 
 @dataclass(frozen=True)
@@ -299,6 +341,80 @@ class FundRiskStore:
             except sqlite3.DatabaseError as exc:
                 connection.rollback()
                 raise RiskStoreError("classification storage failed") from exc
+
+    def publish_document_selection(
+        self,
+        plan: DocumentSelectionPlan,
+        created_at: datetime,
+    ) -> StoredDocumentSelectionManifest:
+        if type(plan) is not DocumentSelectionPlan:
+            raise ValueError("document selection plan must be exact")
+        plan.validate()
+        created = _canonical_utc_text(created_at, "selection created_at")
+        with self._repository.connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                _authenticate_refresh(connection, plan.refresh_run_id, plan.fund_code)
+                connection.execute(
+                    "INSERT INTO fund_document_selection_manifests("
+                    "refresh_run_id, fund_code, manifest_version, selection_policy_checksum, "
+                    "canonical_json, selection_checksum, created_at"
+                    ") VALUES (?, ?, 1, ?, ?, ?, ?)",
+                    (
+                        plan.refresh_run_id,
+                        plan.fund_code,
+                        plan.selection_policy_checksum,
+                        plan.canonical_json,
+                        plan.selection_checksum,
+                        created,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM fund_document_selection_manifests WHERE refresh_run_id = ?",
+                    (plan.refresh_run_id,),
+                ).fetchone()
+                stored = self._row_to_document_selection(connection, row)
+                connection.commit()
+                return stored
+            except sqlite3.DatabaseError as exc:
+                connection.rollback()
+                raise RiskStoreError("classification storage failed") from exc
+            except Exception:
+                connection.rollback()
+                raise
+
+    def document_selection_for_refresh(
+        self,
+        refresh_run_id: int,
+    ) -> Optional[StoredDocumentSelectionManifest]:
+        refresh = _positive_integer(refresh_run_id, "refresh id")
+        with self._repository.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM fund_document_selection_manifests WHERE refresh_run_id = ?",
+                (refresh,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_document_selection(connection, row)
+
+    def current_document_selection(
+        self,
+        fund_code: str,
+    ) -> Optional[StoredDocumentSelectionManifest]:
+        code = _fund_code(fund_code)
+        with self._repository.connect() as connection:
+            row = connection.execute(
+                "SELECT manifest.* FROM fund_document_refresh_runs AS refresh "
+                "JOIN fund_document_selection_manifests AS manifest "
+                "ON manifest.refresh_run_id = refresh.id "
+                "WHERE refresh.fund_code = ? AND refresh.id = ("
+                "SELECT MAX(latest.id) FROM fund_document_refresh_runs AS latest "
+                "WHERE latest.fund_code = ?)",
+                (code, code),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_document_selection(connection, row)
 
     def complete_document_refresh(
         self,
@@ -1306,6 +1422,59 @@ class FundRiskStore:
         except (OSError, TypeError, ValueError) as exc:
             raise RiskStoreError("stored artifact authentication failed") from exc
 
+    def _row_to_document_selection(
+        self,
+        connection: Any,
+        row: Any,
+    ) -> StoredDocumentSelectionManifest:
+        if row is None:
+            raise RiskStoreError("stored document selection is unavailable")
+        try:
+            refresh_run_id = _positive_integer(row["refresh_run_id"], "selection refresh id")
+            fund_code = _fund_code(row["fund_code"])
+            manifest_version = row["manifest_version"]
+            if type(manifest_version) is not int or manifest_version != 1:
+                raise ValueError("stored document selection version is unknown")
+            selection_policy_checksum = _digest(
+                row["selection_policy_checksum"],
+                "selection policy checksum",
+            )
+            if selection_policy_checksum != SELECTION_POLICY_V1_CHECKSUM:
+                raise ValueError("stored document selection policy is unknown")
+            canonical_json = _required_text(row["canonical_json"], "selection canonical JSON")
+            payload = _decode_canonical_object(canonical_json, "document selection manifest")
+            selection_checksum = _digest(row["selection_checksum"], "selection checksum")
+            if hashlib.sha256(canonical_json.encode("ascii")).hexdigest() != selection_checksum:
+                raise ValueError("stored document selection checksum does not match content")
+            created_at = _stored_datetime(row["created_at"], "selection created_at")
+            candidates, states = _decode_document_selection_payload(
+                payload,
+                refresh_run_id=refresh_run_id,
+                fund_code=fund_code,
+                selection_policy_checksum=selection_policy_checksum,
+            )
+            refresh_row = connection.execute(
+                "SELECT fund_code FROM fund_document_refresh_runs WHERE id = ?",
+                (refresh_run_id,),
+            ).fetchone()
+            if refresh_row is None or refresh_row["fund_code"] != fund_code:
+                raise ValueError("stored document selection refresh binding changed")
+            return StoredDocumentSelectionManifest(
+                refresh_run_id=refresh_run_id,
+                fund_code=fund_code,
+                manifest_version=manifest_version,
+                selection_policy_checksum=selection_policy_checksum,
+                canonical_json=canonical_json,
+                selection_checksum=selection_checksum,
+                created_at=created_at,
+                periodic_candidates=candidates,
+                periodic_states=states,
+            )
+        except RiskStoreError:
+            raise
+        except (KeyError, UnicodeError, TypeError, ValueError) as exc:
+            raise RiskStoreError("stored document selection authentication failed") from exc
+
     def _row_to_fact(self, row: Any) -> StoredFact:
         if row is None:
             raise RiskStoreError("stored fact is unavailable")
@@ -2070,6 +2239,128 @@ def _decode_canonical_object(value: str, label: str) -> Dict[str, object]:
     if type(parsed) is not dict:
         raise ValueError(f"{label} must be an object")
     return parsed
+
+
+def _decode_document_selection_payload(
+    payload: Dict[str, object],
+    *,
+    refresh_run_id: int,
+    fund_code: str,
+    selection_policy_checksum: str,
+) -> Tuple[Tuple[SelectionCandidate, ...], Tuple[PeriodicSelectionState, ...]]:
+    if frozenset(payload) != _SELECTION_MANIFEST_KEYS:
+        raise ValueError("document selection manifest has unexpected fields")
+    if (
+        payload["manifest_version"] != 1
+        or type(payload["manifest_version"]) is not int
+        or payload["refresh_run_id"] != refresh_run_id
+        or type(payload["refresh_run_id"]) is not int
+        or payload["fund_code"] != fund_code
+        or type(payload["fund_code"]) is not str
+        or payload["selection_policy_checksum"] != selection_policy_checksum
+        or type(payload["selection_policy_checksum"]) is not str
+    ):
+        raise ValueError("document selection manifest binding changed")
+
+    raw_candidates = payload["periodic_candidates"]
+    if type(raw_candidates) is not list:
+        raise ValueError("document selection candidates must be an array")
+    candidates = tuple(_decode_selection_candidate(item) for item in raw_candidates)
+    periodic_order = {kind: index for index, kind in enumerate(PERIODIC_DOCUMENT_KINDS)}
+    expected_candidates = tuple(
+        sorted(
+            candidates,
+            key=lambda item: (
+                periodic_order[item.document_kind],
+                item.published_at,
+                item.url,
+                item.candidate_fingerprint,
+            ),
+        )
+    )
+    if candidates != expected_candidates:
+        raise ValueError("document selection candidates are not canonically ordered")
+    fingerprints = tuple(item.candidate_fingerprint for item in candidates)
+    if len(set(fingerprints)) != len(fingerprints):
+        raise ValueError("document selection candidates contain duplicate fingerprints")
+
+    raw_states = payload["periodic_states"]
+    if type(raw_states) is not list:
+        raise ValueError("document selection states must be an array")
+    states = tuple(_decode_selection_state(item) for item in raw_states)
+    if tuple(item.document_kind for item in states) != PERIODIC_DOCUMENT_KINDS:
+        raise ValueError("document selection states do not cover every periodic kind")
+    for state in states:
+        _authenticate_selection_state(state, candidates)
+    return candidates, states
+
+
+def _decode_selection_candidate(value: object) -> SelectionCandidate:
+    if type(value) is not dict or frozenset(value) != _SELECTION_CANDIDATE_KEYS:
+        raise ValueError("document selection candidate has unexpected fields")
+    record = SelectionCandidate(
+        candidate_fingerprint=_digest(
+            value["candidate_fingerprint"],
+            "selection candidate fingerprint",
+        ),
+        document_kind=DocumentKind(value["document_kind"]),
+        url=_required_text(value["url"], "selection candidate URL"),
+        published_at=_stored_datetime(
+            value["published_at"],
+            "selection candidate published_at",
+        ),
+    )
+    record.validate()
+    return record
+
+
+def _decode_selection_state(value: object) -> PeriodicSelectionState:
+    if type(value) is not dict or frozenset(value) != _SELECTION_STATE_KEYS:
+        raise ValueError("document selection state has unexpected fields")
+    raw_fingerprints = value["candidate_fingerprints"]
+    if type(raw_fingerprints) is not list:
+        raise ValueError("document selection state fingerprints must be an array")
+    selected = value["selected_fingerprint"]
+    reason = value["reason_code"]
+    record = PeriodicSelectionState(
+        document_kind=DocumentKind(value["document_kind"]),
+        state=_required_text(value["state"], "selection state"),
+        candidate_fingerprints=tuple(
+            _digest(item, "selection state candidate fingerprint")
+            for item in raw_fingerprints
+        ),
+        selected_fingerprint=(
+            None if selected is None else _digest(selected, "selected candidate fingerprint")
+        ),
+        reason_code=None if reason is None else _required_text(reason, "selection reason code"),
+    )
+    record.validate()
+    return record
+
+
+def _authenticate_selection_state(
+    state: PeriodicSelectionState,
+    candidates: Tuple[SelectionCandidate, ...],
+) -> None:
+    matching = tuple(item for item in candidates if item.document_kind is state.document_kind)
+    fingerprints = tuple(sorted(item.candidate_fingerprint for item in matching))
+    if state.candidate_fingerprints != fingerprints:
+        raise ValueError("document selection state candidate binding changed")
+    if not matching:
+        if state.state != "missing":
+            raise ValueError("document selection state must be missing without candidates")
+        return
+    newest_time = max(item.published_at for item in matching)
+    newest = tuple(item for item in matching if item.published_at == newest_time)
+    if len(newest) == 1:
+        if (
+            state.state != "selected"
+            or state.selected_fingerprint != newest[0].candidate_fingerprint
+        ):
+            raise ValueError("document selection state does not bind the newest candidate")
+        return
+    if state.state != "conflicted":
+        raise ValueError("document selection state must fail closed on a newest-time tie")
 
 
 def _decode_code_array(value: str, label: str) -> Tuple[str, ...]:

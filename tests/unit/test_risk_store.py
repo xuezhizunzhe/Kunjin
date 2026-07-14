@@ -47,7 +47,12 @@ from kunjin.funds.risk.parsers import (
     fact_fingerprint,
 )
 from kunjin.funds.risk.policy import ClassificationPolicyV1
-from kunjin.funds.risk.store import FundRiskStore, RiskStoreError
+from kunjin.funds.risk.selection import select_current_candidates
+from kunjin.funds.risk.store import (
+    FundRiskStore,
+    RiskStoreError,
+    StoredDocumentSelectionManifest,
+)
 from kunjin.storage.repository import Repository
 
 NOW = datetime(2026, 7, 13, 8, tzinfo=timezone.utc)
@@ -213,6 +218,27 @@ class FundRiskStoreTest(unittest.TestCase):
             public_code="official_document_parse_failed",
             stage=DocumentFailureStage.PARSER,
             reason_code=DocumentFailureReason.PARSER_FORMAT_INVALID,
+        )
+
+    def _selection_plan(self, refresh_id: int, fund_code: str = "000001"):
+        annual = replace(
+            self._parsed(fund_code).artifact.candidate,
+            document_kind=DocumentKind.ANNUAL_REPORT,
+            title="Synthetic annual report",
+            url=f"https://www.fund001.com/synthetic/{fund_code}/annual",
+            published_at=NOW - timedelta(days=2),
+        )
+        quarter = replace(
+            annual,
+            document_kind=DocumentKind.QUARTERLY_REPORT,
+            title="Synthetic quarterly report",
+            url=f"https://www.fund001.com/synthetic/{fund_code}/quarter",
+            published_at=NOW - timedelta(days=1),
+        )
+        return select_current_candidates(
+            fund_code,
+            refresh_run_id=refresh_id,
+            candidates=(annual, quarter),
         )
 
     def _publish_current(
@@ -608,6 +634,130 @@ class FundRiskStoreTest(unittest.TestCase):
             records[1].facts[0].fact_fingerprint,
         )
         self.assertNotEqual(records[0].facts[0].id, records[1].facts[0].id)
+
+    def test_document_selection_round_trips_and_current_uses_latest_refresh(self) -> None:
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        plan = self._selection_plan(refresh_id)
+        stored = self.store.publish_document_selection(plan, NOW)
+
+        self.assertIs(type(stored), StoredDocumentSelectionManifest)
+        self.assertEqual(stored.refresh_run_id, refresh_id)
+        self.assertEqual(stored.fund_code, "000001")
+        self.assertEqual(stored.manifest_version, 1)
+        self.assertEqual(stored.periodic_candidates, plan.periodic_candidates)
+        self.assertEqual(stored.periodic_states, plan.periodic_states)
+        self.assertEqual(stored.canonical_json, plan.canonical_json)
+        self.assertEqual(stored.selection_checksum, plan.selection_checksum)
+        self.assertEqual(self.store.document_selection_for_refresh(refresh_id), stored)
+        self.assertEqual(self.store.current_document_selection("000001"), stored)
+
+        later = self.store.begin_document_refresh("000001", NOW + timedelta(minutes=1))
+        self.assertIsNone(self.store.current_document_selection("000001"))
+        later_plan = self._selection_plan(later)
+        later_stored = self.store.publish_document_selection(
+            later_plan,
+            NOW + timedelta(minutes=1),
+        )
+        self.assertEqual(self.store.current_document_selection("000001"), later_stored)
+        self.assertIsNone(self.store.document_selection_for_refresh(999999))
+
+    def test_document_selection_publish_rejects_rebinding_and_duplicate_refresh(self) -> None:
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        plan = self._selection_plan(refresh_id)
+        self.store.publish_document_selection(plan, NOW)
+
+        with self.assertRaises(RiskStoreError):
+            self.store.publish_document_selection(plan, NOW)
+
+        foreign_refresh = self.store.begin_document_refresh("000002", NOW)
+        with self.assertRaises(RiskStoreError):
+            self.store.publish_document_selection(
+                self._selection_plan(foreign_refresh),
+                NOW,
+            )
+
+    def test_document_selection_read_authenticates_every_stored_binding(self) -> None:
+        mutations = (
+            ("canonical_json", '{ "fund_code": "000001" }'),
+            ("selection_checksum", "f" * 64),
+            ("selection_policy_checksum", "f" * 64),
+            ("fund_code", "000002"),
+            ("manifest_version", 2),
+            ("created_at", "not-a-time"),
+        )
+        for offset, (column, value) in enumerate(mutations):
+            with self.subTest(column=column):
+                refresh_id = self.store.begin_document_refresh(
+                    "000001", NOW + timedelta(minutes=offset)
+                )
+                self.store.publish_document_selection(
+                    self._selection_plan(refresh_id),
+                    NOW + timedelta(minutes=offset),
+                )
+                with self.repository.connect() as connection, connection:
+                    connection.execute("DROP TRIGGER fund_document_selection_manifest_no_update")
+                    connection.execute("PRAGMA ignore_check_constraints = ON")
+                    connection.execute(
+                        f"UPDATE fund_document_selection_manifests SET {column} = ? "
+                        "WHERE refresh_run_id = ?",
+                        (value, refresh_id),
+                    )
+                    connection.execute("PRAGMA ignore_check_constraints = OFF")
+                with self.assertRaises(RiskStoreError):
+                    self.store.document_selection_for_refresh(refresh_id)
+                with self.repository.connect() as connection, connection:
+                    connection.execute(
+                        "CREATE TRIGGER fund_document_selection_manifest_no_update "
+                        "BEFORE UPDATE ON fund_document_selection_manifests BEGIN "
+                        "SELECT RAISE(ABORT, 'fund document selection manifests are immutable'); "
+                        "END"
+                    )
+
+    def test_document_selection_read_rejects_refresh_id_rebinding(self) -> None:
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        self.store.publish_document_selection(self._selection_plan(refresh_id), NOW)
+        other_refresh = self.store.begin_document_refresh("000001", NOW + timedelta(minutes=1))
+        with self.repository.connect() as connection, connection:
+            connection.execute("DROP TRIGGER fund_document_selection_manifest_no_update")
+            connection.execute(
+                "UPDATE fund_document_selection_manifests SET refresh_run_id = ? "
+                "WHERE refresh_run_id = ?",
+                (other_refresh, refresh_id),
+            )
+        with self.assertRaises(RiskStoreError):
+            self.store.document_selection_for_refresh(other_refresh)
+
+    def test_document_selection_read_rejects_semantic_manifest_tampering(self) -> None:
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        stored = self.store.publish_document_selection(
+            self._selection_plan(refresh_id),
+            NOW,
+        )
+        payload = json.loads(stored.canonical_json)
+        annual = next(
+            item
+            for item in payload["periodic_states"]
+            if item["document_kind"] == DocumentKind.ANNUAL_REPORT.value
+        )
+        annual["state"] = "missing"
+        annual["selected_fingerprint"] = None
+        annual["reason_code"] = "current_periodic_candidate_missing"
+        tampered = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+        with self.repository.connect() as connection, connection:
+            connection.execute("DROP TRIGGER fund_document_selection_manifest_no_update")
+            connection.execute(
+                "UPDATE fund_document_selection_manifests "
+                "SET canonical_json = ?, selection_checksum = ? WHERE refresh_run_id = ?",
+                (
+                    tampered,
+                    hashlib.sha256(tampered.encode("ascii")).hexdigest(),
+                    refresh_id,
+                ),
+            )
+
+        with self.assertRaises(RiskStoreError):
+            self.store.document_selection_for_refresh(refresh_id)
 
     def test_native_parser_input_tampering_fails_closed_on_current_read(self) -> None:
         _, stored = self._publish_current()
