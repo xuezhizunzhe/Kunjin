@@ -2333,6 +2333,51 @@ _PERIODIC_DOCUMENT_KINDS = frozenset(
         DocumentKind.QUARTERLY_REPORT,
     }
 )
+_HISTORICAL_CONTEXT_PATTERN = re.compile(
+    r"历史|上期|上一期|前期|去年|上年度|上季度|historical|prior period|previous period",
+    flags=re.IGNORECASE,
+)
+_CONTEXT_QUARTERS = {
+    "1": (3, 31),
+    "一": (3, 31),
+    "2": (6, 30),
+    "二": (6, 30),
+    "3": (9, 30),
+    "三": (9, 30),
+    "4": (12, 31),
+    "四": (12, 31),
+}
+
+
+def _observation_context_matches_period(
+    observation: CurrentReportObservation,
+    period_end: date,
+) -> bool:
+    section = observation.section_name
+    if section is None:
+        return True
+    normalized = " ".join(unicodedata.normalize("NFKC", section).split())
+    if _HISTORICAL_CONTEXT_PATTERN.search(normalized):
+        return False
+    periods = set()
+    try:
+        periods.update(
+            date(int(match.group(1)), 12, 31)
+            for match in re.finditer(r"(?<![0-9])([0-9]{4})年年度", normalized)
+        )
+        periods.update(
+            date(int(match.group(1)), 6, 30)
+            for match in re.finditer(r"(?<![0-9])([0-9]{4})年(?:半年度|中期)", normalized)
+        )
+        for match in re.finditer(
+            r"(?<![0-9])([0-9]{4})年第?([一二三四1-4])季度",
+            normalized,
+        ):
+            month, day = _CONTEXT_QUARTERS[match.group(2)]
+            periods.add(date(int(match.group(1)), month, day))
+    except ValueError:
+        return False
+    return not periods or periods == {period_end}
 
 
 def _ambiguous_current_fact(fact: ParsedMandateFact) -> ParsedMandateFact:
@@ -2385,6 +2430,13 @@ def _current_common_facts(
     publication_date = artifact.candidate.published_at.astimezone(timezone.utc).date()
     if period_end is None or period_end > publication_date:
         raise _fail(DocumentFailureReason.PARSER_EFFECTIVE_DATE_INVALID)
+    observations = [
+        observation
+        for observation in observations
+        if _observation_context_matches_period(observation, period_end)
+    ]
+    if not observations:
+        return (), ()
 
     facts = []
     fingerprints = set()
@@ -2410,7 +2462,10 @@ def _current_common_facts(
         if len(
             {
                 json.dumps(
-                    canonical_fact_value(fact.normalized_value),
+                    {
+                        "unit": fact.unit,
+                        "value": canonical_fact_value(fact.normalized_value),
+                    },
                     ensure_ascii=False,
                     sort_keys=True,
                 )

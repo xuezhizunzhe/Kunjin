@@ -454,24 +454,29 @@ class CommonReportFactExtractionTest(unittest.TestCase):
             (("报告期末港股资产占基金资产净值的", "%", "8"),),
             section_name="报告期末资产组合",
         )
+        industries = common_table(
+            ("排名", "行业名称", "占基金资产净值比例(%)"),
+            (("1", "科技", "25"), ("2", "金融", "20")),
+            section_name="报告期末全部行业分布",
+        )
 
         observations = extract_common_report_observations(
             text_blocks=(
                 "报告期末最大单一证券占基金资产净值8.5%。",
                 "报告期末前十大持仓合计占基金资产净值40%。",
-                "报告期末最大行业为科技，占基金资产净值25%。",
             ),
-            tables=(allocation, hong_kong),
+            tables=(allocation, hong_kong, industries),
         )
         values = {item.fact_kind: item.normalized_value for item in observations}
 
         self.assertEqual(
             set(values),
-            COMMON_FACTS - {"current_industry_count", "holdings_evidence_complete"},
+            COMMON_FACTS - {"holdings_evidence_complete"},
         )
         self.assertEqual(values["current_stock_asset_allocation_percent"], D("35.2"))
         self.assertEqual(values["current_hong_kong_asset_allocation_percent"], D("8"))
         self.assertEqual(values["current_largest_industry_name"], "科技")
+        self.assertEqual(values["current_industry_count"], 2)
         self.assertTrue(all(item.confidence_state is FactConfidence.EXACT for item in observations))
 
     def test_common_security_tables_require_exact_ranks_and_explicit_scope(self) -> None:
@@ -602,7 +607,13 @@ class CommonReportFactExtractionTest(unittest.TestCase):
         unordered = extract_common_report_observations(text_blocks=(), tables=(out_of_order,))
 
         self.assertFalse(any(item.fact_kind == "current_industry_count" for item in partial))
+        self.assertFalse(
+            any(item.fact_kind.startswith("current_largest_industry") for item in partial)
+        )
         self.assertFalse(any(item.fact_kind == "current_industry_count" for item in unknown))
+        self.assertFalse(
+            any(item.fact_kind.startswith("current_largest_industry") for item in unknown)
+        )
         self.assertFalse(any(item.fact_kind.startswith("current_top_ten") for item in duplicate))
         self.assertFalse(any(item.fact_kind.startswith("current_top_ten") for item in fewer))
         self.assertFalse(any(item.fact_kind == "holdings_evidence_complete" for item in incomplete))
@@ -610,6 +621,47 @@ class CommonReportFactExtractionTest(unittest.TestCase):
             any(item.fact_kind.startswith("current_largest_security") for item in incomplete)
         )
         self.assertFalse(any(item.fact_kind.startswith("current_top_ten") for item in unordered))
+
+    def test_common_rejects_summary_only_and_unknown_largest_industry_evidence(self) -> None:
+        generic = common_table(
+            ("指标", "单位", "数值"),
+            (("报告期末最大行业为科技,占基金资产净值", "%", "25"),),
+            section_name="报告期末资产组合",
+        )
+        unknown = common_table(
+            ("排名", "行业名称", "占基金资产净值比例(%)"),
+            (("1", "Other", "25"), ("2", "科技", "20")),
+            section_name="报告期末全部行业分布",
+        )
+
+        observations = extract_common_report_observations(
+            text_blocks=("报告期末最大行业为科技，占基金资产净值25%。",),
+            tables=(generic, unknown),
+        )
+
+        self.assertFalse(
+            any(item.fact_kind.startswith("current_largest_industry") for item in observations)
+        )
+        self.assertFalse(any(item.fact_kind == "current_industry_count" for item in observations))
+
+    def test_common_ranked_tables_reject_normalized_duplicate_names(self) -> None:
+        duplicate_security = common_table(
+            ("排名", "证券名称", "占基金资产净值比例(%)"),
+            (("1", "Security A", "10"), ("2", "security\u3000a", "5")),
+            section_name="报告期末全部证券持仓明细",
+        )
+        duplicate_industry = common_table(
+            ("排名", "行业名称", "占基金资产净值比例(%)"),
+            (("1", "科技", "25"), ("2", " 科技 ", "20")),
+            section_name="报告期末全部行业分布",
+        )
+
+        for table in (duplicate_security, duplicate_industry):
+            with self.subTest(section=table.section_name):
+                self.assertEqual(
+                    extract_common_report_observations(text_blocks=(), tables=(table,)),
+                    (),
+                )
 
     def test_common_rejects_mandate_wording_and_never_infers_remainders(self) -> None:
         observations = extract_common_report_observations(

@@ -80,9 +80,6 @@ _COMPLETE_INDUSTRY_SCOPES = {
     "报告期末全部行业分布",
     "complete industry distribution at the end of the reporting period",
 }
-_PARTIAL_INDUSTRY_SCOPE_PATTERN = re.compile(
-    r"报告期末前(?:[1-9]|10|[一二三四五六七八九十])大行业"
-)
 _UNKNOWN_INDUSTRY_NAMES = {"其他", "其它", "other", "others"}
 _RANKED_WEIGHT_HEADERS = {
     "占基金资产净值比例(%)": "percent_of_net_assets",
@@ -119,17 +116,6 @@ _TOP_TEN_SENTENCE_PATTERN = re.compile(
     r"(net assets|total assets|fund assets)[.]?",
     flags=re.IGNORECASE,
 )
-_LARGEST_INDUSTRY_SENTENCE_PATTERN = re.compile(
-    r"报告期末最大行业为([^,，。%]+)[,，]占"
-    r"(基金资产净值|基金净资产|基金总资产|基金资产)"
-    r"((?:0|[1-9][0-9]*)(?:\.[0-9]+)?)%[。.]?"
-    r"|largest industry[:：] ([^,;.%]+)[,;] "
-    r"((?:0|[1-9][0-9]*)(?:\.[0-9]+)?)% of "
-    r"(net assets|total assets|fund assets)[.]?",
-    flags=re.IGNORECASE,
-)
-
-
 def _require_exact_record(value: object, expected_type: type, label: str) -> None:
     if type(value) is not expected_type:
         raise ValueError(f"{label} subclasses are not accepted")
@@ -429,13 +415,6 @@ def _generic_concentration_observations(
         r"|top ten holdings percentage of (net assets|total assets|fund assets)",
         flags=re.IGNORECASE,
     )
-    largest_industry = re.compile(
-        r"报告期末最大行业为([^,，。%]+)[,，]占"
-        r"(基金资产净值|基金净资产|基金总资产|基金资产)"
-        r"|largest industry[:：] ([^,;.%]+)[,;] percentage of "
-        r"(net assets|total assets|fund assets)",
-        flags=re.IGNORECASE,
-    )
     observations = []
     for table in tables:
         if _headers(table) not in _INDICATOR_HEADERS:
@@ -450,20 +429,12 @@ def _generic_concentration_observations(
             normalized_label = _normalized_label(label)
             security_match = largest_security.fullmatch(normalized_label)
             top_ten_match = top_ten.fullmatch(normalized_label)
-            industry_match = largest_industry.fullmatch(normalized_label)
             if security_match is not None:
                 denominator = security_match.group(1) or security_match.group(2)
                 kind_values = (("current_largest_security_weight_percent", value),)
             elif top_ten_match is not None:
                 denominator = top_ten_match.group(1) or top_ten_match.group(2)
                 kind_values = (("current_top_ten_holdings_weight_percent", value),)
-            elif industry_match is not None:
-                denominator = industry_match.group(2) or industry_match.group(4)
-                name = " ".join((industry_match.group(1) or industry_match.group(3)).split())
-                kind_values = (
-                    ("current_largest_industry_name", name),
-                    ("current_largest_industry_weight_percent", value),
-                )
             else:
                 continue
             denominator_unit = _denominator_unit(denominator, concentration=True)
@@ -508,10 +479,12 @@ def _ranked_table_rows(
             return None
         parsed.append((rank, " ".join(name.split()), weight))
     ranks = tuple(item[0] for item in parsed)
+    names = tuple(_normalized(item[1]) for item in parsed)
     weights = tuple(item[2] for item in parsed)
     if (
         not parsed
         or len(ranks) != len(set(ranks))
+        or len(names) != len(set(names))
         or set(ranks) != set(range(1, len(ranks) + 1))
         or any(left < right for left, right in zip(weights, weights[1:]))
     ):
@@ -590,8 +563,9 @@ def _industry_observations(
         complete_scope = section in {
             _normalized(value) for value in _COMPLETE_INDUSTRY_SCOPES
         }
-        partial_scope = _PARTIAL_INDUSTRY_SCOPE_PATTERN.fullmatch(section) is not None
-        if not complete_scope and not partial_scope:
+        if not complete_scope or any(
+            _normalized(item[1]) in _UNKNOWN_INDUSTRY_NAMES for item in parsed
+        ):
             continue
         headers = _headers(table)
         if headers is None:
@@ -600,40 +574,36 @@ def _industry_observations(
         largest = next(item for item in parsed if item[0] == 1)
         largest_index = next(index for index, item in enumerate(parsed) if item[0] == 1)
         largest_row = table.rows[1 + largest_index]
-        if _normalized(largest[1]) not in _UNKNOWN_INDUSTRY_NAMES:
-            observations.extend(
-                (
-                    _observation(
-                        "current_largest_industry_name",
-                        largest[1],
-                        None,
-                        page_number=table.page_number,
-                        section_name=table.section_name,
-                        source_excerpt=_row_excerpt(largest_row),
-                    ),
-                    _observation(
-                        "current_largest_industry_weight_percent",
-                        largest[2],
-                        unit,
-                        page_number=table.page_number,
-                        section_name=table.section_name,
-                        source_excerpt=_row_excerpt(largest_row),
-                    ),
-                )
-            )
-        if complete_scope and not any(
-            _normalized(item[1]) in _UNKNOWN_INDUSTRY_NAMES for item in parsed
-        ):
-            observations.append(
+        observations.extend(
+            (
                 _observation(
-                    "current_industry_count",
-                    len(parsed),
+                    "current_largest_industry_name",
+                    largest[1],
                     None,
                     page_number=table.page_number,
                     section_name=table.section_name,
-                    source_excerpt=table.source_excerpt,
-                )
+                    source_excerpt=_row_excerpt(largest_row),
+                ),
+                _observation(
+                    "current_largest_industry_weight_percent",
+                    largest[2],
+                    unit,
+                    page_number=table.page_number,
+                    section_name=table.section_name,
+                    source_excerpt=_row_excerpt(largest_row),
+                ),
             )
+        )
+        observations.append(
+            _observation(
+                "current_industry_count",
+                len(parsed),
+                None,
+                page_number=table.page_number,
+                section_name=table.section_name,
+                source_excerpt=table.source_excerpt,
+            )
+        )
     return tuple(observations)
 
 
@@ -648,7 +618,6 @@ def _explicit_common_text_observations(
         asset = _ASSET_SENTENCE_PATTERN.fullmatch(text)
         security = _LARGEST_SECURITY_SENTENCE_PATTERN.fullmatch(text)
         top_ten = _TOP_TEN_SENTENCE_PATTERN.fullmatch(text)
-        industry = _LARGEST_INDUSTRY_SENTENCE_PATTERN.fullmatch(text)
         if asset is not None:
             asset_name = _normalized(asset.group(1) or asset.group(4))
             if asset_name.endswith(" assets"):
@@ -676,15 +645,6 @@ def _explicit_common_text_observations(
                     value,
                     _denominator_unit(denominator, concentration=True),
                 ),
-            )
-        elif industry is not None:
-            denominator = industry.group(2) or industry.group(6)
-            name = " ".join((industry.group(1) or industry.group(4)).split())
-            value = _percent_value(industry.group(3) or industry.group(5))
-            unit = _denominator_unit(denominator, concentration=True)
-            kind_values = (
-                ("current_largest_industry_name", name, None),
-                ("current_largest_industry_weight_percent", value, unit),
             )
         else:
             continue

@@ -431,6 +431,7 @@ def _input_fingerprint(
 class _Facts:
     def __init__(self, groups: Sequence[Tuple[MandateFact, ...]]) -> None:
         self._values: Dict[str, List[object]] = {}
+        bindings: Dict[str, List[Tuple[object, Optional[str]]]] = {}
         self.conflicts: Set[str] = set()
         self._conflicted_kinds: Set[str] = set()
         for group in groups:
@@ -438,10 +439,20 @@ class _Facts:
                 if item.confidence_state is FactConfidence.AMBIGUOUS:
                     continue
                 self._values.setdefault(item.fact_kind, []).append(item.normalized_value)
-        for kind, values in self._values.items():
+                bindings.setdefault(item.fact_kind, []).append(
+                    (item.normalized_value, item.unit)
+                )
+        for kind, values in bindings.items():
             canonical = {
-                json.dumps(canonical_fact_value(value), ensure_ascii=True, sort_keys=True)
-                for value in values
+                json.dumps(
+                    {
+                        "unit": unit,
+                        "value": canonical_fact_value(value),
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+                for value, unit in values
             }
             if len(canonical) > 1:
                 self.conflicts.add("source_version_conflict")

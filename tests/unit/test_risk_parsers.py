@@ -20,6 +20,7 @@ from kunjin.funds.risk.failures import (
     DocumentFailureStage,
 )
 from kunjin.funds.risk.legacy_doc import LegacyConversionResult, LegacyDocConversionError
+from kunjin.funds.risk.models import FactConfidence
 from kunjin.funds.risk.parsers import (
     ParsedArtifactResult,
     ParsedMandateFact,
@@ -244,6 +245,56 @@ class RiskHtmlParserTest(unittest.TestCase):
         self.assertEqual(
             one(parsed, "current_cash_asset_allocation_percent").normalized_value,
             D("5"),
+        )
+
+    def test_common_same_value_with_different_denominators_is_conflicted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.html"
+            path.write_text(
+                """<h2>报告期末资产组合</h2>
+<table><tr><th>指标</th><th>单位</th><th>数值</th></tr>
+<tr><td>报告期末股票资产占基金总资产的</td><td>%</td><td>35</td></tr></table>
+<table><tr><th>指标</th><th>单位</th><th>数值</th></tr>
+<tr><td>报告期末股票资产占基金资产净值的</td><td>%</td><td>35</td></tr></table>""",
+                encoding="utf-8",
+            )
+            artifact = artifact_for(
+                path,
+                content_type="text/html",
+                kind=DocumentKind.QUARTERLY_REPORT,
+            )
+            parsed = parse_artifact(artifact)
+
+        facts = [
+            fact
+            for fact in parsed.facts
+            if fact.fact_kind == "current_stock_asset_allocation_percent"
+        ]
+        self.assertEqual(
+            {fact.unit for fact in facts},
+            {"percent_of_total_assets", "percent_of_net_assets"},
+        )
+        self.assertTrue(all(fact.confidence_state is FactConfidence.AMBIGUOUS for fact in facts))
+        self.assertIn("duplicate_conflicting_clause", parsed.conflicts)
+
+    def test_common_historical_section_is_not_bound_to_candidate_period(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.html"
+            path.write_text(
+                "<h2>2025年年度历史数据</h2>"
+                "<p>报告期末股票资产占基金总资产35.2%。</p>",
+                encoding="utf-8",
+            )
+            artifact = artifact_for(
+                path,
+                content_type="text/html",
+                kind=DocumentKind.QUARTERLY_REPORT,
+            )
+
+            parsed = parse_artifact(artifact)
+
+        self.assertFalse(
+            any(fact.fact_kind == "current_stock_asset_allocation_percent" for fact in parsed.facts)
         )
 
     def test_parser_errors_keep_public_codes_and_allowlisted_reasons(self) -> None:
@@ -1074,7 +1125,7 @@ class RiskLegacyConvertedParserTest(unittest.TestCase):
         )
         self.assertEqual(one(parsed, "redemption_restriction").normalized_value, "daily_open")
 
-    def test_converted_bound_table_rows_allow_all_current_observation_facts(self) -> None:
+    def test_converted_bound_summary_rows_allow_only_supported_concentration_facts(self) -> None:
         html = self.fixture_html.replace(
             "</table>\n</body>",
             """<tr><td>报告期末最大行业为科技,占基金资产</td><td>%</td><td>25.0</td></tr>
@@ -1085,10 +1136,8 @@ class RiskLegacyConvertedParserTest(unittest.TestCase):
         )
         parsed = self.parse(html).document
 
-        self.assertEqual(one(parsed, "current_largest_industry_name").normalized_value, "科技")
-        self.assertEqual(
-            one(parsed, "current_largest_industry_weight_percent").normalized_value,
-            D("25.0"),
+        self.assertFalse(
+            any(fact.fact_kind.startswith("current_largest_industry") for fact in parsed.facts)
         )
         self.assertEqual(
             one(parsed, "current_top_ten_holdings_weight_percent").normalized_value,
@@ -1227,16 +1276,14 @@ class RiskPdfParserTest(unittest.TestCase):
             "current_stock_asset_allocation_percent": D("0"),
             "current_bond_asset_allocation_percent": D("95"),
             "current_cash_asset_allocation_percent": D("5"),
-            "current_largest_industry_weight_percent": D("30"),
             "current_top_ten_holdings_weight_percent": D("35"),
             "current_largest_security_weight_percent": D("5"),
         }
         for fact_kind, expected in current_facts.items():
             with self.subTest(fact_kind=fact_kind):
                 self.assertEqual(one(pdf, fact_kind).normalized_value, expected)
-        self.assertEqual(
-            one(pdf, "current_largest_industry_name").normalized_value,
-            "Financials",
+        self.assertFalse(
+            any(fact.fact_kind.startswith("current_largest_industry") for fact in pdf.facts)
         )
 
     def test_page_limit_is_checked_before_text_extraction(self) -> None:

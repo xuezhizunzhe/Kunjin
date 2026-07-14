@@ -42,9 +42,18 @@ def D(value: object) -> Decimal:
     return Decimal(str(value))
 
 
-def fact(kind: str, value: object, *, document_id: int = 1) -> MandateFact:
+def fact(
+    kind: str,
+    value: object,
+    *,
+    document_id: int = 1,
+    unit: Optional[str] = None,
+) -> MandateFact:
+    fingerprint_fields = [kind, str(value), document_id]
+    if unit is not None:
+        fingerprint_fields.append(unit)
     canonical = json.dumps(
-        [kind, str(value), document_id],
+        fingerprint_fields,
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("ascii")
@@ -52,7 +61,7 @@ def fact(kind: str, value: object, *, document_id: int = 1) -> MandateFact:
         fund_code="000001",
         fact_kind=kind,
         normalized_value=value,
-        unit=None,
+        unit=unit,
         source_document_id=document_id,
         page_number=1,
         section_name="synthetic_public_evidence",
@@ -1156,6 +1165,32 @@ class DowngradeAndConflictTest(unittest.TestCase):
         self.assertEqual(first.conflicts, second.conflicts)
         self.assertIn("source_version_conflict", first.conflicts)
         self.assertEqual(first.evidence_status, EvidenceStatus.CONFLICTED)
+
+    def test_same_report_value_with_different_units_fails_closed(self) -> None:
+        kind = "current_stock_asset_allocation_percent"
+        base = evidence(report={kind: D("0")})
+        total_assets = fact(
+            kind,
+            D("0"),
+            document_id=3,
+            unit="percent_of_total_assets",
+        )
+        net_assets = fact(
+            kind,
+            D("0"),
+            document_id=3,
+            unit="percent_of_net_assets",
+        )
+        conflicted = replace(
+            base,
+            report_facts=(total_assets, net_assets),
+            fact_ids=(1, 2),
+        )
+
+        result = classify(conflicted)
+
+        self.assertIn("source_version_conflict", result.conflicts)
+        self.assertEqual(result.evidence_status, EvidenceStatus.CONFLICTED)
 
     def test_observed_mandate_breaches_add_stable_conflict_codes(self) -> None:
         cases = (
