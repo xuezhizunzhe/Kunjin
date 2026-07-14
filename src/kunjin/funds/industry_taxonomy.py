@@ -388,17 +388,20 @@ def _require_exact_record_state(
 
 
 def _is_valid_source_hostname(hostname: str, netloc: str) -> bool:
+    bracketed = netloc.startswith("[")
     try:
         address = ipaddress.ip_address(hostname)
     except ValueError:
+        if bracketed:
+            return False
         if ":" in hostname or re.fullmatch(r"[0-9.]+", hostname):
             return False
         if len(hostname) > 253 or hostname.startswith(".") or hostname.endswith("."):
             return False
         return all(_DNS_LABEL_PATTERN.fullmatch(label) for label in hostname.split("."))
     if address.version == 6:
-        return netloc.startswith("[") and "]" in netloc
-    return ":" not in hostname
+        return bracketed and "]" in netloc
+    return not bracketed and ":" not in hostname
 
 
 def _mapping_for_standard(

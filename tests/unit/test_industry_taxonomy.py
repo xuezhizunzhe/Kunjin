@@ -403,6 +403,9 @@ def test_invalid_registry_mapping_raises_value_error(
         "https://example.com/行业.json",
         "https://example.com/\u0007sw.json",
         "https://example.com /sw.json",
+        "https://[example.com]/sw.json",
+        "https://[1.2.3.4]/sw.json",
+        "https://[v1.fe80]/sw.json",
     ),
 )
 def test_registry_rejects_noncanonical_or_invalid_port_source_url(
@@ -414,6 +417,27 @@ def test_registry_rejects_noncanonical_or_invalid_port_source_url(
             complete_scope=True,
             mappings=(_mapping(source_url=source_url),),
         )
+
+
+@pytest.mark.parametrize(
+    "source_url",
+    (
+        "https://example.com/sw.json",
+        "https://192.0.2.1/sw.json",
+        "https://[2001:db8::1]/sw.json",
+    ),
+)
+def test_registry_accepts_valid_dns_ipv4_and_bracketed_ipv6_source_url(
+    source_url: str,
+) -> None:
+    assert (
+        validate_industry_distribution(
+            rows=_rows(),
+            complete_scope=True,
+            mappings=(_mapping(source_url=source_url),),
+        )
+        is not None
+    )
 
 
 def test_noncanonical_mapping_json_is_rejected_even_with_matching_checksum() -> None:
