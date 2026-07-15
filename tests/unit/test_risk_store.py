@@ -14,6 +14,7 @@ from typing import Optional
 from kunjin.funds.models import DocumentKind
 from kunjin.funds.risk.audit import (
     ParserProvenance,
+    ParseRunOutcome,
     RefreshOutcome,
     legacy_parser_provenance,
     native_parser_provenance,
@@ -26,6 +27,7 @@ from kunjin.funds.risk.documents import (
 from kunjin.funds.risk.engine import (
     ClassificationEvidence,
     classification_input_manifest_v1,
+    classification_input_manifest_v2,
     classify_fund,
 )
 from kunjin.funds.risk.failures import (
@@ -50,6 +52,7 @@ from kunjin.funds.risk.parsers import (
 from kunjin.funds.risk.policy import ClassificationPolicyV1
 from kunjin.funds.risk.selection import select_current_candidates
 from kunjin.funds.risk.store import (
+    CurrentDocumentSelectionSnapshot,
     FundRiskStore,
     RiskStoreError,
     StoredDocumentSelectionManifest,
@@ -181,8 +184,31 @@ class FundRiskStoreTest(unittest.TestCase):
         classified_at: datetime = NOW,
         external_marker: str = "a",
     ):
-        artifact, facts = self.store.publish_parsed_document(self._parsed())
-        stored = facts[0]
+        parsed = self._parsed()
+        refresh_id = self.store.begin_document_refresh("000001", classified_at)
+        plan = select_current_candidates(
+            "000001",
+            refresh_run_id=refresh_id,
+            candidates=(parsed.artifact.candidate,),
+        )
+        self.store.publish_document_selection(plan, classified_at)
+        record = self.store.publish_candidate_success(
+            refresh_id=refresh_id,
+            candidate=parsed.artifact.candidate,
+            parsed=parsed,
+            provenance=native_parser_provenance(),
+            parser_input_sha256=parsed.artifact.sha256,
+            attempted_at=classified_at,
+        )
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.SUCCESS,
+            classified_at + timedelta(seconds=1),
+        )
+        snapshot = self.store.current_document_selection_snapshot("000001")
+        assert snapshot is not None
+        artifact = record.artifact
+        stored = record.facts[0]
         normalized = stored.normalized_value
         mandate = MandateFact(
             fund_code=stored.fund_code,
@@ -224,6 +250,11 @@ class FundRiskStoreTest(unittest.TestCase):
             fact_ids=(stored.id,),
             parse_result_ids=(stored.parse_result_id,),
             parser_provenance_checksums=(native_parser_provenance().provenance_checksum,),
+            document_refresh_run_id=refresh_id,
+            selection_policy_checksum=snapshot.selection.selection_policy_checksum,
+            selection_manifest_checksum=snapshot.selection.selection_checksum,
+            candidate_run_snapshot_checksum=snapshot.candidate_run_snapshot_checksum,
+            selection_reason_codes=snapshot.selection_reason_codes,
         )
         policy = ClassificationPolicyV1()
         classification = classify_fund(evidence, policy, classified_at)
@@ -284,6 +315,179 @@ class FundRiskStoreTest(unittest.TestCase):
         )
         return refresh_id, record
 
+    def _selection_bound_inputs(
+        self,
+        *,
+        classified_at: datetime = NOW,
+        outcome: RefreshOutcome = RefreshOutcome.SUCCESS,
+    ):
+        parsed = self._parsed()
+        refresh_id = self.store.begin_document_refresh("000001", classified_at)
+        plan = select_current_candidates(
+            "000001",
+            refresh_run_id=refresh_id,
+            candidates=(parsed.artifact.candidate,),
+        )
+        self.store.publish_document_selection(plan, classified_at)
+        record = self.store.publish_candidate_success(
+            refresh_id=refresh_id,
+            candidate=parsed.artifact.candidate,
+            parsed=parsed,
+            provenance=native_parser_provenance(),
+            parser_input_sha256=parsed.artifact.sha256,
+            attempted_at=classified_at,
+        )
+        self.store.complete_document_refresh(
+            refresh_id,
+            outcome,
+            classified_at + timedelta(seconds=1),
+        )
+        snapshot = self.store.current_document_selection_snapshot("000001")
+        assert snapshot is not None
+        stored = record.facts[0]
+        mandate = MandateFact(
+            fund_code=stored.fund_code,
+            fact_kind=stored.fact_kind,
+            normalized_value=stored.normalized_value,
+            unit=stored.unit,
+            source_document_id=stored.source_document_id,
+            page_number=stored.page_number,
+            section_name=stored.section_name,
+            source_excerpt=stored.source_excerpt,
+            effective_from=stored.effective_from,
+            effective_to=stored.effective_to,
+            confidence_state=stored.confidence_state,
+            parser_version=stored.parser_version,
+            fact_fingerprint=stored.fact_fingerprint,
+        )
+        freshness = EvidenceFreshness(
+            section="legal_scope",
+            source_document_id=record.artifact.id,
+            state=FreshnessState.CURRENT,
+            observed_at=classified_at - timedelta(days=1),
+            valid_until=classified_at + timedelta(days=30),
+            critical=True,
+        )
+        evidence = ClassificationEvidence(
+            fund_code="000001",
+            legal_facts=(mandate,),
+            benchmark_facts=(),
+            report_facts=(),
+            existing_disclosure_facts=(),
+            nav_conflicts=(),
+            external_evidence_fingerprints=(),
+            external_source_references=(),
+            nav_evidence_fingerprint=None,
+            nav_observation_start=None,
+            nav_observation_end=None,
+            freshness=(freshness,),
+            document_ids=(record.artifact.id,),
+            fact_ids=(stored.id,),
+            parse_result_ids=(record.parse_result.id,),
+            parser_provenance_checksums=(record.provenance.provenance_checksum,),
+            document_refresh_run_id=refresh_id,
+            selection_policy_checksum=snapshot.selection.selection_policy_checksum,
+            selection_manifest_checksum=snapshot.selection.selection_checksum,
+            candidate_run_snapshot_checksum=snapshot.candidate_run_snapshot_checksum,
+            selection_reason_codes=snapshot.selection_reason_codes,
+        )
+        policy = ClassificationPolicyV1()
+        return classify_fund(evidence, policy, classified_at), evidence, policy, snapshot
+
+    def _insert_historical_classification(
+        self,
+        classification,
+        evidence: ClassificationEvidence,
+        policy: ClassificationPolicyV1,
+        *,
+        version: int,
+    ) -> int:
+        self.store.ensure_policy(policy)
+        manifest = (
+            classification_input_manifest_v1(evidence, policy, classification.classified_at)
+            if version == 1
+            else classification_input_manifest_v2(evidence, policy, classification.classified_at)
+        )
+        manifest_json = json.dumps(
+            manifest,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        fingerprint = hashlib.sha256(manifest_json.encode("ascii")).hexdigest()
+        historical = replace(classification, input_fingerprint=fingerprint)
+        with self.repository.connect() as connection, connection:
+            cursor = connection.execute(
+                "INSERT INTO fund_risk_classifications("
+                "fund_code, policy_version, input_fingerprint, input_manifest_json, "
+                "product_family, risk_bucket, portfolio_role, evidence_status, "
+                "evidence_tags_json, reason_codes_json, missing_evidence_json, conflicts_json, "
+                "evidence_document_ids_json, evidence_fact_ids_json, freshness_json, "
+                "classified_at, valid_until, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    historical.fund_code,
+                    historical.policy_version,
+                    historical.input_fingerprint,
+                    manifest_json,
+                    historical.product_family.value,
+                    historical.risk_bucket.value,
+                    historical.portfolio_role.value,
+                    historical.evidence_status.value,
+                    json.dumps(list(historical.evidence_tags), separators=(",", ":")),
+                    json.dumps(list(historical.reason_codes), separators=(",", ":")),
+                    json.dumps(list(historical.missing_evidence), separators=(",", ":")),
+                    json.dumps(list(historical.conflicts), separators=(",", ":")),
+                    json.dumps(list(historical.evidence_document_ids), separators=(",", ":")),
+                    json.dumps(list(historical.evidence_fact_ids), separators=(",", ":")),
+                    json.dumps(manifest["freshness"], separators=(",", ":"), sort_keys=True),
+                    historical.classified_at.isoformat(),
+                    historical.valid_until.isoformat(),
+                    historical.classified_at.isoformat(),
+                ),
+            )
+        return cursor.lastrowid
+
+    def _bind_evidence_to_selection(
+        self,
+        evidence: ClassificationEvidence,
+        parsed: ParsedRiskDocument,
+        *,
+        at: datetime = NOW,
+    ) -> ClassificationEvidence:
+        refresh_id = self.store.begin_document_refresh(evidence.fund_code, at)
+        plan = select_current_candidates(
+            evidence.fund_code,
+            refresh_run_id=refresh_id,
+            candidates=(parsed.artifact.candidate,),
+        )
+        self.store.publish_document_selection(plan, at)
+        record = self.store.publish_candidate_success(
+            refresh_id=refresh_id,
+            candidate=parsed.artifact.candidate,
+            parsed=parsed,
+            provenance=native_parser_provenance(),
+            parser_input_sha256=parsed.artifact.sha256,
+            attempted_at=at,
+        )
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.SUCCESS,
+            at + timedelta(seconds=1),
+        )
+        snapshot = self.store.current_document_selection_snapshot(evidence.fund_code)
+        assert snapshot is not None
+        self.assertEqual(evidence.document_ids, (record.artifact.id,))
+        self.assertEqual(evidence.parse_result_ids, (record.parse_result.id,))
+        return replace(
+            evidence,
+            document_refresh_run_id=refresh_id,
+            selection_policy_checksum=snapshot.selection.selection_policy_checksum,
+            selection_manifest_checksum=snapshot.selection.selection_checksum,
+            candidate_run_snapshot_checksum=snapshot.candidate_run_snapshot_checksum,
+            selection_reason_codes=snapshot.selection_reason_codes,
+        )
+
     def test_refresh_start_and_completion_are_independent_exact_events(self) -> None:
         refresh_id = self.store.begin_document_refresh("000001", NOW)
         with self.repository.connect() as connection:
@@ -326,6 +530,838 @@ class FundRiskStoreTest(unittest.TestCase):
 
         self.store.begin_document_refresh("000001", NOW + timedelta(minutes=1))
         self.assertEqual(self.store.current_parsed_documents("000001", (checksum,)), ())
+
+    def test_selection_snapshot_authenticates_manifest_runs_and_reason_projection(self) -> None:
+        _, evidence, _, snapshot = self._selection_bound_inputs()
+
+        self.assertIs(type(snapshot), CurrentDocumentSelectionSnapshot)
+        self.assertEqual(snapshot.selection.refresh_run_id, evidence.document_refresh_run_id)
+        self.assertEqual(
+            snapshot.selection.selection_policy_checksum,
+            evidence.selection_policy_checksum,
+        )
+        self.assertEqual(
+            snapshot.selection.selection_checksum,
+            evidence.selection_manifest_checksum,
+        )
+        self.assertEqual(
+            snapshot.candidate_run_snapshot_checksum,
+            evidence.candidate_run_snapshot_checksum,
+        )
+        self.assertEqual(
+            snapshot.selection_reason_codes,
+            ("current_periodic_candidate_missing",),
+        )
+        self.assertEqual(snapshot.selected_periodic_records, ())
+        self.assertEqual(len(snapshot.nonperiodic_successful_records), 1)
+        self.assertEqual(len(snapshot.candidate_runs), 1)
+
+        exact = self.store.document_selection_snapshot_for_refresh(
+            "000001",
+            snapshot.selection.refresh_run_id,
+        )
+        self.assertEqual(exact, snapshot)
+
+    def test_current_selection_snapshot_never_falls_back_past_absolute_latest_refresh(self) -> None:
+        _, _, _, first = self._selection_bound_inputs()
+        self.assertEqual(
+            self.store.current_document_selection_snapshot("000001"),
+            first,
+        )
+
+        states = (
+            ("running", None),
+            ("failed", RefreshOutcome.FAILED),
+            ("empty", RefreshOutcome.EMPTY),
+        )
+        for index, (label, outcome) in enumerate(states, start=1):
+            with self.subTest(label=label):
+                refresh_id = self.store.begin_document_refresh(
+                    "000001",
+                    NOW + timedelta(minutes=index),
+                )
+                if outcome is RefreshOutcome.FAILED:
+                    self.store.complete_document_refresh(
+                        refresh_id,
+                        outcome,
+                        NOW + timedelta(minutes=index, seconds=1),
+                        failure=self._failure(),
+                    )
+                elif outcome is not None:
+                    self.store.complete_document_refresh(
+                        refresh_id,
+                        outcome,
+                        NOW + timedelta(minutes=index, seconds=1),
+                    )
+                self.assertIsNone(
+                    self.store.current_document_selection_snapshot("000001")
+                )
+
+    def test_selection_snapshot_binds_selected_failure_without_old_fallback(self) -> None:
+        annual = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="selected-failure",
+            published_at=NOW,
+            retrieved_at=NOW,
+        )
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        plan = select_current_candidates(
+            "000001",
+            refresh_run_id=refresh_id,
+            candidates=(annual.artifact.candidate,),
+        )
+        self.store.publish_document_selection(plan, NOW)
+        self.store.publish_candidate_failure(
+            refresh_id=refresh_id,
+            candidate=annual.artifact.candidate,
+            failure=self._failure(),
+            attempted_at=NOW,
+            artifact=None,
+            provenance=None,
+        )
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.PARTIAL,
+            NOW + timedelta(seconds=1),
+        )
+
+        snapshot = self.store.current_document_selection_snapshot("000001")
+
+        assert snapshot is not None
+        self.assertEqual(snapshot.selected_periodic_records, ())
+        self.assertEqual(snapshot.nonperiodic_successful_records, ())
+        self.assertEqual(snapshot.candidate_runs[0].outcome.value, "failed")
+        self.assertEqual(snapshot.candidate_runs[0].failure, self._failure())
+        self.assertEqual(
+            snapshot.selection_reason_codes,
+            ("current_periodic_candidate_missing",),
+        )
+
+    def test_selection_snapshot_uses_exact_periodic_success_and_allows_same_refresh_nonperiodic(
+        self,
+    ) -> None:
+        annual = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="annual-success",
+            published_at=NOW,
+            retrieved_at=NOW,
+        )
+        first = self._document_variant(
+            kind=DocumentKind.PROSPECTUS,
+            marker="prospectus-first",
+            published_at=NOW - timedelta(days=2),
+            retrieved_at=NOW,
+        )
+        second = self._document_variant(
+            kind=DocumentKind.PROSPECTUS,
+            marker="prospectus-second",
+            published_at=NOW - timedelta(days=1),
+            retrieved_at=NOW,
+        )
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        plan = select_current_candidates(
+            "000001",
+            refresh_run_id=refresh_id,
+            candidates=(
+                annual.artifact.candidate,
+                first.artifact.candidate,
+                second.artifact.candidate,
+            ),
+        )
+        self.store.publish_document_selection(plan, NOW)
+        records = tuple(
+            self.store.publish_candidate_success(
+                refresh_id=refresh_id,
+                candidate=parsed.artifact.candidate,
+                parsed=parsed,
+                provenance=native_parser_provenance(),
+                parser_input_sha256=parsed.artifact.sha256,
+                attempted_at=NOW,
+            )
+            for parsed in (annual, first, second)
+        )
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.SUCCESS,
+            NOW + timedelta(seconds=1),
+        )
+
+        snapshot = self.store.current_document_selection_snapshot("000001")
+
+        assert snapshot is not None
+        self.assertEqual(snapshot.selected_periodic_records, (records[0],))
+        self.assertEqual(snapshot.nonperiodic_successful_records, records[1:])
+
+    def test_selection_snapshot_rejects_missing_or_unselected_periodic_runs(self) -> None:
+        annual = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="annual-missing-run",
+            published_at=NOW,
+            retrieved_at=NOW,
+        )
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        plan = select_current_candidates(
+            "000001",
+            refresh_run_id=refresh_id,
+            candidates=(annual.artifact.candidate,),
+        )
+        self.store.publish_document_selection(plan, NOW)
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.SUCCESS,
+            NOW + timedelta(seconds=1),
+        )
+        with self.assertRaisesRegex(RiskStoreError, "selected periodic"):
+            self.store.current_document_selection_snapshot("000001")
+
+        conflicted_a = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="annual-conflict-a",
+            published_at=NOW + timedelta(minutes=1),
+            retrieved_at=NOW,
+        )
+        conflicted_b = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="annual-conflict-b",
+            published_at=NOW + timedelta(minutes=1),
+            retrieved_at=NOW,
+        )
+        conflict_refresh = self.store.begin_document_refresh(
+            "000001", NOW + timedelta(minutes=1)
+        )
+        conflict_plan = select_current_candidates(
+            "000001",
+            refresh_run_id=conflict_refresh,
+            candidates=(conflicted_a.artifact.candidate, conflicted_b.artifact.candidate),
+        )
+        self.store.publish_document_selection(conflict_plan, NOW + timedelta(minutes=1))
+        self.store.publish_candidate_failure(
+            refresh_id=conflict_refresh,
+            candidate=conflicted_a.artifact.candidate,
+            failure=self._failure(),
+            attempted_at=NOW + timedelta(minutes=1),
+            artifact=None,
+            provenance=None,
+        )
+        self.store.complete_document_refresh(
+            conflict_refresh,
+            RefreshOutcome.PARTIAL,
+            NOW + timedelta(minutes=1, seconds=1),
+        )
+        with self.assertRaisesRegex(RiskStoreError, "unselected periodic"):
+            self.store.current_document_selection_snapshot("000001")
+
+    def test_selection_snapshot_conflict_has_no_run_and_exact_reason_projection(self) -> None:
+        first = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="conflict-a",
+            published_at=NOW,
+            retrieved_at=NOW,
+        )
+        second = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="conflict-b",
+            published_at=NOW,
+            retrieved_at=NOW,
+        )
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        plan = select_current_candidates(
+            "000001",
+            refresh_run_id=refresh_id,
+            candidates=(first.artifact.candidate, second.artifact.candidate),
+        )
+        self.store.publish_document_selection(plan, NOW)
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.SUCCESS,
+            NOW + timedelta(seconds=1),
+        )
+
+        snapshot = self.store.current_document_selection_snapshot("000001")
+
+        assert snapshot is not None
+        self.assertEqual(snapshot.candidate_runs, ())
+        self.assertEqual(
+            snapshot.selection_reason_codes,
+            (
+                "current_periodic_candidate_conflict",
+                "current_periodic_candidate_missing",
+            ),
+        )
+
+    def test_selection_snapshot_rejects_failed_candidate_parse_run_mismatch(self) -> None:
+        annual = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="parse-failure",
+            published_at=NOW,
+            retrieved_at=NOW,
+        )
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        plan = select_current_candidates(
+            "000001",
+            refresh_run_id=refresh_id,
+            candidates=(annual.artifact.candidate,),
+        )
+        self.store.publish_document_selection(plan, NOW)
+        run = self.store.publish_candidate_parse_failure(
+            refresh_id=refresh_id,
+            candidate=annual.artifact.candidate,
+            artifact=annual.artifact,
+            provenance=native_parser_provenance(),
+            failure=self._failure(),
+            attempted_at=NOW,
+        )
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.PARTIAL,
+            NOW + timedelta(seconds=1),
+        )
+        with self.repository.connect() as connection, connection:
+            connection.execute("DROP TRIGGER fund_document_parse_run_no_update")
+            connection.execute(
+                "UPDATE fund_document_parse_runs SET public_error_code = ? WHERE id = ?",
+                ("official_document_invalid", run.id),
+            )
+
+        with self.assertRaisesRegex(RiskStoreError, "candidate and parse failure"):
+            self.store.current_document_selection_snapshot("000001")
+
+    def test_new_classification_save_requires_v3_and_historical_v1_v2_remain_readable(self) -> None:
+        _, evidence, policy = self._classification_inputs()
+        historical_evidence = replace(
+            evidence,
+            document_refresh_run_id=None,
+            selection_policy_checksum=None,
+            selection_manifest_checksum=None,
+            candidate_run_snapshot_checksum=None,
+            selection_reason_codes=(),
+        )
+        historical_classification = classify_fund(historical_evidence, policy, NOW)
+        with self.assertRaisesRegex(RiskStoreError, "manifest v3"):
+            self.store.save_classification(
+                historical_classification,
+                historical_evidence,
+                policy,
+            )
+
+        for version in (1, 2):
+            with self.subTest(version=version):
+                classification_id = self._insert_historical_classification(
+                    historical_classification,
+                    historical_evidence,
+                    policy,
+                    version=version,
+                )
+                bound = self.store.classification_evidence("000001", classification_id)
+                assert bound is not None
+                self.assertEqual(
+                    self.store.classification_history("000001")[0].id,
+                    classification_id,
+                )
+                current = self.store.current_classification("000001")
+                assert current is not None
+                self.assertEqual(current.id, classification_id)
+                self.assertIsNone(bound.evidence.document_refresh_run_id)
+                self.assertIsNone(bound.evidence.selection_policy_checksum)
+                self.assertIsNone(bound.evidence.selection_manifest_checksum)
+                self.assertIsNone(bound.evidence.candidate_run_snapshot_checksum)
+                self.assertEqual(bound.evidence.selection_reason_codes, ())
+
+    def test_v3_save_and_historical_readback_authenticate_exact_refresh(self) -> None:
+        classification, evidence, policy, snapshot = self._selection_bound_inputs()
+
+        stored = self.store.save_classification(classification, evidence, policy)
+        later = self.store.begin_document_refresh("000001", NOW + timedelta(minutes=1))
+
+        bound = self.store.classification_evidence("000001", stored.id)
+
+        assert bound is not None
+        self.assertEqual(bound.evidence, evidence)
+        self.assertEqual(
+            self.store.document_selection_snapshot_for_refresh(
+                "000001", snapshot.selection.refresh_run_id
+            ),
+            snapshot,
+        )
+        self.assertNotEqual(later, snapshot.selection.refresh_run_id)
+
+    def test_v3_save_revalidates_absolute_latest_refresh_inside_write_transaction(self) -> None:
+        classification, evidence, policy, _ = self._selection_bound_inputs()
+        self.store.begin_document_refresh("000001", NOW + timedelta(minutes=1))
+
+        with self.assertRaisesRegex(RiskStoreError, "current selection"):
+            self.store.save_classification(classification, evidence, policy)
+
+        with self.repository.connect() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM fund_risk_classifications"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_v3_save_rejects_every_newer_refresh_terminal_state(self) -> None:
+        states = (
+            None,
+            RefreshOutcome.FAILED,
+            RefreshOutcome.EMPTY,
+            RefreshOutcome.PARTIAL,
+            RefreshOutcome.SUCCESS,
+        )
+        for index, outcome in enumerate(states, start=1):
+            with self.subTest(outcome=None if outcome is None else outcome.value):
+                temporary_directory = tempfile.TemporaryDirectory()
+                try:
+                    repository = Repository(Path(temporary_directory.name) / "kunjin.db")
+                    repository.migrate()
+                    original_store, original_repository = self.store, self.repository
+                    original_path = self.document_path
+                    self.store, self.repository = FundRiskStore(repository), repository
+                    self.document_path = Path(temporary_directory.name) / "document.html"
+                    self.document_path.write_bytes(b"<html>synthetic public evidence</html>")
+                    classification, evidence, policy, _ = self._selection_bound_inputs()
+                    newer = self.store.begin_document_refresh(
+                        "000001", NOW + timedelta(minutes=index)
+                    )
+                    if outcome is RefreshOutcome.FAILED:
+                        self.store.complete_document_refresh(
+                            newer,
+                            outcome,
+                            NOW + timedelta(minutes=index, seconds=1),
+                            failure=self._failure(),
+                        )
+                    elif outcome is not None:
+                        self.store.complete_document_refresh(
+                            newer,
+                            outcome,
+                            NOW + timedelta(minutes=index, seconds=1),
+                        )
+                    with self.assertRaisesRegex(RiskStoreError, "current selection"):
+                        self.store.save_classification(classification, evidence, policy)
+                    with repository.connect() as connection:
+                        count = connection.execute(
+                            "SELECT COUNT(*) FROM fund_risk_classifications"
+                        ).fetchone()[0]
+                    self.assertEqual(count, 0)
+                finally:
+                    self.store, self.repository = original_store, original_repository
+                    self.document_path = original_path
+                    temporary_directory.cleanup()
+
+    def test_v3_save_rejects_candidate_run_appended_after_assembly(self) -> None:
+        classification, evidence, policy, snapshot = self._selection_bound_inputs()
+        with self.repository.connect() as connection, connection:
+            connection.execute(
+                "INSERT INTO fund_document_candidate_runs("
+                "refresh_run_id, candidate_fingerprint, fund_code, document_kind, url, "
+                "published_at, outcome, source_document_id, parse_run_id, public_error_code, "
+                "failure_stage, failure_reason, created_at"
+                ") VALUES (?, ?, ?, ?, ?, NULL, 'failed', NULL, NULL, ?, ?, ?, ?)",
+                (
+                    snapshot.selection.refresh_run_id,
+                    "f" * 64,
+                    "000001",
+                    DocumentKind.PRODUCT_SUMMARY.value,
+                    "https://www.fund001.com/synthetic/000001/appended",
+                    self._failure().public_code,
+                    self._failure().stage.value,
+                    self._failure().reason_code.value,
+                    (NOW + timedelta(minutes=1)).isoformat(),
+                ),
+            )
+
+        with self.assertRaisesRegex(RiskStoreError, "selection snapshot"):
+            self.store.save_classification(classification, evidence, policy)
+        with self.repository.connect() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM fund_risk_classifications"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_v3_save_rejects_each_selection_binding_change(self) -> None:
+        _, evidence, policy, _ = self._selection_bound_inputs()
+        changes = {
+            "refresh": {"document_refresh_run_id": evidence.document_refresh_run_id + 1},
+            "policy": {"selection_policy_checksum": "a" * 64},
+            "manifest": {"selection_manifest_checksum": "b" * 64},
+            "candidate_runs": {"candidate_run_snapshot_checksum": "c" * 64},
+            "reasons": {"selection_reason_codes": ()},
+        }
+        for label, values in changes.items():
+            with self.subTest(label=label):
+                changed = replace(evidence, **values)
+                classification = classify_fund(changed, policy, NOW)
+                with self.assertRaisesRegex(
+                    RiskStoreError,
+                    "current selection|selection snapshot",
+                ):
+                    self.store.save_classification(classification, changed, policy)
+
+    def test_v3_save_rejects_empty_official_evidence_when_projection_is_nonempty(self) -> None:
+        _, evidence, policy, _ = self._selection_bound_inputs()
+        emptied = replace(
+            evidence,
+            legal_facts=(),
+            benchmark_facts=(),
+            report_facts=(),
+            freshness=(),
+            document_ids=(),
+            fact_ids=(),
+            parse_result_ids=(),
+            parser_provenance_checksums=(),
+        )
+        classification = classify_fund(emptied, policy, NOW)
+
+        with self.assertRaisesRegex(RiskStoreError, "evidence projection"):
+            self.store.save_classification(classification, emptied, policy)
+        with self.repository.connect() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM fund_risk_classifications"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_v3_save_rejects_misgrouped_official_facts(self) -> None:
+        _, evidence, policy, _ = self._selection_bound_inputs()
+        misgrouped = replace(
+            evidence,
+            legal_facts=(),
+            report_facts=evidence.legal_facts,
+        )
+        classification = classify_fund(misgrouped, policy, NOW)
+
+        with self.assertRaisesRegex(RiskStoreError, "evidence projection"):
+            self.store.save_classification(classification, misgrouped, policy)
+        with self.repository.connect() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM fund_risk_classifications"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_v3_save_rejects_an_authenticated_empty_projection(self) -> None:
+        annual = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="failed-only-annual",
+            published_at=NOW - timedelta(days=1),
+            retrieved_at=NOW,
+        )
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        plan = select_current_candidates(
+            "000001",
+            refresh_run_id=refresh_id,
+            candidates=(annual.artifact.candidate,),
+        )
+        self.store.publish_document_selection(plan, NOW)
+        self.store.publish_candidate_failure(
+            refresh_id=refresh_id,
+            candidate=annual.artifact.candidate,
+            failure=self._failure(),
+            attempted_at=NOW,
+            artifact=None,
+            provenance=None,
+        )
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.PARTIAL,
+            NOW + timedelta(seconds=1),
+        )
+        snapshot = self.store.current_document_selection_snapshot("000001")
+        assert snapshot is not None
+        evidence = ClassificationEvidence(
+            fund_code="000001",
+            legal_facts=(),
+            benchmark_facts=(),
+            report_facts=(),
+            existing_disclosure_facts=(),
+            nav_conflicts=(),
+            external_evidence_fingerprints=(),
+            external_source_references=(),
+            nav_evidence_fingerprint=None,
+            nav_observation_start=None,
+            nav_observation_end=None,
+            freshness=(),
+            document_ids=(),
+            fact_ids=(),
+            parse_result_ids=(),
+            parser_provenance_checksums=(),
+            document_refresh_run_id=refresh_id,
+            selection_policy_checksum=snapshot.selection.selection_policy_checksum,
+            selection_manifest_checksum=snapshot.selection.selection_checksum,
+            candidate_run_snapshot_checksum=snapshot.candidate_run_snapshot_checksum,
+            selection_reason_codes=snapshot.selection_reason_codes,
+        )
+        policy = ClassificationPolicyV1()
+
+        with self.assertRaisesRegex(RiskStoreError, "projection is unavailable"):
+            self.store.save_classification(classify_fund(evidence, policy, NOW), evidence, policy)
+
+    def test_selected_parse_failure_can_reuse_an_artifact_from_an_older_success(self) -> None:
+        annual = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="reused-annual",
+            published_at=NOW - timedelta(days=1),
+            retrieved_at=NOW,
+        )
+        first_refresh = self.store.begin_document_refresh("000001", NOW)
+        self.store.publish_document_selection(
+            select_current_candidates(
+                "000001",
+                refresh_run_id=first_refresh,
+                candidates=(annual.artifact.candidate,),
+            ),
+            NOW,
+        )
+        first = self.store.publish_candidate_success(
+            refresh_id=first_refresh,
+            candidate=annual.artifact.candidate,
+            parsed=annual,
+            provenance=native_parser_provenance(),
+            parser_input_sha256=annual.artifact.sha256,
+            attempted_at=NOW,
+        )
+        self.store.complete_document_refresh(
+            first_refresh,
+            RefreshOutcome.SUCCESS,
+            NOW + timedelta(seconds=1),
+        )
+
+        second_refresh = self.store.begin_document_refresh(
+            "000001", NOW + timedelta(minutes=1)
+        )
+        self.store.publish_document_selection(
+            select_current_candidates(
+                "000001",
+                refresh_run_id=second_refresh,
+                candidates=(annual.artifact.candidate,),
+            ),
+            NOW + timedelta(minutes=1),
+        )
+        self.store.publish_candidate_parse_failure(
+            refresh_id=second_refresh,
+            candidate=annual.artifact.candidate,
+            artifact=annual.artifact,
+            provenance=native_parser_provenance(),
+            failure=self._failure(),
+            attempted_at=NOW + timedelta(minutes=1),
+        )
+        self.store.complete_document_refresh(
+            second_refresh,
+            RefreshOutcome.PARTIAL,
+            NOW + timedelta(minutes=1, seconds=1),
+        )
+
+        snapshot = self.store.current_document_selection_snapshot("000001")
+        assert snapshot is not None
+        self.assertEqual(snapshot.selection.refresh_run_id, second_refresh)
+        self.assertEqual(snapshot.selected_periodic_records, ())
+        self.assertEqual(len(snapshot.candidate_runs), 1)
+        self.assertIs(snapshot.candidate_runs[0].outcome, ParseRunOutcome.FAILED)
+        self.assertEqual(snapshot.candidate_runs[0].source_document_id, first.artifact.id)
+
+    def test_v3_save_rejects_older_periodic_report_instead_of_current_fact_projection(
+        self,
+    ) -> None:
+        annual = self._document_variant(
+            kind=DocumentKind.ANNUAL_REPORT,
+            marker="2025-annual",
+            published_at=NOW - timedelta(days=30),
+            retrieved_at=NOW,
+        )
+        annual = replace(
+            annual,
+            artifact=replace(
+                annual.artifact,
+                candidate=replace(annual.artifact.candidate, title="2025年年度报告"),
+            ),
+        )
+        quarter = self._document_variant(
+            kind=DocumentKind.QUARTERLY_REPORT,
+            marker="2026-q1",
+            published_at=NOW - timedelta(days=1),
+            retrieved_at=NOW,
+        )
+        quarter = replace(
+            quarter,
+            artifact=replace(
+                quarter.artifact,
+                candidate=replace(quarter.artifact.candidate, title="2026年第1季度报告"),
+            ),
+        )
+        refresh_id = self.store.begin_document_refresh("000001", NOW)
+        plan = select_current_candidates(
+            "000001",
+            refresh_run_id=refresh_id,
+            candidates=(annual.artifact.candidate, quarter.artifact.candidate),
+        )
+        self.store.publish_document_selection(plan, NOW)
+        annual_record, _ = tuple(
+            self.store.publish_candidate_success(
+                refresh_id=refresh_id,
+                candidate=parsed.artifact.candidate,
+                parsed=parsed,
+                provenance=native_parser_provenance(),
+                parser_input_sha256=parsed.artifact.sha256,
+                attempted_at=NOW,
+            )
+            for parsed in (annual, quarter)
+        )
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.SUCCESS,
+            NOW + timedelta(seconds=1),
+        )
+        snapshot = self.store.current_document_selection_snapshot("000001")
+        assert snapshot is not None
+        stored = annual_record.facts[0]
+        report_fact = MandateFact(
+            fund_code=stored.fund_code,
+            fact_kind=stored.fact_kind,
+            normalized_value=stored.normalized_value,
+            unit=stored.unit,
+            source_document_id=stored.source_document_id,
+            page_number=stored.page_number,
+            section_name=stored.section_name,
+            source_excerpt=stored.source_excerpt,
+            effective_from=stored.effective_from,
+            effective_to=stored.effective_to,
+            confidence_state=stored.confidence_state,
+            parser_version=stored.parser_version,
+            fact_fingerprint=stored.fact_fingerprint,
+        )
+        freshness = EvidenceFreshness(
+            section=DocumentKind.ANNUAL_REPORT.value,
+            source_document_id=annual_record.artifact.id,
+            state=FreshnessState.CURRENT,
+            observed_at=annual_record.artifact.published_at,
+            valid_until=NOW + timedelta(days=30),
+            critical=True,
+        )
+        evidence = ClassificationEvidence(
+            fund_code="000001",
+            legal_facts=(),
+            benchmark_facts=(),
+            report_facts=(report_fact,),
+            existing_disclosure_facts=(),
+            nav_conflicts=(),
+            external_evidence_fingerprints=(),
+            external_source_references=(),
+            nav_evidence_fingerprint=None,
+            nav_observation_start=None,
+            nav_observation_end=None,
+            freshness=(freshness,),
+            document_ids=(annual_record.artifact.id,),
+            fact_ids=(stored.id,),
+            parse_result_ids=(annual_record.parse_result.id,),
+            parser_provenance_checksums=(annual_record.provenance.provenance_checksum,),
+            document_refresh_run_id=refresh_id,
+            selection_policy_checksum=snapshot.selection.selection_policy_checksum,
+            selection_manifest_checksum=snapshot.selection.selection_checksum,
+            candidate_run_snapshot_checksum=snapshot.candidate_run_snapshot_checksum,
+            selection_reason_codes=snapshot.selection_reason_codes,
+        )
+        policy = ClassificationPolicyV1()
+        classification = classify_fund(evidence, policy, NOW)
+
+        with self.assertRaisesRegex(RiskStoreError, "evidence projection"):
+            self.store.save_classification(classification, evidence, policy)
+
+    def test_v3_readback_rejects_selection_and_candidate_run_tampering(self) -> None:
+        classification, evidence, policy, _ = self._selection_bound_inputs()
+        stored = self.store.save_classification(classification, evidence, policy)
+
+        with self.repository.connect() as connection, connection:
+            connection.execute("DROP TRIGGER fund_document_candidate_run_no_update")
+            connection.execute(
+                "UPDATE fund_document_candidate_runs SET created_at = ?",
+                ((NOW + timedelta(minutes=2)).isoformat(),),
+            )
+
+        with self.assertRaisesRegex(RiskStoreError, "selection snapshot"):
+            self.store.classification_history("000001")
+        with self.assertRaisesRegex(RiskStoreError, "selection snapshot"):
+            self.store.classification_evidence("000001", stored.id)
+
+    def test_v3_readback_rejects_each_manifest_selection_field_change(self) -> None:
+        classification, evidence, policy, _ = self._selection_bound_inputs()
+        stored = self.store.save_classification(classification, evidence, policy)
+        original_manifest = stored.input_manifest_json
+        original_fingerprint = stored.input_fingerprint
+        changes = {
+            "document_refresh_run_id": evidence.document_refresh_run_id + 1,
+            "selection_policy_checksum": "a" * 64,
+            "selection_manifest_checksum": "b" * 64,
+            "candidate_run_snapshot_checksum": "c" * 64,
+            "selection_reason_codes": [],
+        }
+        with self.repository.connect() as connection, connection:
+            connection.execute("DROP TRIGGER fund_risk_classification_no_update")
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                manifest = json.loads(original_manifest)
+                manifest[field] = value
+                manifest_json = json.dumps(
+                    manifest,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                fingerprint = hashlib.sha256(manifest_json.encode("ascii")).hexdigest()
+                with self.repository.connect() as connection, connection:
+                    connection.execute(
+                        "UPDATE fund_risk_classifications SET input_manifest_json = ?, "
+                        "input_fingerprint = ? WHERE id = ?",
+                        (manifest_json, fingerprint, stored.id),
+                    )
+                with self.assertRaises(RiskStoreError):
+                    self.store.classification_history("000001")
+                with self.repository.connect() as connection, connection:
+                    connection.execute(
+                        "UPDATE fund_risk_classifications SET input_manifest_json = ?, "
+                        "input_fingerprint = ? WHERE id = ?",
+                        (original_manifest, original_fingerprint, stored.id),
+                    )
+
+    def test_v3_readback_rejects_changed_safe_candidate_failure(self) -> None:
+        _, evidence, policy, snapshot = self._selection_bound_inputs()
+        with self.repository.connect() as connection, connection:
+            connection.execute(
+                "INSERT INTO fund_document_candidate_runs("
+                "refresh_run_id, candidate_fingerprint, fund_code, document_kind, url, "
+                "published_at, outcome, source_document_id, parse_run_id, public_error_code, "
+                "failure_stage, failure_reason, created_at"
+                ") VALUES (?, ?, ?, ?, ?, NULL, 'failed', NULL, NULL, ?, ?, ?, ?)",
+                (
+                    snapshot.selection.refresh_run_id,
+                    "e" * 64,
+                    "000001",
+                    DocumentKind.PRODUCT_SUMMARY.value,
+                    "https://www.fund001.com/synthetic/000001/failed-summary",
+                    self._failure().public_code,
+                    self._failure().stage.value,
+                    self._failure().reason_code.value,
+                    NOW.isoformat(),
+                ),
+            )
+        rebound = self.store.current_document_selection_snapshot("000001")
+        assert rebound is not None
+        evidence = replace(
+            evidence,
+            candidate_run_snapshot_checksum=rebound.candidate_run_snapshot_checksum,
+        )
+        classification = classify_fund(evidence, policy, NOW)
+        self.store.save_classification(classification, evidence, policy)
+        with self.repository.connect() as connection, connection:
+            connection.execute("DROP TRIGGER fund_document_candidate_run_no_update")
+            connection.execute(
+                "UPDATE fund_document_candidate_runs SET public_error_code = ?, "
+                "failure_stage = ?, failure_reason = ? WHERE candidate_fingerprint = ?",
+                (
+                    "official_document_invalid",
+                    DocumentFailureStage.UNSPECIFIED.value,
+                    DocumentFailureReason.UNSPECIFIED_FAILURE.value,
+                    "e" * 64,
+                ),
+            )
+
+        with self.assertRaisesRegex(RiskStoreError, "selection snapshot"):
+            self.store.classification_history("000001")
 
     def test_latest_refresh_id_blocks_old_success_when_clock_moves_backward(self) -> None:
         self._publish_current(started_at=NOW)
@@ -1067,7 +2103,16 @@ class FundRiskStoreTest(unittest.TestCase):
         )
         evidence = ClassificationEvidence(
             fund_code="000001",
-            legal_facts=mandate_facts,
+            legal_facts=tuple(
+                sorted(
+                    mandate_facts,
+                    key=lambda fact: (
+                        fact.fact_kind,
+                        fact.source_document_id,
+                        fact.fact_fingerprint,
+                    ),
+                )
+            ),
             benchmark_facts=(),
             report_facts=(),
             existing_disclosure_facts=(),
@@ -1083,6 +2128,7 @@ class FundRiskStoreTest(unittest.TestCase):
             parse_result_ids=tuple(sorted({item.parse_result_id for item in stored})),
             parser_provenance_checksums=(native_parser_provenance().provenance_checksum,),
         )
+        evidence = self._bind_evidence_to_selection(evidence, parsed)
         policy = ClassificationPolicyV1()
         classification = classify_fund(evidence, policy, NOW)
         self.store.save_classification(classification, evidence, policy)
@@ -1375,17 +2421,22 @@ class FundRiskStoreTest(unittest.TestCase):
         self.assertEqual(tuple(item.id for item in bound.documents), evidence.document_ids)
         self.assertEqual(tuple(item.id for item in bound.facts), evidence.fact_ids)
 
-    def test_v2_manifest_has_exact_result_and_provenance_bindings(self) -> None:
+    def test_v3_manifest_has_exact_result_provenance_and_selection_bindings(self) -> None:
         classification, evidence, policy = self._classification_inputs()
 
         stored = self.store.save_classification(classification, evidence, policy)
         manifest = json.loads(stored.input_manifest_json)
 
-        self.assertEqual(manifest["manifest_version"], 2)
+        self.assertEqual(manifest["manifest_version"], 3)
         self.assertEqual(manifest["parse_result_ids"], list(evidence.parse_result_ids))
         self.assertEqual(
             manifest["parser_provenance_checksums"],
             list(evidence.parser_provenance_checksums),
+        )
+        self.assertEqual(manifest["document_refresh_run_id"], evidence.document_refresh_run_id)
+        self.assertEqual(
+            manifest["candidate_run_snapshot_checksum"],
+            evidence.candidate_run_snapshot_checksum,
         )
         self.assertEqual(
             stored.input_manifest_json,
@@ -1428,6 +2479,27 @@ class FundRiskStoreTest(unittest.TestCase):
             fact_ids=(),
             parse_result_ids=(record.parse_result.id,),
             parser_provenance_checksums=(record.provenance.provenance_checksum,),
+        )
+        plan = select_current_candidates(
+            "000001",
+            refresh_run_id=refresh_id,
+            candidates=(parsed.artifact.candidate,),
+        )
+        self.store.publish_document_selection(plan, NOW)
+        self.store.complete_document_refresh(
+            refresh_id,
+            RefreshOutcome.SUCCESS,
+            NOW + timedelta(seconds=1),
+        )
+        snapshot = self.store.current_document_selection_snapshot("000001")
+        assert snapshot is not None
+        evidence = replace(
+            evidence,
+            document_refresh_run_id=refresh_id,
+            selection_policy_checksum=snapshot.selection.selection_policy_checksum,
+            selection_manifest_checksum=snapshot.selection.selection_checksum,
+            candidate_run_snapshot_checksum=snapshot.candidate_run_snapshot_checksum,
+            selection_reason_codes=snapshot.selection_reason_codes,
         )
         policy = ClassificationPolicyV1()
         classification = classify_fund(evidence, policy, NOW)
@@ -1549,7 +2621,7 @@ class FundRiskStoreTest(unittest.TestCase):
         )
         expanded_classification = classify_fund(expanded, policy, NOW)
 
-        with self.assertRaisesRegex(RiskStoreError, "parse result binding"):
+        with self.assertRaisesRegex(RiskStoreError, "current selection"):
             self.store.save_classification(expanded_classification, expanded, policy)
 
     def test_v2_document_cannot_omit_its_parse_result(self) -> None:
@@ -1587,7 +2659,7 @@ class FundRiskStoreTest(unittest.TestCase):
         )
         classification = classify_fund(rebound, policy, NOW)
 
-        with self.assertRaisesRegex(RiskStoreError, "parse result document binding"):
+        with self.assertRaisesRegex(RiskStoreError, "current selection"):
             self.store.save_classification(classification, rebound, policy)
 
     def test_same_classification_fingerprint_with_different_content_is_a_conflict(self) -> None:

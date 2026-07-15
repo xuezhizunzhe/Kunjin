@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, fields
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional, Tuple, cast
 
 from kunjin.funds.models import FUND_CODE_PATTERN, DocumentKind
@@ -282,6 +282,116 @@ def select_current_candidates(
     )
     plan.validate()
     return plan
+
+
+def current_evidence_projection(
+    records: tuple,
+) -> tuple[tuple, tuple]:
+    """Return the unique current record set and selected periodic facts."""
+
+    if type(records) is not tuple:
+        raise ValueError("parsed document records must be an immutable tuple")
+    by_kind = {}
+    for record in records:
+        artifact = record.artifact
+        current = by_kind.get(artifact.document_kind)
+        if current is None or _record_order(record) > _record_order(current):
+            by_kind[artifact.document_kind] = record
+    if DocumentKind.PROSPECTUS_UPDATE in by_kind:
+        by_kind.pop(DocumentKind.PROSPECTUS, None)
+    current_records = tuple(
+        sorted(
+            by_kind.values(),
+            key=lambda item: (
+                item.artifact.document_kind.value,
+                _record_order(item),
+            ),
+        )
+    )
+    periodic_records = tuple(
+        record
+        for record in current_records
+        if record.artifact.document_kind in PERIODIC_DOCUMENT_KINDS
+    )
+    candidates = {}
+    for record in periodic_records:
+        for fact in record.facts:
+            candidates.setdefault(fact.fact_kind, []).append((record, fact))
+
+    selected_facts = []
+    used_periodic_records = {}
+    for fact_kind in sorted(candidates):
+        values = candidates[fact_kind]
+        newest_order = max(_report_order(record) for record, _ in values)
+        for record, fact in values:
+            if _report_order(record) == newest_order:
+                selected_facts.append((record, fact))
+                used_periodic_records[record.artifact.id] = record
+    if not selected_facts and periodic_records:
+        newest = max(periodic_records, key=_report_order)
+        used_periodic_records[newest.artifact.id] = newest
+
+    nonperiodic_records = tuple(
+        record
+        for record in current_records
+        if record.artifact.document_kind not in PERIODIC_DOCUMENT_KINDS
+    )
+    selected_periodic_records = tuple(
+        sorted(
+            used_periodic_records.values(),
+            key=lambda item: item.artifact.document_kind.value,
+        )
+    )
+    return (
+        nonperiodic_records + selected_periodic_records,
+        tuple(
+            sorted(
+                selected_facts,
+                key=lambda item: (
+                    item[1].fact_kind,
+                    _report_order(item[0]),
+                    item[1].id,
+                ),
+            )
+        ),
+    )
+
+
+def _record_order(record: object) -> tuple:
+    artifact = record.artifact
+    return (
+        artifact.published_at is not None,
+        artifact.published_at or datetime.min.replace(tzinfo=timezone.utc),
+        artifact.retrieved_at,
+        artifact.id,
+    )
+
+
+def _report_order(record: object) -> tuple:
+    period_end = _report_period_end(record.artifact.title)
+    return (
+        period_end is not None,
+        period_end or date.min,
+        _record_order(record),
+    )
+
+
+def _report_period_end(title: str) -> Optional[date]:
+    normalized = title.replace("第一", "第1").replace("第二", "第2")
+    normalized = normalized.replace("第三", "第3").replace("第四", "第4")
+    year_match = re.search(r"(?P<year>20\d{2})(?:年|[-/])", normalized)
+    if year_match is None:
+        return None
+    year = int(year_match.group("year"))
+    if re.search(r"第?1季度|q1\b", normalized, re.IGNORECASE):
+        return date(year, 3, 31)
+    if re.search(r"半年度|第?2季度|q2\b", normalized, re.IGNORECASE):
+        return date(year, 6, 30)
+    if re.search(r"第?3季度|q3\b", normalized, re.IGNORECASE):
+        return date(year, 9, 30)
+    if re.search(r"年度|第?4季度|q4\b", normalized, re.IGNORECASE):
+        return date(year, 12, 31)
+    return None
 
 
 def _select_periodic_state(

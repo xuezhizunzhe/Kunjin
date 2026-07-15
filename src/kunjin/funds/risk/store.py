@@ -32,6 +32,7 @@ from kunjin.funds.risk.engine import (
     classification_input_manifest,
     classification_input_manifest_v1,
     classification_input_manifest_v2,
+    classification_input_manifest_v3,
     classify_fund,
 )
 from kunjin.funds.risk.failures import (
@@ -67,9 +68,11 @@ from kunjin.funds.risk.policy import (
 from kunjin.funds.risk.selection import (
     PERIODIC_DOCUMENT_KINDS,
     SELECTION_POLICY_V1_CHECKSUM,
+    SELECTION_REASON_CODES,
     DocumentSelectionPlan,
     PeriodicSelectionState,
     SelectionCandidate,
+    current_evidence_projection,
 )
 from kunjin.storage.repository import Repository
 
@@ -108,6 +111,15 @@ _MANIFEST_V2_KEYS = _MANIFEST_V1_KEYS | frozenset(
         "parser_provenance_checksums",
     }
 )
+_MANIFEST_V3_KEYS = _MANIFEST_V2_KEYS | frozenset(
+    {
+        "document_refresh_run_id",
+        "selection_policy_checksum",
+        "selection_manifest_checksum",
+        "candidate_run_snapshot_checksum",
+        "selection_reason_codes",
+    }
+)
 _SELECTION_MANIFEST_KEYS = frozenset(
     {
         "fund_code",
@@ -128,6 +140,15 @@ _SELECTION_STATE_KEYS = frozenset(
         "reason_code",
         "selected_fingerprint",
         "state",
+    }
+)
+_LEGAL_EVIDENCE_DOCUMENT_KINDS = frozenset(
+    {
+        DocumentKind.FUND_CONTRACT,
+        DocumentKind.PROSPECTUS,
+        DocumentKind.PROSPECTUS_UPDATE,
+        DocumentKind.PRODUCT_SUMMARY,
+        DocumentKind.CLASSIFICATION_ANNOUNCEMENT,
     }
 )
 
@@ -238,6 +259,32 @@ class StoredDocumentSelectionManifest:
     created_at: datetime
     periodic_candidates: Tuple[SelectionCandidate, ...]
     periodic_states: Tuple[PeriodicSelectionState, ...]
+
+
+@dataclass(frozen=True)
+class StoredSelectionCandidateRun:
+    id: int
+    candidate_fingerprint: str
+    fund_code: str
+    document_kind: DocumentKind
+    url: str
+    published_at: Optional[datetime]
+    outcome: ParseRunOutcome
+    source_document_id: Optional[int]
+    parse_run_id: Optional[int]
+    parsed_record: Optional[ParsedDocumentRecord]
+    failure: Optional[SafeDocumentFailure]
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class CurrentDocumentSelectionSnapshot:
+    selection: StoredDocumentSelectionManifest
+    candidate_runs: Tuple[StoredSelectionCandidateRun, ...]
+    selected_periodic_records: Tuple[ParsedDocumentRecord, ...]
+    nonperiodic_successful_records: Tuple[ParsedDocumentRecord, ...]
+    candidate_run_snapshot_checksum: str
+    selection_reason_codes: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -417,6 +464,51 @@ class FundRiskStore:
             if row is None:
                 return None
             return self._row_to_document_selection(connection, row)
+
+    def current_document_selection_snapshot(
+        self,
+        fund_code: str,
+    ) -> Optional[CurrentDocumentSelectionSnapshot]:
+        code = _fund_code(fund_code)
+        try:
+            with self._repository.connect() as connection:
+                connection.execute("BEGIN")
+                latest = connection.execute(
+                    "SELECT refresh.id, completion.outcome "
+                    "FROM fund_document_refresh_runs AS refresh "
+                    "LEFT JOIN fund_document_refresh_completions AS completion "
+                    "ON completion.refresh_run_id = refresh.id "
+                    "WHERE refresh.fund_code = ? ORDER BY refresh.id DESC LIMIT 1",
+                    (code,),
+                ).fetchone()
+                if latest is None or latest["outcome"] not in {"success", "partial"}:
+                    connection.commit()
+                    return None
+                snapshot = self._document_selection_snapshot(
+                    connection,
+                    code,
+                    _positive_integer(latest["id"], "refresh id"),
+                )
+                connection.commit()
+                return snapshot
+        except sqlite3.DatabaseError as exc:
+            raise RiskStoreError("classification storage failed") from exc
+
+    def document_selection_snapshot_for_refresh(
+        self,
+        fund_code: str,
+        refresh_run_id: int,
+    ) -> CurrentDocumentSelectionSnapshot:
+        code = _fund_code(fund_code)
+        refresh = _positive_integer(refresh_run_id, "refresh id")
+        try:
+            with self._repository.connect() as connection:
+                connection.execute("BEGIN")
+                snapshot = self._document_selection_snapshot(connection, code, refresh)
+                connection.commit()
+                return snapshot
+        except sqlite3.DatabaseError as exc:
+            raise RiskStoreError("classification storage failed") from exc
 
     def complete_document_refresh(
         self,
@@ -737,6 +829,308 @@ class FundRiskStore:
                 connection.rollback()
                 raise
 
+    def _document_selection_snapshot(
+        self,
+        connection: Any,
+        fund_code: str,
+        refresh_run_id: int,
+    ) -> CurrentDocumentSelectionSnapshot:
+        refresh = connection.execute(
+            "SELECT refresh.fund_code, completion.outcome "
+            "FROM fund_document_refresh_runs AS refresh "
+            "LEFT JOIN fund_document_refresh_completions AS completion "
+            "ON completion.refresh_run_id = refresh.id WHERE refresh.id = ?",
+            (refresh_run_id,),
+        ).fetchone()
+        if refresh is None or refresh["fund_code"] != fund_code:
+            raise RiskStoreError("document selection refresh binding changed")
+        if refresh["outcome"] not in {"success", "partial"}:
+            raise RiskStoreError("document selection refresh is not completed")
+        selection_row = connection.execute(
+            "SELECT * FROM fund_document_selection_manifests WHERE refresh_run_id = ?",
+            (refresh_run_id,),
+        ).fetchone()
+        selection = self._row_to_document_selection(connection, selection_row)
+        if selection.fund_code != fund_code:
+            raise RiskStoreError("document selection fund binding changed")
+
+        rows = connection.execute(
+            "SELECT * FROM fund_document_candidate_runs "
+            "WHERE refresh_run_id = ? ORDER BY id",
+            (refresh_run_id,),
+        ).fetchall()
+        candidate_runs = tuple(
+            self._row_to_selection_candidate_run(
+                connection,
+                row,
+                fund_code=fund_code,
+                refresh_run_id=refresh_run_id,
+            )
+            for row in rows
+        )
+        self._authenticate_selection_candidate_runs(selection, candidate_runs)
+        selected_fingerprints = {
+            state.selected_fingerprint
+            for state in selection.periodic_states
+            if state.state == "selected"
+        }
+        selected_periodic_records = tuple(
+            run.parsed_record
+            for run in candidate_runs
+            if run.candidate_fingerprint in selected_fingerprints
+            and run.outcome is ParseRunOutcome.SUCCESS
+            and run.parsed_record is not None
+        )
+        nonperiodic_successful_records = tuple(
+            run.parsed_record
+            for run in candidate_runs
+            if run.document_kind not in PERIODIC_DOCUMENT_KINDS
+            and run.outcome is ParseRunOutcome.SUCCESS
+            and run.parsed_record is not None
+        )
+        reason_codes = tuple(
+            sorted(
+                {
+                    state.reason_code
+                    for state in selection.periodic_states
+                    if state.reason_code is not None
+                }
+            )
+        )
+        if any(code not in SELECTION_REASON_CODES for code in reason_codes):
+            raise RiskStoreError("document selection reason projection changed")
+        payload = {
+            "candidate_runs": [
+                {
+                    "candidate_fingerprint": run.candidate_fingerprint,
+                    "created_at": run.created_at.isoformat(),
+                    "document_kind": run.document_kind.value,
+                    "failure_reason": (
+                        None if run.failure is None else run.failure.reason_code.value
+                    ),
+                    "failure_stage": None if run.failure is None else run.failure.stage.value,
+                    "fund_code": run.fund_code,
+                    "id": run.id,
+                    "outcome": run.outcome.value,
+                    "parse_run_id": run.parse_run_id,
+                    "public_error_code": (
+                        None if run.failure is None else run.failure.public_code
+                    ),
+                    "published_at": (
+                        None if run.published_at is None else run.published_at.isoformat()
+                    ),
+                    "source_document_id": run.source_document_id,
+                    "url": run.url,
+                }
+                for run in candidate_runs
+            ],
+            "fund_code": fund_code,
+            "refresh_run_id": refresh_run_id,
+        }
+        checksum = hashlib.sha256(_canonical_json(payload).encode("ascii")).hexdigest()
+        return CurrentDocumentSelectionSnapshot(
+            selection=selection,
+            candidate_runs=candidate_runs,
+            selected_periodic_records=selected_periodic_records,
+            nonperiodic_successful_records=nonperiodic_successful_records,
+            candidate_run_snapshot_checksum=checksum,
+            selection_reason_codes=reason_codes,
+        )
+
+    def _row_to_selection_candidate_run(
+        self,
+        connection: Any,
+        row: Any,
+        *,
+        fund_code: str,
+        refresh_run_id: int,
+    ) -> StoredSelectionCandidateRun:
+        try:
+            run_id = _positive_integer(row["id"], "candidate run id")
+            if _positive_integer(row["refresh_run_id"], "refresh id") != refresh_run_id:
+                raise ValueError("candidate refresh binding changed")
+            candidate_fund = _fund_code(row["fund_code"])
+            if candidate_fund != fund_code:
+                raise ValueError("candidate fund binding changed")
+            fingerprint = _digest(row["candidate_fingerprint"], "candidate fingerprint")
+            document_kind = DocumentKind(row["document_kind"])
+            url = _required_text(row["url"], "candidate URL")
+            validate_safe_https_url(url)
+            published_at = _stored_optional_datetime(
+                row["published_at"], "candidate published_at"
+            )
+            outcome = ParseRunOutcome(row["outcome"])
+            source_document_id = _optional_positive_integer(
+                row["source_document_id"], "source document id"
+            )
+            parse_run_id = _optional_positive_integer(row["parse_run_id"], "parse run id")
+            created_at = _stored_datetime(row["created_at"], "candidate created_at")
+            parsed_record = None
+            failure = None
+            if outcome is ParseRunOutcome.SUCCESS:
+                if source_document_id is None or parse_run_id is None:
+                    raise ValueError("successful candidate lacks parser bindings")
+                if any(
+                    row[key] is not None
+                    for key in ("public_error_code", "failure_stage", "failure_reason")
+                ):
+                    raise ValueError("successful candidate carries a failure")
+                parse_row = connection.execute(
+                    "SELECT parse_result_id FROM fund_document_parse_runs WHERE id = ?",
+                    (parse_run_id,),
+                ).fetchone()
+                if parse_row is None:
+                    raise ValueError("candidate parse run is unavailable")
+                parsed_record = self._load_parsed_record(
+                    connection,
+                    parse_row["parse_result_id"],
+                    parse_run_id=parse_run_id,
+                )
+                if parsed_record.artifact.id != source_document_id:
+                    raise ValueError("candidate artifact binding changed")
+                self._authenticate_candidate_identity(
+                    parsed_record.artifact,
+                    fingerprint=fingerprint,
+                    fund_code=fund_code,
+                    document_kind=document_kind,
+                    url=url,
+                    published_at=published_at,
+                )
+            else:
+                failure = SafeDocumentFailure(
+                    public_code=_required_text(
+                        row["public_error_code"], "candidate failure public code"
+                    ),
+                    stage=DocumentFailureStage(row["failure_stage"]),
+                    reason_code=DocumentFailureReason(row["failure_reason"]),
+                )
+                failure.validate()
+                if (source_document_id is None) != (parse_run_id is None):
+                    raise ValueError("failed candidate parser bindings are partial")
+                if source_document_id is not None and parse_run_id is not None:
+                    artifact = self._row_to_artifact(
+                        connection.execute(
+                            "SELECT * FROM fund_document_artifacts WHERE id = ?",
+                            (source_document_id,),
+                        ).fetchone()
+                    )
+                    parse_run = self._row_to_parse_run(
+                        connection.execute(
+                            "SELECT * FROM fund_document_parse_runs WHERE id = ?",
+                            (parse_run_id,),
+                        ).fetchone()
+                    )
+                    self._row_to_provenance(
+                        connection.execute(
+                            "SELECT * FROM fund_document_parser_provenance WHERE id = ?",
+                            (parse_run.provenance_id,),
+                        ).fetchone()
+                    )
+                    if (
+                        parse_run.source_document_id != source_document_id
+                        or parse_run.outcome is not ParseRunOutcome.FAILED
+                        or parse_run.public_error_code != failure.public_code
+                        or parse_run.failure_stage is not failure.stage
+                        or parse_run.failure_reason is not failure.reason_code
+                    ):
+                        raise RiskStoreError("candidate and parse failure binding changed")
+                    self._authenticate_candidate_identity(
+                        artifact,
+                        fingerprint=fingerprint,
+                        fund_code=fund_code,
+                        document_kind=document_kind,
+                        url=url,
+                        published_at=published_at,
+                    )
+            return StoredSelectionCandidateRun(
+                id=run_id,
+                candidate_fingerprint=fingerprint,
+                fund_code=candidate_fund,
+                document_kind=document_kind,
+                url=url,
+                published_at=published_at,
+                outcome=outcome,
+                source_document_id=source_document_id,
+                parse_run_id=parse_run_id,
+                parsed_record=parsed_record,
+                failure=failure,
+                created_at=created_at,
+            )
+        except RiskStoreError:
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RiskStoreError("stored candidate run authentication failed") from exc
+
+    def _authenticate_candidate_identity(
+        self,
+        artifact: StoredDocumentArtifact,
+        *,
+        fingerprint: str,
+        fund_code: str,
+        document_kind: DocumentKind,
+        url: str,
+        published_at: Optional[datetime],
+    ) -> None:
+        candidate = OfficialDocumentCandidate(
+            fund_code=fund_code,
+            document_kind=document_kind,
+            title=artifact.title,
+            url=url,
+            publisher=artifact.publisher,
+            published_at=published_at,
+            source_tier=1,
+        )
+        _validate_candidate(candidate)
+        if (
+            artifact.fund_code != fund_code
+            or artifact.document_kind is not document_kind
+            or artifact.landing_url != url
+            or artifact.published_at != published_at
+            or candidate_fingerprint(candidate) != fingerprint
+        ):
+            raise RiskStoreError("stored candidate identity binding changed")
+
+    def _authenticate_selection_candidate_runs(
+        self,
+        selection: StoredDocumentSelectionManifest,
+        candidate_runs: Tuple[StoredSelectionCandidateRun, ...],
+    ) -> None:
+        periodic_runs = tuple(
+            run for run in candidate_runs if run.document_kind in PERIODIC_DOCUMENT_KINDS
+        )
+        candidates_by_fingerprint = {
+            candidate.candidate_fingerprint: candidate
+            for candidate in selection.periodic_candidates
+        }
+        for run in periodic_runs:
+            candidate = candidates_by_fingerprint.get(run.candidate_fingerprint)
+            if (
+                candidate is None
+                or candidate.document_kind is not run.document_kind
+                or candidate.url != run.url
+                or candidate.published_at != run.published_at
+            ):
+                raise RiskStoreError("periodic candidate manifest binding changed")
+        for state in selection.periodic_states:
+            matching = tuple(
+                run for run in periodic_runs if run.document_kind is state.document_kind
+            )
+            if state.state == "selected":
+                if (
+                    len(matching) != 1
+                    or matching[0].candidate_fingerprint != state.selected_fingerprint
+                ):
+                    raise RiskStoreError("selected periodic candidate run binding changed")
+            elif matching:
+                raise RiskStoreError("unselected periodic candidate run is present")
+        selected = {
+            state.selected_fingerprint
+            for state in selection.periodic_states
+            if state.state == "selected"
+        }
+        if any(run.candidate_fingerprint not in selected for run in periodic_runs):
+            raise RiskStoreError("extra periodic candidate run is present")
+
     def save_classification(
         self,
         classification: FundRiskClassification,
@@ -753,6 +1147,25 @@ class FundRiskStore:
                     (classification.policy_version,),
                 ).fetchone()
                 self._row_to_policy(policy_row)
+                latest = connection.execute(
+                    "SELECT refresh.id, completion.outcome "
+                    "FROM fund_document_refresh_runs AS refresh "
+                    "LEFT JOIN fund_document_refresh_completions AS completion "
+                    "ON completion.refresh_run_id = refresh.id "
+                    "WHERE refresh.fund_code = ? ORDER BY refresh.id DESC LIMIT 1",
+                    (classification.fund_code,),
+                ).fetchone()
+                if (
+                    latest is None
+                    or latest["outcome"] not in {"success", "partial"}
+                    or latest["id"] != evidence.document_refresh_run_id
+                ):
+                    raise RiskStoreError("classification current selection binding changed")
+                snapshot = self._document_selection_snapshot(
+                    connection,
+                    classification.fund_code,
+                    evidence.document_refresh_run_id,
+                )
                 _, _, result_ids, provenance_checksums = _load_bound_evidence(
                     self,
                     connection,
@@ -765,6 +1178,7 @@ class FundRiskStore:
                     raise RiskStoreError("classification parse result binding changed")
                 if provenance_checksums != evidence.parser_provenance_checksums:
                     raise RiskStoreError("classification parser provenance binding changed")
+                _authenticate_v3_evidence_snapshot(evidence, snapshot)
                 row = connection.execute(
                     "SELECT * FROM fund_risk_classifications "
                     "WHERE fund_code = ? AND policy_version = ? AND input_fingerprint = ?",
@@ -980,7 +1394,7 @@ class FundRiskStore:
             manifest, version = _decode_manifest_envelope(classification.input_manifest_json)
             explicit_result_ids = (
                 _manifest_id_tuple(manifest["parse_result_ids"], "parse result IDs")
-                if version == 2
+                if version in {2, 3}
                 else None
             )
             documents, facts, result_ids, provenance_checksums = _load_bound_evidence(
@@ -1003,6 +1417,13 @@ class FundRiskStore:
                 result_ids,
                 provenance_checksums,
             )
+            if version == 3:
+                snapshot = self._document_selection_snapshot(
+                    connection,
+                    classification.fund_code,
+                    evidence.document_refresh_run_id,
+                )
+                _authenticate_v3_evidence_snapshot(evidence, snapshot)
             return ClassificationEvidenceRecord(
                 classification=classification,
                 policy=policy,
@@ -1711,7 +2132,7 @@ class FundRiskStore:
                     manifest_payload["parse_result_ids"],
                     "parse result IDs",
                 )
-                if manifest_version == 2
+                if manifest_version in {2, 3}
                 else None
             )
             documents, facts, result_ids, provenance_checksums = _load_bound_evidence(
@@ -1729,14 +2150,28 @@ class FundRiskStore:
                 result_ids,
                 provenance_checksums,
             )
+            if manifest_version == 3:
+                snapshot = self._document_selection_snapshot(
+                    connection,
+                    record.fund_code,
+                    evidence.document_refresh_run_id,
+                )
+                _authenticate_v3_evidence_snapshot(evidence, snapshot)
             policy = ClassificationPolicyV1()
             if policy_record.policy_checksum != policy.checksum():
                 raise ValueError("classification policy checksum binding changed")
-            manifest = (
-                classification_input_manifest_v1(evidence, policy, record.classified_at)
-                if manifest_version == 1
-                else classification_input_manifest_v2(evidence, policy, record.classified_at)
-            )
+            if manifest_version == 1:
+                manifest = classification_input_manifest_v1(
+                    evidence, policy, record.classified_at
+                )
+            elif manifest_version == 2:
+                manifest = classification_input_manifest_v2(
+                    evidence, policy, record.classified_at
+                )
+            else:
+                manifest = classification_input_manifest_v3(
+                    evidence, policy, record.classified_at
+                )
             canonical_manifest = _canonical_json(manifest)
             if canonical_manifest != record.input_manifest_json:
                 raise ValueError("classification input manifest is not canonical")
@@ -1786,6 +2221,8 @@ def _validated_classification_values(
     classification.validate()
     evidence.validate()
     policy.validate()
+    if evidence.document_refresh_run_id is None:
+        raise RiskStoreError("new classification save requires manifest v3 evidence")
     manifest = classification_input_manifest(evidence, policy, classification.classified_at)
     manifest_json = _canonical_json(manifest)
     fingerprint = hashlib.sha256(manifest_json.encode("ascii")).hexdigest()
@@ -1944,6 +2381,95 @@ def _load_bound_evidence(
     )
 
 
+def _authenticate_v3_evidence_snapshot(
+    evidence: ClassificationEvidence,
+    snapshot: CurrentDocumentSelectionSnapshot,
+) -> None:
+    refresh_id = _positive_integer(
+        evidence.document_refresh_run_id,
+        "classification document refresh run id",
+    )
+    if (
+        evidence.fund_code != snapshot.selection.fund_code
+        or refresh_id != snapshot.selection.refresh_run_id
+        or evidence.selection_policy_checksum
+        != snapshot.selection.selection_policy_checksum
+        or evidence.selection_manifest_checksum != snapshot.selection.selection_checksum
+        or evidence.candidate_run_snapshot_checksum
+        != snapshot.candidate_run_snapshot_checksum
+        or evidence.selection_reason_codes != snapshot.selection_reason_codes
+    ):
+        raise RiskStoreError("classification selection snapshot binding changed")
+    successful = tuple(
+        record
+        for record in (
+            *snapshot.selected_periodic_records,
+            *snapshot.nonperiodic_successful_records,
+        )
+    )
+    records, report_facts = current_evidence_projection(successful)
+    if not records:
+        raise RiskStoreError("classification evidence projection is unavailable")
+    expected_document_ids = tuple(sorted(record.artifact.id for record in records))
+    expected_parse_result_ids = tuple(sorted(record.parse_result.id for record in records))
+    expected_provenance_checksums = tuple(
+        sorted({record.provenance.provenance_checksum for record in records})
+    )
+    expected_fact_ids = tuple(
+        sorted(
+            {
+                fact.id
+                for record in records
+                if record.artifact.document_kind not in PERIODIC_DOCUMENT_KINDS
+                for fact in record.facts
+            }
+            | {fact.id for _, fact in report_facts}
+        )
+    )
+    expected_legal_facts = tuple(
+        sorted(
+            (
+                _stored_fact_as_mandate(fact)
+                for record in records
+                if record.artifact.document_kind in _LEGAL_EVIDENCE_DOCUMENT_KINDS
+                for fact in record.facts
+            ),
+            key=_mandate_fact_order,
+        )
+    )
+    expected_benchmark_facts = tuple(
+        sorted(
+            (
+                _stored_fact_as_mandate(fact)
+                for record in records
+                if record.artifact.document_kind is DocumentKind.INDEX_METHODOLOGY
+                for fact in record.facts
+            ),
+            key=_mandate_fact_order,
+        )
+    )
+    expected_report_facts = tuple(
+        sorted(
+            (_stored_fact_as_mandate(fact) for _, fact in report_facts),
+            key=_mandate_fact_order,
+        )
+    )
+    if (
+        evidence.document_ids != expected_document_ids
+        or evidence.fact_ids != expected_fact_ids
+        or evidence.parse_result_ids != expected_parse_result_ids
+        or evidence.parser_provenance_checksums != expected_provenance_checksums
+        or evidence.legal_facts != expected_legal_facts
+        or evidence.benchmark_facts != expected_benchmark_facts
+        or evidence.report_facts != expected_report_facts
+    ):
+        raise RiskStoreError("classification evidence projection changed")
+
+
+def _mandate_fact_order(fact: MandateFact) -> tuple:
+    return (fact.fact_kind, fact.source_document_id, fact.fact_fingerprint)
+
+
 def _evidence_from_manifest(
     manifest_json: str,
     stored_facts: Tuple[StoredFact, ...],
@@ -2006,8 +2532,48 @@ def _evidence_from_manifest(
         fact_ids=_manifest_id_tuple(manifest["fact_ids"], "fact IDs"),
         parse_result_ids=derived_parse_result_ids,
         parser_provenance_checksums=derived_provenance_checksums,
+        document_refresh_run_id=(
+            None
+            if version < 3
+            else _positive_integer(
+                manifest["document_refresh_run_id"],
+                "manifest document refresh run id",
+            )
+        ),
+        selection_policy_checksum=(
+            None
+            if version < 3
+            else _digest(
+                manifest["selection_policy_checksum"],
+                "manifest selection policy checksum",
+            )
+        ),
+        selection_manifest_checksum=(
+            None
+            if version < 3
+            else _digest(
+                manifest["selection_manifest_checksum"],
+                "manifest selection checksum",
+            )
+        ),
+        candidate_run_snapshot_checksum=(
+            None
+            if version < 3
+            else _digest(
+                manifest["candidate_run_snapshot_checksum"],
+                "manifest candidate run snapshot checksum",
+            )
+        ),
+        selection_reason_codes=(
+            ()
+            if version < 3
+            else _manifest_code_tuple(
+                manifest["selection_reason_codes"],
+                "selection reason codes",
+            )
+        ),
     )
-    if version == 2:
+    if version in {2, 3}:
         manifest_result_ids = _manifest_id_tuple(
             manifest["parse_result_ids"],
             "parse result IDs",
@@ -2224,6 +2790,8 @@ def _decode_manifest_envelope(value: str) -> Tuple[Dict[str, object], int]:
         return manifest, 1
     if keys == _MANIFEST_V2_KEYS and manifest["manifest_version"] == 2:
         return manifest, 2
+    if keys == _MANIFEST_V3_KEYS and manifest["manifest_version"] == 3:
+        return manifest, 3
     raise ValueError("classification input manifest has unexpected fields")
 
 
