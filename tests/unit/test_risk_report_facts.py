@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import unittest
 import zipfile
 from dataclasses import FrozenInstanceError, replace
@@ -8,6 +10,10 @@ from datetime import date
 from decimal import Decimal as D
 from unittest.mock import patch
 
+from kunjin.funds.industry_taxonomy import (
+    SW_LEVEL1_2021,
+    IndustryTaxonomyMapping,
+)
 from kunjin.funds.risk.failures import DocumentFailureReason
 from kunjin.funds.risk.models import FactConfidence
 from kunjin.funds.risk.parsers import (
@@ -68,6 +74,55 @@ def common_table(
         section_name=section_name,
         source_excerpt="；".join(" | ".join(row) for row in (headers, *rows)),
     )
+
+
+def synthetic_taxonomy_mapping() -> IndustryTaxonomyMapping:
+    entries = (
+        ("801080", "电子", ()),
+        ("801780", "银行", ("银行业",)),
+    )
+    payload = {
+        "entries": [
+            {"aliases": list(aliases), "code": code, "name": name}
+            for code, name, aliases in entries
+        ],
+        "published_at": "2021-12-01",
+        "source_url": "https://example.com/sw-level1-2021.json",
+        "taxonomy_id": SW_LEVEL1_2021.taxonomy_id,
+        "version": SW_LEVEL1_2021.version,
+    }
+    canonical_json = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return IndustryTaxonomyMapping(
+        metadata=SW_LEVEL1_2021,
+        source_url="https://example.com/sw-level1-2021.json",
+        published_at=date(2021, 12, 1),
+        entries=entries,
+        canonical_json=canonical_json,
+        checksum=hashlib.sha256(canonical_json.encode("ascii")).hexdigest(),
+    )
+
+
+def controlled_industry_table(
+    rows: tuple[tuple[str, str, str, str, str], ...] = (
+        ("申万一级行业分类（2021）", "801780", "1", "银行", "12.50"),
+        ("申万一级行业分类（2021）", "801080", "2", "电子", "8.35"),
+    ),
+    *,
+    section_name: str = "报告期末全部行业分布",
+    headers: tuple[str, str, str, str, str] = (
+        "分类标准",
+        "行业代码",
+        "排名",
+        "行业名称",
+        "占基金资产净值比例(%)",
+    ),
+) -> ReportTable:
+    return common_table(headers, rows, section_name=section_name)
 
 
 def docx_with_table(*, table_count: int = 1) -> bytes:
@@ -471,12 +526,16 @@ class CommonReportFactExtractionTest(unittest.TestCase):
 
         self.assertEqual(
             set(values),
-            COMMON_FACTS - {"holdings_evidence_complete"},
+            COMMON_FACTS
+            - {
+                "current_largest_industry_name",
+                "current_largest_industry_weight_percent",
+                "current_industry_count",
+                "holdings_evidence_complete",
+            },
         )
         self.assertEqual(values["current_stock_asset_allocation_percent"], D("35.2"))
         self.assertEqual(values["current_hong_kong_asset_allocation_percent"], D("8"))
-        self.assertEqual(values["current_largest_industry_name"], "科技")
-        self.assertEqual(values["current_industry_count"], 2)
         self.assertTrue(all(item.confidence_state is FactConfidence.EXACT for item in observations))
 
     def test_common_security_tables_require_exact_ranks_and_explicit_scope(self) -> None:
@@ -502,7 +561,7 @@ class CommonReportFactExtractionTest(unittest.TestCase):
         self.assertIn(("current_largest_security_weight_percent", D("10")), values)
         self.assertIn(("holdings_evidence_complete", True), values)
 
-    def test_common_industry_table_requires_complete_parse_for_count(self) -> None:
+    def test_three_column_free_text_industry_table_emits_no_industry_facts(self) -> None:
         complete = common_table(
             ("排名", "行业名称", "占基金资产净值比例(%)"),
             (("1", "科技", "25"), ("2", "金融", "20"), ("3", "医药", "15")),
@@ -510,11 +569,186 @@ class CommonReportFactExtractionTest(unittest.TestCase):
         )
 
         observations = extract_common_report_observations(text_blocks=(), tables=(complete,))
-        values = {item.fact_kind: item.normalized_value for item in observations}
+        self.assertFalse(
+            any("industry" in observation.fact_kind for observation in observations)
+        )
 
-        self.assertEqual(values["current_largest_industry_name"], "科技")
-        self.assertEqual(values["current_largest_industry_weight_percent"], D("25"))
-        self.assertEqual(values["current_industry_count"], 3)
+    def test_five_column_industry_table_is_closed_with_empty_production_mapping(
+        self,
+    ) -> None:
+        observations = extract_common_report_observations(
+            text_blocks=(),
+            tables=(controlled_industry_table(),),
+        )
+
+        self.assertFalse(
+            any("industry" in observation.fact_kind for observation in observations)
+        )
+
+    def test_five_column_industry_table_emits_all_facts_with_complete_mapping(
+        self,
+    ) -> None:
+        observations = extract_common_report_observations(
+            text_blocks=(),
+            tables=(controlled_industry_table(),),
+            taxonomy_mappings=(synthetic_taxonomy_mapping(),),
+        )
+
+        self.assertEqual(
+            {
+                observation.fact_kind: observation.normalized_value
+                for observation in observations
+            },
+            {
+                "current_largest_industry_name": "银行",
+                "current_largest_industry_weight_percent": D("12.50"),
+                "current_industry_count": 2,
+            },
+        )
+        weight = next(
+            observation
+            for observation in observations
+            if observation.fact_kind == "current_largest_industry_weight_percent"
+        )
+        self.assertEqual(weight.unit, "percent_of_net_assets")
+
+    def test_controlled_industry_table_requires_exact_header_aliases(self) -> None:
+        accepted_english = controlled_industry_table(
+            headers=(
+                "classification standard",
+                "industry code",
+                "rank",
+                "industry name",
+                "weight (% of net assets)",
+            )
+        )
+        rejected_inferred = controlled_industry_table(
+            headers=(
+                "分类体系",
+                "代码",
+                "序号",
+                "行业",
+                "净值占比(%)",
+            )
+        )
+
+        accepted = extract_common_report_observations(
+            text_blocks=(),
+            tables=(accepted_english,),
+            taxonomy_mappings=(synthetic_taxonomy_mapping(),),
+        )
+        rejected = extract_common_report_observations(
+            text_blocks=(),
+            tables=(rejected_inferred,),
+            taxonomy_mappings=(synthetic_taxonomy_mapping(),),
+        )
+
+        self.assertEqual(len(accepted), 3)
+        self.assertEqual(rejected, ())
+
+    def test_controlled_industry_distribution_fails_closed_on_invalid_rows(self) -> None:
+        mapping = synthetic_taxonomy_mapping()
+        valid_rows = controlled_industry_table().rows[1:]
+        raw_rows = tuple(
+            tuple(cell.text for cell in row.cells) for row in valid_rows
+        )
+        invalid_cases = {
+            "mixed standard": (
+                raw_rows[0],
+                ("中证行业分类", *raw_rows[1][1:]),
+            ),
+            "missing code": (
+                (raw_rows[0][0], "N/A", *raw_rows[0][2:]),
+                raw_rows[1],
+            ),
+            "unmapped code": (
+                (raw_rows[0][0], "801999", *raw_rows[0][2:]),
+                raw_rows[1],
+            ),
+            "name mismatch": (
+                (*raw_rows[0][:3], "电子", raw_rows[0][4]),
+                raw_rows[1],
+            ),
+            "duplicate code": (
+                raw_rows[0],
+                (raw_rows[1][0], raw_rows[0][1], *raw_rows[1][2:]),
+            ),
+            "duplicate name": (
+                raw_rows[0],
+                (*raw_rows[1][:3], raw_rows[0][3], raw_rows[1][4]),
+            ),
+            "duplicate rank": (
+                raw_rows[0],
+                (*raw_rows[1][:2], "1", *raw_rows[1][3:]),
+            ),
+            "unsafe unicode": (
+                (*raw_rows[0][:3], "银\u200b行", raw_rows[0][4]),
+                raw_rows[1],
+            ),
+            "unsafe surrogate": (
+                (*raw_rows[0][:3], "银\ud800行", raw_rows[0][4]),
+                raw_rows[1],
+            ),
+            "tied max": (
+                raw_rows[0],
+                (*raw_rows[1][:4], raw_rows[0][4]),
+            ),
+        }
+
+        for label, rows in invalid_cases.items():
+            with self.subTest(label=label):
+                observations = extract_common_report_observations(
+                    text_blocks=(),
+                    tables=(controlled_industry_table(rows=rows),),
+                    taxonomy_mappings=(mapping,),
+                )
+                self.assertEqual(observations, ())
+
+    def test_controlled_industry_distribution_requires_complete_scope(self) -> None:
+        observations = extract_common_report_observations(
+            text_blocks=(),
+            tables=(
+                controlled_industry_table(section_name="报告期末前两大行业"),
+            ),
+            taxonomy_mappings=(synthetic_taxonomy_mapping(),),
+        )
+
+        self.assertEqual(observations, ())
+
+    def test_taxonomy_mapping_dependency_requires_an_exact_immutable_tuple(self) -> None:
+        with self.assertRaisesRegex(ValueError, "immutable tuples"):
+            extract_common_report_observations(
+                text_blocks=(),
+                tables=(controlled_industry_table(),),
+                taxonomy_mappings=[synthetic_taxonomy_mapping()],  # type: ignore[arg-type]
+            )
+
+    def test_controlled_industry_distribution_rejects_mixed_denominators(self) -> None:
+        mixed = controlled_industry_table(
+            rows=(
+                (
+                    "申万一级行业分类（2021）",
+                    "801780",
+                    "1",
+                    "银行（占基金总资产）",
+                    "12.50",
+                ),
+                (
+                    "申万一级行业分类（2021）",
+                    "801080",
+                    "2",
+                    "电子（占基金资产净值）",
+                    "8.35",
+                ),
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "mixed denominators"):
+            extract_common_report_observations(
+                text_blocks=(),
+                tables=(mixed,),
+                taxonomy_mappings=(synthetic_taxonomy_mapping(),),
+            )
 
     def test_common_rejects_missing_headers_mixed_denominators_and_ranges(self) -> None:
         missing_header = common_table(
@@ -712,17 +946,12 @@ class CommonReportFactExtractionTest(unittest.TestCase):
                 section_name="报告期末全部行业分布",
             )
             with self.subTest(name=legitimate_name):
-                observations = extract_common_report_observations(
-                    text_blocks=(),
-                    tables=(table,),
-                )
                 self.assertEqual(
-                    next(
-                        item.normalized_value
-                        for item in observations
-                        if item.fact_kind == "current_largest_industry_name"
+                    extract_common_report_observations(
+                        text_blocks=(),
+                        tables=(table,),
                     ),
-                    legitimate_name,
+                    (),
                 )
         for unknown_name in unknown_names:
             table = common_table(

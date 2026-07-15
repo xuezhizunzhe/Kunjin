@@ -6,6 +6,12 @@ from dataclasses import dataclass, fields
 from decimal import Decimal
 from typing import Optional, Tuple
 
+from kunjin.funds.industry_taxonomy import (
+    PRODUCTION_TAXONOMY_MAPPINGS,
+    IndustryDistributionRow,
+    IndustryTaxonomyMapping,
+    validate_industry_distribution,
+)
 from kunjin.funds.risk.documents import MAX_EXCERPT_CHARACTERS
 from kunjin.funds.risk.models import FactConfidence
 
@@ -80,6 +86,10 @@ _COMPLETE_INDUSTRY_SCOPES = {
     "报告期末全部行业分布",
     "complete industry distribution at the end of the reporting period",
 }
+_INDUSTRY_STANDARD_HEADERS = {"分类标准", "classification standard"}
+_INDUSTRY_CODE_HEADERS = {"行业代码", "industry code"}
+_INDUSTRY_RANK_HEADERS = {"排名", "序号", "rank"}
+_INDUSTRY_NAME_HEADERS = {"行业名称", "industry name"}
 _RANKED_WEIGHT_HEADERS = {
     "占基金资产净值比例(%)": "percent_of_net_assets",
     "占基金净资产比例(%)": "percent_of_net_assets",
@@ -93,23 +103,6 @@ _DEFAULT_IGNORABLE_PATTERN = re.compile(
     "\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3"
     "\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
 )
-_UNKNOWN_INDUSTRY_CN_AGGREGATE_PATTERN = re.compile(
-    r"^(?:其他|其它)(?:行业|类别)?(?:合计|总计)?$"
-)
-_UNKNOWN_INDUSTRY_EN_AGGREGATE_TOKENS = frozenset(
-    {
-        "and",
-        "category",
-        "categories",
-        "industry",
-        "industries",
-        "other",
-        "others",
-        "total",
-        "unclassified",
-    }
-)
-
 _DECIMAL_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
 _ASSET_ROW_PATTERN = re.compile(
     r"报告期末(股票|债券|现金|港股)资产占(基金总资产|基金资产净值|基金净资产)的"
@@ -327,33 +320,7 @@ def _normalized_label(value: str) -> str:
 
 def _has_unsafe_name_characters(value: str) -> bool:
     return _DEFAULT_IGNORABLE_PATTERN.search(value) is not None or any(
-        unicodedata.category(character) == "Cf" for character in value
-    )
-
-
-def _is_unknown_industry_name(value: str) -> bool:
-    normalized = unicodedata.normalize("NFKC", value).casefold()
-    chinese = "".join(character for character in normalized if character.isalnum())
-    if "未分类" in chinese:
-        return True
-    if _UNKNOWN_INDUSTRY_CN_AGGREGATE_PATTERN.fullmatch(chinese) is not None:
-        return True
-
-    tokens = re.findall(r"[a-z]+", normalized)
-    if "unclassified" in tokens:
-        return True
-    if not tokens or any(
-        token not in _UNKNOWN_INDUSTRY_EN_AGGREGATE_TOKENS for token in tokens
-    ):
-        return False
-    return tokens[0] in {"other", "others", "unclassified"} and (
-        len(tokens) == 1
-        or "total" in tokens
-        or all(
-            token
-            in {"other", "others", "industry", "industries", "category", "categories"}
-            for token in tokens
-        )
+        unicodedata.category(character) in {"Cf", "Cs"} for character in value
     )
 
 
@@ -612,30 +579,80 @@ def _security_concentration_observations(
 
 def _industry_observations(
     tables: Tuple[ReportTable, ...],
+    taxonomy_mappings: Tuple[IndustryTaxonomyMapping, ...],
 ) -> Tuple[CurrentReportObservation, ...]:
     observations = []
     for table in tables:
-        parsed = _ranked_table_rows(table, name_header="行业名称")
-        if parsed is None:
+        headers = _headers(table)
+        if headers is None or len(headers) != 5:
             continue
+        standard_header, code_header, rank_header, name_header, weight_header = headers
+        if (
+            standard_header not in _INDUSTRY_STANDARD_HEADERS
+            or code_header not in _INDUSTRY_CODE_HEADERS
+            or rank_header not in _INDUSTRY_RANK_HEADERS
+            or name_header not in _INDUSTRY_NAME_HEADERS
+            or weight_header not in _RANKED_WEIGHT_HEADERS
+        ):
+            continue
+
         section = _normalized(table.section_name or "")
         complete_scope = section in {
             _normalized(value) for value in _COMPLETE_INDUSTRY_SCOPES
         }
-        if not complete_scope or any(_is_unknown_industry_name(item[1]) for item in parsed):
+        if not complete_scope:
             continue
-        headers = _headers(table)
-        if headers is None:
+
+        rows = []
+        for row in table.rows[1:]:
+            standard, code, rank_text, name, weight_text = (
+                cell.text for cell in row.cells
+            )
+            if any(
+                _has_unsafe_name_characters(value)
+                for value in (standard, code, name)
+            ):
+                rows = []
+                break
+            normalized_rank = _normalized(rank_text)
+            weight = _percent_value(weight_text)
+            if (
+                not normalized_rank.isascii()
+                or not normalized_rank.isdecimal()
+                or int(normalized_rank) <= 0
+                or str(int(normalized_rank)) != normalized_rank
+                or weight is None
+            ):
+                rows = []
+                break
+            rows.append(
+                IndustryDistributionRow(
+                    classification_standard=" ".join(standard.split()),
+                    industry_code=" ".join(code.split()),
+                    industry_name=" ".join(name.split()),
+                    rank=int(normalized_rank),
+                    weight=weight,
+                    unit="percent",
+                )
+            )
+        if not rows:
             continue
-        unit = _RANKED_WEIGHT_HEADERS[headers[2]]
-        largest = next(item for item in parsed if item[0] == 1)
-        largest_index = next(index for index, item in enumerate(parsed) if item[0] == 1)
-        largest_row = table.rows[1 + largest_index]
+
+        validated = validate_industry_distribution(
+            rows=tuple(rows),
+            complete_scope=True,
+            mappings=taxonomy_mappings,
+        )
+        if validated is None:
+            continue
+        largest = validated.rows[0]
+        largest_row = table.rows[1]
+        observation_unit = _RANKED_WEIGHT_HEADERS[weight_header]
         observations.extend(
             (
                 _observation(
                     "current_largest_industry_name",
-                    largest[1],
+                    largest.industry_name,
                     None,
                     page_number=table.page_number,
                     section_name=table.section_name,
@@ -643,8 +660,8 @@ def _industry_observations(
                 ),
                 _observation(
                     "current_largest_industry_weight_percent",
-                    largest[2],
-                    unit,
+                    largest.weight,
+                    observation_unit,
                     page_number=table.page_number,
                     section_name=table.section_name,
                     source_excerpt=_row_excerpt(largest_row),
@@ -654,7 +671,7 @@ def _industry_observations(
         observations.append(
             _observation(
                 "current_industry_count",
-                len(parsed),
+                len(validated.rows),
                 None,
                 page_number=table.page_number,
                 section_name=table.section_name,
@@ -749,11 +766,23 @@ def extract_common_report_observations(
     *,
     text_blocks: Tuple[str, ...],
     tables: Tuple[ReportTable, ...],
+    taxonomy_mappings: Tuple[IndustryTaxonomyMapping, ...] = (
+        PRODUCTION_TAXONOMY_MAPPINGS
+    ),
 ) -> Tuple[CurrentReportObservation, ...]:
     """Extract only exact current asset and concentration observations."""
 
-    if type(text_blocks) is not tuple or type(tables) is not tuple:
+    if (
+        type(text_blocks) is not tuple
+        or type(tables) is not tuple
+        or type(taxonomy_mappings) is not tuple
+    ):
         raise ValueError("current report evidence must use immutable tuples")
+    validate_industry_distribution(
+        rows=(),
+        complete_scope=False,
+        mappings=taxonomy_mappings,
+    )
     for table in tables:
         if type(table) is not ReportTable:
             raise ValueError("current report tables must use exact ReportTable records")
@@ -762,7 +791,7 @@ def extract_common_report_observations(
         _asset_allocation_observations(tables)
         + _generic_concentration_observations(tables)
         + _security_concentration_observations(tables)
-        + _industry_observations(tables)
+        + _industry_observations(tables, taxonomy_mappings)
         + _explicit_common_text_observations(text_blocks)
     )
     return _validated_unique_observations(observations)
