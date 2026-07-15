@@ -2317,11 +2317,11 @@ def _pdf_has_active_or_embedded_content(reader: PdfReader) -> bool:
         raise _fail(DocumentFailureReason.PARSER_FORMAT_INVALID) from exc
 
 
-def _looks_like_heading(value: str, *, allow_overlong: bool = False) -> bool:
+def _looks_like_heading(value: str) -> bool:
     stripped = value.strip()
     if (
         not stripped
-        or (not allow_overlong and len(stripped) > MAX_SECTION_CHARACTERS)
+        or len(stripped) > MAX_SECTION_CHARACTERS
         or any(character.isdigit() for character in stripped)
     ):
         return False
@@ -2335,6 +2335,20 @@ def _looks_like_heading(value: str, *, allow_overlong: bool = False) -> bool:
         return True
     letters = [character for character in stripped if character.isalpha()]
     return bool(letters) and all(character.isupper() for character in letters)
+
+
+_PDF_TRUSTED_SECTION_HEADINGS = frozenset(
+    {
+        "投资范围",
+        "投资目标",
+        "基金类型",
+        "指数目标",
+        "样本与权重限制",
+        "INVESTMENT SCOPE",
+        "CURRENT ASSET ALLOCATION",
+    }
+)
+_PDF_REJECTED_SECTION_HEADINGS = frozenset({"HISTORICAL"})
 
 
 def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
@@ -2351,6 +2365,8 @@ def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
         blocks = []
         total_characters = 0
         extracted_any_text = False
+        section = None
+        section_current_observation_eligible = True
         for page_number, page in enumerate(reader.pages, start=1):
             extracted = page.extract_text()
             if extracted is None:
@@ -2361,18 +2377,23 @@ def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
             total_characters += len(text)
             if total_characters > MAX_EXTRACTED_CHARACTERS:
                 raise _resource_limit()
-            section = None
-            section_current_observation_eligible = True
             normalized_newlines = text.replace("\r\n", "\n").replace("\r", "\n")
             for raw_line in normalized_newlines.split("\n"):
                 line = _normalized_text(raw_line)
                 if not line:
                     continue
                 extracted_any_text = True
-                if _looks_like_heading(line, allow_overlong=True):
+                if _has_unsafe_time_context_character(raw_line):
+                    section_current_observation_eligible = False
+                    continue
+                if line in _PDF_TRUSTED_SECTION_HEADINGS:
                     section, section_current_observation_eligible = _section_context(
                         raw_line, line
                     )
+                    continue
+                if line in _PDF_REJECTED_SECTION_HEADINGS:
+                    section, _ = _section_context(raw_line, line)
+                    section_current_observation_eligible = False
                     continue
                 blocks.append(
                     _TextBlock(

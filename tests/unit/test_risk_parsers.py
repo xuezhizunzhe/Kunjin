@@ -1501,6 +1501,34 @@ class RiskPdfParserTest(unittest.TestCase):
         with patch("pypdf._page.PageObject.extract_text", return_value=text):
             return parse_artifact(artifact)
 
+    def parse_extracted_pages(self, pages: tuple[str, ...]) -> object:
+        class FakeRoot(dict):
+            def get_object(self) -> object:
+                return self
+
+        class FakePage(dict):
+            def __init__(self, text: str) -> None:
+                super().__init__()
+                self.text = text
+
+            def extract_text(self) -> str:
+                return self.text
+
+        class FakeReader:
+            is_encrypted = False
+
+            def __init__(self) -> None:
+                self.pages = tuple(FakePage(text) for text in pages)
+                self.trailer = {"/Root": FakeRoot()}
+
+        artifact = artifact_for(
+            FIXTURES / "current-report.pdf",
+            content_type="application/pdf",
+            kind=DocumentKind.QUARTERLY_REPORT,
+        )
+        with patch("kunjin.funds.risk.parsers.PdfReader", return_value=FakeReader()):
+            return parse_artifact(artifact)
+
     def test_pdf_overlong_uppercase_heading_preserves_unsafe_state_after_bound(self) -> None:
         unsafe_heading = "A" * 264 + "\u2060" + "B" * 40
         parsed = self.parse_extracted_text(
@@ -1515,7 +1543,7 @@ class RiskPdfParserTest(unittest.TestCase):
         )
 
         fact = one(parsed, "current_stock_asset_allocation_percent")
-        self.assertEqual(fact.section_name, "A" * 256)
+        self.assertIsNone(fact.section_name)
 
     def test_pdf_line_splitting_preserves_unsafe_control_heading_state(self) -> None:
         for character in ("\u0085", "\u001c", "\u001d", "\u001e"):
@@ -1537,6 +1565,46 @@ class RiskPdfParserTest(unittest.TestCase):
 
         fact = one(parsed, "current_stock_asset_allocation_percent")
         self.assertIsNone(fact.section_name)
+
+    def test_pdf_historical_and_unsafe_section_state_persists_across_pages(self) -> None:
+        cases = (
+            "HISTORICAL",
+            "CURRENT" + "A" * 264 + "\u2060" + " ASSET ALLOCATION",
+        )
+        for first_page in cases:
+            parsed = self.parse_extracted_pages(
+                (
+                    first_page,
+                    "报告期末股票资产占基金总资产35.2%。",
+                )
+            )
+
+            with self.subTest(first_page=first_page[:20]):
+                self.assertFalse(has_current_stock_fact(parsed))
+
+    def test_pdf_ordinary_uppercase_body_does_not_reset_historical_section(self) -> None:
+        for ordinary_body in ("ORDINARY BODY", "A" * 305):
+            parsed = self.parse_extracted_pages(
+                (
+                    "HISTORICAL",
+                    ordinary_body + "\n报告期末股票资产占基金总资产35.2%。",
+                )
+            )
+
+            with self.subTest(length=len(ordinary_body)):
+                self.assertFalse(has_current_stock_fact(parsed))
+
+    def test_pdf_exact_current_heading_resets_rejected_section_state(self) -> None:
+        parsed = self.parse_extracted_pages(
+            (
+                "HISTORICAL",
+                "ORDINARY BODY\nCURRENT ASSET ALLOCATION\n"
+                "报告期末股票资产占基金总资产35.2%。",
+            )
+        )
+
+        fact = one(parsed, "current_stock_asset_allocation_percent")
+        self.assertEqual(fact.section_name, "CURRENT ASSET ALLOCATION")
 
     def test_pdf_matches_html_facts_and_keeps_page_section_and_effective_date(self) -> None:
         pdf = parse_artifact(
