@@ -80,6 +80,10 @@ For all workflows:
 15. For a named fund's latest formal-NAV performance or risk, run `--json sync fund CODE` before `--json fund research CODE`.
 16. Before answering about identity, share classes, managers, fees, size, benchmark, or announcements, inspect the relevant `freshness.sections` returned by `fund profile`, `fund fees`, or `fund announcements`. Run `--json sync fund-profile CODE` first when any required section is stale, missing, unknown, or unavailable.
 17. Before answering about quarterly holdings or industry exposure, inspect `fund holdings CODE`. Run `--json sync fund-holdings CODE` first when holdings are stale, missing, unknown, or a newer report window is due. Use `--period YYYY-MM-DD` when the user asks about an exact reporting period.
+    The production controlled-taxonomy registry is currently empty. Holdings
+    sync may preserve raw industry-exposure source records, but authenticated
+    current industry-observation coverage is zero. Never promote raw industry
+    names, weights, or free text to current industry facts.
 18. Preserve exact report dates, publication dates, source URLs, source tiers, conflicts, warnings, and missing evidence in the answer. A successful section must not conceal a failed or stale section.
 19. For current market form, run `--json sync market` before `--json market sectors`.
 20. For latest peer questions, run `--json fund peers CODE` and inspect its status, data dates, coverage, warnings, errors, and stored-group freshness. Run `--json sync fund-peers CODE` when the group is missing or stale, then read it again.
@@ -293,9 +297,11 @@ news adapter exists.
 
 Valuation, earnings, persistent capital flows, and automated news ingestion are
 not implemented yet. Fund research covers formal-NAV performance and risk plus
-sourced identity, manager, fee, size, benchmark, quarterly holding, industry,
-announcement, peer-comparison, and disclosed-overlap evidence. Market research
-currently covers sector strength and breadth. Peer comparison has no universal
-score or automatic trade path. Weekly reports explicitly mark missing news and
-causal evidence. Identify missing evidence and do not substitute guesses,
-platform rankings, or unverified snippets.
+sourced identity, manager, fee, size, benchmark, quarterly holding, raw
+industry-source records, announcement, peer-comparison, and disclosed-overlap
+evidence. Authenticated current industry observations are not currently
+available because the production controlled-taxonomy registry is empty. Market
+research currently covers sector strength and breadth. Peer comparison has no
+universal score or automatic trade path. Weekly reports explicitly mark missing
+news and causal evidence. Identify missing evidence and do not substitute
+guesses, platform rankings, or unverified snippets.

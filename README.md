@@ -402,7 +402,10 @@ Tests override these directories and never use live credentials.
 - Annualized daily volatility, maximum drawdown, trough, and recovery dates.
 - Sourced fund identity, A/C share-class relationships, manager tenure, fee
   schedules, size history, benchmark descriptions, quarterly disclosed
-  holdings, industry exposure, and announcements.
+  holdings, raw industry-exposure source records, and announcements. The
+  controlled production taxonomy is currently empty, so authenticated current
+  industry-observation coverage is zero; raw industry names or weights are not
+  promoted to current facts.
 - Exact report and publication dates, source URLs and tiers, section freshness,
   source failures, warnings, and conflicts in structured JSON.
 - Sector daily strength, turnover observations, and advancing-stock breadth.
@@ -414,6 +417,11 @@ CODE` for identity, manager, fee, size, benchmark, and announcement sections;
 run `sync fund-holdings CODE` for quarterly holdings and industry exposure.
 Each disclosure section is synchronized independently, so a failed source does
 not discard previously verified facts from other sections.
+
+Industry synchronization currently preserves source records for research and
+future taxonomy work only. Until a complete pinned official mapping is added,
+KunJin fails closed instead of authenticating current largest-industry,
+industry-weight, or industry-count facts.
 
 Recent sector strength is never presented as proof that a sector is suitable to buy.
 
