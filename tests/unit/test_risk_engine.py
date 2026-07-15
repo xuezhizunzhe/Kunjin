@@ -1371,6 +1371,106 @@ class ConservativeMonotonicityTest(unittest.TestCase):
                 (legal if group == "legal" else report)[kind] = value
                 self.assert_not_improved(classify(evidence(legal=legal, report=report)), baseline)
 
+    def test_each_current_bond_fact_removes_only_its_matching_missing_code(self) -> None:
+        baseline = classify(evidence(legal={"legal_product_family": "ordinary_bond"}))
+        cases = (
+            (
+                "current_convertible_bond_asset_allocation_percent",
+                D("0"),
+                "convertible_observation_evidence_missing",
+            ),
+            (
+                "current_exchangeable_bond_asset_allocation_percent",
+                D("0"),
+                "exchangeable_observation_evidence_missing",
+            ),
+            (
+                "current_effective_duration",
+                D("5"),
+                "duration_observation_evidence_missing",
+            ),
+            (
+                "current_weighted_average_maturity_days",
+                D("365"),
+                "duration_observation_evidence_missing",
+            ),
+            (
+                "current_high_quality_fixed_income_percent",
+                D("80"),
+                "credit_quality_observation_evidence_missing",
+            ),
+            (
+                "current_below_aa_plus_exposure_percent",
+                D("0"),
+                "below_aa_plus_observation_evidence_missing",
+            ),
+            (
+                "current_unrated_non_sovereign_exposure_percent",
+                D("0"),
+                "unrated_non_sovereign_observation_evidence_missing",
+            ),
+            (
+                "current_gross_leverage_percent",
+                D("120"),
+                "leverage_observation_evidence_missing",
+            ),
+            (
+                "current_largest_non_sovereign_issuer_percent",
+                D("10"),
+                "issuer_concentration_evidence_missing",
+            ),
+        )
+        for kind, value, removed_code in cases:
+            with self.subTest(kind=kind):
+                current = classify(
+                    evidence(
+                        legal={"legal_product_family": "ordinary_bond"},
+                        report={kind: value},
+                    )
+                )
+                self.assertEqual(
+                    set(current.missing_evidence),
+                    set(baseline.missing_evidence) - {removed_code},
+                )
+                self.assert_not_improved(current, baseline)
+
+    def test_degraded_or_conflicting_current_bond_fact_never_improves_result(self) -> None:
+        complete = evidence(legal=strict_bond_legal(), report=strict_bond_report())
+        baseline = classify(complete)
+        target_kind = "current_gross_leverage_percent"
+        ambiguous_facts = tuple(
+            replace(item, confidence_state=FactConfidence.AMBIGUOUS)
+            if item.fact_kind == target_kind
+            else item
+            for item in complete.report_facts
+        )
+        stale_freshness = tuple(
+            replace(item, state=FreshnessState.STALE)
+            if item.source_document_id == 3
+            else item
+            for item in complete.freshness
+        )
+        conflicting_facts = complete.report_facts + (
+            fact(target_kind, D("121"), document_id=3),
+        )
+        degraded = (
+            classify(replace(complete, report_facts=ambiguous_facts)),
+            classify(replace(complete, freshness=stale_freshness)),
+            classify(
+                replace(
+                    complete,
+                    report_facts=conflicting_facts,
+                    fact_ids=tuple(range(1, len(complete.fact_ids) + 2)),
+                )
+            ),
+        )
+
+        for result in degraded:
+            self.assert_not_improved(result, baseline)
+        self.assertIn("leverage_observation_evidence_missing", degraded[0].missing_evidence)
+        self.assertEqual(degraded[1].evidence_status, EvidenceStatus.STALE)
+        self.assertIn("source_version_conflict", degraded[2].conflicts)
+
     def test_broad_index_boundary_grid_never_improves_the_result(self) -> None:
         baseline = classify(
             evidence(

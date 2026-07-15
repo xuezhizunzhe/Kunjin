@@ -1480,7 +1480,7 @@ class CliIntegrationTest(unittest.TestCase):
             capability="research_only",
             status="ready",
             reason_code=None,
-            parser_version="3-docker-libreoffice-v1",
+            parser_version="4-docker-libreoffice-v1",
             provenance_checksum="e" * 64,
         )
         self.context.fund_risk_service = service
@@ -1498,7 +1498,7 @@ class CliIntegrationTest(unittest.TestCase):
                 "capability": "research_only",
                 "status": "ready",
                 "reason_code": None,
-                "parser_version": "3-docker-libreoffice-v1",
+                "parser_version": "4-docker-libreoffice-v1",
                 "provenance_checksum": "e" * 64,
             },
         )

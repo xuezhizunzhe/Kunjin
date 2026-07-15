@@ -59,15 +59,15 @@ from kunjin.storage.repository import Repository
 NOW = datetime(2026, 7, 13, 8, tzinfo=timezone.utc)
 
 
-def historical_native_provenance() -> ParserProvenance:
+def historical_native_provenance(parser_version: str = "2") -> ParserProvenance:
     payload = {
         "contract_version": "native-v1",
         "converter_kind": "none",
-        "parser_version": "2",
+        "parser_version": parser_version,
     }
     canonical = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return ParserProvenance(
-        parser_version="2",
+        parser_version=parser_version,
         converter_kind="none",
         canonical_json=canonical,
         provenance_checksum=hashlib.sha256(canonical.encode("ascii")).hexdigest(),
@@ -651,9 +651,12 @@ class FundRiskStoreTest(unittest.TestCase):
         )
         self.assertNotEqual(records[0].facts[0].id, records[1].facts[0].id)
 
-    def test_same_artifact_has_distinct_immutable_v2_and_v3_parse_results(self) -> None:
+    def test_same_artifact_has_distinct_immutable_v3_and_v4_parse_results(self) -> None:
         parsed = self._parsed()
-        provenances = (historical_native_provenance(), native_parser_provenance())
+        historical = historical_native_provenance("3")
+        historical_canonical_json = historical.canonical_json
+        historical_checksum = historical.provenance_checksum
+        provenances = (historical, native_parser_provenance())
         records = []
 
         for offset, provenance in enumerate(provenances):
@@ -679,8 +682,10 @@ class FundRiskStoreTest(unittest.TestCase):
         self.assertNotEqual(records[0].provenance.id, records[1].provenance.id)
         self.assertNotEqual(records[0].parse_result.id, records[1].parse_result.id)
         self.assertNotEqual(records[0].facts[0].id, records[1].facts[0].id)
-        self.assertEqual(records[0].provenance.parser_version, "2")
-        self.assertEqual(records[1].provenance.parser_version, "3")
+        self.assertEqual(records[0].provenance.parser_version, "3")
+        self.assertEqual(records[1].provenance.parser_version, "4")
+        self.assertEqual(records[0].provenance.canonical_json, historical_canonical_json)
+        self.assertEqual(records[0].provenance.provenance_checksum, historical_checksum)
 
     def test_document_selection_round_trips_and_current_uses_latest_refresh(self) -> None:
         refresh_id = self.store.begin_document_refresh("000001", NOW)

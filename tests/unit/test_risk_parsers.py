@@ -167,8 +167,8 @@ def write_docx(
 
 
 class RiskHtmlParserTest(unittest.TestCase):
-    def test_active_parser_version_is_v3(self) -> None:
-        self.assertEqual(PARSER_VERSION, "3")
+    def test_active_parser_version_is_v4(self) -> None:
+        self.assertEqual(PARSER_VERSION, "4")
 
     def test_unsafe_html_section_state_survives_bounded_heading_for_paragraphs_and_tables(
         self,
@@ -273,6 +273,32 @@ class RiskHtmlParserTest(unittest.TestCase):
 
         self.assertEqual(fact.effective_from, date(2026, 6, 30))
         self.assertEqual(fact.effective_to, date(2026, 6, 30))
+
+    def test_fixed_income_current_facts_bind_only_to_candidate_report_period(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixed-income-report.html"
+            path.write_text(
+                "<h2>报告期末固定收益指标</h2>"
+                "<p>报告期末组合有效久期为3.2年。</p>"
+                "<p>报告期末加权平均剩余期限为180天。</p>",
+                encoding="utf-8",
+            )
+            artifact = artifact_for(
+                path,
+                content_type="text/html",
+                kind=DocumentKind.QUARTERLY_REPORT,
+            )
+
+            parsed = parse_artifact(artifact)
+            duration = one(parsed, "current_effective_duration")
+            maturity = one(parsed, "current_weighted_average_maturity_days")
+
+        self.assertEqual(duration.normalized_value, D("3.2"))
+        self.assertEqual(duration.unit, "years")
+        self.assertEqual(duration.effective_from, date(2026, 6, 30))
+        self.assertEqual(maturity.normalized_value, D("180"))
+        self.assertEqual(maturity.unit, "days")
+        self.assertEqual(maturity.effective_to, date(2026, 6, 30))
 
     def test_common_current_fact_rejects_missing_candidate_report_period(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

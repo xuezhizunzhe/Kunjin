@@ -60,6 +60,7 @@ from kunjin.funds.risk.report_facts import (
     ReportRow,
     ReportTable,
     extract_common_report_observations,
+    extract_fixed_income_report_observations,
 )
 from kunjin.funds.risk.reports import (
     ConvertedDocumentContractError,
@@ -2688,6 +2689,9 @@ def _current_common_facts(
     if artifact.candidate.document_kind not in _PERIODIC_DOCUMENT_KINDS:
         return (), ()
     observations = list(extract_common_report_observations(text_blocks=(), tables=tables))
+    observations.extend(
+        extract_fixed_income_report_observations(text_blocks=(), tables=tables)
+    )
     for block in blocks:
         if not block.current_observation_eligible or block.nfc_only:
             continue
@@ -2696,6 +2700,10 @@ def _current_common_facts(
         ):
             continue
         block_observations = extract_common_report_observations(
+            text_blocks=(block.text,),
+            tables=(),
+        )
+        block_observations += extract_fixed_income_report_observations(
             text_blocks=(block.text,),
             tables=(),
         )
