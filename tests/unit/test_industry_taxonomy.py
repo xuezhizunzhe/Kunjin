@@ -416,6 +416,10 @@ def test_invalid_registry_mapping_raises_value_error(
         "https://example.com/sw.json#",
         "https://example.com",
         "https://Example.com/sw.json",
+        "HTTPS://example.com/sw.json",
+        "HtTpS://example.com/sw.json",
+        "https://0x7f000001/sw.json",
+        "https://0x7f.0.0.1/sw.json",
     ),
 )
 def test_registry_rejects_noncanonical_source_url(

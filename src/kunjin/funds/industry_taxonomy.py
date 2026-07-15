@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import socket
 import unicodedata
 from dataclasses import dataclass, fields
 from datetime import date
@@ -234,6 +235,8 @@ def _validate_mapping(mapping: IndustryTaxonomyMapping) -> None:
     )
     if normalized_source_url != mapping.source_url:
         raise ValueError("taxonomy source URL must be canonical")
+    if not mapping.source_url.startswith("https://"):
+        raise ValueError("taxonomy source URL must use canonical HTTPS syntax")
     if not mapping.source_url.isascii() or any(
         character.isspace() or character == "\\"
         for character in mapping.source_url
@@ -391,6 +394,12 @@ def _require_exact_record_state(
 
 
 def _is_valid_source_hostname(hostname: str) -> bool:
+    try:
+        socket.inet_aton(hostname)
+    except OSError:
+        pass
+    else:
+        return False
     if re.fullmatch(r"[0-9.]+", hostname):
         return False
     if len(hostname) > 253 or hostname.startswith(".") or hostname.endswith("."):
