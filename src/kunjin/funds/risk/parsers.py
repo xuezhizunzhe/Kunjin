@@ -2402,6 +2402,9 @@ def _pdf_blocks(
                     section, _ = _section_context(raw_line, line)
                     section_current_observation_eligible = False
                     continue
+                periods, residual = _context_periods_and_residual(line)
+                if periods or _TEMPORAL_CONTEXT_CUE_PATTERN.search(residual):
+                    section_current_observation_eligible = False
                 blocks.append(
                     _TextBlock(
                         line,

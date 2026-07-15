@@ -1596,6 +1596,40 @@ class RiskPdfParserTest(unittest.TestCase):
             with self.subTest(heading=heading):
                 self.assertFalse(has_current_stock_fact(parsed))
 
+    def test_pdf_temporal_cue_blocks_close_trusted_current_section(self) -> None:
+        temporal_cues = (
+            "2025 Q4 ASSET ALLOCATION",
+            "2025年末资产配置",
+            "上月末资产配置",
+            "2026 ANNUAL ASSET ALLOCATION",
+        )
+        for cue in temporal_cues:
+            same_page = self.parse_extracted_text(
+                "CURRENT ASSET ALLOCATION\n"
+                + cue
+                + "\n报告期末股票资产占基金总资产35.2%。"
+            )
+            cross_page = self.parse_extracted_pages(
+                (
+                    "CURRENT ASSET ALLOCATION\n" + cue,
+                    "报告期末股票资产占基金总资产35.2%。",
+                )
+            )
+
+            with self.subTest(cue=cue):
+                self.assertFalse(has_current_stock_fact(same_page))
+                self.assertFalse(has_current_stock_fact(cross_page))
+
+    def test_pdf_temporal_cue_block_remains_available_to_legal_parser(self) -> None:
+        parsed = self.parse_extracted_text(
+            "CURRENT ASSET ALLOCATION\n"
+            "2025年末本基金不投资于股票。\n"
+            "报告期末股票资产占基金总资产35.2%。"
+        )
+
+        self.assertEqual(one(parsed, "stock_exposure_max_percent").normalized_value, D("0"))
+        self.assertFalse(has_current_stock_fact(parsed))
+
     def test_pdf_historical_and_unsafe_section_state_persists_across_pages(self) -> None:
         cases = (
             "HISTORICAL",
