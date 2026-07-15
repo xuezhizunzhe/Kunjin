@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from kunjin.funds.risk.audit import (
     canonical_fact_set_fingerprint,
-    native_parser_provenance,
+    known_native_parser_provenance,
 )
 from kunjin.storage.repository import Repository
 from kunjin.storage.schema import (
@@ -144,7 +144,7 @@ class SchemaV10Test(unittest.TestCase):
             )
 
     def ensure_native_result(self, repository: Repository) -> None:
-        provenance = native_parser_provenance()
+        provenance = known_native_parser_provenance("2")
         with repository.connect() as connection, connection:
             row = connection.execute(
                 "SELECT id FROM fund_document_parser_provenance WHERE provenance_checksum = ?",

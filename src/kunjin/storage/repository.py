@@ -13,7 +13,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from kunjin.funds.models import DocumentKind
 from kunjin.funds.risk.audit import (
     canonical_fact_set_fingerprint,
-    native_parser_provenance,
+    known_native_parser_provenance,
 )
 from kunjin.funds.risk.models import FactConfidence, MandateFact, decode_fact_value_json
 from kunjin.models import (
@@ -691,7 +691,7 @@ def _decode_v11_fact(row: sqlite3.Row, artifact: sqlite3.Row) -> MandateFact:
 
 
 def _backfill_v11_document_audit(connection: sqlite3.Connection) -> None:
-    provenance = native_parser_provenance()
+    provenance = known_native_parser_provenance("2")
     artifact_rows = connection.execute(
         "SELECT * FROM fund_document_artifacts ORDER BY id"
     ).fetchall()

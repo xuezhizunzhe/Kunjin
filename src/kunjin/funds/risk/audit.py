@@ -21,11 +21,6 @@ ACTIVE_LEGACY_PARSER_VERSION = "3-docker-libreoffice-v1"
 HISTORICAL_NATIVE_PARSER_VERSIONS = frozenset({"2"})
 HISTORICAL_LEGACY_PARSER_VERSIONS = frozenset({"2-docker-libreoffice-v1"})
 
-_NATIVE_PAYLOAD = {
-    "contract_version": "native-v1",
-    "converter_kind": "none",
-    "parser_version": ACTIVE_NATIVE_PARSER_VERSION,
-}
 _KNOWN_NATIVE_PARSER_VERSIONS = frozenset(
     {ACTIVE_NATIVE_PARSER_VERSION, *HISTORICAL_NATIVE_PARSER_VERSIONS}
 )
@@ -122,7 +117,19 @@ class ParserProvenance:
 
 
 def native_parser_provenance() -> ParserProvenance:
-    return _provenance_from_payload(_NATIVE_PAYLOAD)
+    return known_native_parser_provenance(ACTIVE_NATIVE_PARSER_VERSION)
+
+
+def known_native_parser_provenance(parser_version: object) -> ParserProvenance:
+    if type(parser_version) is not str or parser_version not in _KNOWN_NATIVE_PARSER_VERSIONS:
+        raise ValueError("known native parser provenance version is unknown")
+    return _provenance_from_payload(
+        {
+            "contract_version": "native-v1",
+            "converter_kind": "none",
+            "parser_version": parser_version,
+        }
+    )
 
 
 def legacy_parser_provenance(

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from kunjin.funds.risk.audit import (
     canonical_fact_set_fingerprint,
+    known_native_parser_provenance,
     legacy_parser_provenance,
     native_parser_provenance,
 )
@@ -75,6 +76,7 @@ class SchemaV12Test(unittest.TestCase):
         sha256: str = "a" * 64,
         parse_status: str = "parsed",
         parse_error_code: str | None = None,
+        parser_version: str = "2",
         url: str | None = None,
     ) -> None:
         final_url = url or f"https://example.test/{artifact_id}.docx"
@@ -87,7 +89,7 @@ class SchemaV12Test(unittest.TestCase):
             ) VALUES (?, ?, 'fund_contract', ?, ?, 'public publisher', 'public contract',
                       ?, ?,
                       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                      1024, ?, ?, ?, '2', ?)
+                      1024, ?, ?, ?, ?, ?)
             """,
             (
                 artifact_id,
@@ -99,6 +101,7 @@ class SchemaV12Test(unittest.TestCase):
                 sha256,
                 f"/private/document-{artifact_id}.docx",
                 parse_status,
+                parser_version,
                 parse_error_code,
             ),
         )
@@ -255,7 +258,7 @@ class SchemaV12Test(unittest.TestCase):
                 "SELECT parse_result_id FROM fund_mandate_facts WHERE id = 11"
             ).fetchone()
 
-        expected = native_parser_provenance()
+        expected = known_native_parser_provenance("2")
         self.assertEqual(provenance["canonical_json"], expected.canonical_json)
         self.assertEqual(provenance["provenance_checksum"], expected.provenance_checksum)
         self.assertEqual(result["parser_input_sha256"], "a" * 64)
@@ -268,6 +271,27 @@ class SchemaV12Test(unittest.TestCase):
         self.assertEqual(run["outcome"], "success")
         self.assertEqual(run["parse_result_id"], result["id"])
         self.assertIsNone(run["public_error_code"])
+
+    def test_v11_migration_rejects_unknown_native_parser_version(self) -> None:
+        repository = self._create_v11()
+        with repository.connect() as connection, connection:
+            self._insert_artifact(connection, artifact_id=7, parser_version="unknown")
+
+        with self.assertRaisesRegex(
+            sqlite3.DatabaseError, "unsupported legacy V11 parser provenance"
+        ):
+            repository.migrate()
+
+    def test_v11_migration_rejects_mixed_native_parser_versions(self) -> None:
+        repository = self._create_v11()
+        with repository.connect() as connection, connection:
+            self._insert_artifact(connection, artifact_id=7, parser_version="2")
+            self._insert_artifact(connection, artifact_id=9, parser_version="3")
+
+        with self.assertRaisesRegex(
+            sqlite3.DatabaseError, "unsupported legacy V11 parser provenance"
+        ):
+            repository.migrate()
 
     def test_v11_failure_backfills_public_code_without_inventing_stage_or_reason(self) -> None:
         repository = self._create_v11()

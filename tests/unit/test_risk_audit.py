@@ -16,6 +16,7 @@ from kunjin.funds.risk.audit import (
     candidate_fingerprint,
     canonical_candidate_payload,
     canonical_fact_set_fingerprint,
+    known_native_parser_provenance,
     legacy_parser_provenance,
     native_parser_provenance,
 )
@@ -54,13 +55,7 @@ def provenance_from_payload(payload: dict[str, object]) -> ParserProvenance:
 
 
 def historical_native_provenance() -> ParserProvenance:
-    return provenance_from_payload(
-        {
-            "contract_version": "native-v1",
-            "converter_kind": "none",
-            "parser_version": "2",
-        }
-    )
+    return known_native_parser_provenance("2")
 
 
 def historical_legacy_provenance() -> ParserProvenance:
@@ -160,6 +155,21 @@ class RiskAuditTests(unittest.TestCase):
                 package_manifest_checksum="b" * 64,
             ),
         )
+
+    def test_known_native_provenance_factory_accepts_only_exact_known_versions(self) -> None:
+        historical = known_native_parser_provenance("2")
+        active = known_native_parser_provenance("3")
+
+        self.assertEqual(historical.parser_version, "2")
+        self.assertEqual(
+            historical.canonical_json,
+            '{"contract_version":"native-v1","converter_kind":"none","parser_version":"2"}',
+        )
+        self.assertEqual(active, native_parser_provenance())
+
+        for unknown in (None, True, 2, "1", "4", "2-docker-libreoffice-v1"):
+            with self.subTest(unknown=unknown), self.assertRaisesRegex(ValueError, "unknown"):
+                known_native_parser_provenance(unknown)
 
     def test_unknown_native_and_legacy_parser_versions_are_rejected(self) -> None:
         native = provenance_from_payload(
