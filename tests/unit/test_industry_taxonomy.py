@@ -406,9 +406,19 @@ def test_invalid_registry_mapping_raises_value_error(
         "https://[example.com]/sw.json",
         "https://[1.2.3.4]/sw.json",
         "https://[v1.fe80]/sw.json",
+        "https://[2001:db8::1]suffix/sw.json",
+        "https://192.0.2.1/sw.json",
+        "https://[2001:db8::1]/sw.json",
+        "https://example.com:443/sw.json",
+        "https://example.com/sw.json?version=1",
+        "https://example.com/sw.json?",
+        "https://example.com/sw.json#official",
+        "https://example.com/sw.json#",
+        "https://example.com",
+        "https://Example.com/sw.json",
     ),
 )
-def test_registry_rejects_noncanonical_or_invalid_port_source_url(
+def test_registry_rejects_noncanonical_source_url(
     source_url: str,
 ) -> None:
     with pytest.raises(ValueError, match="source URL"):
@@ -423,11 +433,11 @@ def test_registry_rejects_noncanonical_or_invalid_port_source_url(
     "source_url",
     (
         "https://example.com/sw.json",
-        "https://192.0.2.1/sw.json",
-        "https://[2001:db8::1]/sw.json",
+        "https://example.com/",
+        "https://xn--fsqu00a.xn--0zwm56d/sw.json",
     ),
 )
-def test_registry_accepts_valid_dns_ipv4_and_bracketed_ipv6_source_url(
+def test_registry_accepts_canonical_dns_source_url(
     source_url: str,
 ) -> None:
     assert (

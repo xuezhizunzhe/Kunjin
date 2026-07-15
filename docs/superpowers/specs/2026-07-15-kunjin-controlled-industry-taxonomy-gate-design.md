@@ -51,6 +51,24 @@ The implementation records the recognized metadata boundary but publishes no
 industry observations until a separately reviewed complete mapping is added.
 It does not upgrade a tier-2 source to tier 1.
 
+#### 2.2.1 Canonical mapping-source provenance
+
+An eligible mapping's `source_url` is authenticated provenance for one pinned
+official asset, not a general-purpose fetch target. It must be an exact ASCII
+HTTPS URL with:
+
+- a lowercase DNS hostname made only of valid DNS labels, including lowercase
+  `xn--` punycode labels when needed;
+- no IP literal, bracketed authority, port, user information, query, or
+  fragment; and
+- a non-empty absolute path beginning with `/`.
+
+The raw authority must equal the parsed hostname exactly. Uppercase hostnames,
+Unicode hostnames, alternate authority syntax, implicit normalization, and URL
+parser ambiguities are invalid registry data. These restrictions do not enable
+any production mapping: `PRODUCTION_TAXONOMY_MAPPINGS` remains empty until a
+complete official mapping receives separate evidence and review.
+
 ### 2.3 No CSRC claim from the HYPZ JSON adapter
 
 The HYPZ JSON adapter receives `HYDM` and `HYMC`, but its current
@@ -273,7 +291,9 @@ uses sorted UTF-8 JSON with exact taxonomy id, version, source URL, publication
 date, canonical code/name pairs, and audited aliases. KunJin pins the SHA-256
 of those canonical bytes. Name and alias matching uses NFKC normalization,
 bounded whitespace normalization, and exact case-folded comparison; unsafe
-characters remain invalid.
+characters remain invalid. The pinned source URL must also satisfy the canonical
+DNS HTTPS provenance contract in section 2.2.1; IP literals and generic URLs are
+not accepted as substitutes for an authenticated official asset location.
 
 ## 8. Acceptance Criteria
 

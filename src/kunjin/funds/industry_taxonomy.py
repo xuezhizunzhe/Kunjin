@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
 import re
 import unicodedata
@@ -64,7 +63,7 @@ PRODUCTION_TAXONOMY_MAPPINGS: Tuple[IndustryTaxonomyMapping, ...] = ()
 
 _SUPPORTED_UNITS = ("percent",)
 _CHECKSUM_PATTERN = re.compile(r"[0-9a-f]{64}")
-_DNS_LABEL_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+_DNS_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 _DEFAULT_IGNORABLE_RANGES = (
     (0x034F, 0x034F),
@@ -242,7 +241,7 @@ def _validate_mapping(mapping: IndustryTaxonomyMapping) -> None:
         raise ValueError("taxonomy source URL must use canonical ASCII URL syntax")
     try:
         parsed_url = urlsplit(mapping.source_url)
-        parsed_url.port
+        parsed_port = parsed_url.port
     except ValueError as exc:
         raise ValueError("taxonomy source URL is invalid") from exc
     if (
@@ -250,8 +249,12 @@ def _validate_mapping(mapping: IndustryTaxonomyMapping) -> None:
         or not parsed_url.hostname
         or parsed_url.username is not None
         or parsed_url.password is not None
-        or parsed_url.fragment
-        or not _is_valid_source_hostname(parsed_url.hostname, parsed_url.netloc)
+        or parsed_url.netloc != parsed_url.hostname
+        or parsed_port is not None
+        or "?" in mapping.source_url
+        or "#" in mapping.source_url
+        or not parsed_url.path.startswith("/")
+        or not _is_valid_source_hostname(parsed_url.hostname)
     ):
         raise ValueError("taxonomy source URL must be an authenticated HTTPS URL")
     if type(mapping.published_at) is not date:
@@ -387,21 +390,12 @@ def _require_exact_record_state(
         raise ValueError(f"{name} must have exact record state")
 
 
-def _is_valid_source_hostname(hostname: str, netloc: str) -> bool:
-    bracketed = netloc.startswith("[")
-    try:
-        address = ipaddress.ip_address(hostname)
-    except ValueError:
-        if bracketed:
-            return False
-        if ":" in hostname or re.fullmatch(r"[0-9.]+", hostname):
-            return False
-        if len(hostname) > 253 or hostname.startswith(".") or hostname.endswith("."):
-            return False
-        return all(_DNS_LABEL_PATTERN.fullmatch(label) for label in hostname.split("."))
-    if address.version == 6:
-        return bracketed and "]" in netloc
-    return not bracketed and ":" not in hostname
+def _is_valid_source_hostname(hostname: str) -> bool:
+    if re.fullmatch(r"[0-9.]+", hostname):
+        return False
+    if len(hostname) > 253 or hostname.startswith(".") or hostname.endswith("."):
+        return False
+    return all(_DNS_LABEL_PATTERN.fullmatch(label) for label in hostname.split("."))
 
 
 def _mapping_for_standard(

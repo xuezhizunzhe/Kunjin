@@ -108,7 +108,7 @@ def test_complete_test_mapping_validates_one_distribution() -> None:
     assert validated.taxonomy_id == "sw_level1_2021"
 ```
 
-Add failures for subclasses, mutable containers, unsafe Unicode, unsupported labels, missing/unmapped/malformed codes, code-name mismatch, duplicate code/name/rank, mixed standard/unit, non-contiguous ranks, increasing weights, tied largest weights, incomplete scope, checksum mismatch, non-canonical JSON, and the empty production registry.
+Add failures for subclasses, mutable containers, unsafe Unicode, unsupported labels, missing/unmapped/malformed codes, code-name mismatch, duplicate code/name/rank, mixed standard/unit, non-contiguous ranks, increasing weights, tied largest weights, incomplete scope, checksum mismatch, non-canonical JSON, and the empty production registry. Registry provenance tests must reject IP and bracketed authorities, ports, user information, queries, fragments, uppercase or non-ASCII hostnames, and empty paths. Exact lowercase DNS and lowercase `xn--` punycode hostnames with a non-empty absolute path remain valid.
 
 - [ ] **Step 2: Run the new tests and record red**
 
@@ -164,7 +164,7 @@ Define recognized `sw_level1_2021` metadata, but keep:
 PRODUCTION_TAXONOMY_MAPPINGS: Tuple[IndustryTaxonomyMapping, ...] = ()
 ```
 
-Canonical mapping JSON contains taxonomy id/version, official source URL, publication date, sorted code/name entries, and sorted aliases. Validate exact ASCII-escaped canonical JSON and its SHA-256.
+Canonical mapping JSON contains taxonomy id/version, official source URL, publication date, sorted code/name entries, and sorted aliases. Validate exact ASCII-escaped canonical JSON and its SHA-256. The source URL is restricted to canonical DNS HTTPS provenance: its raw authority equals one lowercase ASCII DNS hostname, it has no IP literal, brackets, port, user information, query, or fragment, and it has a non-empty absolute path. The production mapping registry remains empty.
 
 - [ ] **Step 4: Implement whole-distribution validation**
 
