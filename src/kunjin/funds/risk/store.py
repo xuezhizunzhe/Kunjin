@@ -2459,15 +2459,31 @@ def _authenticate_v3_evidence_snapshot(
         or evidence.fact_ids != expected_fact_ids
         or evidence.parse_result_ids != expected_parse_result_ids
         or evidence.parser_provenance_checksums != expected_provenance_checksums
-        or evidence.legal_facts != expected_legal_facts
-        or evidence.benchmark_facts != expected_benchmark_facts
-        or evidence.report_facts != expected_report_facts
+        or _canonical_fact_group(evidence.legal_facts)
+        != _canonical_fact_group(expected_legal_facts)
+        or _canonical_fact_group(evidence.benchmark_facts)
+        != _canonical_fact_group(expected_benchmark_facts)
+        or _canonical_fact_group(evidence.report_facts)
+        != _canonical_fact_group(expected_report_facts)
     ):
         raise RiskStoreError("classification evidence projection changed")
 
 
 def _mandate_fact_order(fact: MandateFact) -> tuple:
     return (fact.fact_kind, fact.source_document_id, fact.fact_fingerprint)
+
+
+def _canonical_fact_group(facts: Tuple[MandateFact, ...]) -> Tuple[MandateFact, ...]:
+    return tuple(
+        sorted(
+            facts,
+            key=lambda fact: (
+                fact.fact_fingerprint,
+                fact.source_document_id,
+                fact.fact_kind,
+            ),
+        )
+    )
 
 
 def _evidence_from_manifest(

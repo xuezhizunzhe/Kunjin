@@ -2104,13 +2104,15 @@ class FundRiskStoreTest(unittest.TestCase):
         evidence = ClassificationEvidence(
             fund_code="000001",
             legal_facts=tuple(
-                sorted(
-                    mandate_facts,
-                    key=lambda fact: (
-                        fact.fact_kind,
-                        fact.source_document_id,
-                        fact.fact_fingerprint,
-                    ),
+                reversed(
+                    sorted(
+                        mandate_facts,
+                        key=lambda fact: (
+                            fact.fact_kind,
+                            fact.source_document_id,
+                            fact.fact_fingerprint,
+                        ),
+                    )
                 )
             ),
             benchmark_facts=(),
