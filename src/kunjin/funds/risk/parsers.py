@@ -51,6 +51,7 @@ from kunjin.funds.risk.legacy_doc import (
 )
 from kunjin.funds.risk.models import FactConfidence, canonical_fact_value
 from kunjin.funds.risk.report_facts import (
+    EMPTY_SEQUENCE_CELL_TEXT,
     MAX_REPORT_CELL_CHARACTERS,
     MAX_REPORT_CELLS_PER_ROW,
     MAX_REPORT_ROWS,
@@ -61,6 +62,7 @@ from kunjin.funds.risk.report_facts import (
     ReportTable,
     extract_common_report_observations,
     extract_fixed_income_report_observations,
+    is_real_asset_table_header,
 )
 from kunjin.funds.risk.reports import (
     ConvertedDocumentContractError,
@@ -722,6 +724,7 @@ _TABLE_CELL_WRAPPERS = frozenset(
         "u",
     }
 )
+_CONVERTED_HEADING_LAYOUT_WHITESPACE = frozenset(" \t\r\n\f")
 _KNOWN_TABLE_HEADERS = frozenset(
     {
         "代码",
@@ -760,9 +763,50 @@ def _report_table_excerpt(rows: Tuple[ReportRow, ...]) -> str:
     return excerpt[: MAX_EXCERPT_CHARACTERS - 3] + "..."
 
 
+def _recover_real_asset_empty_sequence_rows(
+    rows: Tuple[Tuple[Tuple[str, bool], ...], ...],
+) -> Optional[Tuple[Tuple[Tuple[str, bool, bool], ...], ...]]:
+    if any(text == EMPTY_SEQUENCE_CELL_TEXT for row in rows for text, _ in row):
+        return None
+    has_empty_cell = any(not text for row in rows for text, _ in row)
+    if not has_empty_cell:
+        if rows and is_real_asset_table_header(tuple(text for text, _ in rows[0])):
+            if any(is_header for row in rows[1:] for _, is_header in row):
+                return None
+        return tuple(
+            tuple((text, is_header, False) for text, is_header in row) for row in rows
+        )
+    if not rows or any(len(row) != 4 for row in rows):
+        return None
+    header = rows[0]
+    header_values = tuple(text for text, _ in header)
+    if not all(header_values) or not is_real_asset_table_header(header_values):
+        return None
+    recovered = []
+    for row in rows[1:]:
+        if any(is_header for _, is_header in row):
+            return None
+        if any(not text for text, _ in row[1:]):
+            return None
+        sequence, _ = row[0]
+        if not sequence:
+            recovered_row = ((EMPTY_SEQUENCE_CELL_TEXT, False, True),)
+        else:
+            recovered_row = ((sequence, False, False),)
+        recovered_row += tuple((text, False, False) for text, _ in row[1:])
+        recovered.append(recovered_row)
+    return (
+        tuple((text, is_header, False) for text, is_header in header),
+        *recovered,
+    )
+
+
 class _StructuredHtmlTableParser(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, *, normalize_heading_layout_whitespace: bool = False) -> None:
+        if type(normalize_heading_layout_whitespace) is not bool:
+            raise ValueError("heading layout whitespace normalization state must be boolean")
         super().__init__(convert_charrefs=True)
+        self._normalize_heading_layout_whitespace = normalize_heading_layout_whitespace
         self.tables: List[ReportTable] = []
         self._ignored_tag: Optional[str] = None
         self._ignored_depth = 0
@@ -873,7 +917,7 @@ class _StructuredHtmlTableParser(HTMLParser):
             text = _normalized_text("".join(self._cell_parts))
             if len(text) > MAX_REPORT_CELL_CHARACTERS:
                 raise _resource_limit()
-            if not text or self._row is None:
+            if self._row is None:
                 self._table_invalid = True
             elif len(self._row) >= MAX_REPORT_CELLS_PER_ROW:
                 raise _resource_limit()
@@ -897,7 +941,17 @@ class _StructuredHtmlTableParser(HTMLParser):
         if self._cell_tag is not None:
             self._cell_parts.append(data)
         elif self._heading_tag is not None and self._table_depth == 0:
-            self._heading_parts.append(data)
+            if (
+                self._normalize_heading_layout_whitespace
+                and data
+                and all(
+                    character in _CONVERTED_HEADING_LAYOUT_WHITESPACE
+                    for character in data
+                )
+            ):
+                self._heading_parts.append(" ")
+            else:
+                self._heading_parts.append(data)
 
     def finish(self) -> None:
         self.close()
@@ -924,15 +978,23 @@ class _StructuredHtmlTableParser(HTMLParser):
             and self._rows
             and self._section_current_observation_eligible
         ):
+            raw_rows = _recover_real_asset_empty_sequence_rows(tuple(self._rows))
+            if raw_rows is None:
+                self._reset_table()
+                return
             rows = []
-            for index, raw_row in enumerate(self._rows):
-                values = tuple(text for text, _ in raw_row)
+            for index, raw_row in enumerate(raw_rows):
+                values = tuple(text for text, _, _ in raw_row)
                 inferred_header = index == 0 and _row_looks_like_header(values)
                 rows.append(
                     ReportRow(
                         tuple(
-                            ReportCell(text, is_header or inferred_header)
-                            for text, is_header in raw_row
+                            ReportCell(
+                                text,
+                                is_header or inferred_header,
+                                is_structural_placeholder,
+                            )
+                            for text, is_header, is_structural_placeholder in raw_row
                         )
                     )
                 )
@@ -948,6 +1010,9 @@ class _StructuredHtmlTableParser(HTMLParser):
                 pass
             else:
                 self.tables.append(table)
+        self._reset_table()
+
+    def _reset_table(self) -> None:
         self._table_invalid = False
         self._rows = []
         self._row = None
@@ -1847,7 +1912,9 @@ def _converted_html_content(
         parser = _ConvertedEvidenceHtmlParser()
         parser.feed(text)
         parser.finish()
-        table_parser = _StructuredHtmlTableParser()
+        table_parser = _StructuredHtmlTableParser(
+            normalize_heading_layout_whitespace=True
+        )
         table_parser.feed(text)
         table_parser.finish()
     except (UnicodeError, ValueError) as exc:

@@ -26,6 +26,7 @@ from kunjin.funds.risk.parsers import (
 )
 from kunjin.funds.risk.report_facts import (
     COMMON_FACTS,
+    EMPTY_SEQUENCE_CELL_TEXT,
     FIXED_INCOME_FACTS,
     MAX_REPORT_CELL_CHARACTERS,
     CurrentReportObservation,
@@ -34,6 +35,7 @@ from kunjin.funds.risk.report_facts import (
     ReportTable,
     extract_common_report_observations,
     extract_fixed_income_report_observations,
+    is_real_asset_table_header,
 )
 
 
@@ -74,6 +76,44 @@ def common_table(
         ),
         page_number=3,
         section_name=section_name,
+        source_excerpt="；".join(" | ".join(row) for row in (headers, *rows)),
+    )
+
+
+def four_column_asset_table(
+    rows: tuple[tuple[str, str, str, str], ...] = (
+        (EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", "1,234.56", "35.2"),
+        (EMPTY_SEQUENCE_CELL_TEXT, "其中:债券", "987.00", "60"),
+        ("7", "银行存款和结算备付金合计", "100.00", "4.8"),
+    ),
+    *,
+    headers: tuple[str, ...] = (
+        "序号",
+        "项目",
+        "金额(元)",
+        "占基金总资产的比例(%)",
+    ),
+    page_number: int = 3,
+) -> ReportTable:
+    return ReportTable(
+        rows=(
+            ReportRow(tuple(ReportCell(value, True) for value in headers)),
+            *(
+                ReportRow(
+                    tuple(
+                        ReportCell(
+                            value,
+                            False,
+                            value == EMPTY_SEQUENCE_CELL_TEXT,
+                        )
+                        for value in row
+                    )
+                )
+                for row in rows
+            ),
+        ),
+        page_number=page_number,
+        section_name="报告期末资产组合",
         source_excerpt="；".join(" | ".join(row) for row in (headers, *rows)),
     )
 
@@ -297,6 +337,19 @@ class CurrentReportRecordTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "row limit"):
                 report_table().validate()
 
+    def test_report_cell_structural_placeholder_requires_authenticated_state(self) -> None:
+        ReportCell(EMPTY_SEQUENCE_CELL_TEXT, False, True).validate()
+        invalid_cells = (
+            ReportCell(EMPTY_SEQUENCE_CELL_TEXT, False),
+            ReportCell(EMPTY_SEQUENCE_CELL_TEXT, True, True),
+            ReportCell("1", False, True),
+            ReportCell(EMPTY_SEQUENCE_CELL_TEXT, False, 1),  # type: ignore[arg-type]
+        )
+
+        for cell in invalid_cells:
+            with self.subTest(cell=repr(cell)), self.assertRaises(ValueError):
+                cell.validate()
+
     def test_observations_reject_invalid_boundaries_and_mixed_units(self) -> None:
         base = CurrentReportObservation(
             "current_stock_asset_allocation_percent",
@@ -496,6 +549,142 @@ class CurrentReportAdapterTest(unittest.TestCase):
 
 
 class CommonReportFactExtractionTest(unittest.TestCase):
+    def test_real_shape_four_column_asset_table_extracts_only_stock_and_bond(self) -> None:
+        observations = extract_common_report_observations(
+            text_blocks=(),
+            tables=(four_column_asset_table(),),
+        )
+        values = {item.fact_kind: item.normalized_value for item in observations}
+
+        self.assertTrue(
+            is_real_asset_table_header(("序号", "项目", "金额（元）", "占基金总资产的比例（%）"))
+        )
+        self.assertEqual(
+            values,
+            {
+                "current_stock_asset_allocation_percent": D("35.2"),
+                "current_bond_asset_allocation_percent": D("60"),
+            },
+        )
+        self.assertTrue(all(item.unit == "percent_of_total_assets" for item in observations))
+        self.assertTrue(
+            all(EMPTY_SEQUENCE_CELL_TEXT not in item.source_excerpt for item in observations)
+        )
+        self.assertEqual(
+            {item.source_excerpt for item in observations},
+            {
+                "其中:股票 | 1,234.56 | 35.2",
+                "其中:债券 | 987.00 | 60",
+            },
+        )
+        self.assertNotIn("current_cash_asset_allocation_percent", values)
+
+    def test_real_shape_four_column_asset_table_requires_exact_header_and_width(
+        self,
+    ) -> None:
+        wrong_header = four_column_asset_table(
+            headers=("序号", "项目", "金额(元)", "占基金资产净值的比例(%)")
+        )
+        wrong_width = four_column_asset_table(
+            rows=((EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", "1,234.56", "35.2", "额外"),),
+            headers=("序号", "项目", "金额(元)", "占基金总资产的比例(%)", "额外"),
+        )
+
+        self.assertFalse(
+            is_real_asset_table_header(("序号", "项目", "金额(元)", "占基金资产净值的比例(%)"))
+        )
+        self.assertEqual(
+            extract_common_report_observations(text_blocks=(), tables=(wrong_header, wrong_width)),
+            (),
+        )
+
+    def test_four_column_asset_rows_reject_empty_keys_invalid_amounts_and_percents(
+        self,
+    ) -> None:
+        rejected_rows = (
+            ("1", EMPTY_SEQUENCE_CELL_TEXT, "1,234.56", "35.2"),
+            ("01", "其中:股票", "1,234.56", "35.2"),
+            ("one", "其中:股票", "1,234.56", "35.2"),
+            (EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", EMPTY_SEQUENCE_CELL_TEXT, "35.2"),
+            (EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", "NaN", "35.2"),
+            (EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", "-1", "35.2"),
+            (EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", "1,23.45", "35.2"),
+            (EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", "1,234.56", "100.01"),
+            (EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", "1,234.56", "-0.01"),
+            (EMPTY_SEQUENCE_CELL_TEXT, "其中:基金", "1,234.56", "35.2"),
+        )
+
+        for row in rejected_rows:
+            with self.subTest(row=row):
+                self.assertEqual(
+                    extract_common_report_observations(
+                        text_blocks=(), tables=(four_column_asset_table(rows=(row,)),)
+                    ),
+                    (),
+                )
+
+    def test_four_column_asset_rows_reject_header_cells_and_flagged_keys(self) -> None:
+        all_header_row = replace(
+            four_column_asset_table(
+                rows=((EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", "1,234.56", "35.2"),)
+            ),
+            rows=(
+                four_column_asset_table().rows[0],
+                ReportRow(
+                    (
+                        ReportCell(EMPTY_SEQUENCE_CELL_TEXT, False, True),
+                        ReportCell("其中:股票", True),
+                        ReportCell("1,234.56", True),
+                        ReportCell("35.2", True),
+                    )
+                ),
+            ),
+        )
+        flagged_key = four_column_asset_table(
+            rows=(("1", EMPTY_SEQUENCE_CELL_TEXT, "1,234.56", "35.2"),)
+        )
+
+        self.assertEqual(
+            extract_common_report_observations(
+                text_blocks=(), tables=(all_header_row, flagged_key)
+            ),
+            (),
+        )
+
+    def test_four_column_asset_sequence_accepts_nfkc_canonical_ascii_decimal(self) -> None:
+        observations = extract_common_report_observations(
+            text_blocks=(),
+            tables=(
+                four_column_asset_table(
+                    rows=(("７", "其中:股票", "1,234.56", "35.2"),)
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            tuple(item.normalized_value for item in observations),
+            (D("35.2"),),
+        )
+
+    def test_four_column_asset_equivalent_duplicates_dedupe_but_conflicts_remain(
+        self,
+    ) -> None:
+        table = four_column_asset_table(
+            rows=((EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", "1,234.56", "35.2"),)
+        )
+        conflicting = four_column_asset_table(
+            rows=((EMPTY_SEQUENCE_CELL_TEXT, "其中:股票", "1,250.00", "36.2"),),
+        )
+
+        equivalent = extract_common_report_observations(text_blocks=(), tables=(table, table))
+        conflicts = extract_common_report_observations(text_blocks=(), tables=(table, conflicting))
+
+        self.assertEqual(len(equivalent), 1)
+        self.assertEqual(
+            tuple(item.normalized_value for item in conflicts),
+            (D("35.2"), D("36.2")),
+        )
+
     def test_common_fact_allowlist_accepts_only_explicit_supported_rows_and_sentences(self) -> None:
         allocation = common_table(
             ("指标", "单位", "数值"),

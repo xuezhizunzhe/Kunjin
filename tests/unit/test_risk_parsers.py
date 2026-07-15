@@ -27,6 +27,7 @@ from kunjin.funds.risk.parsers import (
     ParsedMandateFact,
     RiskDocumentParseError,
     _html_content,
+    _StructuredHtmlTableParser,
     parse_artifact,
     parse_artifact_with_provenance,
 )
@@ -169,6 +170,23 @@ def write_docx(
 class RiskHtmlParserTest(unittest.TestCase):
     def test_active_parser_version_is_v4(self) -> None:
         self.assertEqual(PARSER_VERSION, "4")
+
+    def test_native_html_keeps_layout_whitespace_in_heading_unsafe(self) -> None:
+        raw = (
+            "<h2>\n\t  <span>报告期末资产组合</span>\n</h2>"
+            "<table><tr><th>指标</th><th>单位</th><th>数值</th></tr>"
+            "<tr><td>报告期末股票资产占基金总资产的</td><td>%</td><td>35.2</td>"
+            "</tr></table>"
+        ).encode()
+
+        _, tables = _html_content(raw, None)
+
+        self.assertEqual(tables, ())
+
+        with self.assertRaisesRegex(ValueError, "must be boolean"):
+            _StructuredHtmlTableParser(  # type: ignore[arg-type]
+                normalize_heading_layout_whitespace=1
+            )
 
     def test_unsafe_html_section_state_survives_bounded_heading_for_paragraphs_and_tables(
         self,
@@ -1023,6 +1041,9 @@ class RiskLegacyConvertedParserTest(unittest.TestCase):
         self.ole_path = self.root / "synthetic.doc"
         self.ole_path.write_bytes(bytes.fromhex("d0cf11e0a1b11ae1") + b"synthetic routing only")
         self.fixture_html = (FIXTURES / "legacy-converted-report.html").read_text(encoding="utf-8")
+        self.real_shape_fixture_html = (
+            FIXTURES / "legacy-converted-report-real-shape.html"
+        ).read_text(encoding="utf-8")
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -1338,6 +1359,166 @@ class RiskLegacyConvertedParserTest(unittest.TestCase):
         self.assertEqual(parsed.document.artifact.sha256, legacy_artifact(self.ole_path).sha256)
         self.assertEqual(stock.effective_from, date(2026, 6, 30))
         self.assertEqual(stock.effective_to, date(2026, 6, 30))
+
+    def test_real_shape_asset_table_recovers_empty_sequence_cells(self) -> None:
+        parsed = self.parse(self.real_shape_fixture_html)
+        stock = one(parsed.document, "current_stock_asset_allocation_percent")
+        bond = one(parsed.document, "current_bond_asset_allocation_percent")
+
+        self.assertEqual(stock.normalized_value, D("35.2"))
+        self.assertEqual(bond.normalized_value, D("60"))
+        self.assertEqual(stock.unit, "percent_of_total_assets")
+        self.assertEqual(bond.unit, "percent_of_total_assets")
+        self.assertEqual(stock.effective_from, date(2026, 6, 30))
+        self.assertEqual(stock.effective_to, date(2026, 6, 30))
+        self.assertEqual(bond.effective_from, date(2026, 6, 30))
+        self.assertEqual(bond.effective_to, date(2026, 6, 30))
+        self.assertEqual(parsed.provenance, LEGACY_PROVENANCE)
+
+    def test_real_shape_asset_table_rejects_non_layout_heading_controls(self) -> None:
+        visible_mixed_crlf = self.real_shape_fixture_html.replace(
+            "报告期末资产组合",
+            "报告期末资\r\n产组合",
+            1,
+        )
+        pure_unsafe_fragments = tuple(
+            self.real_shape_fixture_html.replace("\n\t  <span>", character + "<span>", 1)
+            for character in ("\u0085", "\u2060", "\ufe0f")
+        )
+
+        for index, html in enumerate((visible_mixed_crlf, *pure_unsafe_fragments)):
+            with self.subTest(case=index):
+                parsed = self.parse(html).document
+                self.assertFalse(
+                    any(fact.fact_kind.startswith("current_") for fact in parsed.facts)
+                )
+
+    def test_real_shape_asset_table_rejects_empty_financial_cells(self) -> None:
+        cases = (
+            self.real_shape_fixture_html.replace(
+                "<td>其中:股票</td>", "<td></td>", 1
+            ),
+            self.real_shape_fixture_html.replace(
+                "<td>1,234.56</td>", "<td></td>", 1
+            ),
+            self.real_shape_fixture_html.replace("<td>35.2</td>", "<td></td>", 1),
+        )
+
+        for html in cases:
+            with self.subTest(html=html[-200:]):
+                parsed = self.parse(html).document
+                self.assertFalse(
+                    {
+                        "current_stock_asset_allocation_percent",
+                        "current_bond_asset_allocation_percent",
+                    }
+                    & {fact.fact_kind for fact in parsed.facts}
+                )
+
+    def test_real_shape_asset_table_preserves_structural_fail_closed_rules(self) -> None:
+        cases = (
+            self.real_shape_fixture_html.replace(
+                "<tr><td></td><td>其中:股票</td>",
+                '<tr><td rowspan="2"></td><td>其中:股票</td>',
+                1,
+            ),
+            self.real_shape_fixture_html.replace(
+                "<tr><td></td><td>其中:股票</td>",
+                '<tr><td colspan="2"></td><td>其中:股票</td>',
+                1,
+            ),
+            self.real_shape_fixture_html.replace(
+                "<tr><td></td><td>其中:股票</td>",
+                '<tr><td rowspan="1" rowspan="1"></td><td>其中:股票</td>',
+                1,
+            ),
+            self.real_shape_fixture_html.replace(
+                "<tr><td></td><td>其中:股票</td>",
+                "<tr><td><table><tr><td></td></tr></table></td><td>其中:股票</td>",
+                1,
+            ),
+        )
+
+        for html in cases:
+            with self.subTest(html=html[-300:]):
+                parsed = self.parse(html).document
+                self.assertFalse(
+                    {
+                        "current_stock_asset_allocation_percent",
+                        "current_bond_asset_allocation_percent",
+                    }
+                    & {fact.fact_kind for fact in parsed.facts}
+                )
+
+    def test_real_shape_asset_table_rejects_header_data_and_literal_placeholder(self) -> None:
+        all_header_row = self.real_shape_fixture_html.replace(
+            "<tr><td></td><td>其中:股票</td><td>1,234.56</td><td>35.2</td></tr>",
+            "<tr><th></th><th>其中:股票</th><th>1,234.56</th><th>35.2</th></tr>",
+            1,
+        )
+        literal_placeholder = self.real_shape_fixture_html.replace(
+            "<tr><td></td><td>其中:股票</td>",
+            "<tr><td>[kunjin-empty-sequence]</td><td>其中:股票</td>",
+            1,
+        )
+
+        for html in (all_header_row, literal_placeholder):
+            with self.subTest(html=html[-300:]):
+                parsed = self.parse(html).document
+                self.assertFalse(
+                    {
+                        "current_stock_asset_allocation_percent",
+                        "current_bond_asset_allocation_percent",
+                    }
+                    & {fact.fact_kind for fact in parsed.facts}
+                )
+
+    def test_real_shape_asset_table_rejects_wrong_width_and_near_header(self) -> None:
+        uniform_fifth_column = self.real_shape_fixture_html.replace(
+            "<th>占基金总资产的比例（%）</th>",
+            "<th>占基金总资产的比例（%）</th><th>附加</th>",
+            1,
+        )
+        for value in ("35.2", "60", "4.8"):
+            uniform_fifth_column = uniform_fifth_column.replace(
+                f"<td>{value}</td></tr>",
+                f"<td>{value}</td><td>附加</td></tr>",
+                1,
+            )
+        uneven_row = self.real_shape_fixture_html.replace(
+            "<td>35.2</td></tr>",
+            "<td>35.2</td><td>附加</td></tr>",
+            1,
+        )
+        near_header = self.real_shape_fixture_html.replace(
+            "占基金总资产的比例（%）",
+            "占基金资产净值的比例（%）",
+            1,
+        )
+
+        for html in (uniform_fifth_column, uneven_row, near_header):
+            with self.subTest(html=html[-300:]):
+                parsed = self.parse(html).document
+                self.assertFalse(
+                    {
+                        "current_stock_asset_allocation_percent",
+                        "current_bond_asset_allocation_percent",
+                    }
+                    & {fact.fact_kind for fact in parsed.facts}
+                )
+
+    def test_non_target_empty_sequence_cell_remains_rejected(self) -> None:
+        html = self.fixture_html.replace(
+            "<tr><td>报告期末股票资产占基金总资产的</td><td>%</td><td>35.2</td></tr>",
+            "<tr><td></td><td>%</td><td>35.2</td></tr>",
+            1,
+        )
+
+        parsed = self.parse(html).document
+
+        self.assertFalse(
+            any(fact.fact_kind.startswith("current_") for fact in parsed.facts)
+        )
 
     def test_unsafe_converted_section_state_survives_bounded_heading_for_table(self) -> None:
         for character in UNSAFE_TIME_CONTEXT_CHARACTERS:

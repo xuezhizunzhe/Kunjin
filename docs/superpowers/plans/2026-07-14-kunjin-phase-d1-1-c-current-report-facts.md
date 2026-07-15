@@ -898,8 +898,8 @@ Expected: all commands exit zero. Record the fresh final pytest count.
 .venv/bin/kunjin --json fund converter-status
 ```
 
-Expected: ready, parser `2-docker-libreoffice-v1`, checksum
-`06a8943f8e01958aef014f19cfe5443288be26ba456fb164ea7a6890cd9a8479`.
+Expected: ready, parser `4-docker-libreoffice-v1`, checksum
+`d73408012e76ce6264bea8ddcaeff08027cc086c144d0b93622694ff5953c100`.
 
 - [ ] **Step 3: Run a clean four-fund acceptance**
 

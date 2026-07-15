@@ -20,6 +20,7 @@ MAX_REPORT_ROWS = 20_000
 MAX_REPORT_CELLS_PER_ROW = 32
 MAX_REPORT_CELL_CHARACTERS = 4_096
 MAX_REPORT_SECTION_CHARACTERS = 256
+EMPTY_SEQUENCE_CELL_TEXT = "[kunjin-empty-sequence]"
 
 _FACT_KIND_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _UNIT_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -62,6 +63,13 @@ FIXED_INCOME_FACTS = frozenset(
 )
 
 _INDICATOR_HEADERS = {("指标", "单位", "数值"), ("indicator", "unit", "value")}
+_REAL_ASSET_HEADERS = {
+    ("序号", "项目", "金额(元)", "占基金总资产的比例(%)"),
+}
+_REAL_ASSET_LABELS = {
+    "其中:股票": "current_stock_asset_allocation_percent",
+    "其中:债券": "current_bond_asset_allocation_percent",
+}
 _PERCENT_UNITS = {"%", "percent"}
 _ASSET_FACTS = {
     "股票": "current_stock_asset_allocation_percent",
@@ -118,6 +126,9 @@ _DEFAULT_IGNORABLE_PATTERN = re.compile(
     "\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
 )
 _DECIMAL_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
+_COMMA_GROUPED_DECIMAL_PATTERN = re.compile(
+    r"[1-9][0-9]{0,2}(?:,[0-9]{3})+(?:\.[0-9]+)?"
+)
 _ASSET_ROW_PATTERN = re.compile(
     r"报告期末(股票|债券|现金|港股)资产占(基金总资产|基金资产净值|基金净资产)的"
     r"|(?:stocks?|bonds?|cash|hong kong assets?) represent(?:ation)? of (total assets|net assets)",
@@ -303,6 +314,7 @@ def _validate_public_value(value: object) -> None:
 class ReportCell:
     text: str
     is_header: bool
+    is_structural_placeholder: bool = False
 
     def validate(self) -> None:
         _require_exact_record(self, ReportCell, "report cell")
@@ -313,6 +325,13 @@ class ReportCell:
         )
         if type(self.is_header) is not bool:
             raise ValueError("report cell header state must be boolean")
+        if type(self.is_structural_placeholder) is not bool:
+            raise ValueError("report cell structural placeholder state must be boolean")
+        if self.is_structural_placeholder:
+            if self.text != EMPTY_SEQUENCE_CELL_TEXT or self.is_header:
+                raise ValueError("report cell structural placeholder binding is invalid")
+        elif self.text == EMPTY_SEQUENCE_CELL_TEXT:
+            raise ValueError("report cell text cannot impersonate a structural placeholder")
 
 
 @dataclass(frozen=True)
@@ -462,6 +481,19 @@ def _nonnegative_decimal_value(value: str) -> Optional[Decimal]:
     return Decimal(normalized)
 
 
+def _real_asset_amount_value(value: str) -> Optional[Decimal]:
+    normalized = _normalized(value)
+    if (
+        _DECIMAL_PATTERN.fullmatch(normalized) is None
+        and _COMMA_GROUPED_DECIMAL_PATTERN.fullmatch(normalized) is None
+    ):
+        return None
+    parsed = Decimal(normalized.replace(",", ""))
+    if not parsed.is_finite() or parsed < 0:
+        return None
+    return parsed
+
+
 def _excerpt(value: str) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= MAX_EXCERPT_CHARACTERS:
@@ -509,6 +541,12 @@ def _headers(table: ReportTable) -> Optional[Tuple[str, ...]]:
     return tuple(_normalized(cell.text) for cell in first.cells)
 
 
+def is_real_asset_table_header(values: Tuple[str, ...]) -> bool:
+    if type(values) is not tuple or any(type(value) is not str for value in values):
+        return False
+    return tuple(_normalized(value) for value in values) in _REAL_ASSET_HEADERS
+
+
 def _denominator_unit(value: str, *, concentration: bool) -> Optional[str]:
     values = _CONCENTRATION_DENOMINATOR_UNITS if concentration else _DENOMINATOR_UNITS
     return values.get(_normalized(value))
@@ -544,6 +582,60 @@ def _asset_allocation_observations(
                     page_number=table.page_number,
                     section_name=table.section_name,
                     source_excerpt=_bound_value_excerpt(row),
+                )
+            )
+    return tuple(observations)
+
+
+def _real_asset_allocation_observations(
+    tables: Tuple[ReportTable, ...],
+) -> Tuple[CurrentReportObservation, ...]:
+    observations = []
+    for table in tables:
+        headers = _headers(table)
+        if headers is None or not is_real_asset_table_header(headers):
+            continue
+        for row in table.rows[1:]:
+            if any(cell.is_header for cell in row.cells):
+                continue
+            sequence_cell, label_cell, amount_cell, percent_cell = row.cells
+            if any(
+                cell.is_structural_placeholder
+                for cell in (label_cell, amount_cell, percent_cell)
+            ):
+                continue
+            sequence = _normalized(sequence_cell.text)
+            if sequence == EMPTY_SEQUENCE_CELL_TEXT:
+                if not sequence_cell.is_structural_placeholder:
+                    continue
+            elif (
+                sequence_cell.is_structural_placeholder
+                or not sequence.isascii()
+                or not sequence.isdecimal()
+                or str(int(sequence)) != sequence
+            ):
+                continue
+            label_text = label_cell.text
+            amount_text = amount_cell.text
+            percent_text = percent_cell.text
+            fact_kind = _REAL_ASSET_LABELS.get(_normalized_label(label_text))
+            if fact_kind is None:
+                continue
+            if _real_asset_amount_value(amount_text) is None:
+                continue
+            percent = _percent_value(percent_text)
+            if percent is None:
+                continue
+            observations.append(
+                _observation(
+                    fact_kind,
+                    percent,
+                    "percent_of_total_assets",
+                    page_number=table.page_number,
+                    section_name=table.section_name,
+                    source_excerpt=_excerpt(
+                        " | ".join((label_text, amount_text, percent_text))
+                    ),
                 )
             )
     return tuple(observations)
@@ -1227,6 +1319,7 @@ def extract_common_report_observations(
         table.validate()
     observations = (
         _asset_allocation_observations(tables)
+        + _real_asset_allocation_observations(tables)
         + _generic_concentration_observations(tables)
         + _security_concentration_observations(tables)
         + _industry_observations(tables, taxonomy_mappings)
