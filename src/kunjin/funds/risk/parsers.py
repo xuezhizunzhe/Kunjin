@@ -2317,11 +2317,11 @@ def _pdf_has_active_or_embedded_content(reader: PdfReader) -> bool:
         raise _fail(DocumentFailureReason.PARSER_FORMAT_INVALID) from exc
 
 
-def _looks_like_heading(value: str) -> bool:
+def _looks_like_heading(value: str, *, allow_overlong: bool = False) -> bool:
     stripped = value.strip()
     if (
         not stripped
-        or len(stripped) > MAX_SECTION_CHARACTERS
+        or (not allow_overlong and len(stripped) > MAX_SECTION_CHARACTERS)
         or any(character.isdigit() for character in stripped)
     ):
         return False
@@ -2363,12 +2363,13 @@ def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
                 raise _resource_limit()
             section = None
             section_current_observation_eligible = True
-            for raw_line in text.splitlines():
+            normalized_newlines = text.replace("\r\n", "\n").replace("\r", "\n")
+            for raw_line in normalized_newlines.split("\n"):
                 line = _normalized_text(raw_line)
                 if not line:
                     continue
                 extracted_any_text = True
-                if _looks_like_heading(line):
+                if _looks_like_heading(line, allow_overlong=True):
                     section, section_current_observation_eligible = _section_context(
                         raw_line, line
                     )

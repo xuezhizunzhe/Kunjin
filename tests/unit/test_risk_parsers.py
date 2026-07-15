@@ -1492,6 +1492,52 @@ class RiskLegacyConvertedParserTest(unittest.TestCase):
 
 
 class RiskPdfParserTest(unittest.TestCase):
+    def parse_extracted_text(self, text: str) -> object:
+        artifact = artifact_for(
+            FIXTURES / "current-report.pdf",
+            content_type="application/pdf",
+            kind=DocumentKind.QUARTERLY_REPORT,
+        )
+        with patch("pypdf._page.PageObject.extract_text", return_value=text):
+            return parse_artifact(artifact)
+
+    def test_pdf_overlong_uppercase_heading_preserves_unsafe_state_after_bound(self) -> None:
+        unsafe_heading = "A" * 264 + "\u2060" + "B" * 40
+        parsed = self.parse_extracted_text(
+            unsafe_heading + "\n报告期末股票资产占基金总资产35.2%。"
+        )
+
+        self.assertFalse(has_current_stock_fact(parsed))
+
+    def test_safe_pdf_overlong_uppercase_heading_is_bounded_and_current(self) -> None:
+        parsed = self.parse_extracted_text(
+            "A" * 305 + "\n报告期末股票资产占基金总资产35.2%。"
+        )
+
+        fact = one(parsed, "current_stock_asset_allocation_percent")
+        self.assertEqual(fact.section_name, "A" * 256)
+
+    def test_pdf_line_splitting_preserves_unsafe_control_heading_state(self) -> None:
+        for character in ("\u0085", "\u001c", "\u001d", "\u001e"):
+            for index in (255, 264):
+                heading = "A" * index + character + "B" * 40
+                parsed = self.parse_extracted_text(
+                    heading + "\n报告期末股票资产占基金总资产35.2%。"
+                )
+
+                with self.subTest(character=hex(ord(character)), index=index):
+                    self.assertFalse(has_current_stock_fact(parsed))
+
+    def test_pdf_overlong_lowercase_paragraph_is_not_promoted_to_heading(self) -> None:
+        parsed = self.parse_extracted_text(
+            "ordinary lowercase paragraph "
+            + "a" * 300
+            + "\n报告期末股票资产占基金总资产35.2%。"
+        )
+
+        fact = one(parsed, "current_stock_asset_allocation_percent")
+        self.assertIsNone(fact.section_name)
+
     def test_pdf_matches_html_facts_and_keeps_page_section_and_effective_date(self) -> None:
         pdf = parse_artifact(
             artifact_for(
