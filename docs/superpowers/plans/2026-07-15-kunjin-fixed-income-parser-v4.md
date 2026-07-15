@@ -165,9 +165,9 @@ rejection, and v4 converter-status JSON.
 - [ ] **Step 2: Run tests and observe missing parser integration**
 
 ```bash
-.venv/bin/python -m pytest -q \
-  tests/unit/test_risk_parsers.py -k fixed_income \
-  tests/unit/test_risk_engine.py -k 'bond and monotonic'
+.venv/bin/python -m pytest -q tests/unit/test_risk_parsers.py -k fixed_income
+.venv/bin/python -m pytest -q tests/unit/test_risk_engine.py \
+  -k 'bond and monotonic'
 ```
 
 - [ ] **Step 3: Integrate without opening unsafe sources**
@@ -198,8 +198,8 @@ HISTORICAL_LEGACY_PARSER_VERSIONS = frozenset(
 - [ ] **Step 4: Verify and commit report binding**
 
 ```bash
+.venv/bin/python -m pytest -q tests/unit/test_risk_report_facts.py -k fixed_income
 .venv/bin/python -m pytest -q \
-  tests/unit/test_risk_report_facts.py -k fixed_income \
   tests/unit/test_risk_parsers.py tests/unit/test_risk_engine.py \
   tests/unit/test_risk_audit.py tests/unit/test_risk_legacy_doc.py \
   tests/unit/test_risk_service.py tests/unit/test_risk_store.py \
