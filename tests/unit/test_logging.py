@@ -1,8 +1,10 @@
 import json
 import logging
 import unittest
+from collections import UserDict
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import MappingProxyType
 
 from kunjin.allocation.crypto import EncryptedAllocationAssessment
 from kunjin.allocation.engine import AllocationCapitalInputs, AllocationInputs
@@ -561,6 +563,326 @@ class LoggingTest(unittest.TestCase):
             "secret-attachment.bin",
         ):
             self.assertNotIn(sentinel, rendered)
+
+    def test_d1_selection_internal_fields_are_redacted_from_structured_logs(self) -> None:
+        value = {
+            "fund_code": "519755",
+            "status": "partial",
+            "selection_checksum": "a" * 64,
+            "selection": {
+                "candidate_fingerprint": "candidate-single-sentinel",
+                "candidate_fingerprints": (
+                    "candidate-one-sentinel",
+                    "candidate-two-sentinel",
+                ),
+                "selected_fingerprint": "selected-candidate-sentinel",
+                "unselected_urls": ("https://private.invalid/unselected-sentinel",),
+                "raw_selection_json": "raw-selection-json-sentinel",
+                "raw_selection_manifest_json": "raw-selection-manifest-sentinel",
+                "selection_manifest_json": "selection-manifest-sentinel",
+                "selection_canonical_json": "selection-canonical-sentinel",
+                "input_manifest_json": "classification-manifest-sentinel",
+                "normalized_html": "<html>normalized-html-sentinel</html>",
+                "database_path": "/private/tmp/database-path-sentinel.db",
+                "exception_text": "traceback exception-text-sentinel",
+            },
+            "selection_record": {
+                "canonical_json": "selection-record-canonical-sentinel",
+                "selection_checksum": "b" * 64,
+                "created_at": "2026-07-15T00:00:00+00:00",
+            },
+        }
+
+        redacted = redact_secrets(value)
+        rendered = json.dumps(redacted, ensure_ascii=False)
+
+        for sentinel in (
+            "candidate-single-sentinel",
+            "candidate-one-sentinel",
+            "candidate-two-sentinel",
+            "selected-candidate-sentinel",
+            "unselected-sentinel",
+            "raw-selection-json-sentinel",
+            "raw-selection-manifest-sentinel",
+            "selection-manifest-sentinel",
+            "selection-canonical-sentinel",
+            "classification-manifest-sentinel",
+            "normalized-html-sentinel",
+            "database-path-sentinel",
+            "exception-text-sentinel",
+            "selection-record-canonical-sentinel",
+        ):
+            self.assertNotIn(sentinel, rendered)
+        self.assertEqual(redacted["fund_code"], "519755")
+        self.assertEqual(redacted["status"], "partial")
+        self.assertEqual(redacted["selection_checksum"], "a" * 64)
+        self.assertEqual(redacted["selection_record"]["selection_checksum"], "b" * 64)
+        self.assertEqual(
+            redacted["selection_record"]["created_at"],
+            "2026-07-15T00:00:00+00:00",
+        )
+
+    def test_d1_selection_internal_fields_are_redacted_from_embedded_text(self) -> None:
+        payload = {
+            "fund_code": "519755",
+            "status": "partial",
+            "candidate_fingerprints": [
+                "json-candidate-one-sentinel",
+                "json-candidate-two-sentinel",
+            ],
+            "unselected_urls": ["https://private.invalid/json-unselected-sentinel"],
+            "raw_selection_json": "json-raw-selection-sentinel",
+            "normalized_html": "<html>json-html-sentinel</html>",
+            "database_path": "/private/tmp/json-database-sentinel.db",
+            "exception_text": "traceback json-exception-sentinel",
+            "selection_record": {
+                "canonical_json": "json-selection-canonical-sentinel",
+                "selection_checksum": "c" * 64,
+            },
+        }
+        embedded_json = f"sync context={json.dumps(payload, separators=(',', ':'))} done"
+        assignments = (
+            "fund_code=519755 status=partial "
+            "candidate_fingerprint=candidate-assignment-sentinel "
+            "raw_selection_manifest_json=manifest-assignment-sentinel "
+            "normalized_html='<html>html-assignment-sentinel</html>' "
+            "database_path=/private/tmp/database-assignment-sentinel.db "
+            "exception_text='traceback exception-assignment-sentinel'"
+        )
+        container_assignment = (
+            'status=partial candidate_fingerprints=["container-one-sentinel",'
+            '"container-two-sentinel"]'
+        )
+
+        redacted_json = redact_secrets(embedded_json)
+        redacted_assignments = redact_secrets(assignments)
+        redacted_container = redact_secrets(container_assignment)
+
+        for sentinel in (
+            "json-candidate-one-sentinel",
+            "json-candidate-two-sentinel",
+            "json-unselected-sentinel",
+            "json-raw-selection-sentinel",
+            "json-html-sentinel",
+            "json-database-sentinel",
+            "json-exception-sentinel",
+            "json-selection-canonical-sentinel",
+            "candidate-assignment-sentinel",
+            "manifest-assignment-sentinel",
+            "html-assignment-sentinel",
+            "database-assignment-sentinel",
+            "exception-assignment-sentinel",
+            "container-one-sentinel",
+            "container-two-sentinel",
+        ):
+            self.assertNotIn(sentinel, redacted_json)
+            self.assertNotIn(sentinel, redacted_assignments)
+            self.assertNotIn(sentinel, redacted_container)
+        self.assertIn("fund_code", redacted_json)
+        self.assertIn("519755", redacted_json)
+        self.assertIn("status", redacted_json)
+        self.assertIn("partial", redacted_json)
+        self.assertIn("c" * 64, redacted_json)
+        self.assertIn("fund_code=519755", redacted_assignments)
+        self.assertIn("status=partial", redacted_assignments)
+
+    def test_d1_selection_internal_fields_are_redacted_from_bytes(self) -> None:
+        source = (
+            b'fund_code=519755 candidate_fingerprints=["bytes-one-sentinel",'
+            b'"bytes-two-sentinel"] status=partial'
+        )
+
+        for value in (source, bytearray(source)):
+            with self.subTest(value_type=type(value).__name__):
+                redacted = redact_secrets(value)
+                self.assertIs(type(redacted), type(value))
+                rendered = bytes(redacted).decode("utf-8")
+                self.assertNotIn("bytes-one-sentinel", rendered)
+                self.assertNotIn("bytes-two-sentinel", rendered)
+                self.assertIn("fund_code=519755", rendered)
+                self.assertIn("status=partial", rendered)
+                self.assertIn("candidate_fingerprints=[REDACTED]", rendered)
+
+    def test_non_utf8_bytes_fail_closed_without_exposing_selection_fields(self) -> None:
+        source = b'candidate_fingerprints=["binary-secret-sentinel"]\xff'
+
+        for value, expected in (
+            (source, b"[REDACTED]"),
+            (bytearray(source), bytearray(b"[REDACTED]")),
+        ):
+            with self.subTest(value_type=type(value).__name__):
+                redacted = redact_secrets(value)
+                self.assertIs(type(redacted), type(value))
+                self.assertEqual(redacted, expected)
+                self.assertNotIn(b"binary-secret-sentinel", bytes(redacted))
+
+    def test_d1_selection_container_redaction_preserves_surrounding_safe_fields(
+        self,
+    ) -> None:
+        checksum = "d" * 64
+        cases = (
+            (
+                'candidate_fingerprints=["array-one-sentinel",'
+                '{"nested":["array-two-sentinel]still-secret"]}]',
+                "candidate_fingerprints=[REDACTED]",
+            ),
+            (
+                "candidate_fingerprints=('tuple-one-sentinel', "
+                "{'nested': ('tuple-two-sentinel)still-secret',)})",
+                "candidate_fingerprints=[REDACTED]",
+            ),
+            (
+                "unselected_urls={'primary': ['https://private.invalid/object-sentinel']}",
+                "unselected_urls=[REDACTED]",
+            ),
+            (
+                '"candidate_fingerprints": ["quoted-key-sentinel"]',
+                '"candidate_fingerprints": [REDACTED]',
+            ),
+        )
+
+        for sensitive, expected in cases:
+            with self.subTest(sensitive=sensitive[:40]):
+                value = (
+                    f"fund_code=519755 status=partial {sensitive} "
+                    f"selection_checksum={checksum} done"
+                )
+                redacted = redact_secrets(value)
+                self.assertIn("fund_code=519755", redacted)
+                self.assertIn("status=partial", redacted)
+                self.assertIn(f"selection_checksum={checksum}", redacted)
+                self.assertIn("done", redacted)
+                self.assertIn(expected, redacted)
+                self.assertNotIn("sentinel", redacted)
+
+    def test_d1_selection_unclosed_or_mismatched_container_fails_closed(self) -> None:
+        cases = (
+            'candidate_fingerprints=["unclosed-array-sentinel"',
+            'candidate_fingerprints=[{"nested":"mismatched-sentinel"]}',
+            "unselected_urls={'nested': ('unclosed-tuple-sentinel'}",
+            'raw_selection_json={"nested":["unclosed-object-sentinel"]',
+        )
+
+        for sensitive in cases:
+            with self.subTest(sensitive=sensitive):
+                value = f"fund_code=519755 {sensitive} trailing-secret-sentinel"
+                redacted = redact_secrets(value)
+                self.assertEqual(
+                    redacted,
+                    f"fund_code=519755 {sensitive.split('=', 1)[0]}=[REDACTED]",
+                )
+                self.assertNotIn("sentinel", redacted)
+
+    def test_d1_selection_quoted_values_handle_escapes_and_preserve_safe_suffix(
+        self,
+    ) -> None:
+        checksum = "e" * 64
+        cases = (
+            (
+                r'candidate_fingerprint="prefix\"double-escaped-sentinel"',
+                'candidate_fingerprint="[REDACTED]"',
+            ),
+            (
+                r"candidate_fingerprint='prefix\'single-escaped-sentinel'",
+                "candidate_fingerprint='[REDACTED]'",
+            ),
+            (
+                'exception_text="prefix\\\\backslash-sentinel"',
+                'exception_text="[REDACTED]"',
+            ),
+            (
+                'candidate_fingerprint="[REDACTED]"',
+                'candidate_fingerprint="[REDACTED]"',
+            ),
+            (
+                "candidate_fingerprint='[REDACTED]'",
+                "candidate_fingerprint='[REDACTED]'",
+            ),
+        )
+
+        for sensitive, expected in cases:
+            with self.subTest(sensitive=sensitive):
+                value = f"fund_code=519755 {sensitive} status=partial selection_checksum={checksum}"
+                redacted = redact_secrets(value)
+                self.assertIn("fund_code=519755", redacted)
+                self.assertIn(expected, redacted)
+                self.assertIn("status=partial", redacted)
+                self.assertIn(f"selection_checksum={checksum}", redacted)
+                self.assertNotIn("sentinel", redacted)
+
+    def test_d1_selection_unclosed_quoted_values_fail_closed(self) -> None:
+        cases = (
+            r'candidate_fingerprint="prefix\"double-unclosed-sentinel',
+            r"candidate_fingerprint='prefix\'single-unclosed-sentinel",
+            r'context={"status":"partial","candidate_fingerprint":"json\"unclosed-sentinel',
+        )
+
+        for value in cases:
+            with self.subTest(value=value):
+                redacted = redact_secrets(f"fund_code=519755 {value} trailing-secret-sentinel")
+                self.assertIn("fund_code=519755", redacted)
+                self.assertIn("candidate_fingerprint", redacted)
+                self.assertIn("[REDACTED]", redacted)
+                self.assertNotIn("sentinel", redacted)
+                self.assertNotIn("trailing-secret", redacted)
+
+    def test_d1_selection_fields_are_redacted_from_non_dict_mappings(self) -> None:
+        mappings = (
+            UserDict(
+                {
+                    "fund_code": "519755",
+                    "status": "partial",
+                    "candidate_fingerprints": ("userdict-secret-sentinel",),
+                    "nested": MappingProxyType(
+                        {
+                            "normalized_html": "<html>nested-userdict-sentinel</html>",
+                            "safe_code": "current_periodic_candidate_missing",
+                        }
+                    ),
+                }
+            ),
+            MappingProxyType(
+                {
+                    "fund_code": "519755",
+                    "status": "partial",
+                    "unselected_urls": ("https://private.invalid/proxy-secret-sentinel",),
+                    "nested": UserDict(
+                        {
+                            "exception_text": "traceback nested-proxy-sentinel",
+                            "safe_code": "current_periodic_candidate_conflict",
+                        }
+                    ),
+                }
+            ),
+        )
+
+        for value in mappings:
+            with self.subTest(value_type=type(value).__name__):
+                redacted = redact_secrets(value)
+                rendered = json.dumps(redacted, ensure_ascii=False)
+                self.assertEqual(redacted["fund_code"], "519755")
+                self.assertEqual(redacted["status"], "partial")
+                self.assertIn(redacted["nested"]["safe_code"], rendered)
+                self.assertNotIn("sentinel", rendered)
+
+    def test_d1_escaped_and_double_serialized_selection_fields_fail_closed(self) -> None:
+        payload = {
+            "candidate_fingerprint": "double-json-candidate-secret-sentinel",
+            "unselected_urls": ["https://private.invalid/double-json-url-secret-sentinel"],
+            "exception_text": "traceback double-json-exception-secret-sentinel",
+        }
+        cases = (
+            r"context={\"candidate_fingerprint\":\"escaped-key-secret-sentinel\"}",
+            r"candidate_fingerprint=\"escaped-value-secret-sentinel\"",
+            json.dumps(json.dumps(payload, separators=(",", ":"))),
+        )
+
+        for value in cases:
+            with self.subTest(value=value):
+                redacted = redact_secrets(f"fund_code=519755 {value} trailing-secret-sentinel")
+                self.assertIn("fund_code=519755", redacted)
+                self.assertIn("[REDACTED]", redacted)
+                self.assertNotIn("secret-sentinel", redacted)
 
     def test_d1_public_audit_fields_remain_visible_but_input_fingerprint_is_redacted(
         self,

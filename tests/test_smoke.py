@@ -423,6 +423,39 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("classification evidence", agent)
         self.assertIn("research_only", agent)
 
+    def test_readme_skill_privacy_phase_d1_1_c_contracts_are_packaged(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(encoding="utf-8")
+
+        shared_contract = (
+            "bounded newest-per-kind selection",
+            "current_periodic_candidate_missing",
+            "current_periodic_candidate_conflict",
+            "does not fall back to an older report",
+            "mandate facts",
+            "current observations",
+            "top-ten disclosure is incomplete",
+            "selection codes are audit bindings only",
+            "Manifest V3",
+            "parser v4",
+            "authenticated current industry-observation coverage is zero",
+            "D2",
+            "D3",
+            "Phase E",
+            "research_only",
+            "not a 90% beginner-help claim",
+            "no direction or amount",
+        )
+        normalized_readme = " ".join(readme.split())
+        normalized_skill = " ".join(skill.split())
+        for phrase in shared_contract:
+            self.assertIn(phrase, normalized_readme)
+            self.assertIn(phrase, normalized_skill)
+
+        for document in (readme, skill):
+            self.assertNotIn("D1.1-C is still required", document)
+
     def test_legacy_image_build_requires_digest_base_and_exact_package_version(self) -> None:
         root = Path(__file__).resolve().parents[1]
         dockerfile = (root / "containers/legacy-doc/Dockerfile").read_text(encoding="utf-8")

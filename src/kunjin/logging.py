@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Mapping
 from typing import Any, Optional
 
 _SECRET_KEYS = (
@@ -25,6 +26,7 @@ _SECRET_KEYS = (
     "parser_exception",
     "parser_exception_chain",
     "exception_chain",
+    "exception_text",
     "embedded_file",
     "embedded_files",
     "embedded_file_metadata",
@@ -100,6 +102,19 @@ _SECRET_KEYS = (
     "expected_profile_fingerprint",
     "expected_suitability_input_fingerprint",
     "encrypted_keyed_fingerprint",
+    "candidate_fingerprint",
+    "candidate_fingerprints",
+    "selected_fingerprint",
+    "unselected_url",
+    "unselected_urls",
+    "raw_selection_json",
+    "raw_selection_manifest_json",
+    "selection_manifest_json",
+    "selection_canonical_json",
+    "canonical_selection_json",
+    "input_manifest_json",
+    "normalized_html",
+    "database_path",
 )
 _SECRET_KEY_SET = frozenset(key.casefold() for key in _SECRET_KEYS)
 _SECRET_TYPE_NAMES = frozenset(
@@ -113,6 +128,9 @@ _SECRET_TYPE_NAMES = frozenset(
         "EncryptedAllocationAssessment",
         "GoalFundingDetail",
         "ObligationFundingDetail",
+        "DocumentSelectionPlan",
+        "PeriodicSelectionState",
+        "SelectionCandidate",
     }
 )
 _SECRET_REPR_START_PATTERN = re.compile(
@@ -127,15 +145,33 @@ _EXACT_PAYLOAD_MARKERS = frozenset(
         "total_financial_assets",
     }
 )
+_SELECTION_MANIFEST_MARKERS = frozenset({"canonical_json", "selection_checksum"})
 _JSON_DECODER = json.JSONDecoder()
 _SECRET_PATTERN = re.compile(
     rf"(?i)(?<![\w-])(?P<key_quote>[\"']?)"
     rf"(?P<key>{'|'.join(re.escape(key) for key in _SECRET_KEYS)})"
     r"(?P=key_quote)(?P<separator>\s*[:=]\s*)"
-    r"(?:(?P<decimal_value>Decimal\s*\(\s*(?:\"[^\"]*\"|'[^']*')\s*\))|"
+    r"(?:(?P<redacted_value>\[REDACTED\])|"
+    r"(?P<decimal_value>Decimal\s*\(\s*(?:\"[^\"]*\"|'[^']*')\s*\))|"
     r"\"(?P<double_value>[^\"]*)\"|"
     r"'(?P<single_value>[^']*)'|"
     r"(?P<bare_value>[^\s,;}\]\"']+))"
+)
+_SECRET_CONTAINER_START_PATTERN = re.compile(
+    rf"(?i)(?<![\w-])(?:[\"']?)"
+    rf"(?:{'|'.join(re.escape(key) for key in _SECRET_KEYS)})"
+    r"(?:[\"']?)(?:\s*[:=]\s*)(?P<opening>[\[({])"
+)
+_SECRET_QUOTED_VALUE_START_PATTERN = re.compile(
+    rf"(?i)(?<![\w-])(?P<key_quote>[\"']?)"
+    rf"(?:{'|'.join(re.escape(key) for key in _SECRET_KEYS)})"
+    r"(?P=key_quote)(?:\s*[:=]\s*)(?P<value_quote>[\"'])"
+)
+_ESCAPED_SECRET_START_PATTERN = re.compile(
+    rf"(?i)(?:\\+[\"'](?:{'|'.join(re.escape(key) for key in _SECRET_KEYS)})"
+    rf"\\+[\"']\s*[:=]|(?<![\w-])"
+    rf"(?:{'|'.join(re.escape(key) for key in _SECRET_KEYS)})"
+    r"\s*[:=]\s*\\+[\"'])"
 )
 
 
@@ -150,17 +186,25 @@ def _redact_value(value: Any) -> Any:
         try:
             decoded = bytes(value).decode("utf-8")
         except UnicodeDecodeError:
-            return value
-        redacted = _redact_embedded_exact_payloads(decoded)
+            marker = b"[REDACTED]"
+            return bytearray(marker) if isinstance(value, bytearray) else marker
+        redacted = _redact_text(decoded)
         if redacted == decoded:
             return value
         encoded = redacted.encode("utf-8")
         return bytearray(encoded) if isinstance(value, bytearray) else encoded
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
+        selection_manifest = _SELECTION_MANIFEST_MARKERS.issubset(
+            key.casefold() for key in value if isinstance(key, str)
+        )
         return {
             key: (
                 "[REDACTED]"
-                if isinstance(key, str) and key.casefold() in _SECRET_KEY_SET
+                if isinstance(key, str)
+                and (
+                    key.casefold() in _SECRET_KEY_SET
+                    or (selection_manifest and key.casefold() == "canonical_json")
+                )
                 else _redact_value(item)
             )
             for key, item in value.items()
@@ -176,8 +220,19 @@ def _redact_value(value: Any) -> Any:
     if not isinstance(value, str):
         return value
 
+    return _redact_text(value)
+
+
+def _redact_text(value: str) -> str:
+    escaped_secret = _ESCAPED_SECRET_START_PATTERN.search(value)
+    if escaped_secret is not None:
+        return value[: escaped_secret.start()] + "[REDACTED]"
+
     value = _redact_embedded_exact_payloads(value)
+    value = _redact_embedded_secret_payloads(value)
     value = _redact_secret_reprs(value)
+    value = _redact_secret_containers(value)
+    value = _redact_secret_quoted_values(value)
 
     def replacement(match: re.Match) -> str:
         value_quote = ""
@@ -195,8 +250,138 @@ def _redact_value(value: Any) -> Any:
     return _SECRET_PATTERN.sub(replacement, value)
 
 
+def _redact_secret_containers(value: str) -> str:
+    fragments = []
+    retained_from = 0
+    search_from = 0
+    while True:
+        match = _SECRET_CONTAINER_START_PATTERN.search(value, search_from)
+        if match is None:
+            break
+        opening = match.start("opening")
+        end = _balanced_container_end(value, opening)
+        fragments.extend((value[retained_from:opening], "[REDACTED]"))
+        if end is None:
+            return "".join(fragments)
+        retained_from = end
+        search_from = end
+    if not fragments:
+        return value
+    return "".join(fragments) + value[retained_from:]
+
+
+def _redact_secret_quoted_values(value: str) -> str:
+    fragments = []
+    retained_from = 0
+    search_from = 0
+    while True:
+        match = _SECRET_QUOTED_VALUE_START_PATTERN.search(value, search_from)
+        if match is None:
+            break
+        opening = match.start("value_quote")
+        quote = match.group("value_quote")
+        end = _quoted_value_end(value, opening, quote)
+        fragments.append(value[retained_from:opening])
+        if end is None:
+            fragments.append("[REDACTED]")
+            return "".join(fragments)
+        fragments.append(f"{quote}[REDACTED]{quote}")
+        retained_from = end
+        search_from = end
+    if not fragments:
+        return value
+    return "".join(fragments) + value[retained_from:]
+
+
+def _quoted_value_end(value: str, opening: int, quote: str) -> Optional[int]:
+    escaped = False
+    for index in range(opening + 1, len(value)):
+        character = value[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == quote:
+            return index + 1
+    return None
+
+
+def _balanced_container_end(value: str, opening: int) -> Optional[int]:
+    pairs = {"[": "]", "(": ")", "{": "}"}
+    stack = []
+    quote = None
+    escaped = False
+    for index in range(opening, len(value)):
+        character = value[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            continue
+        if character in pairs:
+            stack.append(character)
+            continue
+        if character not in pairs.values():
+            continue
+        if not stack or pairs[stack[-1]] != character:
+            return None
+        stack.pop()
+        if not stack:
+            return index + 1
+    return None
+
+
 def _is_exact_payload(value: object) -> bool:
-    return isinstance(value, dict) and _EXACT_PAYLOAD_MARKERS.issubset(value)
+    return isinstance(value, Mapping) and _EXACT_PAYLOAD_MARKERS.issubset(value)
+
+
+def _contains_secret_keys(value: object) -> bool:
+    if isinstance(value, Mapping):
+        keys = {key.casefold() for key in value if isinstance(key, str)}
+        if keys & _SECRET_KEY_SET or _SELECTION_MANIFEST_MARKERS.issubset(keys):
+            return True
+        return any(_contains_secret_keys(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_secret_keys(item) for item in value)
+    return False
+
+
+def _redact_embedded_secret_payloads(value: str) -> str:
+    fragments = []
+    retained_from = 0
+    search_from = 0
+    redacted = False
+    while True:
+        start = value.find("{", search_from)
+        if start < 0:
+            break
+        try:
+            payload, consumed = _JSON_DECODER.raw_decode(value[start:])
+        except json.JSONDecodeError:
+            search_from = start + 1
+            continue
+        end = start + consumed
+        if not _contains_secret_keys(payload):
+            search_from = start + 1
+            continue
+        source = value[start:end]
+        separators = None if re.search(r'"\s*:\s+', source) else (",", ":")
+        rendered = json.dumps(
+            _redact_value(payload),
+            ensure_ascii=False,
+            separators=separators,
+        )
+        fragments.extend((value[retained_from:start], rendered))
+        retained_from = end
+        search_from = end
+        redacted = True
+    return "".join(fragments) + value[retained_from:] if redacted else value
 
 
 def _redact_embedded_exact_payloads(value: str) -> str:

@@ -207,6 +207,20 @@ privately.
   exactly, together with evidence tags, freshness, source documents, publication
   dates, and bounded excerpts. Explain them separately without omission or
   softening.
+- D1.1-C uses bounded newest-per-kind selection for annual, semiannual, and
+  quarterly reports. Preserve `current_periodic_candidate_missing` and
+  `current_periodic_candidate_conflict` exactly. A selected technical failure,
+  missing newest candidate, or newest-time conflict does not fall back to an older report.
+- The selection codes are audit bindings only. They do not replace Policy V1
+  financial reason, conflict, freshness, or missing-evidence codes. New current
+  classifications authenticate the exact refresh and terminal candidate-run
+  outcomes through Manifest V3 and require active parser v4 provenance.
+- Keep mandate facts from legal documents separate from current observations in
+  periodic reports. Do not infer either category from the other. A top-ten
+  disclosure is incomplete evidence of the whole portfolio; never treat omitted
+  holdings, issuers, ratings, industries, or exposures as zero.
+- The authenticated current industry-observation coverage is zero because the
+  production controlled-taxonomy registry is empty.
 - Treat D1 `cash_like_candidate` as distinct from Phase C `protected_cash`.
   Treat `core_eligible` as classification eligibility, not a recommendation,
   suitability result, allocation, target, or buy signal.
@@ -221,8 +235,10 @@ privately.
 - The optional personal-use converter must use the reviewed local SHA-256 Docker
   image with runtime `--pull=never` and `--network=none`. There is no host `textutil` fallback and no host LibreOffice fallback. Never build or pull the image
   during a fund sync.
-- Conversion success is not financial evidence. D1.1-C is still required for
-  current report facts; D2, D3, and Phase E remain unimplemented.
+- Conversion success is not financial evidence. D1.1-C current-report selection,
+  Manifest V3 authentication, and parser v4 extraction do not implement D2, D3,
+  or Phase E; every result remains `research_only`, with no direction or amount
+  authorized. This is not a 90% beginner-help claim.
 - State `insufficient_data` plainly when KunJin cannot support a conclusion.
 
 ## Suitability And Allocation Prompt-Injection Checks

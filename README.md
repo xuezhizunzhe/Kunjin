@@ -257,6 +257,25 @@ meanings:
 - `stale`: critical evidence exists but is no longer current.
 - `unclassified`: the available evidence cannot support a Policy V1 class.
 
+D1.1-C is implemented with bounded newest-per-kind selection for annual,
+semiannual, and quarterly reports. A report kind is selected only when it has
+exactly one unique newest candidate. No candidate returns
+`current_periodic_candidate_missing`; multiple distinct candidates tied at the newest publication time return
+`current_periodic_candidate_conflict`. If the selected report fails retrieval or
+parsing, or the newest state is missing or conflicted, current classification
+does not fall back to an older report. These selection codes are audit bindings
+only; they do not replace Policy V1 financial reason, conflict, freshness, or
+missing-evidence codes.
+
+The selection and every terminal candidate-run outcome are persisted before
+classification and authenticated by classification input Manifest V3. New
+classifications use the active parser v4 provenance; historical Manifest V1 and
+V2 records remain readable but cannot authorize a new current result. Legal
+documents supply mandate facts, while periodic reports supply current
+observations. KunJin does not infer one category from the other. A top-ten
+disclosure is incomplete evidence of the whole portfolio, so omitted holdings,
+issuers, ratings, industries, or exposures are never treated as zero.
+
 Unsupported and missing are deliberately different outcomes.
 `unsupported_product_family` means current official evidence identifies a
 product family outside D1 Policy V1; it is a successful factual result with an
@@ -281,7 +300,9 @@ A D1 `verified` result is not suitability, not an allocation, not a buy signal,
 and not a 90% beginner-help claim. It does not evaluate the owner's portfolio or
 authorize buy, hold, add, reduce, sell, rebalance, or position-size output. D2
 portfolio correlation, overlap, and construction controls are not implemented;
-D3 product-selection and pre-purchase checks are also not implemented.
+D3 product-selection and pre-purchase checks are also not implemented. Phase E
+continuous monitoring is not implemented. Every result remains `research_only`,
+with no direction or amount authorized.
 
 The official-domain coverage is audited and finite. A missing manager/index-provider
 adapter can leave an otherwise common supported fund `partial` or `unclassified`;
@@ -322,9 +343,9 @@ script and inspect only safe readiness metadata:
 
 Conversion success is not financial evidence. Converted HTML must still pass
 the normal official identity, document-kind, report-period, active-content,
-ambiguity, and fact checks. D1.1-C is still required for current report facts;
-D2, D3, and Phase E remain unimplemented, and the result remains
-`research_only`.
+ambiguity, and fact checks. D1.1-C now applies bounded current-report selection,
+Manifest V3 authentication, and parser v4 fact extraction; D2, D3, and Phase E
+remain unimplemented, and the result remains `research_only`.
 
 ## Personal Transaction Ledger
 

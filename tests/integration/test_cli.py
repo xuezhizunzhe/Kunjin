@@ -134,6 +134,7 @@ def document_selections(
         ),
     )
 
+
 class FakeProfileKeyStore:
     def __init__(self) -> None:
         self.key = b"fake-profile-key-secret-value!!!"
@@ -1548,9 +1549,7 @@ class CliIntegrationTest(unittest.TestCase):
             fund_code="519755",
             status="failed",
             documents=(item,),
-            selections=document_selections(
-                annual_url="https://www.fund001.com/report.doc"
-            ),
+            selections=document_selections(annual_url="https://www.fund001.com/report.doc"),
             selection_checksum="a" * 64,
             attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
         )
@@ -1791,8 +1790,7 @@ class CliIntegrationTest(unittest.TestCase):
                     self.assertEqual(payload["data"]["documents"], [])
                     self.assertTrue(
                         all(
-                            item["status"] == "missing"
-                            and item["selected_url"] is None
+                            item["status"] == "missing" and item["selected_url"] is None
                             for item in payload["data"]["selections"]
                         )
                     )
@@ -1999,7 +1997,7 @@ class CliIntegrationTest(unittest.TestCase):
             "canonical_json",
             "private-selection-manifest-sentinel",
         )
-        service.sync_result = DocumentSyncResult(
+        result = DocumentSyncResult(
             fund_code="519755",
             status="empty",
             documents=(),
@@ -2007,6 +2005,22 @@ class CliIntegrationTest(unittest.TestCase):
             selection_checksum="a" * 64,
             attempted_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
         )
+        object.__setattr__(
+            result,
+            "raw_selection_json",
+            '{"managed_path":"/private/tmp/private-selection.doc"}',
+        )
+        object.__setattr__(result, "candidate_fingerprints", ("c" * 64,))
+        object.__setattr__(
+            result,
+            "unselected_urls",
+            ("https://private.invalid/unselected?token=private-result-sentinel",),
+        )
+        object.__setattr__(result, "managed_path", "/private/tmp/private-selection.doc")
+        object.__setattr__(result, "normalized_html", "<html>private-result-sentinel</html>")
+        object.__setattr__(result, "database_path", str(self.context.paths.database))
+        object.__setattr__(result, "exception_text", "traceback private-result-sentinel")
+        service.sync_result = result
         self.context.fund_risk_service = service
 
         with (
@@ -2025,6 +2039,12 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertNotIn("canonical_json", rendered)
         self.assertNotIn("private-selection-sentinel", rendered)
         self.assertNotIn("private-selection-manifest-sentinel", rendered)
+        self.assertNotIn("raw_selection_json", rendered)
+        self.assertNotIn("private-result-sentinel", rendered)
+        self.assertNotIn("/private/tmp/private-selection.doc", rendered)
+        self.assertNotIn(str(self.context.paths.database), rendered)
+        self.assertNotIn("<html>", rendered)
+        self.assertNotIn("traceback", rendered.casefold())
 
     def test_fund_risk_technical_errors_use_only_public_messages(self) -> None:
         service = FakeRiskService()
