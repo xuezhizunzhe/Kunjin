@@ -23,85 +23,34 @@
 - `tests/unit/test_risk_report_facts.py`, `test_risk_parsers.py`, and
   `test_risk_engine.py`: financial extraction and monotonicity.
 
-## Task 1: Activate Parser V4 Without Rewriting History
+## Task 1: Preserve Parser V3 Until V4 Behavior Is Complete
 
 **Files:**
 
-- Modify: `src/kunjin/funds/risk/audit.py`
-- Verify or modify only when required: `src/kunjin/funds/risk/legacy_doc.py`
-- Verify or modify only when required: `src/kunjin/funds/risk/service.py`
-- Modify: `tests/unit/test_risk_audit.py`
-- Modify: `tests/unit/test_risk_legacy_doc.py`
-- Modify: `tests/unit/test_risk_service.py`
-- Modify: `tests/unit/test_risk_store.py`
-- Modify: `tests/unit/test_schema_v12.py`
-- Modify: `tests/test_smoke.py`
+- Verify: `src/kunjin/funds/risk/audit.py`
+- Verify: `src/kunjin/funds/risk/parsers.py`
 
-- [ ] **Step 1: Write failing provenance tests**
+- [x] **Step 1: Prove early activation is unsafe**
 
-Assert the exact identities:
+Independent review demonstrated that activating v4 before the nine fixed-income
+facts exist permits an artifact to persist the old fact set under the future v4
+identity. Reprocessing the same artifact after Task 3 would then violate the
+immutable `(source_document_id, provenance_id)` result contract.
 
-```python
-self.assertEqual(native_parser_provenance().parser_version, "4")
-self.assertEqual(
-    legacy_parser_provenance(...).parser_version,
-    "4-docker-libreoffice-v1",
-)
-self.assertEqual(HISTORICAL_NATIVE_PARSER_VERSIONS, frozenset({"2", "3"}))
-self.assertEqual(
-    HISTORICAL_LEGACY_PARSER_VERSIONS,
-    frozenset({"2-docker-libreoffice-v1", "3-docker-libreoffice-v1"}),
-)
-```
+- [x] **Step 2: Restore the accepted v3 runtime identity**
 
-Also prove one artifact can retain separate v3/v4 parse results, v3 bytes and
-checksums remain unchanged, v3 cannot satisfy current evidence, and unknown v5
-is rejected.
-
-- [ ] **Step 2: Run tests and observe the v3 baseline failure**
-
-```bash
-.venv/bin/python -m pytest -q \
-  tests/unit/test_risk_audit.py tests/unit/test_risk_legacy_doc.py \
-  tests/unit/test_risk_service.py tests/unit/test_risk_store.py \
-  tests/unit/test_schema_v12.py tests/test_smoke.py \
-  -k 'parser or provenance or converter'
-```
-
-Expected: failures identify active v3 or unknown v4, not unrelated behavior.
-
-- [ ] **Step 3: Change only the parser identity sets**
+The active identity remains:
 
 ```python
-ACTIVE_NATIVE_PARSER_VERSION = "4"
-ACTIVE_LEGACY_PARSER_VERSION = "4-docker-libreoffice-v1"
-HISTORICAL_NATIVE_PARSER_VERSIONS = frozenset({"2", "3"})
-HISTORICAL_LEGACY_PARSER_VERSIONS = frozenset(
-    {"2-docker-libreoffice-v1", "3-docker-libreoffice-v1"}
-)
+ACTIVE_NATIVE_PARSER_VERSION = "3"
+ACTIVE_LEGACY_PARSER_VERSION = "3-docker-libreoffice-v1"
+HISTORICAL_NATIVE_PARSER_VERSIONS = frozenset({"2"})
+HISTORICAL_LEGACY_PARSER_VERSIONS = frozenset({"2-docker-libreoffice-v1"})
 ```
 
-Use these constants through existing legacy status and service gates. Do not
-rebuild the converter image, alter labels, or rewrite stored v2/v3 rows.
-
-- [ ] **Step 4: Verify and commit parser v4 identity**
-
-Run Step 2 again, then:
-
-```bash
-.venv/bin/ruff check src/kunjin/funds/risk/audit.py \
-  src/kunjin/funds/risk/legacy_doc.py src/kunjin/funds/risk/service.py \
-  tests/unit/test_risk_audit.py tests/unit/test_risk_legacy_doc.py \
-  tests/unit/test_risk_service.py tests/unit/test_risk_store.py \
-  tests/unit/test_schema_v12.py tests/test_smoke.py
-git diff --check
-git add src/kunjin/funds/risk/audit.py \
-  src/kunjin/funds/risk/legacy_doc.py src/kunjin/funds/risk/service.py \
-  tests/unit/test_risk_audit.py tests/unit/test_risk_legacy_doc.py \
-  tests/unit/test_risk_service.py tests/unit/test_risk_store.py \
-  tests/unit/test_schema_v12.py tests/test_smoke.py
-git commit -m "feat: activate report parser v4"
-```
+Do not run a real sync under an incomplete v4 identity. The v4 switch and all
+v4 compatibility tests move to Task 3 and must land in the same commit as the
+complete parser behavior.
 
 ## Task 2: Extract Structurally Complete Fixed-Income Facts
 
@@ -181,8 +130,18 @@ git commit -m "feat: extract current fixed income facts"
 **Files:**
 
 - Modify: `src/kunjin/funds/risk/parsers.py`
+- Modify: `src/kunjin/funds/risk/audit.py`
+- Verify or modify only when required: `src/kunjin/funds/risk/legacy_doc.py`
+- Verify or modify only when required: `src/kunjin/funds/risk/service.py`
 - Modify: `tests/unit/test_risk_parsers.py`
 - Modify: `tests/unit/test_risk_engine.py`
+- Modify: `tests/unit/test_risk_audit.py`
+- Modify: `tests/unit/test_risk_legacy_doc.py`
+- Modify: `tests/unit/test_risk_service.py`
+- Modify: `tests/unit/test_risk_store.py`
+- Modify: `tests/unit/test_schema_v12.py`
+- Modify: `tests/integration/test_cli.py`
+- Modify: `tests/test_smoke.py`
 
 - [ ] **Step 1: Write failing parser and monotonicity tests**
 
@@ -198,7 +157,10 @@ self.assert_not_improved(current, baseline)
 ```
 
 Also test deletion, ambiguous confidence, stale freshness, conflicting values,
-and threshold breaches.
+and threshold breaches. In the same red phase, add the complete v4 provenance
+contract: active native/legacy v4, v2/v3 immutable history, stored native and
+legacy v3 rejected as current, same-artifact v3/v4 coexistence, unknown v5
+rejection, and v4 converter-status JSON.
 
 - [ ] **Step 2: Run tests and observe missing parser integration**
 
@@ -222,19 +184,42 @@ page/section binding. Do not reconstruct PDF tables, enable legacy `nfc_only`
 text, or relax trusted-heading and temporal-context checks. Reuse the existing
 report-period validation and `duplicate_conflicting_clause` handling.
 
+Only after the complete extraction path is present, atomically switch identity:
+
+```python
+ACTIVE_NATIVE_PARSER_VERSION = "4"
+ACTIVE_LEGACY_PARSER_VERSION = "4-docker-libreoffice-v1"
+HISTORICAL_NATIVE_PARSER_VERSIONS = frozenset({"2", "3"})
+HISTORICAL_LEGACY_PARSER_VERSIONS = frozenset(
+    {"2-docker-libreoffice-v1", "3-docker-libreoffice-v1"}
+)
+```
+
 - [ ] **Step 4: Verify and commit report binding**
 
 ```bash
 .venv/bin/python -m pytest -q \
   tests/unit/test_risk_report_facts.py -k fixed_income \
-  tests/unit/test_risk_parsers.py tests/unit/test_risk_engine.py
+  tests/unit/test_risk_parsers.py tests/unit/test_risk_engine.py \
+  tests/unit/test_risk_audit.py tests/unit/test_risk_legacy_doc.py \
+  tests/unit/test_risk_service.py tests/unit/test_risk_store.py \
+  tests/unit/test_schema_v12.py tests/integration/test_cli.py tests/test_smoke.py
 .venv/bin/ruff check src/kunjin/funds/risk/report_facts.py \
-  src/kunjin/funds/risk/parsers.py tests/unit/test_risk_report_facts.py \
-  tests/unit/test_risk_parsers.py tests/unit/test_risk_engine.py
+  src/kunjin/funds/risk/parsers.py src/kunjin/funds/risk/audit.py \
+  src/kunjin/funds/risk/legacy_doc.py src/kunjin/funds/risk/service.py \
+  tests/unit/test_risk_report_facts.py tests/unit/test_risk_parsers.py \
+  tests/unit/test_risk_engine.py tests/unit/test_risk_audit.py \
+  tests/unit/test_risk_legacy_doc.py tests/unit/test_risk_service.py \
+  tests/unit/test_risk_store.py tests/unit/test_schema_v12.py \
+  tests/integration/test_cli.py tests/test_smoke.py
 git diff --check
-git add src/kunjin/funds/risk/parsers.py tests/unit/test_risk_parsers.py \
-  tests/unit/test_risk_engine.py
-git commit -m "feat: bind fixed income facts to current reports"
+git add src/kunjin/funds/risk/audit.py src/kunjin/funds/risk/legacy_doc.py \
+  src/kunjin/funds/risk/service.py src/kunjin/funds/risk/parsers.py \
+  tests/unit/test_risk_parsers.py tests/unit/test_risk_engine.py \
+  tests/unit/test_risk_audit.py tests/unit/test_risk_legacy_doc.py \
+  tests/unit/test_risk_service.py tests/unit/test_risk_store.py \
+  tests/unit/test_schema_v12.py tests/integration/test_cli.py tests/test_smoke.py
+git commit -m "feat: activate fixed income report parser v4"
 ```
 
 ## Task 4: Full Regression And Independent Acceptance
