@@ -1493,41 +1493,6 @@ def _external_facts(
                 )
             )
 
-    industries = _current_sourced_records(
-        bundle,
-        bundle.industry_exposure,
-        DocumentKind.INDUSTRY_EXPOSURE,
-        classified_at,
-    )
-    if industries:
-        latest_period = max(item.report_period for item in industries)
-        current_industries = tuple(
-            item for item in industries if item.report_period == latest_period
-        )
-        source_id = current_industries[0].source_document_id
-        facts.extend(
-            (
-                _synthetic_fact(
-                    current_industries[0].fund_code,
-                    "current_largest_industry_weight_percent",
-                    max(item.weight for item in current_industries),
-                    source_id,
-                    "industry",
-                    unit="percent_of_net_assets",
-                    effective_from=latest_period,
-                    effective_to=latest_period,
-                ),
-                _synthetic_fact(
-                    current_industries[0].fund_code,
-                    "current_industry_count",
-                    len({item.industry_code or item.industry_name for item in current_industries}),
-                    source_id,
-                    "industry",
-                    effective_from=latest_period,
-                    effective_to=latest_period,
-                ),
-            )
-        )
     return tuple(sorted(facts, key=_fact_order))
 
 

@@ -3028,7 +3028,9 @@ class RiskServiceBoundaryTest(unittest.TestCase):
         self.assertIn("nav_behavior_conflicts_with_declared_scope", base_result.conflicts)
         self.assertNotEqual(base_result.risk_bucket.value, "high_quality_fixed_income")
 
-    def test_sourced_bundle_generates_only_supported_external_facts(self) -> None:
+    def test_external_industry_records_are_bound_but_not_promoted_to_current_facts(
+        self,
+    ) -> None:
         legal = stored_fact(
             fact_id=1,
             document_id=1,
@@ -3042,10 +3044,11 @@ class RiskServiceBoundaryTest(unittest.TestCase):
             published_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
             facts=(legal,),
         )
+        bundle = sourced_disclosure_bundle()
         store = FakeRiskStore((record,))
         result = FundRiskService(
             risk_store=store,
-            disclosure_store=FakeDisclosureStore(sourced_disclosure_bundle()),
+            disclosure_store=FakeDisclosureStore(bundle),
             repository=FakeRepository(),
             discovery=SimpleNamespace(),
             document_client=SimpleNamespace(),
@@ -3065,19 +3068,32 @@ class RiskServiceBoundaryTest(unittest.TestCase):
         self.assertEqual(facts["size_evidence_present"], True)
         self.assertEqual(facts["holdings_evidence_complete"], False)
         self.assertEqual(facts["current_largest_security_weight_percent"], Decimal("8"))
-        self.assertEqual(facts["current_largest_industry_weight_percent"], Decimal("20"))
+        self.assertTrue(
+            {
+                "current_largest_industry_name",
+                "current_largest_industry_weight_percent",
+                "current_industry_count",
+            }.isdisjoint(facts)
+        )
         self.assertEqual(
             units["current_largest_security_weight_percent"],
             "percent_of_net_assets",
         )
-        self.assertEqual(
-            units["current_largest_industry_weight_percent"],
-            "percent_of_net_assets",
-        )
         self.assertNotIn("source_version_conflict", result.conflicts)
-        self.assertEqual(facts["current_industry_count"], 2)
         self.assertNotIn("current_top_ten_holdings_weight_percent", facts)
         self.assertNotIn("current_stock_asset_allocation_percent", facts)
+        self.assertEqual(len(bundle.industry_exposure), 2)
+        self.assertIn(
+            "industry",
+            dict(store.saved_evidence.external_evidence_fingerprints),
+        )
+        self.assertIn(
+            (99, "industry"),
+            {
+                (item.source_document_id, item.section)
+                for item in store.saved_evidence.external_source_references
+            },
+        )
         report = build_authenticated_risk_research_report(
             SimpleNamespace(
                 evidence=store.saved_evidence,
@@ -3095,6 +3111,102 @@ class RiskServiceBoundaryTest(unittest.TestCase):
         }
         self.assertIn(("d1_artifact", 1, None), source_keys)
         self.assertIn(("fund_disclosure", 99, "holdings"), source_keys)
+        self.assertIn(("fund_disclosure", 99, "industry"), source_keys)
+
+    def test_external_industry_absence_fails_active_equity_gates_as_missing(self) -> None:
+        report_period = date(2026, 3, 31)
+        bundle = sourced_disclosure_bundle()
+        holdings = tuple(
+            FundHolding(
+                fund_code="519755",
+                report_period=report_period,
+                published_at=NOW,
+                rank=rank,
+                security_code=f"600{rank:03d}",
+                security_name=f"公开证券{rank}",
+                asset_type=AssetType.STOCK,
+                weight=Decimal("5"),
+                disclosure_scope="complete",
+                source_document_id=99,
+            )
+            for rank in range(1, 11)
+        )
+        industries = tuple(
+            FundIndustryExposure(
+                fund_code="519755",
+                report_period=report_period,
+                published_at=NOW,
+                classification_standard="申万",
+                industry_name=f"公开行业{rank}",
+                weight=Decimal(str(21 - rank)),
+                source_document_id=99,
+                industry_code=f"801{rank:03d}",
+            )
+            for rank in range(1, 6)
+        )
+        legal = stored_fact(
+            fact_id=1,
+            document_id=1,
+            fact_kind="legal_product_family",
+            value="active_equity",
+        )
+        record = stored_document(
+            DocumentKind.PROSPECTUS_UPDATE,
+            artifact_id=1,
+            title="2026年更新招募说明书",
+            published_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            facts=(legal,),
+        )
+        nav = FundNavObservation(
+            fund_code="519755",
+            nav_date=date(2026, 7, 10),
+            unit_nav=Decimal("1.1"),
+            accumulated_nav=Decimal("1.2"),
+            daily_growth=Decimal("0.1"),
+            source="eastmoney_formal_nav",
+            retrieved_at=NOW,
+        )
+        store = FakeRiskStore((record,))
+
+        result = FundRiskService(
+            risk_store=store,
+            disclosure_store=FakeDisclosureStore(
+                replace(bundle, holdings=holdings, industry_exposure=industries)
+            ),
+            repository=FakeRepository((nav,)),
+            discovery=SimpleNamespace(),
+            document_client=SimpleNamespace(),
+            clock=lambda: NOW,
+        ).classify("519755")
+
+        facts = {
+            item.fact_kind: item.normalized_value
+            for item in store.saved_evidence.existing_disclosure_facts
+        }
+        self.assertEqual(facts["current_largest_security_weight_percent"], Decimal("5"))
+        self.assertEqual(facts["current_top_ten_holdings_weight_percent"], Decimal("50"))
+        self.assertEqual(facts["current_stock_asset_allocation_percent"], Decimal("50"))
+        self.assertEqual(facts["fee_evidence_present"], True)
+        self.assertEqual(facts["size_evidence_present"], True)
+        self.assertEqual(facts["share_class_evidence_present"], True)
+        self.assertIsNotNone(store.saved_evidence.nav_evidence_fingerprint)
+        self.assertEqual(
+            result.missing_evidence,
+            (
+                "industry_concentration_evidence_missing",
+                "industry_count_evidence_missing",
+            ),
+        )
+        self.assertEqual(
+            result.reason_codes,
+            (
+                "classification_partial",
+                "critical_evidence_missing",
+                "industry_evidence_missing",
+            ),
+        )
+        self.assertEqual(result.conflicts, ())
+        self.assertEqual(result.portfolio_role.value, "not_eligible")
 
     def test_complete_sourced_holdings_use_explicit_net_asset_denominators(self) -> None:
         bundle = sourced_disclosure_bundle()
@@ -3145,7 +3257,6 @@ class RiskServiceBoundaryTest(unittest.TestCase):
             "current_largest_security_weight_percent",
             "current_top_ten_holdings_weight_percent",
             "current_stock_asset_allocation_percent",
-            "current_largest_industry_weight_percent",
         ):
             with self.subTest(fact_kind=fact_kind):
                 self.assertEqual(units[fact_kind], "percent_of_net_assets")

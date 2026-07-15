@@ -957,6 +957,35 @@ class ProductFamilyMatrixTest(unittest.TestCase):
 
 
 class DowngradeAndConflictTest(unittest.TestCase):
+    def test_absent_industry_facts_are_missing_and_not_zero(self) -> None:
+        report = complete_equity_report()
+        del report["current_largest_industry_weight_percent"]
+        del report["current_industry_count"]
+
+        result = classify(
+            evidence(legal={"legal_product_family": "active_equity"}, report=report)
+        )
+
+        self.assertEqual(result.evidence_status, EvidenceStatus.PARTIAL)
+        self.assertEqual(result.risk_bucket, RiskBucket.CONCENTRATED_EQUITY)
+        self.assertEqual(result.portfolio_role, PortfolioRole.NOT_ELIGIBLE)
+        self.assertEqual(
+            result.reason_codes,
+            (
+                "classification_partial",
+                "critical_evidence_missing",
+                "industry_evidence_missing",
+            ),
+        )
+        self.assertEqual(
+            result.missing_evidence,
+            (
+                "industry_concentration_evidence_missing",
+                "industry_count_evidence_missing",
+            ),
+        )
+        self.assertEqual(result.conflicts, ())
+
     def test_missing_active_concentration_evidence_is_partial_and_not_eligible(self) -> None:
         report = complete_equity_report()
         del report["current_industry_count"]
