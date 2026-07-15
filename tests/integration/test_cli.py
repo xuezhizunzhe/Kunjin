@@ -38,6 +38,7 @@ from kunjin.funds.risk.engine import classification_input_manifest_v1
 from kunjin.funds.risk.legacy_doc import ConverterStatus
 from kunjin.funds.risk.parsers import ParsedRiskDocument
 from kunjin.funds.risk.policy import ClassificationPolicyV1
+from kunjin.funds.risk.selection import select_current_candidates
 from kunjin.funds.risk.service import (
     DocumentSelectionItem,
     DocumentSyncItem,
@@ -1385,6 +1386,14 @@ class CliIntegrationTest(unittest.TestCase):
         )
         parsed = ParsedRiskDocument(artifact=artifact, facts=(), warnings=(), conflicts=())
         refresh_id = risk_store.begin_document_refresh("519755", now)
+        risk_store.publish_document_selection(
+            select_current_candidates(
+                "519755",
+                refresh_run_id=refresh_id,
+                candidates=(candidate,),
+            ),
+            now,
+        )
         risk_store.publish_candidate_success(
             refresh_id=refresh_id,
             candidate=candidate,
