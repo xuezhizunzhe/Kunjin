@@ -980,6 +980,15 @@ def _issuer_category(value: str) -> Optional[str]:
     return None
 
 
+def _canonical_credit_rating(value: str) -> Optional[str]:
+    normalized = _normalized_label(value)
+    if normalized in _HIGH_QUALITY_RATINGS | _BELOW_AA_PLUS_RATINGS:
+        return normalized.removesuffix("级")
+    if normalized in _UNRATED_RATINGS:
+        return "unrated"
+    return None
+
+
 def _credit_distribution_observations(
     tables: Tuple[ReportTable, ...],
 ) -> Tuple[CurrentReportObservation, ...]:
@@ -1007,18 +1016,15 @@ def _credit_distribution_observations(
         valid = True
         for row in table.rows[1:]:
             rating_text, category_text, weight_text = (cell.text for cell in row.cells)
-            rating = _normalized_label(rating_text)
+            rating = _canonical_credit_rating(rating_text)
             category = _issuer_category(category_text)
             weight = _percent_value(weight_text)
             key = (rating, category)
             if (
-                category is None
+                rating is None
+                or category is None
                 or weight is None
                 or key in seen
-                or rating
-                not in _HIGH_QUALITY_RATINGS
-                | _BELOW_AA_PLUS_RATINGS
-                | _UNRATED_RATINGS
             ):
                 valid = False
                 break
@@ -1030,7 +1036,7 @@ def _credit_distribution_observations(
             elif rating in _BELOW_AA_PLUS_RATINGS:
                 below_aa_plus += weight
                 found["below"] = True
-            elif category == "non_sovereign":
+            elif rating == "unrated" and category == "non_sovereign":
                 unrated_non_sovereign += weight
                 found["unrated_non_sovereign"] = True
         if (
@@ -1137,11 +1143,12 @@ def _issuer_concentration_observations(
         unit = _ISSUER_WEIGHT_HEADERS[weight_header]
         seen_names = set()
         non_sovereign_weights = []
+        total = Decimal("0")
         valid = True
         for row in table.rows[1:]:
             category_text, name_text, weight_text = (cell.text for cell in row.cells)
             category = _issuer_category(category_text)
-            name = _normalized(name_text)
+            name = _normalized_label(name_text)
             weight = _percent_value(weight_text)
             if (
                 category is None
@@ -1153,9 +1160,10 @@ def _issuer_concentration_observations(
                 valid = False
                 break
             seen_names.add(name)
+            total += weight
             if category == "non_sovereign":
                 non_sovereign_weights.append(weight)
-        if not valid or not non_sovereign_weights:
+        if not valid or total > 100 or not non_sovereign_weights:
             continue
         observations.append(
             _observation(

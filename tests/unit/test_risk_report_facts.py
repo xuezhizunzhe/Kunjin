@@ -1304,6 +1304,80 @@ class FixedIncomeReportFactExtractionTest(unittest.TestCase):
                     (),
                 )
 
+    def test_fixed_income_credit_rejects_duplicate_canonical_rating_aliases(self) -> None:
+        duplicate_aliases = (
+            self.complete_credit_table(
+                rows=(
+                    ("AAA", "其他非主权", "40"),
+                    ("AAA级", "其他非主权", "40"),
+                    ("AA", "其他非主权", "10"),
+                    ("未评级", "其他非主权", "10"),
+                )
+            ),
+            self.complete_credit_table(
+                rows=(
+                    ("AAA", "其他非主权", "40"),
+                    ("AA", "其他非主权", "5"),
+                    ("AA级", "其他非主权", "5"),
+                    ("未评级", "其他非主权", "50"),
+                )
+            ),
+        )
+
+        for table in duplicate_aliases:
+            with self.subTest(excerpt=table.source_excerpt):
+                self.assertEqual(
+                    extract_fixed_income_report_observations(
+                        text_blocks=(), tables=(table,)
+                    ),
+                    (),
+                )
+
+    def test_fixed_income_issuer_rejects_normalized_chinese_name_duplicates(
+        self,
+    ) -> None:
+        duplicate = self.complete_issuer_table(
+            rows=(
+                ("主权", "中华人民共和国财政部", "87"),
+                ("其他非主权", "发行人甲", "8"),
+                ("其他非主权", "发行 人甲", "5"),
+            )
+        )
+
+        self.assertEqual(
+            extract_fixed_income_report_observations(
+                text_blocks=(), tables=(duplicate,)
+            ),
+            (),
+        )
+
+    def test_fixed_income_issuer_rejects_total_weight_above_one_hundred(self) -> None:
+        tables = (
+            self.complete_issuer_table(
+                rows=(
+                    ("主权", "中华人民共和国财政部", "60"),
+                    ("其他非主权", "发行人甲", "50"),
+                )
+            ),
+            common_table(
+                ("发行人类别", "发行人名称", "占基金资产比例(%)"),
+                (
+                    ("政策性银行", "国家开发银行", "70"),
+                    ("其他非主权", "发行人甲", "40"),
+                ),
+                section_name="报告期末全部固定收益证券发行人分布",
+            ),
+        )
+
+        for table in tables:
+            with self.subTest(header=table.rows[0].cells[2].text):
+                self.assertEqual(
+                    extract_fixed_income_report_observations(
+                        text_blocks=(), tables=(table,)
+                    ),
+                    (),
+                )
+
     def test_fixed_income_combined_convertible_exchangeable_row_is_not_split(self) -> None:
         combined = common_table(
             ("指标", "单位", "数值"),
