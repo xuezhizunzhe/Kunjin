@@ -289,25 +289,7 @@ def current_evidence_projection(
 ) -> tuple[tuple, tuple]:
     """Return the unique current record set and selected periodic facts."""
 
-    if type(records) is not tuple:
-        raise ValueError("parsed document records must be an immutable tuple")
-    by_kind = {}
-    for record in records:
-        artifact = record.artifact
-        current = by_kind.get(artifact.document_kind)
-        if current is None or _record_order(record) > _record_order(current):
-            by_kind[artifact.document_kind] = record
-    if DocumentKind.PROSPECTUS_UPDATE in by_kind:
-        by_kind.pop(DocumentKind.PROSPECTUS, None)
-    current_records = tuple(
-        sorted(
-            by_kind.values(),
-            key=lambda item: (
-                item.artifact.document_kind.value,
-                _record_order(item),
-            ),
-        )
-    )
+    current_records = select_current_documents(records)
     periodic_records = tuple(
         record
         for record in current_records
@@ -355,6 +337,31 @@ def current_evidence_projection(
             )
         ),
     )
+
+
+def select_current_documents(records: tuple) -> tuple:
+    """Select the newest record per kind without applying report-fact projection."""
+
+    if type(records) is not tuple:
+        raise ValueError("parsed document records must be an immutable tuple")
+    by_kind = {}
+    for record in records:
+        artifact = record.artifact
+        current = by_kind.get(artifact.document_kind)
+        if current is None or _record_order(record) > _record_order(current):
+            by_kind[artifact.document_kind] = record
+    if DocumentKind.PROSPECTUS_UPDATE in by_kind:
+        by_kind.pop(DocumentKind.PROSPECTUS, None)
+    current_records = tuple(
+        sorted(
+            by_kind.values(),
+            key=lambda item: (
+                item.artifact.document_kind.value,
+                _record_order(item),
+            ),
+        )
+    )
+    return current_records
 
 
 def _record_order(record: object) -> tuple:

@@ -62,6 +62,10 @@ from kunjin.funds.risk.parsers import (
 )
 from kunjin.funds.risk.policy import ClassificationPolicyV1
 from kunjin.funds.risk.research import build_authenticated_risk_research_report
+from kunjin.funds.risk.selection import (
+    PERIODIC_DOCUMENT_KINDS,
+    select_current_candidates,
+)
 from kunjin.funds.risk.service import (
     DocumentSelectionItem,
     DocumentSyncItem,
@@ -319,6 +323,12 @@ def publish_current_document(
     started_at: datetime = NOW,
 ) -> ParsedDocumentRecord:
     refresh_id = store.begin_document_refresh(parsed.artifact.candidate.fund_code, started_at)
+    selection = select_current_candidates(
+        parsed.artifact.candidate.fund_code,
+        refresh_run_id=refresh_id,
+        candidates=(parsed.artifact.candidate,),
+    )
+    store.publish_document_selection(selection, started_at)
     record = store.publish_candidate_success(
         refresh_id=refresh_id,
         candidate=parsed.artifact.candidate,
@@ -668,6 +678,7 @@ class FakeRiskStore:
         self.saved = None
         self.saved_evidence = None
         self._next_refresh_id = 1
+        self.snapshot_override = None
 
     def begin_document_refresh(self, fund_code: str, started_at: datetime) -> int:
         refresh_id = self._next_refresh_id
@@ -762,6 +773,63 @@ class FakeRiskStore:
             if record.provenance.provenance_checksum in active_provenance_checksums
         )
 
+    def current_document_selection_snapshot(self, fund_code: str) -> object:
+        if self.snapshot_override is not None:
+            return self.snapshot_override
+        refresh_id = 1
+        if self.refreshes:
+            refresh_id = max(self.refreshes)
+            latest = self.refreshes[refresh_id]
+            completion = latest["completion"]
+            if completion is None or completion[0] not in {
+                RefreshOutcome.SUCCESS,
+                RefreshOutcome.PARTIAL,
+            }:
+                return None
+        periodic = tuple(
+            record
+            for record in self.records
+            if record.artifact.document_kind in PERIODIC_DOCUMENT_KINDS
+        )
+        nonperiodic = tuple(
+            record
+            for record in self.records
+            if record.artifact.document_kind not in PERIODIC_DOCUMENT_KINDS
+        )
+        snapshot_payload = {
+            "refresh_run_id": refresh_id,
+            "records": [
+                {
+                    "artifact_id": record.artifact.id,
+                    "parse_result_id": record.parse_result.id,
+                    "provenance_checksum": record.provenance.provenance_checksum,
+                }
+                for record in self.records
+            ],
+        }
+        snapshot_checksum = hashlib.sha256(
+            json.dumps(
+                snapshot_payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+        ).hexdigest()
+        return SimpleNamespace(
+            selection=SimpleNamespace(
+                refresh_run_id=refresh_id,
+                fund_code=fund_code,
+                selection_policy_checksum="a" * 64,
+                selection_checksum=hashlib.sha256(
+                    f"selection:{fund_code}:{refresh_id}".encode("ascii")
+                ).hexdigest(),
+            ),
+            selected_periodic_records=periodic,
+            nonperiodic_successful_records=nonperiodic,
+            candidate_run_snapshot_checksum=snapshot_checksum,
+            selection_reason_codes=(),
+        )
+
     def current_parser_requirements(self, _: str) -> tuple[StoredParserProvenance, ...]:
         return tuple(
             sorted(
@@ -804,6 +872,30 @@ class FakeRepository:
 
     def fund_history(self, _: str) -> list[FundNavObservation]:
         return list(self.history)
+
+
+def selection_snapshot(
+    *,
+    periodic: tuple[ParsedDocumentRecord, ...] = (),
+    nonperiodic: tuple[ParsedDocumentRecord, ...] = (),
+    refresh_run_id: int = 1,
+    reason_codes: tuple[str, ...] = (),
+    selection_policy_checksum: str = "a" * 64,
+    selection_checksum: str = "b" * 64,
+    candidate_run_snapshot_checksum: str = "c" * 64,
+) -> object:
+    return SimpleNamespace(
+        selection=SimpleNamespace(
+            refresh_run_id=refresh_run_id,
+            fund_code="519755",
+            selection_policy_checksum=selection_policy_checksum,
+            selection_checksum=selection_checksum,
+        ),
+        selected_periodic_records=periodic,
+        nonperiodic_successful_records=nonperiodic,
+        candidate_run_snapshot_checksum=candidate_run_snapshot_checksum,
+        selection_reason_codes=reason_codes,
+    )
 
 
 class RiskServiceBoundaryTest(unittest.TestCase):
@@ -1391,7 +1483,7 @@ class RiskServiceBoundaryTest(unittest.TestCase):
         service.current_classification("519755")
 
         self.assertEqual(
-            store.active_provenance_checksums,
+            store.saved_evidence.parser_provenance_checksums,
             (native_parser_provenance().provenance_checksum,),
         )
         self.assertEqual(converter.active_provenance_calls, 0)
@@ -1420,7 +1512,7 @@ class RiskServiceBoundaryTest(unittest.TestCase):
         service.classify("519755")
 
         self.assertEqual(
-            store.active_provenance_checksums,
+            store.saved_evidence.parser_provenance_checksums,
             (LEGACY_PROVENANCE.provenance_checksum,),
         )
         self.assertGreaterEqual(converter.active_provenance_calls, 1)
@@ -1497,10 +1589,6 @@ class RiskServiceBoundaryTest(unittest.TestCase):
                     store.saved_evidence.parser_provenance_checksums,
                     (current.provenance.provenance_checksum,),
                 )
-                self.assertEqual(
-                    store.active_provenance_checksums,
-                    (native_parser_provenance().provenance_checksum,),
-                )
 
     def test_known_legacy_v2_and_v3_evidence_is_unavailable_until_v4_refresh(
         self,
@@ -1558,6 +1646,313 @@ class RiskServiceBoundaryTest(unittest.TestCase):
             ).classify("519755")
 
         self.assertEqual(caught.exception.code, "classification_storage_failed")
+
+    def test_selected_v4_success_uses_exact_snapshot_record(self) -> None:
+        old_fact = stored_fact(
+            fact_id=901,
+            document_id=901,
+            fact_kind="current_stock_asset_allocation_percent",
+            value=Decimal("10"),
+            unit="percent_of_net_assets",
+        )
+        current_fact = stored_fact(
+            fact_id=902,
+            document_id=902,
+            fact_kind="current_stock_asset_allocation_percent",
+            value=Decimal("20"),
+            unit="percent_of_net_assets",
+        )
+        old = stored_document(
+            DocumentKind.QUARTERLY_REPORT,
+            artifact_id=901,
+            title="2026年第1季度报告",
+            published_at=NOW - timedelta(days=30),
+            facts=(old_fact,),
+        )
+        current = stored_document(
+            DocumentKind.SEMIANNUAL_REPORT,
+            artifact_id=902,
+            title="2026年半年度报告",
+            published_at=NOW,
+            facts=(current_fact,),
+        )
+        store = FakeRiskStore((old, current))
+        store.snapshot_override = selection_snapshot(
+            periodic=(current,),
+            refresh_run_id=7,
+        )
+
+        FundRiskService(
+            risk_store=store,
+            disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+            repository=FakeRepository(),
+            discovery=SimpleNamespace(),
+            document_client=SimpleNamespace(),
+            clock=lambda: NOW,
+        ).classify("519755")
+
+        self.assertEqual(store.saved_evidence.document_ids, (902,))
+        self.assertEqual(
+            tuple(fact.normalized_value for fact in store.saved_evidence.report_facts),
+            (Decimal("20"),),
+        )
+        self.assertEqual(store.saved_evidence.document_refresh_run_id, 7)
+        self.assertEqual(store.saved_evidence.selection_policy_checksum, "a" * 64)
+        self.assertEqual(store.saved_evidence.selection_manifest_checksum, "b" * 64)
+        self.assertEqual(store.saved_evidence.candidate_run_snapshot_checksum, "c" * 64)
+
+    def test_failed_or_missing_periodic_selection_never_uses_old_report(self) -> None:
+        old = stored_document(
+            DocumentKind.ANNUAL_REPORT,
+            artifact_id=901,
+            title="2025年年度报告",
+            published_at=NOW - timedelta(days=90),
+            facts=(
+                stored_fact(
+                    fact_id=901,
+                    document_id=901,
+                    fact_kind="current_stock_asset_allocation_percent",
+                    value=Decimal("40"),
+                    unit="percent_of_net_assets",
+                ),
+            ),
+        )
+        legal = stored_document(
+            DocumentKind.PRODUCT_SUMMARY,
+            artifact_id=902,
+            title="2026年产品资料概要",
+            published_at=NOW,
+        )
+        for reason_codes in ((), ("current_periodic_candidate_missing",)):
+            with self.subTest(reason_codes=reason_codes):
+                store = FakeRiskStore((old, legal))
+                store.snapshot_override = selection_snapshot(
+                    nonperiodic=(legal,),
+                    reason_codes=reason_codes,
+                )
+
+                result = FundRiskService(
+                    risk_store=store,
+                    disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+                    repository=FakeRepository(),
+                    discovery=SimpleNamespace(),
+                    document_client=SimpleNamespace(),
+                    clock=lambda: NOW,
+                ).classify("519755")
+
+                self.assertEqual(store.saved_evidence.document_ids, (902,))
+                self.assertEqual(store.saved_evidence.report_facts, ())
+                self.assertEqual(
+                    store.saved_evidence.selection_reason_codes,
+                    reason_codes,
+                )
+                self.assertEqual(
+                    tuple(item.source_document_id for item in store.saved_evidence.freshness),
+                    (902,),
+                )
+                self.assertNotIn(
+                    "current_periodic_candidate_missing",
+                    result.reason_codes,
+                )
+                self.assertNotIn(
+                    "current_periodic_candidate_missing",
+                    result.missing_evidence,
+                )
+
+    def test_selection_reason_binding_is_audit_only_and_cannot_improve_rank(self) -> None:
+        record = stored_document(
+            DocumentKind.PRODUCT_SUMMARY,
+            artifact_id=901,
+            title="2026年产品资料概要",
+            published_at=NOW,
+        )
+
+        def classify_with(reason_codes: tuple[str, ...]):
+            store = FakeRiskStore((record,))
+            store.snapshot_override = selection_snapshot(
+                nonperiodic=(record,),
+                reason_codes=reason_codes,
+            )
+            result = FundRiskService(
+                risk_store=store,
+                disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+                repository=FakeRepository(),
+                discovery=SimpleNamespace(),
+                document_client=SimpleNamespace(),
+                clock=lambda: NOW,
+            ).classify("519755")
+            return result
+
+        baseline = classify_with(())
+        bound = classify_with(
+            (
+                "current_periodic_candidate_conflict",
+                "current_periodic_candidate_missing",
+            )
+        )
+
+        self.assertEqual(bound.product_family, baseline.product_family)
+        self.assertEqual(bound.risk_bucket, baseline.risk_bucket)
+        self.assertEqual(bound.portfolio_role, baseline.portfolio_role)
+        self.assertEqual(bound.evidence_status, baseline.evidence_status)
+        self.assertEqual(bound.reason_codes, baseline.reason_codes)
+        self.assertEqual(bound.missing_evidence, baseline.missing_evidence)
+
+    def test_mixed_active_and_historical_snapshot_is_entirely_unavailable(self) -> None:
+        active = stored_document(
+            DocumentKind.QUARTERLY_REPORT,
+            artifact_id=901,
+            title="2026年第1季度报告",
+            published_at=NOW,
+        )
+        historical = stored_document(
+            DocumentKind.PRODUCT_SUMMARY,
+            artifact_id=902,
+            title="2026年产品资料概要",
+            published_at=NOW,
+            parser_provenance=historical_native_provenance("3"),
+        )
+        store = FakeRiskStore((active, historical))
+        store.snapshot_override = selection_snapshot(
+            periodic=(active,),
+            nonperiodic=(historical,),
+        )
+
+        with self.assertRaises(RiskServiceError) as caught:
+            FundRiskService(
+                risk_store=store,
+                disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+                repository=FakeRepository(),
+                discovery=SimpleNamespace(),
+                document_client=SimpleNamespace(),
+                clock=lambda: NOW,
+            ).classify("519755")
+
+        self.assertEqual(caught.exception.code, "official_document_unavailable")
+
+    def test_selection_snapshot_change_before_insert_is_evidence_changed(self) -> None:
+        record = stored_document(
+            DocumentKind.PRODUCT_SUMMARY,
+            artifact_id=901,
+            title="2026年产品资料概要",
+            published_at=NOW,
+        )
+        changes = (
+            {"refresh_run_id": 2},
+            {"selection_policy_checksum": "d" * 64},
+            {"selection_checksum": "d" * 64},
+            {"candidate_run_snapshot_checksum": "d" * 64},
+            {"reason_codes": ("current_periodic_candidate_missing",)},
+        )
+        for change in changes:
+            with self.subTest(change=tuple(change)):
+                store = FakeRiskStore((record,))
+                store.snapshot_override = selection_snapshot(nonperiodic=(record,))
+
+                def checkpoint(point: str) -> None:
+                    if point == "before_insert":
+                        store.snapshot_override = selection_snapshot(
+                            nonperiodic=(record,),
+                            **change,
+                        )
+
+                with self.assertRaises(RiskServiceError) as caught:
+                    FundRiskService(
+                        risk_store=store,
+                        disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+                        repository=FakeRepository(),
+                        discovery=SimpleNamespace(),
+                        document_client=SimpleNamespace(),
+                        clock=lambda: NOW,
+                        evidence_checkpoint=checkpoint,
+                    ).classify("519755")
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "classification_calculation_failed",
+                )
+                self.assertEqual(caught.exception.reason, "evidence_changed")
+
+    def test_report_retrieval_time_does_not_extend_freshness(self) -> None:
+        report = stored_document(
+            DocumentKind.ANNUAL_REPORT,
+            artifact_id=901,
+            title="公开基金2025年年度报告",
+            published_at=datetime(2026, 3, 31, tzinfo=timezone.utc),
+        ).artifact
+        later_retrieval = replace(report, retrieved_at=NOW + timedelta(days=30))
+
+        original = evidence_freshness(report, ClassificationPolicyV1(), NOW)
+        retrieved_later = evidence_freshness(
+            later_retrieval,
+            ClassificationPolicyV1(),
+            NOW,
+        )
+
+        self.assertEqual(retrieved_later.observed_at, original.observed_at)
+        self.assertEqual(retrieved_later.valid_until, original.valid_until)
+        self.assertEqual(retrieved_later.state, original.state)
+
+    def test_same_refresh_nonperiodic_projection_keeps_only_current_update(self) -> None:
+        prospectus = stored_document(
+            DocumentKind.PROSPECTUS,
+            artifact_id=901,
+            title="2025年招募说明书",
+            published_at=NOW - timedelta(days=365),
+        )
+        old_update = stored_document(
+            DocumentKind.PROSPECTUS_UPDATE,
+            artifact_id=902,
+            title="2026年第一次更新招募说明书",
+            published_at=NOW - timedelta(days=30),
+        )
+        current_update = stored_document(
+            DocumentKind.PROSPECTUS_UPDATE,
+            artifact_id=903,
+            title="2026年第二次更新招募说明书",
+            published_at=NOW,
+        )
+        records = (prospectus, current_update, old_update)
+        store = FakeRiskStore(records)
+        store.snapshot_override = selection_snapshot(nonperiodic=records)
+
+        FundRiskService(
+            risk_store=store,
+            disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+            repository=FakeRepository(),
+            discovery=SimpleNamespace(),
+            document_client=SimpleNamespace(),
+            clock=lambda: NOW,
+        ).classify("519755")
+
+        self.assertEqual(store.saved_evidence.document_ids, (903,))
+
+    def test_snapshot_storage_revalidation_failure_is_public_storage_failure(self) -> None:
+        record = stored_document(
+            DocumentKind.PRODUCT_SUMMARY,
+            artifact_id=901,
+            title="2026年产品资料概要",
+            published_at=NOW,
+        )
+
+        class RevalidationFailureStore(FakeRiskStore):
+            def save_classification(self, *_: object) -> object:
+                raise RiskStoreError("private selection snapshot changed")
+
+        store = RevalidationFailureStore((record,))
+        store.snapshot_override = selection_snapshot(nonperiodic=(record,))
+        with self.assertRaises(RiskServiceError) as caught:
+            FundRiskService(
+                risk_store=store,
+                disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+                repository=FakeRepository(),
+                discovery=SimpleNamespace(),
+                document_client=SimpleNamespace(),
+                clock=lambda: NOW,
+            ).classify("519755")
+
+        self.assertEqual(caught.exception.code, "classification_storage_failed")
+        self.assertNotIn("private selection snapshot changed", repr(caught.exception))
 
     def test_refresh_start_is_committed_before_discovery_is_called(self) -> None:
         events: list[object] = []
@@ -2080,6 +2475,13 @@ class RiskServiceBoundaryTest(unittest.TestCase):
                 ),
             )
             refresh_id = store.begin_document_refresh("519755", NOW)
+            failed = candidate(DocumentKind.PRODUCT_SUMMARY, "failed")
+            selection = select_current_candidates(
+                "519755",
+                refresh_run_id=refresh_id,
+                candidates=(current.artifact.candidate, failed),
+            )
+            store.publish_document_selection(selection, NOW)
             current_record = store.publish_candidate_success(
                 refresh_id=refresh_id,
                 candidate=current.artifact.candidate,
@@ -2088,7 +2490,6 @@ class RiskServiceBoundaryTest(unittest.TestCase):
                 parser_input_sha256=current.artifact.sha256,
                 attempted_at=NOW,
             )
-            failed = candidate(DocumentKind.PRODUCT_SUMMARY, "failed")
             store.publish_candidate_failure(
                 refresh_id=refresh_id,
                 candidate=failed,
@@ -2865,6 +3266,10 @@ class RiskServiceBoundaryTest(unittest.TestCase):
                 facts=(semiannual_value,),
             ),
         )
+        self.assertEqual(
+            {record.artifact.id for record in select_current_documents(records)},
+            {1, 2, 3},
+        )
         store = FakeRiskStore(records)
         service = FundRiskService(
             risk_store=store,
@@ -2932,10 +3337,6 @@ class RiskServiceBoundaryTest(unittest.TestCase):
         self.assertEqual(
             evidence.parser_provenance_checksums,
             (record.provenance.provenance_checksum,),
-        )
-        self.assertEqual(
-            risk_store.active_provenance_checksums,
-            (native_parser_provenance().provenance_checksum,),
         )
         report = build_authenticated_risk_research_report(
             SimpleNamespace(

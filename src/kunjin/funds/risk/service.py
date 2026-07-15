@@ -64,7 +64,11 @@ from kunjin.funds.risk.selection import (
     PERIODIC_DOCUMENT_KINDS,
     SELECTION_STATES,
     DocumentSelectionPlan,
+    current_evidence_projection,
     select_current_candidates,
+)
+from kunjin.funds.risk.selection import (
+    select_current_documents as select_current_document_records,
 )
 from kunjin.funds.risk.store import RiskStoreError, StoredParserProvenance
 from kunjin.funds.service import expected_report_period
@@ -866,16 +870,26 @@ class FundRiskService:
         fund_code: str,
         classified_at: datetime,
     ) -> ClassificationEvidence:
-        active_provenance_checksums = self._current_provenance_checksums(fund_code)
         try:
-            current_records = self._risk_store.current_parsed_documents(
-                fund_code,
-                active_provenance_checksums,
-            )
+            snapshot = self._risk_store.current_document_selection_snapshot(fund_code)
         except RiskStoreError as exc:
             raise RiskServiceError("classification_storage_failed") from exc
-        candidate_records = select_current_documents(current_records)
-        if not candidate_records:
+        if snapshot is None:
+            raise RiskServiceError("official_document_unavailable")
+        successful_records = (
+            snapshot.selected_periodic_records + snapshot.nonperiodic_successful_records
+        )
+        if not successful_records:
+            raise RiskServiceError("official_document_unavailable")
+        self._require_active_provenance(successful_records)
+
+        nonperiodic_records, _ = current_evidence_projection(
+            snapshot.nonperiodic_successful_records
+        )
+        records, report_facts = current_evidence_projection(
+            snapshot.selected_periodic_records + nonperiodic_records
+        )
+        if not records:
             raise RiskServiceError("official_document_unavailable")
         bundle = self._disclosure_store.load_bundle(fund_code)
         validate_bundle = getattr(bundle, "validate", None)
@@ -889,15 +903,6 @@ class FundRiskService:
 
         legal_facts = []
         benchmark_facts = []
-        report_facts, current_report_records = _current_report_facts(candidate_records)
-        records = (
-            tuple(
-                record
-                for record in candidate_records
-                if record.artifact.document_kind not in _REPORT_KINDS
-            )
-            + current_report_records
-        )
         existing_facts = list(_external_facts(bundle, classified_at))
         fact_ids = []
         for record in records:
@@ -965,23 +970,23 @@ class FundRiskService:
             parser_provenance_checksums=tuple(
                 sorted({record.provenance.provenance_checksum for record in records})
             ),
+            document_refresh_run_id=snapshot.selection.refresh_run_id,
+            selection_policy_checksum=snapshot.selection.selection_policy_checksum,
+            selection_manifest_checksum=snapshot.selection.selection_checksum,
+            candidate_run_snapshot_checksum=snapshot.candidate_run_snapshot_checksum,
+            selection_reason_codes=snapshot.selection_reason_codes,
         )
         evidence.validate()
         return evidence
 
-    def _current_provenance_checksums(self, fund_code: str) -> Tuple[str, ...]:
-        try:
-            requirements = self._risk_store.current_parser_requirements(fund_code)
-        except RiskStoreError as exc:
-            raise RiskServiceError("classification_storage_failed") from exc
-        if type(requirements) is not tuple:
+    def _require_active_provenance(self, records: tuple) -> None:
+        if type(records) is not tuple:
             raise RiskServiceError("classification_storage_failed")
-
         native = native_parser_provenance()
         legacy_checksums = set()
-        checksums = set()
         historical_provenance_found = False
-        for requirement in requirements:
+        for record in records:
+            requirement = getattr(record, "provenance", None)
             if type(requirement) is not StoredParserProvenance:
                 raise RiskServiceError("classification_storage_failed")
             try:
@@ -1009,7 +1014,6 @@ class FundRiskService:
                 legacy_checksums.add(provenance.provenance_checksum)
             else:
                 raise RiskServiceError("classification_storage_failed")
-            checksums.add(provenance.provenance_checksum)
 
         if historical_provenance_found:
             raise RiskServiceError("official_document_unavailable")
@@ -1017,7 +1021,6 @@ class FundRiskService:
             active = self._current_legacy_provenance()
             if active is None or legacy_checksums != {active.provenance_checksum}:
                 raise RiskServiceError("official_document_unavailable")
-        return tuple(sorted(checksums))
 
 
 def _validate_parser_result(
@@ -1048,29 +1051,9 @@ def _validate_parser_result(
 
 
 def select_current_documents(records: tuple) -> tuple:
-    """Select current authenticated documents without mixing superseded versions."""
+    """Compatibility wrapper for newest-per-kind document selection."""
 
-    if type(records) is not tuple:
-        raise ValueError("parsed document history must be an immutable tuple")
-    by_kind = {}
-    for record in records:
-        artifact = record.artifact
-        key = artifact.document_kind
-        current = by_kind.get(key)
-        if current is None or _document_order(record) > _document_order(current):
-            by_kind[key] = record
-
-    if DocumentKind.PROSPECTUS_UPDATE in by_kind:
-        by_kind.pop(DocumentKind.PROSPECTUS, None)
-    return tuple(
-        sorted(
-            by_kind.values(),
-            key=lambda item: (
-                item.artifact.document_kind.value,
-                _document_order(item),
-            ),
-        )
-    )
+    return select_current_document_records(records)
 
 
 def evidence_freshness(
@@ -1129,16 +1112,6 @@ def evidence_freshness(
     return result
 
 
-def _document_order(record: object) -> tuple:
-    artifact = record.artifact
-    return (
-        artifact.published_at is not None,
-        artifact.published_at or datetime.min.replace(tzinfo=timezone.utc),
-        artifact.retrieved_at,
-        artifact.id,
-    )
-
-
 def _report_period_end(title: str) -> Optional[date]:
     normalized = title.replace("第一", "第1").replace("第二", "第2")
     normalized = normalized.replace("第三", "第3").replace("第四", "第4")
@@ -1167,57 +1140,6 @@ def _next_report_period_end(period_end: date) -> date:
     if (period_end.month, period_end.day) == (12, 31):
         return date(period_end.year + 1, 3, 31)
     raise ValueError("unsupported report period end")
-
-
-def _current_report_facts(records: tuple) -> tuple:
-    report_records = tuple(
-        record for record in records if record.artifact.document_kind in _REPORT_KINDS
-    )
-    candidates = {}
-    for record in report_records:
-        for fact in record.facts:
-            candidates.setdefault(fact.fact_kind, []).append((record, fact))
-
-    selected = []
-    used_records = {}
-    for fact_kind in sorted(candidates):
-        values = candidates[fact_kind]
-        newest_order = max(_report_order(record) for record, _ in values)
-        for record, fact in values:
-            if _report_order(record) == newest_order:
-                selected.append((record, fact))
-                used_records[record.artifact.id] = record
-
-    if not selected and report_records:
-        newest = max(report_records, key=_report_order)
-        used_records[newest.artifact.id] = newest
-    return (
-        tuple(
-            sorted(
-                selected,
-                key=lambda item: (
-                    item[1].fact_kind,
-                    _report_order(item[0]),
-                    item[1].id,
-                ),
-            )
-        ),
-        tuple(
-            sorted(
-                used_records.values(),
-                key=lambda item: item.artifact.document_kind.value,
-            )
-        ),
-    )
-
-
-def _report_order(record: object) -> tuple:
-    period_end = _report_period_end(record.artifact.title)
-    return (
-        period_end is not None,
-        period_end or date.min,
-        _document_order(record),
-    )
 
 
 def _mandate_fact(stored: object) -> MandateFact:
