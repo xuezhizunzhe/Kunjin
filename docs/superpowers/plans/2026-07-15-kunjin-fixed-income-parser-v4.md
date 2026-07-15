@@ -118,6 +118,7 @@ leverage-specific non-negative Decimal parser instead of the ordinary 100 limit.
 
 ```bash
 .venv/bin/python -m pytest -q tests/unit/test_risk_report_facts.py -k fixed_income
+.venv/bin/python -m pytest -q tests/unit/test_risk_report_facts.py
 .venv/bin/ruff check src/kunjin/funds/risk/report_facts.py \
   tests/unit/test_risk_report_facts.py
 git diff --check
@@ -200,7 +201,8 @@ HISTORICAL_LEGACY_PARSER_VERSIONS = frozenset(
 ```bash
 .venv/bin/python -m pytest -q tests/unit/test_risk_report_facts.py -k fixed_income
 .venv/bin/python -m pytest -q \
-  tests/unit/test_risk_parsers.py tests/unit/test_risk_engine.py \
+  tests/unit/test_risk_report_facts.py tests/unit/test_risk_parsers.py \
+  tests/unit/test_risk_engine.py \
   tests/unit/test_risk_audit.py tests/unit/test_risk_legacy_doc.py \
   tests/unit/test_risk_service.py tests/unit/test_risk_store.py \
   tests/unit/test_schema_v12.py tests/integration/test_cli.py tests/test_smoke.py
