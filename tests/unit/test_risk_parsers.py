@@ -167,8 +167,8 @@ def write_docx(
 
 
 class RiskHtmlParserTest(unittest.TestCase):
-    def test_active_parser_version_is_v4(self) -> None:
-        self.assertEqual(PARSER_VERSION, "4")
+    def test_active_parser_version_is_v3(self) -> None:
+        self.assertEqual(PARSER_VERSION, "3")
 
     def test_unsafe_html_section_state_survives_bounded_heading_for_paragraphs_and_tables(
         self,

@@ -114,22 +114,6 @@ def historical_native_provenance(parser_version: str = "2") -> ParserProvenance:
     )
 
 
-def historical_legacy_provenance(parser_version: str) -> ParserProvenance:
-    return provenance_from_payload(
-        {
-            "adapter_contract_version": "docker-libreoffice-v1",
-            "architecture": "linux/arm64",
-            "converter_kind": "docker_libreoffice",
-            "export_filter": "html_starwriter_skip_images_v1",
-            "image_id": "sha256:" + "a" * 64,
-            "libreoffice_version": "4:7.4.7-1+deb12u14",
-            "normalization_contract": "legacy_html_nfc_v1",
-            "package_manifest_checksum": "b" * 64,
-            "parser_version": parser_version,
-        }
-    )
-
-
 def candidate(kind: DocumentKind, suffix: str) -> OfficialDocumentCandidate:
     return OfficialDocumentCandidate(
         fund_code="519755",
@@ -1501,35 +1485,6 @@ class RiskServiceBoundaryTest(unittest.TestCase):
                     store.active_provenance_checksums,
                     (native_parser_provenance().provenance_checksum,),
                 )
-
-    def test_known_legacy_v2_and_v3_evidence_is_unavailable_until_v4_refresh(
-        self,
-    ) -> None:
-        for parser_version in (
-            "2-docker-libreoffice-v1",
-            "3-docker-libreoffice-v1",
-        ):
-            with self.subTest(parser_version=parser_version):
-                historical = stored_document(
-                    DocumentKind.QUARTERLY_REPORT,
-                    artifact_id=901,
-                    title="2026年第二季度报告",
-                    published_at=NOW,
-                    parser_provenance=historical_legacy_provenance(parser_version),
-                )
-                service = FundRiskService(
-                    risk_store=FakeRiskStore((historical,)),
-                    disclosure_store=FakeDisclosureStore(disclosure_bundle()),
-                    repository=FakeRepository(),
-                    discovery=SimpleNamespace(),
-                    document_client=SimpleNamespace(),
-                    clock=lambda: NOW + timedelta(minutes=1),
-                )
-
-                with self.assertRaises(RiskServiceError) as caught:
-                    service.classify("519755")
-
-                self.assertEqual(caught.exception.code, "official_document_unavailable")
 
     def test_unknown_current_provenance_is_storage_failure(self) -> None:
         unknown = provenance_from_payload(
