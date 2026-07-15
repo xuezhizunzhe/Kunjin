@@ -1537,13 +1537,12 @@ class RiskPdfParserTest(unittest.TestCase):
 
         self.assertFalse(has_current_stock_fact(parsed))
 
-    def test_safe_pdf_overlong_uppercase_heading_is_bounded_and_current(self) -> None:
+    def test_safe_pdf_overlong_uppercase_text_does_not_enable_current(self) -> None:
         parsed = self.parse_extracted_text(
             "A" * 305 + "\n报告期末股票资产占基金总资产35.2%。"
         )
 
-        fact = one(parsed, "current_stock_asset_allocation_percent")
-        self.assertIsNone(fact.section_name)
+        self.assertFalse(has_current_stock_fact(parsed))
 
     def test_pdf_line_splitting_preserves_unsafe_control_heading_state(self) -> None:
         for character in ("\u0085", "\u001c", "\u001d", "\u001e"):
@@ -1556,15 +1555,46 @@ class RiskPdfParserTest(unittest.TestCase):
                 with self.subTest(character=hex(ord(character)), index=index):
                     self.assertFalse(has_current_stock_fact(parsed))
 
-    def test_pdf_overlong_lowercase_paragraph_is_not_promoted_to_heading(self) -> None:
+    def test_pdf_overlong_lowercase_paragraph_does_not_enable_current(self) -> None:
         parsed = self.parse_extracted_text(
             "ordinary lowercase paragraph "
             + "a" * 300
             + "\n报告期末股票资产占基金总资产35.2%。"
         )
 
+        self.assertFalse(has_current_stock_fact(parsed))
+
+    def test_periodic_pdf_page_start_current_sentence_requires_trusted_heading(self) -> None:
+        parsed = self.parse_extracted_text("报告期末股票资产占基金总资产35.2%。")
+
+        self.assertFalse(has_current_stock_fact(parsed))
+
+    def test_periodic_pdf_exact_trusted_current_heading_enables_current(self) -> None:
+        parsed = self.parse_extracted_text(
+            "CURRENT ASSET ALLOCATION\n报告期末股票资产占基金总资产35.2%。"
+        )
+
         fact = one(parsed, "current_stock_asset_allocation_percent")
-        self.assertIsNone(fact.section_name)
+        self.assertEqual(fact.section_name, "CURRENT ASSET ALLOCATION")
+
+    def test_pdf_historical_context_patterns_close_trusted_current_section(self) -> None:
+        historical_headings = (
+            "历史数据",
+            "往期资产配置",
+            "HISTORICAL DATA",
+            "HISTORICAL ASSET ALLOCATION",
+            "PRIOR PERIOD ASSET ALLOCATION",
+            "PREVIOUS PERIOD ASSET ALLOCATION",
+        )
+        for heading in historical_headings:
+            parsed = self.parse_extracted_text(
+                "CURRENT ASSET ALLOCATION\n"
+                + heading
+                + "\n报告期末股票资产占基金总资产35.2%。"
+            )
+
+            with self.subTest(heading=heading):
+                self.assertFalse(has_current_stock_fact(parsed))
 
     def test_pdf_historical_and_unsafe_section_state_persists_across_pages(self) -> None:
         cases = (
@@ -1606,6 +1636,26 @@ class RiskPdfParserTest(unittest.TestCase):
         fact = one(parsed, "current_stock_asset_allocation_percent")
         self.assertEqual(fact.section_name, "CURRENT ASSET ALLOCATION")
 
+    def test_pdf_trusted_current_section_and_historical_lock_persist_across_pages(self) -> None:
+        current = self.parse_extracted_pages(
+            (
+                "CURRENT ASSET ALLOCATION",
+                "报告期末股票资产占基金总资产35.2%。",
+            )
+        )
+        historical = self.parse_extracted_pages(
+            (
+                "CURRENT ASSET ALLOCATION\nPREVIOUS PERIOD ASSET ALLOCATION",
+                "报告期末股票资产占基金总资产35.2%。",
+            )
+        )
+
+        self.assertEqual(
+            one(current, "current_stock_asset_allocation_percent").section_name,
+            "CURRENT ASSET ALLOCATION",
+        )
+        self.assertFalse(has_current_stock_fact(historical))
+
     def test_pdf_matches_html_facts_and_keeps_page_section_and_effective_date(self) -> None:
         pdf = parse_artifact(
             artifact_for(
@@ -1643,6 +1693,10 @@ class RiskPdfParserTest(unittest.TestCase):
         for fact_kind, expected in current_facts.items():
             with self.subTest(fact_kind=fact_kind):
                 self.assertEqual(one(pdf, fact_kind).normalized_value, expected)
+        self.assertEqual(
+            one(pdf, "current_stock_asset_allocation_percent").section_name,
+            "CURRENT ASSET ALLOCATION",
+        )
         self.assertFalse(
             any(fact.fact_kind.startswith("current_largest_industry") for fact in pdf.facts)
         )

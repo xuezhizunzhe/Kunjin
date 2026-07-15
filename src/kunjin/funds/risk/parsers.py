@@ -2337,7 +2337,7 @@ def _looks_like_heading(value: str) -> bool:
     return bool(letters) and all(character.isupper() for character in letters)
 
 
-_PDF_TRUSTED_SECTION_HEADINGS = frozenset(
+_PDF_LEGAL_SECTION_HEADINGS = frozenset(
     {
         "投资范围",
         "投资目标",
@@ -2345,13 +2345,16 @@ _PDF_TRUSTED_SECTION_HEADINGS = frozenset(
         "指数目标",
         "样本与权重限制",
         "INVESTMENT SCOPE",
-        "CURRENT ASSET ALLOCATION",
     }
 )
-_PDF_REJECTED_SECTION_HEADINGS = frozenset({"HISTORICAL"})
+_PDF_CURRENT_SECTION_HEADINGS = frozenset({"CURRENT ASSET ALLOCATION"})
 
 
-def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
+def _pdf_blocks(
+    raw: bytes,
+    *,
+    current_observation_eligible_by_default: bool = True,
+) -> Tuple[_TextBlock, ...]:
     try:
         reader = PdfReader(io.BytesIO(raw), strict=True)
         if reader.is_encrypted:
@@ -2366,7 +2369,7 @@ def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
         total_characters = 0
         extracted_any_text = False
         section = None
-        section_current_observation_eligible = True
+        section_current_observation_eligible = current_observation_eligible_by_default
         for page_number, page in enumerate(reader.pages, start=1):
             extracted = page.extract_text()
             if extracted is None:
@@ -2386,12 +2389,16 @@ def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
                 if _has_unsafe_time_context_character(raw_line):
                     section_current_observation_eligible = False
                     continue
-                if line in _PDF_TRUSTED_SECTION_HEADINGS:
+                if _HISTORICAL_CONTEXT_PATTERN.search(line):
+                    section, _ = _section_context(raw_line, line)
+                    section_current_observation_eligible = False
+                    continue
+                if line in _PDF_CURRENT_SECTION_HEADINGS:
                     section, section_current_observation_eligible = _section_context(
                         raw_line, line
                     )
                     continue
-                if line in _PDF_REJECTED_SECTION_HEADINGS:
+                if line in _PDF_LEGAL_SECTION_HEADINGS:
                     section, _ = _section_context(raw_line, line)
                     section_current_observation_eligible = False
                     continue
@@ -2415,8 +2422,18 @@ def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
         raise _fail(DocumentFailureReason.PARSER_FORMAT_INVALID) from exc
 
 
-def _pdf_content(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable, ...]]:
-    return _pdf_blocks(raw), ()
+def _pdf_content(
+    raw: bytes,
+    *,
+    periodic_report: bool = False,
+) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable, ...]]:
+    return (
+        _pdf_blocks(
+            raw,
+            current_observation_eligible_by_default=not periodic_report,
+        ),
+        (),
+    )
 
 
 def _legacy_conversion_failure(reason: DocumentFailureReason) -> LegacyDocConversionError:
@@ -2828,7 +2845,12 @@ def parse_artifact_with_provenance(
         if media_type in _HTML_MEDIA_TYPES:
             blocks, tables = _html_content(raw, charset)
         elif media_type == "application/pdf" and charset is None:
-            blocks, tables = _pdf_content(raw)
+            blocks, tables = _pdf_content(
+                raw,
+                periodic_report=(
+                    artifact.candidate.document_kind in _PERIODIC_DOCUMENT_KINDS
+                ),
+            )
         elif media_type in _DOCX_MEDIA_TYPES and charset is None:
             blocks, tables = _docx_content(raw)
             _validate_document_fund_identity(blocks, artifact.candidate)

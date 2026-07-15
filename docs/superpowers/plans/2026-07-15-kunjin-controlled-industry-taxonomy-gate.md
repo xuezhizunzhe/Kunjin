@@ -305,6 +305,18 @@ Add cases:
 
 Each emits no current observations. Exact current periods and generic `报告期末` controls still pass.
 
+For periodic PDFs, also prove:
+
+- a current-looking sentence at page start emits no current fact;
+- exact `CURRENT ASSET ALLOCATION` enables current facts and remains active
+  across pages;
+- unknown and ordinary uppercase lines do not enable or reset eligibility;
+- Chinese and English historical-context patterns disable eligibility across
+  pages;
+- a trusted current heading followed by a historical line becomes closed; and
+- the existing PDF fixture retains its legal facts and its current facts because
+  it contains the exact trusted current heading.
+
 - [ ] **Step 4: Implement active v3 and historical v2 provenance**
 
 Set report `PARSER_VERSION = "3"`. Active native and legacy provenance use `3` and `3-docker-libreoffice-v1`. In `audit.py`, validate exact known v2 and v3 payloads, while `native_parser_provenance()` and `legacy_parser_provenance()` return only v3.
@@ -324,6 +336,13 @@ Do not reuse v2 free-text industry facts as current evidence.
 - [ ] **Step 6: Reject unsafe time context before normalization**
 
 Before period parsing, reject section names containing control, `Cf`, or default-ignorable characters. Do not strip and continue.
+
+For periodic PDFs, initialize current-observation eligibility to false. Carry
+section and eligibility state across pages. Only exact audited current-section
+headings may enable it; the initial allowlist is `CURRENT ASSET ALLOCATION`.
+Existing historical-context patterns and unsafe raw lines disable eligibility
+until a later exact trusted current heading. Keep legal-fact extraction
+independent from this gate.
 
 - [ ] **Step 7: Run complete verification**
 

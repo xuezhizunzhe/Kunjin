@@ -152,6 +152,27 @@ The existing period-plus-residual-cue model remains:
 Support for exact Chinese-numeral dates may improve coverage later, but failure
 to parse them cannot publish a current fact.
 
+#### 2.7.1 Periodic PDF current-section authorization
+
+Periodic-report PDFs begin with current-observation eligibility disabled. Page
+starts, unknown headings, ordinary uppercase text, and legal-section headings
+cannot authorize current facts. Eligibility is enabled only by one exact,
+audited current-section heading. The initial allowlist contains:
+
+- `CURRENT ASSET ALLOCATION`
+
+A Chinese current-section heading may be added only when an exact authenticated
+fixture and parser test justify that literal form. Generic uppercase shape is
+not evidence that a PDF line is a section heading.
+
+The PDF section and eligibility state persists across page boundaries. An exact
+trusted current heading may remain active on following pages. A line containing
+an existing historical-context pattern, or any control, `Cf`, or default-
+ignorable character, disables current eligibility until a later exact trusted
+current heading replaces the state. Historical and unsafe lines never authorize
+a fact themselves. Legal fact extraction remains independent of this current-
+observation gate.
+
 ## 3. Components
 
 ### 3.1 Taxonomy registry
@@ -183,7 +204,9 @@ service-only taxonomy logic or inferred evidence envelope is allowed.
 ### 3.4 Parser context validation
 
 `src/kunjin/funds/risk/parsers.py` rejects unsafe invisible characters before
-historical/current period matching.
+historical/current period matching. Periodic PDFs additionally use an exact
+current-section allowlist and carry their section authorization state across
+pages; legal fact parsing is unchanged.
 
 ### 3.5 Parser version and provenance
 
@@ -229,6 +252,10 @@ industry facts as current evidence.
 - Existing `FundIndustryExposure` records: no synthesized current industry
   observations because their evidence envelope is incomplete.
 - Unsafe temporal context: no current observations from that context.
+- Periodic PDF text before an exact trusted current-section heading: no current
+  observations.
+- Unknown, ordinary uppercase, or historical PDF headings: no current
+  authorization; historical state remains closed across pages.
 - Existing parser v2 facts: immutable history only; they do not satisfy the
   new current industry gate.
 - Existing stored classifications and manifest bytes are not rewritten.
