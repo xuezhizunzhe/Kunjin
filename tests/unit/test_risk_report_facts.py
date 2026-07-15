@@ -26,12 +26,14 @@ from kunjin.funds.risk.parsers import (
 )
 from kunjin.funds.risk.report_facts import (
     COMMON_FACTS,
+    FIXED_INCOME_FACTS,
     MAX_REPORT_CELL_CHARACTERS,
     CurrentReportObservation,
     ReportCell,
     ReportRow,
     ReportTable,
     extract_common_report_observations,
+    extract_fixed_income_report_observations,
 )
 
 
@@ -994,6 +996,348 @@ class CommonReportFactExtractionTest(unittest.TestCase):
             {
                 "current_stock_asset_allocation_percent",
                 "current_bond_asset_allocation_percent",
+            },
+        )
+
+
+class FixedIncomeReportFactExtractionTest(unittest.TestCase):
+    def complete_credit_table(
+        self,
+        *,
+        rows: tuple[tuple[str, str, str], ...] = (
+            ("AAA", "其他非主权", "50"),
+            ("AA+", "其他非主权", "30"),
+            ("AA", "其他非主权", "10"),
+            ("未评级", "主权", "5"),
+            ("未评级", "政策性银行", "3"),
+            ("未评级", "其他非主权", "2"),
+        ),
+        section_name: str = "报告期末全部固定收益资产信用评级分布",
+        weight_header: str = "占固定收益资产比例(%)",
+    ) -> ReportTable:
+        return common_table(
+            ("信用评级", "发行人类别", weight_header),
+            rows,
+            section_name=section_name,
+        )
+
+    def complete_issuer_table(
+        self,
+        *,
+        rows: tuple[tuple[str, str, str], ...] = (
+            ("主权", "中华人民共和国财政部", "20"),
+            ("政策性银行", "国家开发银行", "15"),
+            ("其他非主权", "发行人甲", "8"),
+            ("其他非主权", "发行人乙", "5"),
+        ),
+        section_name: str = "报告期末全部固定收益证券发行人分布",
+    ) -> ReportTable:
+        return common_table(
+            ("发行人类别", "发行人名称", "占基金资产净值比例(%)"),
+            rows,
+            section_name=section_name,
+        )
+
+    def test_fixed_income_fact_allowlist_extracts_nine_explicit_current_facts(
+        self,
+    ) -> None:
+        metrics = common_table(
+            ("指标", "单位", "数值"),
+            (
+                ("报告期末组合有效久期", "年", "3.2"),
+                ("报告期末加权平均剩余期限", "天", "180"),
+                ("报告期末可转换债券资产占基金总资产的", "%", "1.5"),
+                ("报告期末可交换债券资产占基金总资产的", "%", "0.5"),
+            ),
+            section_name="报告期末固定收益指标",
+        )
+        leverage = common_table(
+            ("指标", "分母", "单位", "数值"),
+            (("报告期末总资产杠杆率", "基金资产净值", "%", "115.2"),),
+            section_name="报告期末杠杆指标",
+        )
+
+        observations = extract_fixed_income_report_observations(
+            text_blocks=(),
+            tables=(
+                metrics,
+                leverage,
+                self.complete_credit_table(),
+                self.complete_issuer_table(),
+            ),
+        )
+        values = {item.fact_kind: item.normalized_value for item in observations}
+
+        self.assertEqual(set(values), FIXED_INCOME_FACTS)
+        self.assertEqual(values["current_effective_duration"], D("3.2"))
+        self.assertEqual(values["current_weighted_average_maturity_days"], D("180"))
+        self.assertEqual(
+            values["current_convertible_bond_asset_allocation_percent"], D("1.5")
+        )
+        self.assertEqual(
+            values["current_exchangeable_bond_asset_allocation_percent"], D("0.5")
+        )
+        self.assertEqual(values["current_high_quality_fixed_income_percent"], D("80"))
+        self.assertEqual(values["current_below_aa_plus_exposure_percent"], D("10"))
+        self.assertEqual(
+            values["current_unrated_non_sovereign_exposure_percent"], D("2")
+        )
+        self.assertEqual(values["current_gross_leverage_percent"], D("115.2"))
+        self.assertEqual(
+            values["current_largest_non_sovereign_issuer_percent"], D("8")
+        )
+
+    def test_fixed_income_duration_and_maturity_are_never_substituted(self) -> None:
+        duration = common_table(
+            ("指标", "单位", "数值"),
+            (("报告期末组合有效久期", "年", "3.2"),),
+            section_name="报告期末固定收益指标",
+        )
+        maturity = common_table(
+            ("指标", "单位", "数值"),
+            (("报告期末加权平均剩余期限", "天", "180"),),
+            section_name="报告期末固定收益指标",
+        )
+
+        duration_kinds = {
+            item.fact_kind
+            for item in extract_fixed_income_report_observations(
+                text_blocks=(), tables=(duration,)
+            )
+        }
+        maturity_kinds = {
+            item.fact_kind
+            for item in extract_fixed_income_report_observations(
+                text_blocks=(), tables=(maturity,)
+            )
+        }
+
+        self.assertEqual(duration_kinds, {"current_effective_duration"})
+        self.assertEqual(maturity_kinds, {"current_weighted_average_maturity_days"})
+
+    def test_fixed_income_convertible_and_exchangeable_rows_are_separate(self) -> None:
+        convertible = common_table(
+            ("指标", "单位", "数值"),
+            (("报告期末可转换债券资产占基金资产净值的", "%", "1.5"),),
+            section_name="报告期末固定收益指标",
+        )
+        exchangeable = common_table(
+            ("指标", "单位", "数值"),
+            (("报告期末可交换债券资产占基金资产净值的", "%", "0.5"),),
+            section_name="报告期末固定收益指标",
+        )
+
+        first = extract_fixed_income_report_observations(
+            text_blocks=(), tables=(convertible,)
+        )
+        second = extract_fixed_income_report_observations(
+            text_blocks=(), tables=(exchangeable,)
+        )
+
+        self.assertEqual(
+            {item.fact_kind for item in first},
+            {"current_convertible_bond_asset_allocation_percent"},
+        )
+        self.assertEqual(
+            {item.fact_kind for item in second},
+            {"current_exchangeable_bond_asset_allocation_percent"},
+        )
+
+    def test_fixed_income_credit_requires_complete_scope_and_all_explicit_buckets(
+        self,
+    ) -> None:
+        incomplete = self.complete_credit_table(section_name="信用评级前五名")
+        missing_below = self.complete_credit_table(
+            rows=(
+                ("AAA", "其他非主权", "90"),
+                ("未评级", "主权", "5"),
+                ("未评级", "其他非主权", "5"),
+            )
+        )
+        missing_unrated_non_sovereign = self.complete_credit_table(
+            rows=(
+                ("AAA", "其他非主权", "90"),
+                ("AA", "其他非主权", "5"),
+                ("未评级", "主权", "5"),
+            )
+        )
+        absent_rating = self.complete_credit_table(
+            rows=(
+                ("AAA", "其他非主权", "90"),
+                ("-", "其他非主权", "5"),
+                ("未评级", "其他非主权", "5"),
+            )
+        )
+
+        for table in (
+            incomplete,
+            missing_below,
+            missing_unrated_non_sovereign,
+            absent_rating,
+        ):
+            with self.subTest(section=table.section_name, excerpt=table.source_excerpt):
+                observations = extract_fixed_income_report_observations(
+                    text_blocks=(), tables=(table,)
+                )
+                self.assertFalse(
+                    any(
+                        item.fact_kind
+                        in {
+                            "current_high_quality_fixed_income_percent",
+                            "current_below_aa_plus_exposure_percent",
+                            "current_unrated_non_sovereign_exposure_percent",
+                        }
+                        for item in observations
+                    )
+                )
+
+    def test_fixed_income_credit_excludes_only_explicit_sovereign_and_policy_bank(
+        self,
+    ) -> None:
+        observations = extract_fixed_income_report_observations(
+            text_blocks=(), tables=(self.complete_credit_table(),)
+        )
+        values = {item.fact_kind: item.normalized_value for item in observations}
+
+        self.assertEqual(values["current_high_quality_fixed_income_percent"], D("80"))
+        self.assertEqual(
+            values["current_unrated_non_sovereign_exposure_percent"], D("2")
+        )
+
+    def test_fixed_income_issuer_requires_complete_unique_rows(self) -> None:
+        duplicate = self.complete_issuer_table(
+            rows=(
+                ("主权", "中华人民共和国财政部", "20"),
+                ("其他非主权", "发行人甲", "8"),
+                ("其他非主权", "发行人甲", "5"),
+            )
+        )
+        incomplete = self.complete_issuer_table(section_name="前五大发行人")
+        unknown_category = self.complete_issuer_table(
+            rows=(("未知", "发行人甲", "8"),)
+        )
+        empty_after_exclusions = self.complete_issuer_table(
+            rows=(
+                ("主权", "中华人民共和国财政部", "60"),
+                ("政策性银行", "国家开发银行", "40"),
+            )
+        )
+
+        for table in (duplicate, incomplete, unknown_category, empty_after_exclusions):
+            with self.subTest(section=table.section_name, excerpt=table.source_excerpt):
+                self.assertEqual(
+                    extract_fixed_income_report_observations(
+                        text_blocks=(), tables=(table,)
+                    ),
+                    (),
+                )
+
+    def test_fixed_income_leverage_requires_exact_net_asset_denominator(self) -> None:
+        valid = common_table(
+            ("指标", "分母", "单位", "数值"),
+            (("报告期末总资产杠杆率", "基金资产净值", "%", "115.2"),),
+            section_name="报告期末杠杆指标",
+        )
+        invalid = common_table(
+            ("指标", "分母", "单位", "数值"),
+            (("报告期末总资产杠杆率", "基金总资产", "%", "115.2"),),
+            section_name="报告期末杠杆指标",
+        )
+
+        valid_observations = extract_fixed_income_report_observations(
+            text_blocks=(), tables=(valid,)
+        )
+        invalid_observations = extract_fixed_income_report_observations(
+            text_blocks=(), tables=(invalid,)
+        )
+
+        self.assertEqual(
+            [(item.fact_kind, item.normalized_value, item.unit) for item in valid_observations],
+            [("current_gross_leverage_percent", D("115.2"), "percent_of_net_assets")],
+        )
+        self.assertEqual(invalid_observations, ())
+
+    def test_fixed_income_credit_rejects_unknown_other_duplicate_and_incomplete_total(
+        self,
+    ) -> None:
+        unknown_rating = self.complete_credit_table(
+            rows=(
+                ("AAA", "其他非主权", "80"),
+                ("未知评级", "其他非主权", "10"),
+                ("未评级", "其他非主权", "10"),
+            )
+        )
+        unexplained_other = self.complete_credit_table(
+            rows=(
+                ("AAA", "其他非主权", "80"),
+                ("其他", "其他非主权", "10"),
+                ("未评级", "其他非主权", "10"),
+            )
+        )
+        duplicate_category = self.complete_credit_table(
+            rows=(
+                ("AAA", "其他非主权", "50"),
+                ("AAA", "其他非主权", "30"),
+                ("AA", "其他非主权", "10"),
+                ("未评级", "其他非主权", "10"),
+            )
+        )
+        incomplete_total = self.complete_credit_table(
+            rows=(
+                ("AAA", "其他非主权", "70"),
+                ("AA", "其他非主权", "10"),
+                ("未评级", "其他非主权", "10"),
+            )
+        )
+
+        for table in (
+            unknown_rating,
+            unexplained_other,
+            duplicate_category,
+            incomplete_total,
+        ):
+            with self.subTest(excerpt=table.source_excerpt):
+                self.assertEqual(
+                    extract_fixed_income_report_observations(
+                        text_blocks=(), tables=(table,)
+                    ),
+                    (),
+                )
+
+    def test_fixed_income_combined_convertible_exchangeable_row_is_not_split(self) -> None:
+        combined = common_table(
+            ("指标", "单位", "数值"),
+            (("报告期末可转换债券(含可交换债券)资产占基金资产净值的", "%", "2"),),
+            section_name="报告期末固定收益指标",
+        )
+
+        self.assertEqual(
+            extract_fixed_income_report_observations(
+                text_blocks=(), tables=(combined,)
+            ),
+            (),
+        )
+
+    def test_fixed_income_explicit_text_rejects_mandates_and_does_not_fill_missing_rows(
+        self,
+    ) -> None:
+        observations = extract_fixed_income_report_observations(
+            text_blocks=(
+                "报告期末组合有效久期为3.2年。",
+                "报告期末加权平均剩余期限为180天。",
+                "报告期末基金总资产占基金资产净值的比例为115.2%。",
+                "组合有效久期不得超过5年。",
+                "基金总资产占基金资产净值的比例不得超过140%。",
+            ),
+            tables=(),
+        )
+
+        self.assertEqual(
+            {item.fact_kind for item in observations},
+            {
+                "current_effective_duration",
+                "current_weighted_average_maturity_days",
+                "current_gross_leverage_percent",
             },
         )
 

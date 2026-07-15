@@ -47,6 +47,20 @@ COMMON_FACTS = frozenset(
     }
 )
 
+FIXED_INCOME_FACTS = frozenset(
+    {
+        "current_effective_duration",
+        "current_weighted_average_maturity_days",
+        "current_convertible_bond_asset_allocation_percent",
+        "current_exchangeable_bond_asset_allocation_percent",
+        "current_high_quality_fixed_income_percent",
+        "current_below_aa_plus_exposure_percent",
+        "current_unrated_non_sovereign_exposure_percent",
+        "current_gross_leverage_percent",
+        "current_largest_non_sovereign_issuer_percent",
+    }
+)
+
 _INDICATOR_HEADERS = {("指标", "单位", "数值"), ("indicator", "unit", "value")}
 _PERCENT_UNITS = {"%", "percent"}
 _ASSET_FACTS = {
@@ -130,6 +144,113 @@ _TOP_TEN_SENTENCE_PATTERN = re.compile(
     r"(net assets|total assets|fund assets)[.]?",
     flags=re.IGNORECASE,
 )
+
+_FIXED_INCOME_METRICS = {
+    "报告期末组合有效久期": ("current_effective_duration", "年", "years"),
+    "报告期末加权平均剩余期限": (
+        "current_weighted_average_maturity_days",
+        "天",
+        "days",
+    ),
+    "portfolio effective duration at the end of the reporting period": (
+        "current_effective_duration",
+        "years",
+        "years",
+    ),
+    "weighted average remaining maturity at the end of the reporting period": (
+        "current_weighted_average_maturity_days",
+        "days",
+        "days",
+    ),
+}
+_BOND_TYPE_FACTS = {
+    "可转换债券": "current_convertible_bond_asset_allocation_percent",
+    "可交换债券": "current_exchangeable_bond_asset_allocation_percent",
+    "convertible bond": "current_convertible_bond_asset_allocation_percent",
+    "exchangeable bond": "current_exchangeable_bond_asset_allocation_percent",
+}
+_COMPLETE_CREDIT_SCOPES = {
+    "报告期末全部固定收益资产信用评级分布",
+    "complete fixed income credit rating distribution at the end of the reporting period",
+}
+_CREDIT_RATING_HEADERS = {"信用评级", "credit rating"}
+_ISSUER_CATEGORY_HEADERS = {"发行人类别", "issuer category"}
+_CREDIT_WEIGHT_HEADERS = {
+    "占基金资产净值比例(%)": "percent_of_net_assets",
+    "占基金净资产比例(%)": "percent_of_net_assets",
+    "占债券资产比例(%)": "percent_of_bond_assets",
+    "占固定收益资产比例(%)": "percent_of_fixed_income_assets",
+    "weight (% of net assets)": "percent_of_net_assets",
+    "weight (% of bond assets)": "percent_of_bond_assets",
+    "weight (% of fixed income assets)": "percent_of_fixed_income_assets",
+}
+_HIGH_QUALITY_RATINGS = frozenset({"aaa", "aa+", "aaa级", "aa+级"})
+_BELOW_AA_PLUS_RATINGS = frozenset(
+    {
+        "aa",
+        "aa-",
+        "a+",
+        "a",
+        "a-",
+        "bbb+",
+        "bbb",
+        "bbb-",
+        "bb+",
+        "bb",
+        "bb-",
+        "b+",
+        "b",
+        "b-",
+        "ccc",
+        "cc",
+        "c",
+        "d",
+        "aa级",
+        "aa-级",
+        "a+级",
+        "a级",
+        "a-级",
+        "bbb+级",
+        "bbb级",
+        "bbb-级",
+        "bb+级",
+        "bb级",
+        "bb-级",
+        "b+级",
+        "b级",
+        "b-级",
+        "ccc级",
+        "cc级",
+        "c级",
+        "d级",
+    }
+)
+_UNRATED_RATINGS = frozenset({"未评级", "unrated"})
+_SOVEREIGN_CATEGORIES = frozenset({"主权", "政府", "sovereign", "government"})
+_POLICY_BANK_CATEGORIES = frozenset({"政策性银行", "policy bank"})
+_NON_SOVEREIGN_CATEGORIES = frozenset(
+    {"非主权", "其他非主权", "non-sovereign", "other non-sovereign"}
+)
+_COMPLETE_ISSUER_SCOPES = {
+    "报告期末全部固定收益证券发行人分布",
+    "complete fixed income issuer distribution at the end of the reporting period",
+}
+_ISSUER_NAME_HEADERS = {"发行人名称", "issuer name"}
+_ISSUER_WEIGHT_HEADERS = {
+    "占基金资产净值比例(%)": "percent_of_net_assets",
+    "占基金净资产比例(%)": "percent_of_net_assets",
+    "占基金资产比例(%)": "percent_of_fund_assets",
+    "weight (% of net assets)": "percent_of_net_assets",
+    "weight (% of fund assets)": "percent_of_fund_assets",
+}
+_LEVERAGE_HEADERS = {
+    ("指标", "分母", "单位", "数值"),
+    ("indicator", "denominator", "unit", "value"),
+}
+_LEVERAGE_LABELS = {
+    "报告期末总资产杠杆率",
+    "gross leverage at the end of the reporting period",
+}
 def _require_exact_record(value: object, expected_type: type, label: str) -> None:
     if type(value) is not expected_type:
         raise ValueError(f"{label} subclasses are not accepted")
@@ -334,6 +455,13 @@ def _percent_value(value: str) -> Optional[Decimal]:
     return parsed
 
 
+def _nonnegative_decimal_value(value: str) -> Optional[Decimal]:
+    normalized = _normalized(value)
+    if _DECIMAL_PATTERN.fullmatch(normalized) is None:
+        return None
+    return Decimal(normalized)
+
+
 def _excerpt(value: str) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= MAX_EXCERPT_CHARACTERS:
@@ -359,8 +487,8 @@ def _observation(
     section_name: Optional[str],
     source_excerpt: str,
 ) -> CurrentReportObservation:
-    if fact_kind not in COMMON_FACTS:
-        raise ValueError("current report fact kind is outside the common allowlist")
+    if fact_kind not in COMMON_FACTS | FIXED_INCOME_FACTS:
+        raise ValueError("current report fact kind is outside the allowlist")
     observation = CurrentReportObservation(
         fact_kind=fact_kind,
         normalized_value=normalized_value,
@@ -740,6 +868,308 @@ def _explicit_common_text_observations(
     return tuple(observations)
 
 
+def _duration_and_maturity_observations(
+    tables: Tuple[ReportTable, ...],
+    text_blocks: Tuple[str, ...],
+) -> Tuple[CurrentReportObservation, ...]:
+    observations = []
+    for table in tables:
+        if _headers(table) not in _INDICATOR_HEADERS:
+            continue
+        for row in table.rows[1:]:
+            label, unit_text, value_text = (cell.text for cell in row.cells)
+            metric = _FIXED_INCOME_METRICS.get(_normalized_label(label))
+            value = _nonnegative_decimal_value(value_text)
+            if metric is None or value is None or _normalized_label(unit_text) != metric[1]:
+                continue
+            observations.append(
+                _observation(
+                    metric[0],
+                    value,
+                    metric[2],
+                    page_number=table.page_number,
+                    section_name=table.section_name,
+                    source_excerpt=_bound_value_excerpt(row),
+                )
+            )
+
+    text_patterns = (
+        (
+            re.compile(r"报告期末组合有效久期为(" + _DECIMAL_PATTERN.pattern + r")年[。.]?"),
+            "current_effective_duration",
+            "years",
+        ),
+        (
+            re.compile(
+                r"报告期末加权平均剩余期限为(" + _DECIMAL_PATTERN.pattern + r")天[。.]?"
+            ),
+            "current_weighted_average_maturity_days",
+            "days",
+        ),
+    )
+    for block in text_blocks:
+        normalized = _normalized_label(block)
+        for pattern, fact_kind, unit in text_patterns:
+            match = pattern.fullmatch(normalized)
+            if match is None:
+                continue
+            observations.append(
+                _observation(
+                    fact_kind,
+                    Decimal(match.group(1)),
+                    unit,
+                    page_number=None,
+                    section_name=None,
+                    source_excerpt=block,
+                )
+            )
+    return tuple(observations)
+
+
+def _convertible_exchangeable_observations(
+    tables: Tuple[ReportTable, ...],
+) -> Tuple[CurrentReportObservation, ...]:
+    chinese = re.compile(
+        r"报告期末(可转换债券|可交换债券)资产占"
+        r"(基金总资产|基金资产净值|基金净资产)的"
+    )
+    english = re.compile(
+        r"(convertible bond|exchangeable bond) assets at the end of the reporting "
+        r"period as a percentage of (total assets|net assets)"
+    )
+    observations = []
+    for table in tables:
+        if _headers(table) not in _INDICATOR_HEADERS:
+            continue
+        for row in table.rows[1:]:
+            label, unit_text, value_text = (cell.text for cell in row.cells)
+            if _normalized(unit_text) not in _PERCENT_UNITS:
+                continue
+            normalized_label = _normalized_label(label)
+            match = chinese.fullmatch(normalized_label) or english.fullmatch(
+                normalized_label
+            )
+            value = _percent_value(value_text)
+            if match is None or value is None:
+                continue
+            denominator = _denominator_unit(match.group(2), concentration=False)
+            fact_kind = _BOND_TYPE_FACTS.get(_normalized(match.group(1)))
+            if denominator is None or fact_kind is None:
+                continue
+            observations.append(
+                _observation(
+                    fact_kind,
+                    value,
+                    denominator,
+                    page_number=table.page_number,
+                    section_name=table.section_name,
+                    source_excerpt=_bound_value_excerpt(row),
+                )
+            )
+    return tuple(observations)
+
+
+def _issuer_category(value: str) -> Optional[str]:
+    normalized = _normalized_label(value)
+    if normalized in _SOVEREIGN_CATEGORIES:
+        return "sovereign"
+    if normalized in _POLICY_BANK_CATEGORIES:
+        return "policy_bank"
+    if normalized in _NON_SOVEREIGN_CATEGORIES:
+        return "non_sovereign"
+    return None
+
+
+def _credit_distribution_observations(
+    tables: Tuple[ReportTable, ...],
+) -> Tuple[CurrentReportObservation, ...]:
+    observations = []
+    for table in tables:
+        headers = _headers(table)
+        if headers is None or len(headers) != 3:
+            continue
+        rating_header, category_header, weight_header = headers
+        if (
+            rating_header not in _CREDIT_RATING_HEADERS
+            or category_header not in _ISSUER_CATEGORY_HEADERS
+            or weight_header not in _CREDIT_WEIGHT_HEADERS
+            or _normalized(table.section_name or "")
+            not in {_normalized(value) for value in _COMPLETE_CREDIT_SCOPES}
+        ):
+            continue
+        unit = _CREDIT_WEIGHT_HEADERS[weight_header]
+        high_quality = Decimal("0")
+        below_aa_plus = Decimal("0")
+        unrated_non_sovereign = Decimal("0")
+        total = Decimal("0")
+        seen = set()
+        found = {"high": False, "below": False, "unrated_non_sovereign": False}
+        valid = True
+        for row in table.rows[1:]:
+            rating_text, category_text, weight_text = (cell.text for cell in row.cells)
+            rating = _normalized_label(rating_text)
+            category = _issuer_category(category_text)
+            weight = _percent_value(weight_text)
+            key = (rating, category)
+            if (
+                category is None
+                or weight is None
+                or key in seen
+                or rating
+                not in _HIGH_QUALITY_RATINGS
+                | _BELOW_AA_PLUS_RATINGS
+                | _UNRATED_RATINGS
+            ):
+                valid = False
+                break
+            seen.add(key)
+            total += weight
+            if rating in _HIGH_QUALITY_RATINGS:
+                high_quality += weight
+                found["high"] = True
+            elif rating in _BELOW_AA_PLUS_RATINGS:
+                below_aa_plus += weight
+                found["below"] = True
+            elif category == "non_sovereign":
+                unrated_non_sovereign += weight
+                found["unrated_non_sovereign"] = True
+        if (
+            not valid
+            or not all(found.values())
+            or total > 100
+            or (
+                unit in {"percent_of_bond_assets", "percent_of_fixed_income_assets"}
+                and total != 100
+            )
+        ):
+            continue
+        for fact_kind, value in (
+            ("current_high_quality_fixed_income_percent", high_quality),
+            ("current_below_aa_plus_exposure_percent", below_aa_plus),
+            (
+                "current_unrated_non_sovereign_exposure_percent",
+                unrated_non_sovereign,
+            ),
+        ):
+            observations.append(
+                _observation(
+                    fact_kind,
+                    value,
+                    unit,
+                    page_number=table.page_number,
+                    section_name=table.section_name,
+                    source_excerpt=table.source_excerpt,
+                )
+            )
+    return tuple(observations)
+
+
+def _gross_leverage_observations(
+    tables: Tuple[ReportTable, ...],
+    text_blocks: Tuple[str, ...],
+) -> Tuple[CurrentReportObservation, ...]:
+    observations = []
+    for table in tables:
+        if _headers(table) not in _LEVERAGE_HEADERS:
+            continue
+        for row in table.rows[1:]:
+            label, denominator_text, unit_text, value_text = (
+                cell.text for cell in row.cells
+            )
+            value = _nonnegative_decimal_value(value_text)
+            if (
+                _normalized_label(label) not in _LEVERAGE_LABELS
+                or _normalized(unit_text) not in _PERCENT_UNITS
+                or _denominator_unit(denominator_text, concentration=False)
+                != "percent_of_net_assets"
+                or value is None
+            ):
+                continue
+            observations.append(
+                _observation(
+                    "current_gross_leverage_percent",
+                    value,
+                    "percent_of_net_assets",
+                    page_number=table.page_number,
+                    section_name=table.section_name,
+                    source_excerpt=_row_excerpt(row),
+                )
+            )
+
+    pattern = re.compile(
+        r"报告期末基金总资产占基金资产净值的比例为("
+        + _DECIMAL_PATTERN.pattern
+        + r")%[。.]?"
+    )
+    for block in text_blocks:
+        match = pattern.fullmatch(_normalized_label(block))
+        if match is not None:
+            observations.append(
+                _observation(
+                    "current_gross_leverage_percent",
+                    Decimal(match.group(1)),
+                    "percent_of_net_assets",
+                    page_number=None,
+                    section_name=None,
+                    source_excerpt=block,
+                )
+            )
+    return tuple(observations)
+
+
+def _issuer_concentration_observations(
+    tables: Tuple[ReportTable, ...],
+) -> Tuple[CurrentReportObservation, ...]:
+    observations = []
+    for table in tables:
+        headers = _headers(table)
+        if headers is None or len(headers) != 3:
+            continue
+        category_header, name_header, weight_header = headers
+        if (
+            category_header not in _ISSUER_CATEGORY_HEADERS
+            or name_header not in _ISSUER_NAME_HEADERS
+            or weight_header not in _ISSUER_WEIGHT_HEADERS
+            or _normalized(table.section_name or "")
+            not in {_normalized(value) for value in _COMPLETE_ISSUER_SCOPES}
+        ):
+            continue
+        unit = _ISSUER_WEIGHT_HEADERS[weight_header]
+        seen_names = set()
+        non_sovereign_weights = []
+        valid = True
+        for row in table.rows[1:]:
+            category_text, name_text, weight_text = (cell.text for cell in row.cells)
+            category = _issuer_category(category_text)
+            name = _normalized(name_text)
+            weight = _percent_value(weight_text)
+            if (
+                category is None
+                or not name
+                or _has_unsafe_name_characters(name_text)
+                or name in seen_names
+                or weight is None
+            ):
+                valid = False
+                break
+            seen_names.add(name)
+            if category == "non_sovereign":
+                non_sovereign_weights.append(weight)
+        if not valid or not non_sovereign_weights:
+            continue
+        observations.append(
+            _observation(
+                "current_largest_non_sovereign_issuer_percent",
+                max(non_sovereign_weights),
+                unit,
+                page_number=table.page_number,
+                section_name=table.section_name,
+                source_excerpt=table.source_excerpt,
+            )
+        )
+    return tuple(observations)
+
+
 def _validated_unique_observations(
     observations: Tuple[CurrentReportObservation, ...],
 ) -> Tuple[CurrentReportObservation, ...]:
@@ -793,5 +1223,31 @@ def extract_common_report_observations(
         + _security_concentration_observations(tables)
         + _industry_observations(tables, taxonomy_mappings)
         + _explicit_common_text_observations(text_blocks)
+    )
+    return _validated_unique_observations(observations)
+
+
+def extract_fixed_income_report_observations(
+    *,
+    text_blocks: Tuple[str, ...],
+    tables: Tuple[ReportTable, ...],
+) -> Tuple[CurrentReportObservation, ...]:
+    """Extract only exact current fixed-income observations."""
+
+    if type(text_blocks) is not tuple or type(tables) is not tuple:
+        raise ValueError("current report evidence must use immutable tuples")
+    for block in text_blocks:
+        if type(block) is not str:
+            raise ValueError("current report text blocks must be exact strings")
+    for table in tables:
+        if type(table) is not ReportTable:
+            raise ValueError("current report tables must use exact ReportTable records")
+        table.validate()
+    observations = (
+        _duration_and_maturity_observations(tables, text_blocks)
+        + _convertible_exchangeable_observations(tables)
+        + _credit_distribution_observations(tables)
+        + _gross_leverage_observations(tables, text_blocks)
+        + _issuer_concentration_observations(tables)
     )
     return _validated_unique_observations(observations)
