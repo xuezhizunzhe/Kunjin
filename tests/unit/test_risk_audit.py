@@ -53,17 +53,43 @@ def provenance_from_payload(payload: dict[str, object]) -> ParserProvenance:
     )
 
 
+def historical_native_provenance() -> ParserProvenance:
+    return provenance_from_payload(
+        {
+            "contract_version": "native-v1",
+            "converter_kind": "none",
+            "parser_version": "2",
+        }
+    )
+
+
+def historical_legacy_provenance() -> ParserProvenance:
+    return provenance_from_payload(
+        {
+            "adapter_contract_version": "docker-libreoffice-v1",
+            "architecture": "linux/arm64",
+            "converter_kind": "docker_libreoffice",
+            "export_filter": "html_starwriter_skip_images_v1",
+            "image_id": "sha256:" + "a" * 64,
+            "libreoffice_version": "4:7.4.7-1+deb12u14",
+            "normalization_contract": "legacy_html_nfc_v1",
+            "package_manifest_checksum": "b" * 64,
+            "parser_version": "2-docker-libreoffice-v1",
+        }
+    )
+
+
 class RiskAuditTests(unittest.TestCase):
     def test_native_provenance_is_fixed_and_canonical(self) -> None:
         value = native_parser_provenance()
 
         value.validate()
 
-        self.assertEqual(value.parser_version, "2")
+        self.assertEqual(value.parser_version, "3")
         self.assertEqual(value.converter_kind, "none")
         self.assertEqual(
             value.canonical_json,
-            '{"contract_version":"native-v1","converter_kind":"none","parser_version":"2"}',
+            '{"contract_version":"native-v1","converter_kind":"none","parser_version":"3"}',
         )
         self.assertEqual(len(value.provenance_checksum), 64)
         self.assertEqual(value.canonical_json.encode("ascii").decode("ascii"), value.canonical_json)
@@ -81,7 +107,7 @@ class RiskAuditTests(unittest.TestCase):
         )
 
         value.validate()
-        self.assertEqual(value.parser_version, "2-docker-libreoffice-v1")
+        self.assertEqual(value.parser_version, "3-docker-libreoffice-v1")
         self.assertEqual(value.converter_kind, "docker_libreoffice")
         self.assertEqual(
             json.loads(value.canonical_json),
@@ -94,9 +120,64 @@ class RiskAuditTests(unittest.TestCase):
                 "libreoffice_version": libreoffice_version,
                 "normalization_contract": "legacy_html_nfc_v1",
                 "package_manifest_checksum": package_checksum,
-                "parser_version": "2-docker-libreoffice-v1",
+                "parser_version": "3-docker-libreoffice-v1",
             },
         )
+
+    def test_exact_historical_v2_provenance_remains_readable_but_inactive(self) -> None:
+        native = historical_native_provenance()
+        legacy = historical_legacy_provenance()
+
+        native.validate()
+        legacy.validate()
+
+        self.assertEqual(native.parser_version, "2")
+        self.assertEqual(
+            native.canonical_json,
+            '{"contract_version":"native-v1","converter_kind":"none","parser_version":"2"}',
+        )
+        self.assertEqual(legacy.parser_version, "2-docker-libreoffice-v1")
+        self.assertEqual(
+            legacy.canonical_json,
+            '{"adapter_contract_version":"docker-libreoffice-v1",'
+            '"architecture":"linux/arm64","converter_kind":"docker_libreoffice",'
+            '"export_filter":"html_starwriter_skip_images_v1",'
+            '"image_id":"sha256:'
+            + "a" * 64
+            + '","libreoffice_version":"4:7.4.7-1+deb12u14",'
+            '"normalization_contract":"legacy_html_nfc_v1",'
+            '"package_manifest_checksum":"'
+            + "b" * 64
+            + '","parser_version":"2-docker-libreoffice-v1"}',
+        )
+        self.assertNotEqual(native, native_parser_provenance())
+        self.assertNotEqual(
+            legacy,
+            legacy_parser_provenance(
+                image_id="sha256:" + "a" * 64,
+                architecture="linux/arm64",
+                libreoffice_version="4:7.4.7-1+deb12u14",
+                package_manifest_checksum="b" * 64,
+            ),
+        )
+
+    def test_unknown_native_and_legacy_parser_versions_are_rejected(self) -> None:
+        native = provenance_from_payload(
+            {
+                "contract_version": "native-v1",
+                "converter_kind": "none",
+                "parser_version": "4",
+            }
+        )
+        legacy_payload = json.loads(historical_legacy_provenance().canonical_json)
+        legacy_payload["parser_version"] = "4-docker-libreoffice-v1"
+        legacy = provenance_from_payload(legacy_payload)
+
+        for value in (native, legacy):
+            with self.subTest(parser_version=value.parser_version), self.assertRaisesRegex(
+                ValueError, "unknown"
+            ):
+                value.validate()
 
     def test_retryable_failure_and_success_outcomes_are_distinct(self) -> None:
         self.assertEqual(ParseRunOutcome.FAILED.value, "failed")

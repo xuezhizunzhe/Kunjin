@@ -26,6 +26,7 @@ from kunjin.funds.models import (
     SourceDocument,
 )
 from kunjin.funds.risk.audit import (
+    ParserProvenance,
     ParseRunKind,
     ParseRunOutcome,
     RefreshOutcome,
@@ -91,6 +92,26 @@ LEGACY_PROVENANCE = legacy_parser_provenance(
     package_manifest_checksum="b" * 64,
 )
 RISK_FIXTURES = Path(__file__).parents[1] / "fixtures" / "funds" / "risk"
+
+
+def provenance_from_payload(payload: dict[str, object]) -> ParserProvenance:
+    canonical = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return ParserProvenance(
+        parser_version=str(payload["parser_version"]),
+        converter_kind=str(payload["converter_kind"]),
+        canonical_json=canonical,
+        provenance_checksum=hashlib.sha256(canonical.encode("ascii")).hexdigest(),
+    )
+
+
+def historical_native_provenance() -> ParserProvenance:
+    return provenance_from_payload(
+        {
+            "contract_version": "native-v1",
+            "converter_kind": "none",
+            "parser_version": "2",
+        }
+    )
 
 
 def candidate(kind: DocumentKind, suffix: str) -> OfficialDocumentCandidate:
@@ -1418,6 +1439,75 @@ class RiskServiceBoundaryTest(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "official_document_unavailable")
         self.assertEqual(converter.active_provenance_calls, 1)
+
+    def test_known_v2_current_evidence_is_unavailable_until_v3_refresh(self) -> None:
+        historical = stored_document(
+            DocumentKind.QUARTERLY_REPORT,
+            artifact_id=901,
+            title="2026年第二季度报告",
+            published_at=NOW,
+            parser_provenance=historical_native_provenance(),
+        )
+        current = stored_document(
+            DocumentKind.QUARTERLY_REPORT,
+            artifact_id=902,
+            title="2026年第二季度报告",
+            published_at=NOW + timedelta(minutes=1),
+        )
+        store = FakeRiskStore((historical,))
+        service = FundRiskService(
+            risk_store=store,
+            disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+            repository=FakeRepository(),
+            discovery=SimpleNamespace(),
+            document_client=SimpleNamespace(),
+            clock=lambda: NOW + timedelta(minutes=2),
+        )
+
+        with self.assertRaises(RiskServiceError) as caught:
+            service.classify("519755")
+        self.assertEqual(caught.exception.code, "official_document_unavailable")
+
+        store.records = (current,)
+        service.classify("519755")
+
+        self.assertEqual(store.saved_evidence.parse_result_ids, (current.parse_result.id,))
+        self.assertEqual(
+            store.saved_evidence.parser_provenance_checksums,
+            (current.provenance.provenance_checksum,),
+        )
+        self.assertEqual(
+            store.active_provenance_checksums,
+            (native_parser_provenance().provenance_checksum,),
+        )
+
+    def test_unknown_current_provenance_is_storage_failure(self) -> None:
+        unknown = provenance_from_payload(
+            {
+                "contract_version": "native-v1",
+                "converter_kind": "none",
+                "parser_version": "99",
+            }
+        )
+        record = stored_document(
+            DocumentKind.QUARTERLY_REPORT,
+            artifact_id=901,
+            title="2026年第二季度报告",
+            published_at=NOW,
+            parser_provenance=unknown,
+        )
+
+        with self.assertRaises(RiskServiceError) as caught:
+            FundRiskService(
+                risk_store=FakeRiskStore((record,)),
+                disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+                repository=FakeRepository(),
+                discovery=SimpleNamespace(),
+                document_client=SimpleNamespace(),
+                clock=lambda: NOW,
+            ).classify("519755")
+
+        self.assertEqual(caught.exception.code, "classification_storage_failed")
 
     def test_refresh_start_is_committed_before_discovery_is_called(self) -> None:
         events: list[object] = []

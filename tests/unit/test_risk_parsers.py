@@ -22,6 +22,7 @@ from kunjin.funds.risk.failures import (
 from kunjin.funds.risk.legacy_doc import LegacyConversionResult, LegacyDocConversionError
 from kunjin.funds.risk.models import FactConfidence
 from kunjin.funds.risk.parsers import (
+    PARSER_VERSION,
     ParsedArtifactResult,
     ParsedMandateFact,
     RiskDocumentParseError,
@@ -146,6 +147,9 @@ def write_docx(
 
 
 class RiskHtmlParserTest(unittest.TestCase):
+    def test_active_parser_version_is_v3(self) -> None:
+        self.assertEqual(PARSER_VERSION, "3")
+
     def test_structured_table_channel_preserves_existing_legal_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report.html"
@@ -325,6 +329,11 @@ class RiskHtmlParserTest(unittest.TestCase):
             "上月末资产配置",
             "上半年末资产配置",
             "截至2026-06-30及年初资产配置",
+            "历\u200b史数据",
+            "往\u2060期资产配置",
+            "prior\u200b period asset allocation",
+            "历\ufe0f史数据",
+            "报告期末\x1f资产配置",
         )
         allowed_sections = (
             "截至2026-06-30",

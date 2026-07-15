@@ -16,11 +16,22 @@ _VERSION_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _LIBREOFFICE_VERSION_PATTERN = re.compile(r"^[0-9][0-9A-Za-z.+:~_-]{0,127}$")
 _MAX_LIBREOFFICE_VERSION_LENGTH = 128
 
+ACTIVE_NATIVE_PARSER_VERSION = "3"
+ACTIVE_LEGACY_PARSER_VERSION = "3-docker-libreoffice-v1"
+HISTORICAL_NATIVE_PARSER_VERSIONS = frozenset({"2"})
+HISTORICAL_LEGACY_PARSER_VERSIONS = frozenset({"2-docker-libreoffice-v1"})
+
 _NATIVE_PAYLOAD = {
     "contract_version": "native-v1",
     "converter_kind": "none",
-    "parser_version": "2",
+    "parser_version": ACTIVE_NATIVE_PARSER_VERSION,
 }
+_KNOWN_NATIVE_PARSER_VERSIONS = frozenset(
+    {ACTIVE_NATIVE_PARSER_VERSION, *HISTORICAL_NATIVE_PARSER_VERSIONS}
+)
+_KNOWN_LEGACY_PARSER_VERSIONS = frozenset(
+    {ACTIVE_LEGACY_PARSER_VERSION, *HISTORICAL_LEGACY_PARSER_VERSIONS}
+)
 _LEGACY_PAYLOAD_KEYS = frozenset(
     {
         "adapter_contract_version",
@@ -96,7 +107,11 @@ class ParserProvenance:
         if payload.get("converter_kind") != self.converter_kind:
             raise ValueError("parser provenance converter kind does not match its payload")
         if self.converter_kind == "none":
-            if payload != _NATIVE_PAYLOAD:
+            if payload != {
+                "contract_version": "native-v1",
+                "converter_kind": "none",
+                "parser_version": self.parser_version,
+            } or self.parser_version not in _KNOWN_NATIVE_PARSER_VERSIONS:
                 raise ValueError("native parser provenance contract is unknown")
         else:
             _validate_legacy_payload(payload)
@@ -132,7 +147,7 @@ def legacy_parser_provenance(
         "libreoffice_version": libreoffice_version,
         "normalization_contract": "legacy_html_nfc_v1",
         "package_manifest_checksum": package_manifest_checksum,
-        "parser_version": "2-docker-libreoffice-v1",
+        "parser_version": ACTIVE_LEGACY_PARSER_VERSION,
     }
     return _provenance_from_payload(payload)
 
@@ -191,11 +206,12 @@ def _validate_legacy_payload(payload: dict[str, object]) -> None:
         "converter_kind": "docker_libreoffice",
         "export_filter": "html_starwriter_skip_images_v1",
         "normalization_contract": "legacy_html_nfc_v1",
-        "parser_version": "2-docker-libreoffice-v1",
     }
     for key, expected in fixed_values.items():
         if type(payload[key]) is not str or payload[key] != expected:
             raise ValueError(f"legacy parser provenance {key} is unknown")
+    if payload["parser_version"] not in _KNOWN_LEGACY_PARSER_VERSIONS:
+        raise ValueError("legacy parser provenance parser_version is unknown")
     _validate_legacy_parameters(
         image_id=payload["image_id"],
         architecture=payload["architecture"],

@@ -12,6 +12,9 @@ from typing import Callable, Optional, Tuple
 
 from kunjin.funds.models import FUND_CODE_PATTERN, DocumentKind
 from kunjin.funds.risk.audit import (
+    ACTIVE_LEGACY_PARSER_VERSION,
+    HISTORICAL_LEGACY_PARSER_VERSIONS,
+    HISTORICAL_NATIVE_PARSER_VERSIONS,
     ParserProvenance,
     RefreshOutcome,
     native_parser_provenance,
@@ -977,6 +980,7 @@ class FundRiskService:
         native = native_parser_provenance()
         legacy_checksums = set()
         checksums = set()
+        historical_provenance_found = False
         for requirement in requirements:
             if type(requirement) is not StoredParserProvenance:
                 raise RiskServiceError("classification_storage_failed")
@@ -991,14 +995,24 @@ class FundRiskService:
             except (TypeError, ValueError) as exc:
                 raise RiskServiceError("classification_storage_failed") from exc
             if provenance.converter_kind == "none":
+                if provenance.parser_version in HISTORICAL_NATIVE_PARSER_VERSIONS:
+                    historical_provenance_found = True
+                    continue
                 if provenance != native:
                     raise RiskServiceError("classification_storage_failed")
             elif provenance.converter_kind == "docker_libreoffice":
+                if provenance.parser_version in HISTORICAL_LEGACY_PARSER_VERSIONS:
+                    historical_provenance_found = True
+                    continue
+                if provenance.parser_version != ACTIVE_LEGACY_PARSER_VERSION:
+                    raise RiskServiceError("classification_storage_failed")
                 legacy_checksums.add(provenance.provenance_checksum)
             else:
                 raise RiskServiceError("classification_storage_failed")
             checksums.add(provenance.provenance_checksum)
 
+        if historical_provenance_found:
+            raise RiskServiceError("official_document_unavailable")
         if legacy_checksums:
             active = self._current_legacy_provenance()
             if active is None or legacy_checksums != {active.provenance_checksum}:

@@ -21,7 +21,11 @@ from pypdf import PdfReader
 
 from kunjin.funds.html import HEADING_ELEMENTS, IGNORED_ELEMENTS
 from kunjin.funds.models import DocumentKind
-from kunjin.funds.risk.audit import ParserProvenance, native_parser_provenance
+from kunjin.funds.risk.audit import (
+    ACTIVE_NATIVE_PARSER_VERSION,
+    ParserProvenance,
+    native_parser_provenance,
+)
 from kunjin.funds.risk.documents import (
     MAX_DOCUMENT_BYTES,
     MAX_DOCX_ENTRIES,
@@ -65,7 +69,7 @@ from kunjin.funds.risk.reports import (
     validate_converted_document_contract,
 )
 
-PARSER_VERSION = "2"
+PARSER_VERSION = ACTIVE_NATIVE_PARSER_VERSION
 MAX_SECTION_CHARACTERS = 256
 
 _FACT_KIND_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -423,8 +427,9 @@ class _EvidenceHtmlParser(HTMLParser):
                     self._ignored_tag = None
             return
         if self._heading_tag == tag:
-            section = _normalized_text("".join(self._heading_parts))
-            self._section = section[:MAX_SECTION_CHARACTERS] if section else None
+            raw_section = "".join(self._heading_parts)
+            section = _normalized_text(raw_section)
+            self._section = _bounded_section_context(raw_section, section)
             self._heading_tag = None
             self._heading_parts = []
         if self._block_tag == tag:
@@ -582,9 +587,10 @@ class _ConvertedEvidenceHtmlParser(HTMLParser):
             self._title_parts = []
             return
         if self._heading_tag == tag:
-            heading = _normalized_converted_text("".join(self._heading_parts))
+            raw_heading = "".join(self._heading_parts)
+            heading = _normalized_converted_text(raw_heading)
             if heading:
-                self._section = heading[:MAX_SECTION_CHARACTERS]
+                self._section = _bounded_section_context(raw_heading, heading)
                 self.views.append(TextBlockView(heading, None, self._section, True, False))
             self._heading_tag = None
             self._heading_parts = []
@@ -823,8 +829,9 @@ class _StructuredHtmlTableParser(HTMLParser):
             self._handle_table_end(tag)
             return
         if self._heading_tag == tag:
-            heading = _normalized_text("".join(self._heading_parts))
-            self._section = heading[:MAX_SECTION_CHARACTERS] if heading else None
+            raw_heading = "".join(self._heading_parts)
+            heading = _normalized_text(raw_heading)
+            self._section = _bounded_section_context(raw_heading, heading)
             self._heading_tag = None
             self._heading_parts = []
 
@@ -921,6 +928,13 @@ def _normalized_text(value: str) -> str:
 
 def _normalized_converted_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFC", value).split())
+
+
+def _bounded_section_context(raw: str, normalized: str) -> Optional[str]:
+    if not normalized:
+        return None
+    value = raw if _has_unsafe_time_context_character(raw) else normalized
+    return value[:MAX_SECTION_CHARACTERS]
 
 
 def _normalized_fact_text(block: _TextBlock, value: str) -> str:
@@ -1927,7 +1941,7 @@ def _docx_reject_external_relationships(
                 )
 
 
-def _docx_paragraph_text(paragraph: ElementTree.Element) -> str:
+def _docx_paragraph_raw_text(paragraph: ElementTree.Element) -> str:
     parts = []
     for element in paragraph.iter():
         local_name = element.tag.rsplit("}", 1)[-1]
@@ -1935,7 +1949,11 @@ def _docx_paragraph_text(paragraph: ElementTree.Element) -> str:
             parts.append(element.text)
         elif local_name in {"tab", "br", "cr"}:
             parts.append(" ")
-    return _normalized_text("".join(parts))
+    return "".join(parts)
+
+
+def _docx_paragraph_text(paragraph: ElementTree.Element) -> str:
+    return _normalized_text(_docx_paragraph_raw_text(paragraph))
 
 
 def _docx_is_heading(paragraph: ElementTree.Element, text: str) -> bool:
@@ -2047,9 +2065,10 @@ def _docx_content(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable
         local_name = child.tag.rsplit("}", 1)[-1]
         texts = []
         if local_name == "p":
-            text = _docx_paragraph_text(child)
+            raw_text = _docx_paragraph_raw_text(child)
+            text = _normalized_text(raw_text)
             if text and _docx_is_heading(child, text):
-                section = text[:MAX_SECTION_CHARACTERS]
+                section = _bounded_section_context(raw_text, text)
                 continue
             if text:
                 texts.append(text)
@@ -2297,7 +2316,7 @@ def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
                     continue
                 extracted_any_text = True
                 if _looks_like_heading(line):
-                    section = line
+                    section = _bounded_section_context(raw_line, line)
                     continue
                 blocks.append(_TextBlock(line, page_number, section))
         if not extracted_any_text:
@@ -2378,6 +2397,37 @@ _CONTEXT_MONTHS = {
     "november": 11,
     "december": 12,
 }
+
+# Unicode Default_Ignorable_Code_Point ranges; Cf is also checked by category.
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+
+
+def _has_unsafe_time_context_character(value: str) -> bool:
+    for character in value:
+        if unicodedata.category(character) in {"Cc", "Cf"}:
+            return True
+        codepoint = ord(character)
+        if any(start <= codepoint <= end for start, end in _DEFAULT_IGNORABLE_RANGES):
+            return True
+    return False
 
 
 def _context_periods_and_residual(normalized: str) -> Tuple[set[date], str]:
@@ -2496,6 +2546,8 @@ def _observation_context_matches_period(
     section = observation.section_name
     if section is None:
         return True
+    if _has_unsafe_time_context_character(section):
+        return False
     normalized = " ".join(unicodedata.normalize("NFKC", section).split())
     if _HISTORICAL_CONTEXT_PATTERN.search(normalized):
         return False
@@ -2534,6 +2586,10 @@ def _current_common_facts(
     observations = list(extract_common_report_observations(text_blocks=(), tables=tables))
     for block in blocks:
         if not block.current_observation_eligible or block.nfc_only:
+            continue
+        if block.section_name is not None and _has_unsafe_time_context_character(
+            block.section_name
+        ):
             continue
         block_observations = extract_common_report_observations(
             text_blocks=(block.text,),

@@ -16,7 +16,11 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional, Protocol, Tuple
 
-from kunjin.funds.risk.audit import ParserProvenance, legacy_parser_provenance
+from kunjin.funds.risk.audit import (
+    ACTIVE_LEGACY_PARSER_VERSION,
+    ParserProvenance,
+    legacy_parser_provenance,
+)
 from kunjin.funds.risk.documents import RetrievedArtifact
 from kunjin.funds.risk.failures import (
     DocumentFailureReason,
@@ -174,7 +178,7 @@ class ConverterStatus:
         if self.status == "ready":
             if self.reason_code is not None:
                 raise ValueError("ready converter cannot have a failure reason")
-            if self.parser_version != "2-docker-libreoffice-v1":
+            if self.parser_version != ACTIVE_LEGACY_PARSER_VERSION:
                 raise ValueError("ready converter parser version is invalid")
             if type(self.provenance_checksum) is not str or not _SHA256_PATTERN.fullmatch(
                 self.provenance_checksum

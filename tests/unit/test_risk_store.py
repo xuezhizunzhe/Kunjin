@@ -13,6 +13,7 @@ from typing import Optional
 
 from kunjin.funds.models import DocumentKind
 from kunjin.funds.risk.audit import (
+    ParserProvenance,
     RefreshOutcome,
     legacy_parser_provenance,
     native_parser_provenance,
@@ -56,6 +57,21 @@ from kunjin.funds.risk.store import (
 from kunjin.storage.repository import Repository
 
 NOW = datetime(2026, 7, 13, 8, tzinfo=timezone.utc)
+
+
+def historical_native_provenance() -> ParserProvenance:
+    payload = {
+        "contract_version": "native-v1",
+        "converter_kind": "none",
+        "parser_version": "2",
+    }
+    canonical = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return ParserProvenance(
+        parser_version="2",
+        converter_kind="none",
+        canonical_json=canonical,
+        provenance_checksum=hashlib.sha256(canonical.encode("ascii")).hexdigest(),
+    )
 
 
 class FundRiskStoreTest(unittest.TestCase):
@@ -634,6 +650,37 @@ class FundRiskStoreTest(unittest.TestCase):
             records[1].facts[0].fact_fingerprint,
         )
         self.assertNotEqual(records[0].facts[0].id, records[1].facts[0].id)
+
+    def test_same_artifact_has_distinct_immutable_v2_and_v3_parse_results(self) -> None:
+        parsed = self._parsed()
+        provenances = (historical_native_provenance(), native_parser_provenance())
+        records = []
+
+        for offset, provenance in enumerate(provenances):
+            started_at = NOW + timedelta(minutes=offset)
+            refresh_id = self.store.begin_document_refresh("000001", started_at)
+            records.append(
+                self.store.publish_candidate_success(
+                    refresh_id=refresh_id,
+                    candidate=parsed.artifact.candidate,
+                    parsed=parsed,
+                    provenance=provenance,
+                    parser_input_sha256=parsed.artifact.sha256,
+                    attempted_at=started_at,
+                )
+            )
+            self.store.complete_document_refresh(
+                refresh_id,
+                RefreshOutcome.SUCCESS,
+                started_at + timedelta(seconds=1),
+            )
+
+        self.assertEqual(records[0].artifact.id, records[1].artifact.id)
+        self.assertNotEqual(records[0].provenance.id, records[1].provenance.id)
+        self.assertNotEqual(records[0].parse_result.id, records[1].parse_result.id)
+        self.assertNotEqual(records[0].facts[0].id, records[1].facts[0].id)
+        self.assertEqual(records[0].provenance.parser_version, "2")
+        self.assertEqual(records[1].provenance.parser_version, "3")
 
     def test_document_selection_round_trips_and_current_uses_latest_refresh(self) -> None:
         refresh_id = self.store.begin_document_refresh("000001", NOW)
