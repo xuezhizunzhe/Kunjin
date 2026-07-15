@@ -16,6 +16,7 @@ from kunjin.funds.risk.engine import (
     classification_input_manifest,
     classification_input_manifest_v1,
     classification_input_manifest_v2,
+    classification_input_manifest_v3,
     classify_fund,
     conservative_classification_rank,
 )
@@ -32,6 +33,7 @@ from kunjin.funds.risk.models import (
 )
 from kunjin.funds.risk.parsers import parse_artifact
 from kunjin.funds.risk.policy import ClassificationPolicyV1
+from kunjin.funds.risk.selection import SELECTION_REASON_CODES
 
 NOW = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
 POLICY = ClassificationPolicyV1()
@@ -169,6 +171,11 @@ def parsed_evidence(
         parser_provenance_checksums=tuple(
             chr(ord("a") + index) * 64 for index in range(len(document_ids))
         ),
+        document_refresh_run_id=None,
+        selection_policy_checksum=None,
+        selection_manifest_checksum=None,
+        candidate_run_snapshot_checksum=None,
+        selection_reason_codes=(),
     )
 
 
@@ -208,6 +215,11 @@ def evidence(
     nav_evidence_fingerprint: Optional[str] = None,
     nav_observation_start: Optional[date] = None,
     nav_observation_end: Optional[date] = None,
+    document_refresh_run_id: Optional[int] = None,
+    selection_policy_checksum: Optional[str] = None,
+    selection_manifest_checksum: Optional[str] = None,
+    candidate_run_snapshot_checksum: Optional[str] = None,
+    selection_reason_codes: Tuple[str, ...] = (),
 ) -> ClassificationEvidence:
     legal_facts = facts(legal or {}, document_id=1)
     benchmark_facts = facts(benchmark or {}, document_id=2)
@@ -249,6 +261,11 @@ def evidence(
         parser_provenance_checksums=tuple(
             chr(ord("a") + index) * 64 for index in range(len(document_ids))
         ),
+        document_refresh_run_id=document_refresh_run_id,
+        selection_policy_checksum=selection_policy_checksum,
+        selection_manifest_checksum=selection_manifest_checksum,
+        candidate_run_snapshot_checksum=candidate_run_snapshot_checksum,
+        selection_reason_codes=selection_reason_codes,
     )
 
 
@@ -411,6 +428,78 @@ class ClassificationEvidenceContractTest(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 replace(valid, **changes).validate()
 
+    def test_selection_bindings_default_to_exact_historical_values(self) -> None:
+        value = evidence(legal={"legal_product_family": "sector_theme"})
+
+        self.assertIsNone(value.document_refresh_run_id)
+        self.assertIsNone(value.selection_policy_checksum)
+        self.assertIsNone(value.selection_manifest_checksum)
+        self.assertIsNone(value.candidate_run_snapshot_checksum)
+        self.assertEqual(value.selection_reason_codes, ())
+        value.validate()
+
+        class EmptyTuple(tuple):
+            pass
+
+        with self.assertRaises(ValueError):
+            replace(value, selection_reason_codes=EmptyTuple()).validate()
+
+    def test_selection_bindings_are_all_or_none_and_strictly_validated(self) -> None:
+        valid = evidence(
+            legal={"legal_product_family": "sector_theme"},
+            document_refresh_run_id=7,
+            selection_policy_checksum="a" * 64,
+            selection_manifest_checksum="b" * 64,
+            candidate_run_snapshot_checksum="c" * 64,
+            selection_reason_codes=("current_periodic_candidate_missing",),
+        )
+        valid.validate()
+
+        invalid_changes = (
+            {"document_refresh_run_id": None},
+            {"selection_policy_checksum": None},
+            {"selection_manifest_checksum": None},
+            {"candidate_run_snapshot_checksum": None},
+            {"document_refresh_run_id": 0},
+            {"document_refresh_run_id": True},
+            {"selection_policy_checksum": "A" * 64},
+            {"selection_manifest_checksum": "short"},
+            {"candidate_run_snapshot_checksum": True},
+            {"selection_reason_codes": ["current_periodic_candidate_missing"]},
+            {
+                "selection_reason_codes": (
+                    "current_periodic_candidate_missing",
+                    "current_periodic_candidate_conflict",
+                )
+            },
+            {
+                "selection_reason_codes": (
+                    "current_periodic_candidate_missing",
+                    "current_periodic_candidate_missing",
+                )
+            },
+            {"selection_reason_codes": ("critical_evidence_missing",)},
+        )
+        for changes in invalid_changes:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                replace(valid, **changes).validate()
+
+        with self.assertRaises(ValueError):
+            replace(
+                evidence(legal={"legal_product_family": "sector_theme"}),
+                selection_reason_codes=("current_periodic_candidate_missing",),
+            ).validate()
+
+        self.assertEqual(
+            SELECTION_REASON_CODES,
+            frozenset(
+                {
+                    "current_periodic_candidate_conflict",
+                    "current_periodic_candidate_missing",
+                }
+            ),
+        )
+
     def test_nav_binding_is_all_or_none_and_has_an_ordered_window(self) -> None:
         valid = evidence(
             legal={"legal_product_type": "fof"},
@@ -522,6 +611,88 @@ class ClassificationEvidenceContractTest(unittest.TestCase):
             {key: value for key, value in current.items() if key in legacy},
             legacy,
         )
+        encoded = json.dumps(
+            current,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        self.assertEqual(len(encoded), 1227)
+        self.assertEqual(
+            hashlib.sha256(encoded).hexdigest(),
+            "3aab9bd7149c512e566ce2a049aae2ce5c7ba624f4a3df7e68f4b2fbd1b00c78",
+        )
+
+    def test_manifest_v3_requires_and_binds_the_complete_selection_snapshot(self) -> None:
+        unbound = evidence(legal={"legal_product_type": "fof"})
+        with self.assertRaises(ValueError):
+            classification_input_manifest_v3(unbound, POLICY, NOW)
+
+        bound = replace(
+            unbound,
+            document_refresh_run_id=7,
+            selection_policy_checksum="a" * 64,
+            selection_manifest_checksum="b" * 64,
+            candidate_run_snapshot_checksum="c" * 64,
+            selection_reason_codes=("current_periodic_candidate_missing",),
+        )
+        partial = replace(bound, selection_manifest_checksum=None)
+        with self.assertRaises(ValueError):
+            classification_input_manifest_v3(partial, POLICY, NOW)
+
+        previous = classification_input_manifest_v2(bound, POLICY, NOW)
+        current = classification_input_manifest_v3(bound, POLICY, NOW)
+
+        self.assertEqual(classification_input_manifest(bound, POLICY, NOW), current)
+        self.assertEqual(classification_input_manifest(unbound, POLICY, NOW), previous)
+        self.assertEqual(
+            set(current),
+            set(previous)
+            | {
+                "document_refresh_run_id",
+                "selection_policy_checksum",
+                "selection_manifest_checksum",
+                "candidate_run_snapshot_checksum",
+                "selection_reason_codes",
+            },
+        )
+        self.assertEqual(current["manifest_version"], 3)
+        self.assertEqual(current["document_refresh_run_id"], 7)
+        self.assertEqual(current["selection_policy_checksum"], "a" * 64)
+        self.assertEqual(current["selection_manifest_checksum"], "b" * 64)
+        self.assertEqual(current["candidate_run_snapshot_checksum"], "c" * 64)
+        self.assertEqual(
+            current["selection_reason_codes"],
+            ["current_periodic_candidate_missing"],
+        )
+
+    def test_each_v3_binding_changes_fingerprint_without_changing_classification_rank(self) -> None:
+        base = evidence(
+            legal={"legal_product_family": "sector_theme"},
+            document_refresh_run_id=7,
+            selection_policy_checksum="a" * 64,
+            selection_manifest_checksum="b" * 64,
+            candidate_run_snapshot_checksum="c" * 64,
+            selection_reason_codes=("current_periodic_candidate_missing",),
+        )
+        changes = (
+            {"document_refresh_run_id": 8},
+            {"selection_policy_checksum": "d" * 64},
+            {"selection_manifest_checksum": "e" * 64},
+            {"candidate_run_snapshot_checksum": "f" * 64},
+            {"selection_reason_codes": ("current_periodic_candidate_conflict",)},
+        )
+        baseline = classify(base)
+        for change in changes:
+            with self.subTest(change=change):
+                result = classify(replace(base, **change))
+                self.assertNotEqual(result.input_fingerprint, baseline.input_fingerprint)
+                self.assertEqual(
+                    conservative_classification_rank(result),
+                    conservative_classification_rank(baseline),
+                )
+                self.assertEqual(result.reason_codes, baseline.reason_codes)
+                self.assertEqual(result.missing_evidence, baseline.missing_evidence)
 
     def test_v2_result_and_provenance_bindings_change_the_input_fingerprint(self) -> None:
         base = evidence(legal={"legal_product_family": "sector_theme"})

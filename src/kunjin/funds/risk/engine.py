@@ -25,6 +25,7 @@ from kunjin.funds.risk.models import (
     canonical_fact_value,
 )
 from kunjin.funds.risk.policy import CLASSIFICATION_CONFLICT_CODES, ClassificationPolicyV1
+from kunjin.funds.risk.selection import SELECTION_REASON_CODES
 
 _FUND_CODE_PATTERN = re.compile(r"^\d{6}$")
 _STABLE_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -114,6 +115,11 @@ class ClassificationEvidence:
     fact_ids: Tuple[int, ...]
     parse_result_ids: Tuple[int, ...]
     parser_provenance_checksums: Tuple[str, ...]
+    document_refresh_run_id: Optional[int] = None
+    selection_policy_checksum: Optional[str] = None
+    selection_manifest_checksum: Optional[str] = None
+    candidate_run_snapshot_checksum: Optional[str] = None
+    selection_reason_codes: Tuple[str, ...] = ()
 
     def validate(self) -> None:
         if type(self) is not ClassificationEvidence:
@@ -242,6 +248,40 @@ class ClassificationEvidence:
             self.parser_provenance_checksums,
             "parser provenance checksums",
         )
+        selection_bindings = (
+            self.document_refresh_run_id,
+            self.selection_policy_checksum,
+            self.selection_manifest_checksum,
+            self.candidate_run_snapshot_checksum,
+        )
+        if any(value is None for value in selection_bindings) and not all(
+            value is None for value in selection_bindings
+        ):
+            raise ValueError("classification selection bindings are all-or-none")
+        if type(self.selection_reason_codes) is not tuple:
+            raise ValueError("selection reason codes must be an immutable tuple")
+        if self.document_refresh_run_id is None:
+            if self.selection_reason_codes != ():
+                raise ValueError("selectionless classification evidence cannot have reason codes")
+        else:
+            if type(self.document_refresh_run_id) is not int or self.document_refresh_run_id <= 0:
+                raise ValueError("document refresh run id must be a positive integer")
+            for checksum, label in (
+                (self.selection_policy_checksum, "selection policy checksum"),
+                (self.selection_manifest_checksum, "selection manifest checksum"),
+                (
+                    self.candidate_run_snapshot_checksum,
+                    "candidate run snapshot checksum",
+                ),
+            ):
+                if type(checksum) is not str or not _SHA256_PATTERN.fullmatch(checksum):
+                    raise ValueError(f"{label} must be lowercase SHA-256")
+            if any(type(code) is not str for code in self.selection_reason_codes):
+                raise ValueError("selection reason codes must use exact text")
+            if self.selection_reason_codes != tuple(sorted(set(self.selection_reason_codes))):
+                raise ValueError("selection reason codes must be unique and sorted")
+            if not set(self.selection_reason_codes).issubset(SELECTION_REASON_CODES):
+                raise ValueError("selection reason codes must use declared selection codes")
         used_document_ids = {item.source_document_id for item in d1_facts}
         used_document_ids.update(item.source_document_id for item in self.freshness)
         if not used_document_ids.issubset(self.document_ids):
@@ -384,6 +424,30 @@ def classification_input_manifest_v2(
     return payload
 
 
+def classification_input_manifest_v3(
+    evidence: ClassificationEvidence,
+    policy: ClassificationPolicyV1,
+    classified_at: datetime,
+) -> Dict[str, object]:
+    """Return the manifest bound to an authenticated document selection snapshot."""
+
+    evidence.validate()
+    if evidence.document_refresh_run_id is None:
+        raise ValueError("classification manifest v3 requires selection-bound evidence")
+    payload = classification_input_manifest_v2(evidence, policy, classified_at)
+    payload.update(
+        {
+            "manifest_version": 3,
+            "document_refresh_run_id": evidence.document_refresh_run_id,
+            "selection_policy_checksum": evidence.selection_policy_checksum,
+            "selection_manifest_checksum": evidence.selection_manifest_checksum,
+            "candidate_run_snapshot_checksum": evidence.candidate_run_snapshot_checksum,
+            "selection_reason_codes": list(evidence.selection_reason_codes),
+        }
+    )
+    return payload
+
+
 def classification_input_manifest(
     evidence: ClassificationEvidence,
     policy: ClassificationPolicyV1,
@@ -391,7 +455,9 @@ def classification_input_manifest(
 ) -> Dict[str, object]:
     """Return the canonical current inputs bound by a classification fingerprint."""
 
-    return classification_input_manifest_v2(evidence, policy, classified_at)
+    if evidence.document_refresh_run_id is None:
+        return classification_input_manifest_v2(evidence, policy, classified_at)
+    return classification_input_manifest_v3(evidence, policy, classified_at)
 
 
 def _external_source_payload(value: ExternalSourceReference) -> object:
@@ -1504,5 +1570,6 @@ __all__ = [
     "classification_input_manifest",
     "classification_input_manifest_v1",
     "classification_input_manifest_v2",
+    "classification_input_manifest_v3",
     "conservative_classification_rank",
 ]
