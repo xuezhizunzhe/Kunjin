@@ -104,12 +104,12 @@ def provenance_from_payload(payload: dict[str, object]) -> ParserProvenance:
     )
 
 
-def historical_native_provenance(parser_version: str = "2") -> ParserProvenance:
+def historical_native_provenance() -> ParserProvenance:
     return provenance_from_payload(
         {
             "contract_version": "native-v1",
             "converter_kind": "none",
-            "parser_version": parser_version,
+            "parser_version": "2",
         }
     )
 
@@ -1440,51 +1440,46 @@ class RiskServiceBoundaryTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "official_document_unavailable")
         self.assertEqual(converter.active_provenance_calls, 1)
 
-    def test_known_v2_and_v3_evidence_is_unavailable_until_v4_refresh(self) -> None:
-        for parser_version in ("2", "3"):
-            with self.subTest(parser_version=parser_version):
-                historical = stored_document(
-                    DocumentKind.QUARTERLY_REPORT,
-                    artifact_id=901,
-                    title="2026年第二季度报告",
-                    published_at=NOW,
-                    parser_provenance=historical_native_provenance(parser_version),
-                )
-                current = stored_document(
-                    DocumentKind.QUARTERLY_REPORT,
-                    artifact_id=902,
-                    title="2026年第二季度报告",
-                    published_at=NOW + timedelta(minutes=1),
-                )
-                store = FakeRiskStore((historical,))
-                service = FundRiskService(
-                    risk_store=store,
-                    disclosure_store=FakeDisclosureStore(disclosure_bundle()),
-                    repository=FakeRepository(),
-                    discovery=SimpleNamespace(),
-                    document_client=SimpleNamespace(),
-                    clock=lambda: NOW + timedelta(minutes=2),
-                )
+    def test_known_v2_current_evidence_is_unavailable_until_v3_refresh(self) -> None:
+        historical = stored_document(
+            DocumentKind.QUARTERLY_REPORT,
+            artifact_id=901,
+            title="2026年第二季度报告",
+            published_at=NOW,
+            parser_provenance=historical_native_provenance(),
+        )
+        current = stored_document(
+            DocumentKind.QUARTERLY_REPORT,
+            artifact_id=902,
+            title="2026年第二季度报告",
+            published_at=NOW + timedelta(minutes=1),
+        )
+        store = FakeRiskStore((historical,))
+        service = FundRiskService(
+            risk_store=store,
+            disclosure_store=FakeDisclosureStore(disclosure_bundle()),
+            repository=FakeRepository(),
+            discovery=SimpleNamespace(),
+            document_client=SimpleNamespace(),
+            clock=lambda: NOW + timedelta(minutes=2),
+        )
 
-                with self.assertRaises(RiskServiceError) as caught:
-                    service.classify("519755")
-                self.assertEqual(caught.exception.code, "official_document_unavailable")
+        with self.assertRaises(RiskServiceError) as caught:
+            service.classify("519755")
+        self.assertEqual(caught.exception.code, "official_document_unavailable")
 
-                store.records = (current,)
-                service.classify("519755")
+        store.records = (current,)
+        service.classify("519755")
 
-                self.assertEqual(
-                    store.saved_evidence.parse_result_ids,
-                    (current.parse_result.id,),
-                )
-                self.assertEqual(
-                    store.saved_evidence.parser_provenance_checksums,
-                    (current.provenance.provenance_checksum,),
-                )
-                self.assertEqual(
-                    store.active_provenance_checksums,
-                    (native_parser_provenance().provenance_checksum,),
-                )
+        self.assertEqual(store.saved_evidence.parse_result_ids, (current.parse_result.id,))
+        self.assertEqual(
+            store.saved_evidence.parser_provenance_checksums,
+            (current.provenance.provenance_checksum,),
+        )
+        self.assertEqual(
+            store.active_provenance_checksums,
+            (native_parser_provenance().provenance_checksum,),
+        )
 
     def test_unknown_current_provenance_is_storage_failure(self) -> None:
         unknown = provenance_from_payload(
