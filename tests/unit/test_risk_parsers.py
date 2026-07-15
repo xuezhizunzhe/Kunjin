@@ -1603,6 +1603,28 @@ class RiskPdfParserTest(unittest.TestCase):
         fact = one(parsed, "current_stock_asset_allocation_percent")
         self.assertEqual(fact.section_name, "CURRENT ASSET ALLOCATION")
 
+    def test_pdf_asset_heading_does_not_authorize_fixed_income_text(self) -> None:
+        parsed = self.parse_extracted_text(
+            "CURRENT ASSET ALLOCATION\n"
+            "报告期末股票资产占基金总资产35.2%。\n"
+            "报告期末组合有效久期为3.2年。\n"
+            "报告期末加权平均剩余期限为180天。\n"
+            "报告期末基金总资产占基金资产净值的比例为115.2%。"
+        )
+
+        self.assertEqual(
+            one(parsed, "current_stock_asset_allocation_percent").normalized_value,
+            D("35.2"),
+        )
+        self.assertFalse(
+            {
+                "current_effective_duration",
+                "current_weighted_average_maturity_days",
+                "current_gross_leverage_percent",
+            }
+            & {fact.fact_kind for fact in parsed.facts}
+        )
+
     def test_pdf_historical_context_patterns_close_trusted_current_section(self) -> None:
         historical_headings = (
             "历史数据",

@@ -2692,6 +2692,7 @@ def _current_common_facts(
     observations.extend(
         extract_fixed_income_report_observations(text_blocks=(), tables=tables)
     )
+    media_type, _ = _parse_content_type(artifact.content_type)
     for block in blocks:
         if not block.current_observation_eligible or block.nfc_only:
             continue
@@ -2703,10 +2704,11 @@ def _current_common_facts(
             text_blocks=(block.text,),
             tables=(),
         )
-        block_observations += extract_fixed_income_report_observations(
-            text_blocks=(block.text,),
-            tables=(),
-        )
+        if media_type != "application/pdf":
+            block_observations += extract_fixed_income_report_observations(
+                text_blocks=(block.text,),
+                tables=(),
+            )
         for observation in block_observations:
             bound = replace(
                 observation,
