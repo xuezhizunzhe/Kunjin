@@ -394,6 +394,7 @@ class _EvidenceHtmlParser(HTMLParser):
         self._block_tag: Optional[str] = None
         self._block_parts: List[str] = []
         self._section: Optional[str] = None
+        self._section_current_observation_eligible = True
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         del attrs
@@ -429,7 +430,10 @@ class _EvidenceHtmlParser(HTMLParser):
         if self._heading_tag == tag:
             raw_section = "".join(self._heading_parts)
             section = _normalized_text(raw_section)
-            self._section = _bounded_section_context(raw_section, section)
+            (
+                self._section,
+                self._section_current_observation_eligible,
+            ) = _section_context(raw_section, section)
             self._heading_tag = None
             self._heading_parts = []
         if self._block_tag == tag:
@@ -451,7 +455,14 @@ class _EvidenceHtmlParser(HTMLParser):
         if self._block_tag is not None:
             text = _normalized_text("".join(self._block_parts))
             if text:
-                self.blocks.append(_TextBlock(text, None, self._section))
+                self.blocks.append(
+                    _TextBlock(
+                        text,
+                        None,
+                        self._section,
+                        self._section_current_observation_eligible,
+                    )
+                )
         self._block_tag = None
         self._block_parts = []
 
@@ -489,6 +500,7 @@ class _ConvertedEvidenceHtmlParser(HTMLParser):
         self._block_tag: Optional[str] = None
         self._block_parts: List[str] = []
         self._section: Optional[str] = None
+        self._section_current_observation_eligible = True
         self._table_depth = 0
         self._table_columns: Optional[Tuple[str, str, str]] = None
         self._row_cells: Optional[List[Tuple[str, str]]] = None
@@ -590,8 +602,14 @@ class _ConvertedEvidenceHtmlParser(HTMLParser):
             raw_heading = "".join(self._heading_parts)
             heading = _normalized_converted_text(raw_heading)
             if heading:
-                self._section = _bounded_section_context(raw_heading, heading)
+                (
+                    self._section,
+                    self._section_current_observation_eligible,
+                ) = _section_context(raw_heading, heading)
                 self.views.append(TextBlockView(heading, None, self._section, True, False))
+            elif _has_unsafe_time_context_character(raw_heading):
+                self._section = None
+                self._section_current_observation_eligible = False
             self._heading_tag = None
             self._heading_parts = []
         if self._block_tag == tag:
@@ -675,7 +693,13 @@ class _ConvertedEvidenceHtmlParser(HTMLParser):
         self._cell_parts = []
 
     def _append_bound_block(self, text: str, current_observation_eligible: bool) -> None:
-        block = _TextBlock(text, None, self._section, current_observation_eligible, True)
+        block = _TextBlock(
+            text,
+            None,
+            self._section,
+            current_observation_eligible and self._section_current_observation_eligible,
+            True,
+        )
         self.blocks.append(block)
         self.views.append(TextBlockView(text, None, self._section, False, False))
 
@@ -744,6 +768,7 @@ class _StructuredHtmlTableParser(HTMLParser):
         self._heading_tag: Optional[str] = None
         self._heading_parts: List[str] = []
         self._section: Optional[str] = None
+        self._section_current_observation_eligible = True
         self._table_depth = 0
         self._table_count = 0
         self._total_rows = 0
@@ -831,7 +856,10 @@ class _StructuredHtmlTableParser(HTMLParser):
         if self._heading_tag == tag:
             raw_heading = "".join(self._heading_parts)
             heading = _normalized_text(raw_heading)
-            self._section = _bounded_section_context(raw_heading, heading)
+            (
+                self._section,
+                self._section_current_observation_eligible,
+            ) = _section_context(raw_heading, heading)
             self._heading_tag = None
             self._heading_parts = []
 
@@ -890,7 +918,11 @@ class _StructuredHtmlTableParser(HTMLParser):
         self._cell_parts = []
 
     def _finish_table(self) -> None:
-        if not self._table_invalid and self._rows:
+        if (
+            not self._table_invalid
+            and self._rows
+            and self._section_current_observation_eligible
+        ):
             rows = []
             for index, raw_row in enumerate(self._rows):
                 values = tuple(text for text, _ in raw_row)
@@ -930,11 +962,17 @@ def _normalized_converted_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFC", value).split())
 
 
-def _bounded_section_context(raw: str, normalized: str) -> Optional[str]:
-    if not normalized:
-        return None
-    value = raw if _has_unsafe_time_context_character(raw) else normalized
-    return value[:MAX_SECTION_CHARACTERS]
+def _section_context(raw: str, normalized: str) -> Tuple[Optional[str], bool]:
+    unsafe = _has_unsafe_time_context_character(raw)
+    if unsafe:
+        normalized = " ".join(
+            "".join(
+                " " if _has_unsafe_time_context_character(character) else character
+                for character in normalized
+            ).split()
+        )
+    section = normalized[:MAX_SECTION_CHARACTERS] if normalized else None
+    return section, not unsafe
 
 
 def _normalized_fact_text(block: _TextBlock, value: str) -> str:
@@ -2058,6 +2096,7 @@ def _docx_content(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable
     blocks = []
     tables = []
     section = None
+    section_current_observation_eligible = True
     total_characters = 0
     total_table_rows = 0
     table_count = 0
@@ -2068,7 +2107,9 @@ def _docx_content(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable
             raw_text = _docx_paragraph_raw_text(child)
             text = _normalized_text(raw_text)
             if text and _docx_is_heading(child, text):
-                section = _bounded_section_context(raw_text, text)
+                section, section_current_observation_eligible = _section_context(
+                    raw_text, text
+                )
                 continue
             if text:
                 texts.append(text)
@@ -2080,7 +2121,11 @@ def _docx_content(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable
             if candidate_row_count > MAX_REPORT_ROWS - total_table_rows:
                 raise _resource_limit()
             total_table_rows += candidate_row_count
-            table = _docx_report_table(child, section)
+            table = (
+                _docx_report_table(child, section)
+                if section_current_observation_eligible
+                else None
+            )
             if table is not None:
                 tables.append(table)
             for row in child.findall(".//" + word + "tr"):
@@ -2105,7 +2150,14 @@ def _docx_content(raw: bytes) -> Tuple[Tuple[_TextBlock, ...], Tuple[ReportTable
             total_characters += len(text)
             if total_characters > MAX_EXTRACTED_CHARACTERS:
                 raise _resource_limit()
-            blocks.append(_TextBlock(text, None, section))
+            blocks.append(
+                _TextBlock(
+                    text,
+                    None,
+                    section,
+                    section_current_observation_eligible,
+                )
+            )
     if not blocks:
         raise _fail(
             DocumentFailureReason.PARSER_FORMAT_INVALID,
@@ -2310,15 +2362,25 @@ def _pdf_blocks(raw: bytes) -> Tuple[_TextBlock, ...]:
             if total_characters > MAX_EXTRACTED_CHARACTERS:
                 raise _resource_limit()
             section = None
+            section_current_observation_eligible = True
             for raw_line in text.splitlines():
                 line = _normalized_text(raw_line)
                 if not line:
                     continue
                 extracted_any_text = True
                 if _looks_like_heading(line):
-                    section = _bounded_section_context(raw_line, line)
+                    section, section_current_observation_eligible = _section_context(
+                        raw_line, line
+                    )
                     continue
-                blocks.append(_TextBlock(line, page_number, section))
+                blocks.append(
+                    _TextBlock(
+                        line,
+                        page_number,
+                        section,
+                        section_current_observation_eligible,
+                    )
+                )
         if not extracted_any_text:
             raise _fail(
                 DocumentFailureReason.PARSER_FORMAT_INVALID,

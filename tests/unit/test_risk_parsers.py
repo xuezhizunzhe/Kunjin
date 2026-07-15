@@ -40,6 +40,18 @@ LEGACY_PROVENANCE = legacy_parser_provenance(
     libreoffice_version="24.2.7.2",
     package_manifest_checksum="b" * 64,
 )
+UNSAFE_TIME_CONTEXT_CHARACTERS = ("\u0085", "\u2060", "\ufe0f")
+
+
+def report_heading_with_character(character: str, index: int) -> str:
+    prefix = "报告期末"
+    return prefix + "资" * (index - len(prefix)) + character + "资产组合"
+
+
+def has_current_stock_fact(result: object) -> bool:
+    return any(
+        fact.fact_kind == "current_stock_asset_allocation_percent" for fact in result.facts
+    )
 
 
 def artifact_for(
@@ -114,8 +126,16 @@ def write_docx(
     *,
     table_rows: tuple[tuple[str, ...], ...] = (),
     extra_entries: tuple[tuple[str, bytes], ...] = (),
+    heading_indexes: tuple[int, ...] = (),
 ) -> None:
-    body = "".join("<w:p><w:r><w:t>" + paragraph + "</w:t></w:r></w:p>" for paragraph in paragraphs)
+    body = "".join(
+        "<w:p>"
+        + ("<w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>" if index in heading_indexes else "")
+        + "<w:r><w:t>"
+        + paragraph
+        + "</w:t></w:r></w:p>"
+        for index, paragraph in enumerate(paragraphs)
+    )
     body += "".join(
         "<w:tbl><w:tr>"
         + "".join("<w:tc><w:p><w:r><w:t>" + cell + "</w:t></w:r></w:p></w:tc>" for cell in row)
@@ -149,6 +169,63 @@ def write_docx(
 class RiskHtmlParserTest(unittest.TestCase):
     def test_active_parser_version_is_v3(self) -> None:
         self.assertEqual(PARSER_VERSION, "3")
+
+    def test_unsafe_html_section_state_survives_bounded_heading_for_paragraphs_and_tables(
+        self,
+    ) -> None:
+        bodies = (
+            "<p>报告期末股票资产占基金总资产35.2%。</p>",
+            "<table><tr><th>指标</th><th>单位</th><th>数值</th></tr>"
+            "<tr><td>报告期末股票资产占基金总资产的</td><td>%</td><td>35.2</td>"
+            "</tr></table>",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for character in UNSAFE_TIME_CONTEXT_CHARACTERS:
+                for index in (255, 264):
+                    for body_index, body in enumerate(bodies):
+                        path = root / f"unsafe-{ord(character)}-{index}-{body_index}.html"
+                        heading = report_heading_with_character(character, index)
+                        path.write_text(f"<h2>{heading}</h2>{body}", encoding="utf-8")
+
+                        parsed = parse_artifact(
+                            artifact_for(
+                                path,
+                                content_type="text/html",
+                                kind=DocumentKind.QUARTERLY_REPORT,
+                            )
+                        )
+
+                        with self.subTest(
+                            character=hex(ord(character)), index=index, body=body_index
+                        ):
+                            self.assertFalse(has_current_stock_fact(parsed))
+
+    def test_safe_overlong_html_section_remains_bounded_and_current(self) -> None:
+        bodies = (
+            "<p>报告期末股票资产占基金总资产35.2%。</p>",
+            "<table><tr><th>指标</th><th>单位</th><th>数值</th></tr>"
+            "<tr><td>报告期末股票资产占基金总资产的</td><td>%</td><td>35.2</td>"
+            "</tr></table>",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            heading = "报告期末" + "资" * 300
+            for index, body in enumerate(bodies):
+                path = root / f"safe-{index}.html"
+                path.write_text(f"<h2>{heading}</h2>{body}", encoding="utf-8")
+                fact = one(
+                    parse_artifact(
+                        artifact_for(
+                            path,
+                            content_type="text/html",
+                            kind=DocumentKind.QUARTERLY_REPORT,
+                        )
+                    ),
+                    "current_stock_asset_allocation_percent",
+                )
+
+                self.assertEqual(len(fact.section_name), 256)
 
     def test_structured_table_channel_preserves_existing_legal_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -702,6 +779,74 @@ class RiskHtmlParserTest(unittest.TestCase):
 
 
 class RiskDocxParserTest(unittest.TestCase):
+    def test_unsafe_docx_section_state_survives_bounded_heading_for_paragraphs_and_tables(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for character in UNSAFE_TIME_CONTEXT_CHARACTERS:
+                for index in (255, 264):
+                    heading = report_heading_with_character(character, index)
+                    paragraph_path = root / f"paragraph-{ord(character)}-{index}.docx"
+                    write_docx(
+                        paragraph_path,
+                        (
+                            "基金代码：519755",
+                            heading,
+                            "报告期末股票资产占基金总资产35.2%。",
+                        ),
+                        heading_indexes=(1,),
+                    )
+                    table_path = root / f"table-{ord(character)}-{index}.docx"
+                    write_docx(
+                        table_path,
+                        ("基金代码：519755", heading),
+                        heading_indexes=(1,),
+                        table_rows=(
+                            ("指标", "单位", "数值"),
+                            ("报告期末股票资产占基金总资产的", "%", "35.2"),
+                        ),
+                    )
+
+                    for path in (paragraph_path, table_path):
+                        parsed = parse_artifact(
+                            artifact_for(
+                                path,
+                                content_type="application/msword",
+                                kind=DocumentKind.QUARTERLY_REPORT,
+                            )
+                        )
+                        with self.subTest(
+                            character=hex(ord(character)), index=index, path=path.name
+                        ):
+                            self.assertFalse(has_current_stock_fact(parsed))
+
+    def test_safe_overlong_docx_section_remains_bounded_and_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "safe.docx"
+            write_docx(
+                path,
+                (
+                    "基金代码：519755",
+                    "报告期末" + "资" * 300,
+                    "报告期末股票资产占基金总资产35.2%。",
+                ),
+                heading_indexes=(1,),
+            )
+
+            fact = one(
+                parse_artifact(
+                    artifact_for(
+                        path,
+                        content_type="application/msword",
+                        kind=DocumentKind.QUARTERLY_REPORT,
+                    )
+                ),
+                "current_stock_asset_allocation_percent",
+            )
+
+        self.assertEqual(len(fact.section_name), 256)
+
     def test_docx_ignores_historical_effective_dates_and_keeps_specific_index_type(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "official.doc"
@@ -1167,6 +1312,34 @@ class RiskLegacyConvertedParserTest(unittest.TestCase):
         self.assertEqual(parsed.document.artifact.sha256, legacy_artifact(self.ole_path).sha256)
         self.assertEqual(stock.effective_from, date(2026, 6, 30))
         self.assertEqual(stock.effective_to, date(2026, 6, 30))
+
+    def test_unsafe_converted_section_state_survives_bounded_heading_for_table(self) -> None:
+        for character in UNSAFE_TIME_CONTEXT_CHARACTERS:
+            for index in (255, 264):
+                heading = report_heading_with_character(character, index)
+                html = self.fixture_html.replace(
+                    "<h2>报告期末资产组合</h2>",
+                    f"<h2>{heading}</h2>",
+                )
+
+                parsed = self.parse(html).document
+
+                with self.subTest(character=hex(ord(character)), index=index):
+                    self.assertFalse(has_current_stock_fact(parsed))
+
+    def test_safe_overlong_converted_section_remains_bounded_and_current(self) -> None:
+        heading = "报告期末" + "资" * 300
+        html = self.fixture_html.replace(
+            "<h2>报告期末资产组合</h2>",
+            f"<h2>{heading}</h2>",
+        )
+
+        fact = one(
+            self.parse(html).document,
+            "current_stock_asset_allocation_percent",
+        )
+
+        self.assertEqual(len(fact.section_name), 256)
 
     def test_converted_current_observations_require_unambiguous_bound_table_rows(self) -> None:
         html = self.fixture_html.replace(
