@@ -181,7 +181,7 @@ class LegacyDocConverterTests(unittest.TestCase):
         ready = self._converter().status()
         self.assertEqual(ready.status, "ready")
         self.assertEqual(ready.reason_code, None)
-        self.assertEqual(ready.parser_version, "3-docker-libreoffice-v1")
+        self.assertEqual(ready.parser_version, "4-docker-libreoffice-v1")
         self.assertEqual(len(ready.provenance_checksum or ""), 64)
         self.assertIn(
             (str(DockerLegacyDocConverter.DOCKER_PATH), "image", "inspect", IMAGE_ID),
@@ -206,17 +206,23 @@ class LegacyDocConverterTests(unittest.TestCase):
             ):
                 self.assertEqual(self._converter().status().status, "unavailable")
 
-    def test_ready_status_rejects_historical_v2_parser_version(self) -> None:
-        historical = ConverterStatus(
-            capability="research_only",
-            status="ready",
-            reason_code=None,
-            parser_version="2-docker-libreoffice-v1",
-            provenance_checksum="d" * 64,
-        )
+    def test_ready_status_rejects_historical_v2_and_v3_parser_versions(self) -> None:
+        for parser_version in (
+            "2-docker-libreoffice-v1",
+            "3-docker-libreoffice-v1",
+        ):
+            historical = ConverterStatus(
+                capability="research_only",
+                status="ready",
+                reason_code=None,
+                parser_version=parser_version,
+                provenance_checksum="d" * 64,
+            )
 
-        with self.assertRaisesRegex(ValueError, "parser version"):
-            historical.validate()
+            with self.subTest(parser_version=parser_version), self.assertRaisesRegex(
+                ValueError, "parser version"
+            ):
+                historical.validate()
 
     def test_image_id_only_derives_and_caches_verified_label_provenance(self) -> None:
         converter = self._converter(
@@ -232,7 +238,7 @@ class LegacyDocConverterTests(unittest.TestCase):
 
         self.assertEqual(status.status, "ready")
         self.assertIsNotNone(provenance)
-        self.assertEqual(provenance.parser_version, "3-docker-libreoffice-v1")
+        self.assertEqual(provenance.parser_version, "4-docker-libreoffice-v1")
         self.assertEqual(provenance.provenance_checksum, status.provenance_checksum)
         self.assertIn(LIBREOFFICE_VERSION, provenance.canonical_json)
         self.assertIn(PACKAGE_CHECKSUM, provenance.canonical_json)

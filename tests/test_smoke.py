@@ -219,6 +219,7 @@ class SmokeTest(unittest.TestCase):
     def test_fund_risk_commands_are_packaged(self) -> None:
         cases = [
             ["--json", "sync", "fund-documents", "519755"],
+            ["--json", "fund", "converter-status"],
             ["--json", "fund", "classify", "519755"],
             ["--json", "fund", "classification", "519755"],
             ["--json", "fund", "classification-history", "519755"],
