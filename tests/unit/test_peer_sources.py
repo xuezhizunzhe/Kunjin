@@ -119,10 +119,12 @@ class PeerDirectoryParserTest(unittest.TestCase):
 class PeerDirectoryClientSecurityTest(unittest.TestCase):
     def test_allows_the_exact_audited_directory_host(self) -> None:
         response = make_http_response(FIXTURE.encode("utf-8"), PEER_DIRECTORY_URL)
+        opener = MagicMock()
+        opener.open.return_value = response
         with patch(
             "kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT
         ), patch(
-            "kunjin.funds.sources.urllib.request.urlopen", return_value=response
+            "kunjin.funds.sources._build_secure_opener", return_value=opener
         ):
             fetched = FundTextClient().fetch(PEER_DIRECTORY_URL, PEER_DIRECTORY_REFERER)
 
@@ -134,10 +136,12 @@ class PeerDirectoryClientSecurityTest(unittest.TestCase):
             FIXTURE.encode("utf-8"),
             "https://fundf10.eastmoney.com/js/fundcode_search.js",
         )
+        opener = MagicMock()
+        opener.open.return_value = response
         with patch(
             "kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT
         ), patch(
-            "kunjin.funds.sources.urllib.request.urlopen", return_value=response
+            "kunjin.funds.sources._build_secure_opener", return_value=opener
         ):
             with self.assertRaises(FundSourceError):
                 FundTextClient().fetch(PEER_DIRECTORY_URL, PEER_DIRECTORY_REFERER)
@@ -148,10 +152,10 @@ class PeerDirectoryClientSecurityTest(unittest.TestCase):
         ]
         with patch(
             "kunjin.funds.sources.socket.getaddrinfo", return_value=private_dns
-        ), patch("kunjin.funds.sources.urllib.request.urlopen") as urlopen:
+        ), patch("kunjin.funds.sources._build_secure_opener") as builder:
             with self.assertRaises(FundSourceError):
                 FundTextClient().fetch(PEER_DIRECTORY_URL, PEER_DIRECTORY_REFERER)
-            urlopen.assert_not_called()
+            builder.assert_not_called()
 
 
 if __name__ == "__main__":

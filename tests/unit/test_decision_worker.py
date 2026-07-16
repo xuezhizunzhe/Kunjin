@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -105,6 +106,36 @@ def test_protocol_binds_exact_identity_schema_and_sizes() -> None:
 def test_request_frame_limit_is_enforced_before_launch() -> None:
     with pytest.raises(ValueError, match="request.*limit"):
         decode_worker_request(b"x" * (MAX_REQUEST_BYTES + 1))
+
+
+def test_worker_contract_rejects_source_field_and_host_impersonation() -> None:
+    request = _request()
+    invalid_requests = (
+        replace(request, source_id="fund_manager_official_documents"),
+        replace(request, field_id="net_asset_value"),
+        replace(
+            request,
+            arguments={
+                "url": "https://api.fund.eastmoney.com/f10/JBGK/",
+                "referer": "https://fundf10.eastmoney.com/",
+            },
+        ),
+    )
+    for invalid in invalid_requests:
+        with pytest.raises(ValueError, match="worker.*binding"):
+            encode_worker_request(invalid)
+
+
+def test_worker_contract_allows_controlled_api_disclosures() -> None:
+    request = replace(
+        _request(),
+        field_id="announcement",
+        arguments={
+            "url": "https://api.fund.eastmoney.com/f10/JJGG?fundcode=000000",
+            "referer": "https://fundf10.eastmoney.com/",
+        },
+    )
+    assert decode_worker_request(encode_worker_request(request)) == request
 
 
 @pytest.mark.parametrize(
@@ -296,6 +327,51 @@ def test_cancelled_budget_does_not_launch_worker() -> None:
     popen.assert_not_called()
 
 
+def test_prelaunch_worker_cutoff_cancels_budget_and_never_launches() -> None:
+    budget = _budget(0.0)
+    with patch("kunjin.decision.worker.subprocess.Popen") as popen:
+        with pytest.raises(WorkerExecutionError) as error:
+            run_public_worker(_request(), budget)
+    assert error.value.reason_code == "worker_timeout"
+    assert budget.cancelled
+    assert budget.cancel_reason == "worker_timeout"
+    assert budget.worker_seconds() == 0.0
+    popen.assert_not_called()
+
+
+def test_cleanup_failure_overrides_and_chains_original_timeout() -> None:
+    processes: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def capture(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    cleanup_error = WorkerExecutionError(
+        "worker_cleanup_failed",
+        "public source worker process group could not be removed",
+    )
+    try:
+        with (
+            patch("kunjin.decision.worker.subprocess.Popen", side_effect=capture),
+            patch("kunjin.decision.worker._default_worker_argv", return_value=_argv("sleep")),
+            patch(
+                "kunjin.decision.worker._terminate_and_reap",
+                side_effect=cleanup_error,
+            ),
+        ):
+            with pytest.raises(WorkerExecutionError) as raised:
+                run_public_worker(_request(), _budget(0.1))
+        assert raised.value is cleanup_error
+        assert isinstance(raised.value.__cause__, WorkerExecutionError)
+        assert raised.value.__cause__.reason_code == "worker_timeout"
+    finally:
+        for process in processes:
+            _kill_process_group(process.pid)
+            process.wait(timeout=1)
+
+
 def test_launch_isolated_with_anonymous_pipes_and_allowlisted_environment(monkeypatch) -> None:
     monkeypatch.setenv("KUNJIN_PRIVATE_TOKEN", "must-not-cross")
     calls = []
@@ -320,6 +396,30 @@ def test_launch_isolated_with_anonymous_pipes_and_allowlisted_environment(monkey
     assert kwargs["start_new_session"] is True
     assert result.payload is not None
     assert "KUNJIN_PRIVATE_TOKEN" not in result.payload.text
+
+
+def test_launch_fails_closed_when_process_group_identity_is_unexpected() -> None:
+    process = subprocess.Popen(
+        _argv("sleep"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    budget = _budget()
+    try:
+        with (
+            patch("kunjin.decision.worker.subprocess.Popen", return_value=process),
+            patch("kunjin.decision.worker.os.getpgid", return_value=process.pid + 1),
+        ):
+            with pytest.raises(WorkerExecutionError) as raised:
+                run_public_worker(_request(), budget)
+        assert raised.value.reason_code == "worker_launch_failed"
+        assert budget.cancelled
+        assert process.poll() is not None
+    finally:
+        _kill_process_group(process.pid)
+        process.wait(timeout=1)
 
 
 def test_keyboard_interrupt_cancels_terminates_and_reaps() -> None:
@@ -382,15 +482,12 @@ def test_worker_module_import_boundary_excludes_private_and_storage_modules() ->
     assert all(name not in source.casefold() for name in forbidden)
 
 
-def test_production_worker_entrypoint_returns_a_structured_safe_error() -> None:
-    request = _request()
-    object.__setattr__(
-        request,
-        "arguments",
-        {"url": "https://example.com/", "referer": "https://example.com/"},
+def test_production_worker_entrypoint_rejects_unbound_url_before_launch() -> None:
+    request = replace(
+        _request(),
+        arguments={"url": "https://example.com/", "referer": "https://example.com/"},
     )
-    result = run_public_worker(request, _budget())
-    assert result.ok is False
-    assert result.reason_code == "unsafe_url"
-    assert result.retryable is False
-    assert result.payload is None
+    with patch("kunjin.decision.worker.subprocess.Popen") as popen:
+        with pytest.raises(ValueError, match="worker.*binding"):
+            run_public_worker(request, _budget())
+    popen.assert_not_called()

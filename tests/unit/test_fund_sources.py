@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import http.client
 import socket
+import ssl
 import unittest
 import urllib.error
 import urllib.request
 from datetime import timezone
 from email.message import Message
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from kunjin.funds.models import DocumentKind
@@ -19,7 +21,11 @@ from kunjin.funds.sources import (
     MAX_RESPONSE_BYTES,
     FundSourceError,
     FundTextClient,
+    _build_secure_opener,
+    _PinnedHTTPSConnection,
+    _PinnedHTTPSHandler,
     _SameHostRedirectHandler,
+    _validate_public_dns,
     build_disclosure_url,
     build_f10_url,
     classify_source,
@@ -41,6 +47,13 @@ def make_response(
     response.geturl.return_value = final_url
     response.headers = headers
     return response
+
+
+def patch_secure_open(*, response=None, side_effect=None):
+    opener = MagicMock()
+    opener.open.return_value = response
+    opener.open.side_effect = side_effect
+    return patch("kunjin.funds.sources._build_secure_opener", return_value=opener), opener
 
 
 class FundSourceUrlTest(unittest.TestCase):
@@ -95,9 +108,10 @@ class FundTextClientTest(unittest.TestCase):
         response = make_response(
             "基金资料".encode("gb18030"), content_type="text/html; charset=gbk"
         )
+        opener_patch, opener = patch_secure_open(response=response)
         with (
             patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
-            patch("kunjin.funds.sources.urllib.request.urlopen", return_value=response) as urlopen,
+            opener_patch,
         ):
             result = self.client.fetch(
                 "https://fundf10.eastmoney.com/jbgk_519755.html",
@@ -108,7 +122,7 @@ class FundTextClientTest(unittest.TestCase):
         self.assertEqual(result.final_url, "https://fundf10.eastmoney.com/jbgk_519755.html")
         self.assertEqual(len(result.checksum), 64)
         self.assertIs(result.retrieved_at.tzinfo, timezone.utc)
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 3)
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 3)
         self.assertEqual(response.read.call_args.args, (MAX_RESPONSE_BYTES + 1,))
 
     def test_allows_audited_api_host_without_cross_host_redirects(self) -> None:
@@ -118,9 +132,10 @@ class FundTextClientTest(unittest.TestCase):
         response = make_response(
             b'{"Data":[]}', final_url=final_url, content_type="application/json"
         )
+        opener_patch, _opener = patch_secure_open(response=response)
         with (
             patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
-            patch("kunjin.funds.sources.urllib.request.urlopen", return_value=response),
+            opener_patch,
         ):
             result = self.client.fetch(final_url, "https://fundf10.eastmoney.com/")
 
@@ -130,9 +145,10 @@ class FundTextClientTest(unittest.TestCase):
         response = make_response(
             "基金资料".encode("gb18030"), content_type="text/html; charset=big5"
         )
+        opener_patch, _opener = patch_secure_open(response=response)
         with (
             patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
-            patch("kunjin.funds.sources.urllib.request.urlopen", return_value=response),
+            opener_patch,
         ):
             result = self.client.fetch(
                 "https://fundf10.eastmoney.com/jbgk_519755.html",
@@ -152,11 +168,11 @@ class FundTextClientTest(unittest.TestCase):
         for url in urls:
             with (
                 self.subTest(url=url),
-                patch("kunjin.funds.sources.urllib.request.urlopen") as urlopen,
+                patch("kunjin.funds.sources._build_secure_opener") as builder,
             ):
                 with self.assertRaises(FundSourceError):
                     self.client.fetch(url, "https://fundf10.eastmoney.com/")
-                urlopen.assert_not_called()
+                builder.assert_not_called()
 
     def test_rejects_host_when_dns_resolves_to_non_public_address(self) -> None:
         unsafe_addresses = (
@@ -175,20 +191,21 @@ class FundTextClientTest(unittest.TestCase):
             with (
                 self.subTest(address=address),
                 patch("kunjin.funds.sources.socket.getaddrinfo", return_value=dns_result),
-                patch("kunjin.funds.sources.urllib.request.urlopen") as urlopen,
+                patch("kunjin.funds.sources._build_secure_opener") as builder,
             ):
                 with self.assertRaises(FundSourceError):
                     self.client.fetch(
                         "https://fundf10.eastmoney.com/jbgk_519755.html",
                         "https://fundf10.eastmoney.com/",
                     )
-                urlopen.assert_not_called()
+                builder.assert_not_called()
 
     def test_rejects_oversized_response(self) -> None:
         response = make_response(b"x" * (MAX_RESPONSE_BYTES + 1))
+        opener_patch, _opener = patch_secure_open(response=response)
         with (
             patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
-            patch("kunjin.funds.sources.urllib.request.urlopen", return_value=response),
+            opener_patch,
         ):
             with self.assertRaises(FundSourceError):
                 self.client.fetch(
@@ -202,9 +219,10 @@ class FundTextClientTest(unittest.TestCase):
             "http://fundf10.eastmoney.com/jbgk_519755.html",
             "https://example.com/jbgk_519755.html",
         )
+        opener_patch, _opener = patch_secure_open(response=accepted)
         with (
             patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
-            patch("kunjin.funds.sources.urllib.request.urlopen", return_value=accepted),
+            opener_patch,
         ):
             self.client.fetch(
                 "https://fundf10.eastmoney.com/jbgk_519755.html",
@@ -213,10 +231,11 @@ class FundTextClientTest(unittest.TestCase):
 
         for final_url in rejected_urls:
             response = make_response(b"blocked", final_url)
+            opener_patch, _opener = patch_secure_open(response=response)
             with (
                 self.subTest(final_url=final_url),
                 patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
-                patch("kunjin.funds.sources.urllib.request.urlopen", return_value=response),
+                opener_patch,
             ):
                 with self.assertRaises(FundSourceError):
                     self.client.fetch(
@@ -262,6 +281,66 @@ class FundTextClientTest(unittest.TestCase):
         self.assertEqual(result, "allowed")
         delegated.assert_called_once()
 
+    def test_secure_opener_disables_proxies_and_installs_pinned_handlers(self) -> None:
+        with patch("kunjin.funds.sources.urllib.request.build_opener") as build_opener:
+            _build_secure_opener("fundf10.eastmoney.com")
+        handlers = build_opener.call_args.args
+        proxy = next(item for item in handlers if isinstance(item, urllib.request.ProxyHandler))
+        self.assertEqual(proxy.proxies, {})
+        self.assertTrue(any(isinstance(item, _SameHostRedirectHandler) for item in handlers))
+        self.assertTrue(any(isinstance(item, _PinnedHTTPSHandler) for item in handlers))
+
+    def test_pinned_connection_connects_validated_ip_and_uses_origin_for_sni(self) -> None:
+        raw_socket = MagicMock()
+        raw_socket.getpeername.return_value = ("1.1.1.1", 443)
+        context = SimpleNamespace(
+            verify_mode=ssl.CERT_REQUIRED,
+            check_hostname=True,
+            post_handshake_auth=None,
+            wrap_socket=MagicMock(return_value=MagicMock()),
+        )
+        connection = _PinnedHTTPSConnection(
+            "fundf10.eastmoney.com",
+            context=context,
+        )
+        with (
+            patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
+            patch("kunjin.funds.sources.socket.socket", return_value=raw_socket),
+        ):
+            connection.connect()
+        raw_socket.connect.assert_called_once_with(("1.1.1.1", 443))
+        context.wrap_socket.assert_called_once_with(
+            raw_socket,
+            server_hostname="fundf10.eastmoney.com",
+        )
+
+    def test_second_dns_result_cannot_connect_private_address(self) -> None:
+        private_result = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("10.0.0.1", 443))
+        ]
+        context = SimpleNamespace(
+            verify_mode=ssl.CERT_REQUIRED,
+            check_hostname=True,
+            post_handshake_auth=None,
+            wrap_socket=MagicMock(),
+        )
+        connection = _PinnedHTTPSConnection(
+            "fundf10.eastmoney.com",
+            context=context,
+        )
+        with (
+            patch(
+                "kunjin.funds.sources.socket.getaddrinfo",
+                side_effect=(PUBLIC_DNS_RESULT, private_result),
+            ) as getaddrinfo,
+            patch("kunjin.funds.sources.socket.socket") as socket_factory,
+        ):
+            _validate_public_dns("fundf10.eastmoney.com", 443)
+            with self.assertRaises(FundSourceError):
+                connection.connect()
+        self.assertEqual(getaddrinfo.call_count, 2)
+        socket_factory.assert_not_called()
+
     def test_failure_reasons_are_stable_and_retryable_only_when_transient(self) -> None:
         url = "https://fundf10.eastmoney.com/jbgk_519755.html"
         cases = (
@@ -271,12 +350,23 @@ class FundTextClientTest(unittest.TestCase):
             (http.client.IncompleteRead(b"partial"), "transient_network_failure", True),
             (http.client.BadStatusLine("private status"), "transient_network_failure", True),
             (urllib.error.HTTPError(url, 404, "private header", {}, None), "http_4xx", False),
+            (
+                urllib.error.HTTPError(url, 503, "private server error", {}, None),
+                "transient_network_failure",
+                True,
+            ),
+            (
+                urllib.error.HTTPError(url, 302, "private redirect", {}, None),
+                "unsafe_redirect",
+                False,
+            ),
         )
         for exception, reason_code, retryable in cases:
+            opener_patch, _opener = patch_secure_open(side_effect=exception)
             with (
                 self.subTest(reason_code=reason_code),
                 patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
-                patch("kunjin.funds.sources.urllib.request.urlopen", side_effect=exception),
+                opener_patch,
             ):
                 with self.assertRaises(FundSourceError) as raised:
                     self.client.fetch(url, "https://fundf10.eastmoney.com/")
@@ -310,18 +400,13 @@ class FundTextClientTest(unittest.TestCase):
         )
         for (reason_code, action), response in zip(cases, responses):
             with self.subTest(reason_code=reason_code):
-                if response is None:
-                    context = patch("kunjin.funds.sources.urllib.request.urlopen")
-                else:
-                    context = patch(
-                        "kunjin.funds.sources.urllib.request.urlopen", return_value=response
-                    )
+                opener_patch, _opener = patch_secure_open(response=response)
                 with (
                     patch(
                         "kunjin.funds.sources.socket.getaddrinfo",
                         return_value=PUBLIC_DNS_RESULT,
                     ),
-                    context,
+                    opener_patch,
                 ):
                     with self.assertRaises(FundSourceError) as raised:
                         action()

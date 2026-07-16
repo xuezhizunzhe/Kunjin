@@ -23,8 +23,8 @@ from kunjin.decision.worker_protocol import (
 from kunjin.funds.sources import FETCHABLE_HOSTS
 
 _READ_CHUNK_BYTES = 64 * 1024
-_TERM_GRACE_SECONDS = 0.25
-_KILL_GRACE_SECONDS = 0.25
+_TERM_GRACE_SECONDS = 0.15
+_KILL_GRACE_SECONDS = 0.10
 _SELECT_SLICE_SECONDS = 0.05
 _GROUP_POLL_SECONDS = 0.01
 _AUDIT_CLOCK_SKEW = timedelta(seconds=1)
@@ -142,10 +142,7 @@ def _cancel_and_terminate(
     reason: str,
 ) -> None:
     budget.cancel(reason)
-    try:
-        _terminate_and_reap(process, pgid)
-    except BaseException:
-        return
+    _terminate_and_reap(process, pgid)
 
 
 def _worker_error(reason_code: str, message: str) -> WorkerExecutionError:
@@ -158,10 +155,52 @@ def _remaining_worker_seconds(budget: RequestBudget) -> float:
     try:
         remaining = budget.worker_seconds()
     except BudgetExpired:
+        if not budget.cancelled:
+            budget.cancel("worker_timeout")
         raise _worker_error("worker_timeout", "public source worker deadline reached") from None
     if remaining <= 0.0:
+        budget.cancel("worker_timeout")
         raise _worker_error("worker_timeout", "public source worker deadline reached")
     return remaining
+
+
+def _terminate_unverified_process(process: subprocess.Popen) -> None:
+    try:
+        process.terminate()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=_TERM_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise _worker_error(
+            "worker_cleanup_failed",
+            "unverified public source worker could not be reaped",
+        ) from None
+
+
+def _abort_worker(
+    budget: RequestBudget,
+    process: subprocess.Popen,
+    pgid: int,
+    error: BaseException,
+    reason: str,
+) -> None:
+    try:
+        _cancel_and_terminate(budget, process, pgid, reason)
+    except WorkerExecutionError as cleanup_error:
+        _close_worker_pipes(process)
+        raise cleanup_error from error
+    _close_worker_pipes(process)
+    raise error
 
 
 def _safe_https_host(url: str) -> str:
@@ -310,7 +349,22 @@ def run_public_worker(
         raise _worker_error(
             "worker_launch_failed", "public source worker could not start"
         ) from None
-    pgid = process.pid
+    try:
+        pgid = os.getpgid(process.pid)
+    except OSError:
+        budget.cancel("worker_launch_failed")
+        _terminate_unverified_process(process)
+        raise _worker_error(
+            "worker_launch_failed",
+            "public source worker process group could not be verified",
+        ) from None
+    if pgid != process.pid:
+        budget.cancel("worker_launch_failed")
+        _terminate_unverified_process(process)
+        raise _worker_error(
+            "worker_launch_failed",
+            "public source worker process group identity is invalid",
+        )
     try:
         _remaining_worker_seconds(budget)
         response = _exchange_frames(process, frame, budget)
@@ -324,9 +378,7 @@ def run_public_worker(
         budget.require_publishable()
     except subprocess.TimeoutExpired:
         error = _worker_error("worker_timeout", "public source worker did not exit")
-        _cancel_and_terminate(budget, process, pgid, error.reason_code)
-        _close_worker_pipes(process)
-        raise error from None
+        _abort_worker(budget, process, pgid, error, error.reason_code)
     except ValueError as exc:
         reason = (
             "worker_identity_mismatch"
@@ -334,19 +386,13 @@ def run_public_worker(
             else "worker_protocol_error"
         )
         error = _worker_error(reason, "public source worker returned an invalid response")
-        _cancel_and_terminate(budget, process, pgid, error.reason_code)
-        _close_worker_pipes(process)
-        raise error from None
+        _abort_worker(budget, process, pgid, error, error.reason_code)
     except BudgetExpired:
         error = _worker_error("request_expired", "request result is no longer publishable")
-        _cancel_and_terminate(budget, process, pgid, error.reason_code)
-        _close_worker_pipes(process)
-        raise error from None
+        _abort_worker(budget, process, pgid, error, error.reason_code)
     except BaseException as exc:
         reason = exc.reason_code if isinstance(exc, WorkerExecutionError) else "worker_aborted"
-        _cancel_and_terminate(budget, process, pgid, reason)
-        _close_worker_pipes(process)
-        raise
+        _abort_worker(budget, process, pgid, exc, reason)
     _close_worker_pipes(process)
     _terminate_and_reap(process, pgid)
     return result

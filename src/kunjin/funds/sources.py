@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 from kunjin.decision.models import TRANSIENT_SOURCE_ERRORS, SourceErrorCode
 from kunjin.funds.models import DocumentKind
@@ -29,7 +29,6 @@ _FUND_SOURCE_REASON_CODES = frozenset(item.value for item in SourceErrorCode)
 _TRANSIENT_FUND_SOURCE_REASON_CODES = frozenset(
     item.value for item in TRANSIENT_SOURCE_ERRORS
 )
-_ORIGINAL_URLOPEN = urllib.request.urlopen
 
 F10_PAGE_PATHS: Dict[DocumentKind, str] = {
     DocumentKind.BASIC_PROFILE: "jbgk_{code}.html",
@@ -182,7 +181,7 @@ def _is_disallowed_address(address: IpAddress) -> bool:
     )
 
 
-def _validate_public_dns(host: str, port: int) -> None:
+def _resolve_public_addresses(host: str, port: int) -> Tuple[tuple, ...]:
     try:
         results = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror:
@@ -213,6 +212,11 @@ def _validate_public_dns(host: str, port: int) -> None:
                 reason_code="unsafe_url",
                 retryable=False,
             )
+    return tuple(results)
+
+
+def _validate_public_dns(host: str, port: int) -> None:
+    _resolve_public_addresses(host, port)
 
 
 def _validate_fetch_url(
@@ -266,17 +270,107 @@ class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, target)
 
 
-def _open_with_redirect_policy(
-    request: urllib.request.Request,
-    *,
-    timeout_seconds: int,
-    host: str,
-) -> object:
-    # Existing callers inject urlopen in tests; production always uses the scoped opener.
-    if urllib.request.urlopen is not _ORIGINAL_URLOPEN:
-        return urllib.request.urlopen(request, timeout=timeout_seconds)
-    opener = urllib.request.build_opener(_SameHostRedirectHandler(host))
-    return opener.open(request, timeout=timeout_seconds)
+def _validated_peer_address(peer: object, expected: IpAddress) -> None:
+    try:
+        peer_address = ipaddress.ip_address(peer[0])  # type: ignore[index]
+    except (ValueError, IndexError, TypeError):
+        raise FundSourceError(
+            "fund source connection returned an invalid peer address",
+            reason_code="unsafe_url",
+            retryable=False,
+        ) from None
+    if _is_disallowed_address(peer_address) or peer_address != expected:
+        raise FundSourceError(
+            "fund source connection peer did not match validated DNS",
+            reason_code="unsafe_url",
+            retryable=False,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        if self._tunnel_host is not None:
+            raise FundSourceError(
+                "fund source proxy tunnels are disabled",
+                reason_code="unsafe_url",
+                retryable=False,
+            )
+        host = self.host.lower().rstrip(".")
+        if host not in FETCHABLE_HOSTS:
+            raise FundSourceError(
+                "fund source connection host is not fetchable",
+                reason_code="unsafe_url",
+                retryable=False,
+            )
+        results = _resolve_public_addresses(host, self.port)
+        last_error: Optional[OSError] = None
+        for family, socktype, proto, _canonname, sockaddr in results:
+            expected = ipaddress.ip_address(sockaddr[0])
+            raw_socket = socket.socket(family, socktype, proto)
+            try:
+                if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                    raw_socket.settimeout(self.timeout)
+                if self.source_address:
+                    raw_socket.bind(self.source_address)
+                raw_socket.connect(sockaddr)
+                _validated_peer_address(raw_socket.getpeername(), expected)
+                raw_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.sock = self._context.wrap_socket(
+                    raw_socket,
+                    server_hostname=host,
+                )
+                return
+            except FundSourceError:
+                raw_socket.close()
+                raise
+            except OSError as exc:
+                last_error = exc
+                raw_socket.close()
+        if last_error is None:
+            raise FundSourceError(
+                "fund source DNS returned no usable addresses",
+                reason_code="dns_failure",
+                retryable=True,
+            )
+        raise last_error
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, original_host: str) -> None:
+        super().__init__()
+        if original_host not in FETCHABLE_HOSTS:
+            raise ValueError("HTTPS pinning requires a fetchable host")
+        self.original_host = original_host
+
+    def https_open(self, request: urllib.request.Request) -> object:
+        parsed = _validate_fetch_url(request.full_url, reason_code="unsafe_redirect")
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if host != self.original_host:
+            raise FundSourceError(
+                "fund source HTTPS request changed host",
+                reason_code="unsafe_redirect",
+                retryable=False,
+            )
+
+        def connection_factory(connection_host: str, **kwargs) -> _PinnedHTTPSConnection:
+            return _PinnedHTTPSConnection(connection_host, **kwargs)
+
+        return self.do_open(
+            connection_factory,
+            request,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
+
+
+def _build_secure_opener(host: str) -> urllib.request.OpenerDirector:
+    if host not in FETCHABLE_HOSTS:
+        raise ValueError("secure opener requires a fetchable host")
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _SameHostRedirectHandler(host),
+        _PinnedHTTPSHandler(host),
+    )
 
 
 def _decode_text(payload: bytes, declared_charset: Optional[str]) -> str:
@@ -327,12 +421,9 @@ class FundTextClient:
             },
             method="GET",
         )
+        opener = _build_secure_opener(host)
         try:
-            with _open_with_redirect_policy(
-                request,
-                timeout_seconds=self.timeout_seconds,
-                host=host,
-            ) as response:
+            with opener.open(request, timeout=self.timeout_seconds) as response:
                 final_url = response.geturl()
                 final = _validate_fetch_url(final_url, reason_code="unsafe_redirect")
                 final_host = (final.hostname or "").lower().rstrip(".")
@@ -372,6 +463,12 @@ class FundTextClient:
         except FundSourceError:
             raise
         except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise FundSourceError(
+                    "fund source redirect was rejected",
+                    reason_code="unsafe_redirect",
+                    retryable=False,
+                ) from None
             if 400 <= exc.code < 500:
                 raise FundSourceError(
                     "fund source returned an HTTP client error",

@@ -5,9 +5,11 @@ import binascii
 import hashlib
 import json
 import re
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from types import MappingProxyType
+from typing import Any, Dict, Mapping, Optional
 
 from kunjin.decision.models import (
     TRANSIENT_SOURCE_ERRORS,
@@ -49,6 +51,30 @@ _PAYLOAD_KEYS = frozenset(
 )
 _SOURCE_ERROR_CODES = frozenset(item.value for item in SourceErrorCode)
 _TRANSIENT_ERROR_CODES = frozenset(item.value for item in TRANSIENT_SOURCE_ERRORS)
+_F10_FIELD_HOSTS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "announcement": frozenset(
+            {"api.fund.eastmoney.com", "fundf10.eastmoney.com"}
+        ),
+        "basic_profile": frozenset({"fundf10.eastmoney.com"}),
+        "fee_schedule": frozenset({"fundf10.eastmoney.com"}),
+        "industry_exposure": frozenset(
+            {"api.fund.eastmoney.com", "fundf10.eastmoney.com"}
+        ),
+        "manager_history": frozenset({"fundf10.eastmoney.com"}),
+        "quarterly_holdings": frozenset({"fundf10.eastmoney.com"}),
+        "size_history": frozenset({"fundf10.eastmoney.com"}),
+    }
+)
+_WORKER_BINDINGS: Mapping[str, Mapping[str, Mapping[str, frozenset[str]]]] = (
+    MappingProxyType(
+        {
+            "fund_text_fetch": MappingProxyType(
+                {"eastmoney_f10": _F10_FIELD_HOSTS}
+            )
+        }
+    )
+)
 
 
 def _reject_duplicate_pairs(pairs: list) -> Dict[str, Any]:
@@ -117,6 +143,44 @@ def _validate_schema(value: object) -> int:
     return value
 
 
+def _binding_host(url: object) -> str:
+    if type(url) is not str:
+        raise ValueError("worker request binding URL must be exact text")
+    try:
+        parsed = urllib.parse.urlparse(url)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("worker request binding URL is invalid") from None
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        raise ValueError("worker request binding requires safe HTTPS")
+    return parsed.hostname.lower().rstrip(".")
+
+
+def _validate_worker_binding(
+    operation: object,
+    source_id: object,
+    field_id: object,
+    arguments: object,
+) -> None:
+    if type(operation) is not str or type(source_id) is not str or type(field_id) is not str:
+        raise ValueError("worker request binding is invalid")
+    source_bindings = _WORKER_BINDINGS.get(operation)
+    field_bindings = None if source_bindings is None else source_bindings.get(source_id)
+    allowed_hosts = None if field_bindings is None else field_bindings.get(field_id)
+    if allowed_hosts is None or type(arguments) is not dict:
+        raise ValueError("worker request binding is not allowed")
+    if _binding_host(arguments.get("url")) not in allowed_hosts:
+        raise ValueError("worker request binding host is not allowed")
+    if _binding_host(arguments.get("referer")) != "fundf10.eastmoney.com":
+        raise ValueError("worker request binding referer is not allowed")
+
+
 @dataclass(frozen=True)
 class WorkerRequest:
     schema_version: int
@@ -135,12 +199,16 @@ class WorkerRequest:
         validate_identifier(self.source_id, "worker source id")
         validate_identifier(self.field_id, "worker field id")
         _validate_subject_key(self.subject_key)
-        if self.operation != "fund_text_fetch":
-            raise ValueError("worker operation is not supported")
         if type(self.arguments) is not dict or set(self.arguments) != {"url", "referer"}:
             raise ValueError("worker arguments must contain only url and referer")
         _validate_url_argument(self.arguments["url"], "url")
         _validate_url_argument(self.arguments["referer"], "referer")
+        _validate_worker_binding(
+            self.operation,
+            self.source_id,
+            self.field_id,
+            self.arguments,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         self.validate()
