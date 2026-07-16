@@ -4,7 +4,6 @@ import math
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from types import MappingProxyType
 from typing import Callable, Optional
 
 from kunjin.decision.models import (
@@ -14,13 +13,6 @@ from kunjin.decision.models import (
     validate_request_id,
 )
 
-_TOTAL_SECONDS = MappingProxyType(
-    {
-        RequestMode.RAPID: 90.0,
-        RequestMode.DEEP: 480.0,
-    }
-)
-CLEANUP_RESERVE_SECONDS = 2.0
 _CONSTRUCTION_TOKEN = object()
 
 
@@ -153,12 +145,12 @@ class RequestBudget:
         monotonic_start = _validate_monotonic_time(monotonic_value)
         try:
             wall_clock_value = wall_clock()
+            started_at = validate_aware_datetime(
+                wall_clock_value,
+                "wall clock",
+            ).astimezone(timezone.utc)
         except Exception:
             raise ValueError("wall clock failed") from None
-        started_at = validate_aware_datetime(
-            wall_clock_value,
-            "wall clock",
-        ).astimezone(timezone.utc)
         return cls(
             _token=_CONSTRUCTION_TOKEN,
             mode=mode,

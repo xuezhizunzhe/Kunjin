@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 
@@ -131,7 +131,7 @@ def test_create_rejects_non_finite_or_non_float_monotonic_time(tick: object) -> 
     [datetime(2026, 7, 16, 6, 0), "2026-07-16T06:00:00+00:00", None],
 )
 def test_create_rejects_invalid_wall_clock_time(wall_time: object) -> None:
-    with pytest.raises(ValueError, match="timezone-aware exact datetime"):
+    with pytest.raises(ValueError, match="^wall clock failed$"):
         RequestBudget.create(
             RequestMode.RAPID,
             monotonic=lambda: 1.0,
@@ -248,10 +248,10 @@ def test_cancelled_state_cannot_be_reversed_by_normal_assignment() -> None:
         budget.require_publishable()
 
 
-def test_total_seconds_policy_cannot_be_mutated() -> None:
+def test_shadow_policy_names_are_not_exposed() -> None:
     assert not hasattr(budget_module, "TOTAL_SECONDS")
-    with pytest.raises(TypeError):
-        budget_module._TOTAL_SECONDS[RequestMode.RAPID] = 480.0
+    assert not hasattr(budget_module, "_TOTAL_SECONDS")
+    assert not hasattr(budget_module, "CLEANUP_RESERVE_SECONDS")
 
 
 def test_wall_clock_audit_timestamps_are_normalized_to_utc() -> None:
@@ -301,8 +301,14 @@ def test_rebinding_module_policy_names_cannot_change_fixed_budget_semantics(
         budget_module,
         "_TOTAL_SECONDS",
         {RequestMode.RAPID: 480.0, RequestMode.DEEP: 90.0},
+        raising=False,
     )
-    monkeypatch.setattr(budget_module, "CLEANUP_RESERVE_SECONDS", 3.0)
+    monkeypatch.setattr(
+        budget_module,
+        "CLEANUP_RESERVE_SECONDS",
+        3.0,
+        raising=False,
+    )
 
     rapid = RequestBudget.create(
         RequestMode.RAPID,
@@ -382,6 +388,8 @@ def test_audit_deadline_overflow_fails_as_a_validation_error() -> None:
     [
         (RequestMode.RAPID, float(2**59), 128.0),
         (RequestMode.DEEP, float(2**58), 512.0),
+        (RequestMode.RAPID, -float(2**60), 128.0),
+        (RequestMode.DEEP, -float(2**60), 512.0),
     ],
 )
 def test_represented_monotonic_span_cannot_exceed_policy_total(
@@ -413,6 +421,24 @@ def test_conservatively_shortened_represented_span_is_allowed() -> None:
 
     assert budget.monotonic_deadline - budget.monotonic_start == 64.0
     assert budget.worker_seconds() == 62.0
+
+
+def test_cleanup_cutoff_is_exactly_two_seconds_before_publication_deadline() -> None:
+    ticks = [100.0]
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id="0" * 32,
+        monotonic=lambda: ticks[0],
+        wall_clock=lambda: UTC_START,
+    )
+
+    ticks[0] = 188.0
+    assert budget.worker_seconds() == 0.0
+    budget.require_publishable()
+
+    ticks[0] = 190.0
+    with pytest.raises(BudgetExpired, match="deadline"):
+        budget.require_publishable()
 
 
 @pytest.mark.parametrize("clock_name", ["monotonic", "wall_clock"])
@@ -461,3 +487,37 @@ def test_create_does_not_swallow_control_flow_exceptions(
             request_id="d" * 32,
             **arguments,
         )
+
+
+def test_create_sanitizes_wall_clock_timezone_validation_exception() -> None:
+    class ExplodingTZ(tzinfo):
+        def utcoffset(self, value):
+            raise RuntimeError("sensitive tz detail")
+
+    wall_time = datetime(2026, 7, 16, 6, 0, tzinfo=ExplodingTZ())
+
+    with pytest.raises(ValueError, match="^wall clock failed$") as raised:
+        RequestBudget.create(
+            RequestMode.RAPID,
+            request_id="e" * 32,
+            monotonic=lambda: 1.0,
+            wall_clock=lambda: wall_time,
+        )
+
+    assert "sensitive" not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+def test_create_sanitizes_wall_clock_utc_normalization_underflow() -> None:
+    utc_plus_fourteen = timezone(timedelta(hours=14))
+    wall_time = datetime.min.replace(tzinfo=utc_plus_fourteen)
+
+    with pytest.raises(ValueError, match="^wall clock failed$") as raised:
+        RequestBudget.create(
+            RequestMode.RAPID,
+            request_id="f" * 32,
+            monotonic=lambda: 1.0,
+            wall_clock=lambda: wall_time,
+        )
+
+    assert raised.value.__cause__ is None
