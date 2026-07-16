@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -79,10 +80,20 @@ _DECISION_AUDIT_TABLES = {
     "source_attempts",
     "decision_snapshots",
 }
-_DECISION_AUDIT_OBJECT_PREFIXES = (
-    "request_run",
-    "source_attempt",
-    "decision_snapshot",
+_DECISION_AUDIT_OBJECT_NAMESPACES = (
+    "request_run_",
+    "request_runs_",
+    "source_attempt_",
+    "source_attempts_",
+    "decision_snapshot_",
+    "decision_snapshots_",
+)
+_DECISION_AUDIT_IDENTIFIER_PATTERNS = tuple(
+    re.compile(
+        rf"(?<![A-Za-z0-9_$]){re.escape(table)}(?![A-Za-z0-9_$])",
+        re.ASCII | re.IGNORECASE,
+    )
+    for table in sorted(_DECISION_AUDIT_TABLES)
 )
 _LEGACY_V8_POLICY_TABLE = "__kunjin_legacy_v8_policy_versions"
 _LEGACY_V8_ASSESSMENT_TABLE = "__kunjin_legacy_v8_assessments"
@@ -217,10 +228,10 @@ def _owned_decision_audit_objects(
         name: value
         for name, value in objects.items()
         if _ascii_identifier(value[1]) in _DECISION_AUDIT_TABLES
-        or _ascii_identifier(name).startswith(_DECISION_AUDIT_OBJECT_PREFIXES)
+        or _ascii_identifier(name).startswith(_DECISION_AUDIT_OBJECT_NAMESPACES)
         or any(
-            table in _ascii_identifier(value[2])
-            for table in _DECISION_AUDIT_TABLES
+            pattern.search(value[2]) is not None
+            for pattern in _DECISION_AUDIT_IDENTIFIER_PATTERNS
         )
     }
 

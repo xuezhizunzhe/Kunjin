@@ -333,6 +333,27 @@ class SchemaV14Test(unittest.TestCase):
                 SELECT count(*) FROM ReQuEsT_RuNs;
             END;
             """,
+            """
+            CREATE TRIGGER quoted_audit_reader
+            AFTER INSERT ON sync_runs
+            BEGIN
+                SELECT count(*) FROM "request_runs";
+            END;
+            """,
+            """
+            CREATE TRIGGER bracketed_audit_reader
+            AFTER INSERT ON sync_runs
+            BEGIN
+                SELECT count(*) FROM [source_attempts];
+            END;
+            """,
+            """
+            CREATE TRIGGER backtick_audit_reader
+            AFTER INSERT ON sync_runs
+            BEGIN
+                SELECT count(*) FROM `decision_snapshots`;
+            END;
+            """,
         )
         for index, hostile_script in enumerate(hostile_scripts):
             with self.subTest(index=index):
@@ -346,6 +367,32 @@ class SchemaV14Test(unittest.TestCase):
                     "decision audit schema does not match V14",
                 ):
                     repository.migrate()
+
+    def test_similar_non_audit_identifiers_are_not_owned_by_v14(self) -> None:
+        repository = self.repository("similar-identifiers.db")
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            connection.executescript(
+                """
+                CREATE TABLE unrelated_metrics(
+                    request_runs_total INTEGER,
+                    request_runs_backup INTEGER,
+                    source_attempts_total INTEGER,
+                    decision_snapshots_backup INTEGER
+                );
+                CREATE TABLE request_runtime_metrics(id INTEGER PRIMARY KEY);
+                CREATE INDEX unrelated_request_runs_total
+                ON unrelated_metrics(request_runs_total);
+                CREATE TRIGGER unrelated_metrics_copy
+                AFTER INSERT ON sync_runs
+                BEGIN
+                    INSERT INTO unrelated_metrics(request_runs_backup)
+                    VALUES (NEW.id);
+                END;
+                """
+            )
+
+        repository.migrate()
 
     def test_v14_has_exact_three_tables_columns_foreign_keys_indexes_and_triggers(self) -> None:
         repository = self._create_at_version(13)
