@@ -381,6 +381,8 @@ class SchemaV14Test(unittest.TestCase):
                     decision_snapshots_backup INTEGER
                 );
                 CREATE TABLE request_runtime_metrics(id INTEGER PRIMARY KEY);
+                CREATE TABLE "request""_runs"(id INTEGER PRIMARY KEY);
+                CREATE TABLE `source``_attempts`(id INTEGER PRIMARY KEY);
                 CREATE INDEX unrelated_request_runs_total
                 ON unrelated_metrics(request_runs_total);
                 CREATE TRIGGER unrelated_metrics_copy
@@ -393,6 +395,60 @@ class SchemaV14Test(unittest.TestCase):
             )
 
         repository.migrate()
+
+    def test_string_literals_and_comments_do_not_bind_audit_tables(self) -> None:
+        repository = self.repository("literal-and-comment-identifiers.db")
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            connection.executescript(
+                """
+                CREATE TABLE narrative_metrics(
+                    id INTEGER PRIMARY KEY,
+                    label TEXT DEFAULT 'request_runs',
+                    escaped TEXT DEFAULT 'source_attempts'' decision_snapshots',
+                    -- request_runs is prose, not an identifier
+                    value INTEGER /* source_attempts and decision_snapshots */
+                );
+                CREATE TRIGGER narrative_metrics_note
+                AFTER INSERT ON sync_runs
+                BEGIN
+                    SELECT 'request_runs';
+                    SELECT 'source_attempts'' decision_snapshots';
+                    -- request_runs remains prose here
+                    SELECT 1 /* source_attempts and decision_snapshots */;
+                END;
+                """
+            )
+
+        repository.migrate()
+
+    def test_exact_singular_audit_object_roots_are_rejected(self) -> None:
+        hostile_scripts = (
+            "CREATE TABLE request_run(id INTEGER PRIMARY KEY);",
+            """
+            CREATE TABLE singular_index_target(id INTEGER PRIMARY KEY);
+            CREATE INDEX source_attempt ON singular_index_target(id);
+            """,
+            """
+            CREATE TRIGGER decision_snapshot
+            AFTER INSERT ON sync_runs
+            BEGIN
+                SELECT 1;
+            END;
+            """,
+        )
+        for index, hostile_script in enumerate(hostile_scripts):
+            with self.subTest(index=index):
+                repository = self.repository(f"singular-root-{index}.db")
+                repository.migrate()
+                with repository.connect() as connection, connection:
+                    connection.executescript(hostile_script)
+
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "decision audit schema does not match V14",
+                ):
+                    repository.migrate()
 
     def test_v14_has_exact_three_tables_columns_foreign_keys_indexes_and_triggers(self) -> None:
         repository = self._create_at_version(13)

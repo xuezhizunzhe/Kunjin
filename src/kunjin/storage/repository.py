@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -88,12 +87,8 @@ _DECISION_AUDIT_OBJECT_NAMESPACES = (
     "decision_snapshot_",
     "decision_snapshots_",
 )
-_DECISION_AUDIT_IDENTIFIER_PATTERNS = tuple(
-    re.compile(
-        rf"(?<![A-Za-z0-9_$]){re.escape(table)}(?![A-Za-z0-9_$])",
-        re.ASCII | re.IGNORECASE,
-    )
-    for table in sorted(_DECISION_AUDIT_TABLES)
+_DECISION_AUDIT_OBJECT_ROOTS = frozenset(
+    ("request_run", "source_attempt", "decision_snapshot")
 )
 _LEGACY_V8_POLICY_TABLE = "__kunjin_legacy_v8_policy_versions"
 _LEGACY_V8_ASSESSMENT_TABLE = "__kunjin_legacy_v8_assessments"
@@ -221,6 +216,83 @@ def _owned_d1_objects(
     }
 
 
+def _is_sqlite_identifier_character(character: str) -> bool:
+    return (
+        character in {"_", "$"}
+        or "0" <= character <= "9"
+        or "A" <= character <= "Z"
+        or "a" <= character <= "z"
+        or ord(character) >= 0x80
+    )
+
+
+def _consume_sqlite_doubled_quote(
+    sql: str,
+    start: int,
+    quote: str,
+) -> Tuple[int, str]:
+    index = start + 1
+    decoded: List[str] = []
+    while index < len(sql):
+        character = sql[index]
+        if character != quote:
+            decoded.append(character)
+            index += 1
+            continue
+        if index + 1 < len(sql) and sql[index + 1] == quote:
+            decoded.append(quote)
+            index += 2
+            continue
+        return index + 1, "".join(decoded)
+    return len(sql), "".join(decoded)
+
+
+def _iter_sqlite_ddl_identifiers(sql: str) -> Iterator[str]:
+    index = 0
+    while index < len(sql):
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            index = len(sql) if newline < 0 else newline + 1
+            continue
+        if sql.startswith("/*", index):
+            closing = sql.find("*/", index + 2)
+            index = len(sql) if closing < 0 else closing + 2
+            continue
+
+        character = sql[index]
+        if character == "'":
+            index, _ = _consume_sqlite_doubled_quote(sql, index, character)
+            continue
+        if character in {'"', "`"}:
+            index, identifier = _consume_sqlite_doubled_quote(sql, index, character)
+            yield _ascii_identifier(identifier)
+            continue
+        if character == "[":
+            # SQLite bracket quoting ends at the first closing bracket; ]] is not an escape.
+            closing = sql.find("]", index + 1)
+            if closing < 0:
+                yield _ascii_identifier(sql[index + 1 :])
+                return
+            yield _ascii_identifier(sql[index + 1 : closing])
+            index = closing + 1
+            continue
+        if _is_sqlite_identifier_character(character):
+            start = index
+            index += 1
+            while index < len(sql) and _is_sqlite_identifier_character(sql[index]):
+                index += 1
+            yield _ascii_identifier(sql[start:index])
+            continue
+        index += 1
+
+
+def _references_decision_audit_table(sql: str) -> bool:
+    return any(
+        identifier in _DECISION_AUDIT_TABLES
+        for identifier in _iter_sqlite_ddl_identifiers(sql)
+    )
+
+
 def _owned_decision_audit_objects(
     objects: Dict[str, Tuple[str, str, str]],
 ) -> Dict[str, Tuple[str, str, str]]:
@@ -228,11 +300,9 @@ def _owned_decision_audit_objects(
         name: value
         for name, value in objects.items()
         if _ascii_identifier(value[1]) in _DECISION_AUDIT_TABLES
+        or _ascii_identifier(name) in _DECISION_AUDIT_OBJECT_ROOTS
         or _ascii_identifier(name).startswith(_DECISION_AUDIT_OBJECT_NAMESPACES)
-        or any(
-            pattern.search(value[2]) is not None
-            for pattern in _DECISION_AUDIT_IDENTIFIER_PATTERNS
-        )
+        or _references_decision_audit_table(value[2])
     }
 
 
