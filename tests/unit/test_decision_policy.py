@@ -2,7 +2,7 @@ import json
 import re
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 
@@ -14,6 +14,7 @@ from kunjin.decision.models import (
     DecisionRoute,
     EvidenceCompleteness,
     EvidenceFreshness,
+    ForceReasonCode,
     FreshnessContext,
     FreshnessKind,
     RequestFieldResolution,
@@ -29,8 +30,12 @@ from kunjin.decision.models import (
     WorkflowLevel,
     canonical_json_bytes,
 )
-from kunjin.decision.policy import EvidencePolicyV1
-from kunjin.decision.source_registry import SOURCE_IDS, SourceRegistryV1
+from kunjin.decision.policy import EVIDENCE_POLICY_V1_CHECKSUM, EvidencePolicyV1
+from kunjin.decision.source_registry import (
+    SOURCE_IDS,
+    SOURCE_REGISTRY_V1_CHECKSUM,
+    SourceRegistryV1,
+)
 
 UTC_NOW = datetime(2026, 7, 16, 6, 0, tzinfo=timezone.utc)
 
@@ -67,9 +72,9 @@ def _route(evidence: tuple = ()) -> DecisionRoute:
         opposing_evidence=(),
         missing_fields=(),
         policy_version="1",
-        policy_checksum="a" * 64,
+        policy_checksum=EVIDENCE_POLICY_V1_CHECKSUM,
         registry_version="1",
-        registry_checksum="b" * 64,
+        registry_checksum=SOURCE_REGISTRY_V1_CHECKSUM,
     )
 
 
@@ -93,6 +98,28 @@ def _complete_current_tier1(**overrides) -> ConclusionEvidence:
     }
     values.update(overrides)
     return ConclusionEvidence(**values)
+
+
+def _source_attempt(**overrides) -> SourceAttempt:
+    values = {
+        "source_id": "eastmoney_f10",
+        "field_id": "identity_active_status",
+        "subject_key": "fund:123456",
+        "attempt_number": 1,
+        "outcome": SourceAttemptOutcome.SUCCESS,
+        "started_at": UTC_NOW - timedelta(seconds=1),
+        "finished_at": UTC_NOW,
+        "data_as_of": UTC_NOW - timedelta(minutes=1),
+        "error_code": None,
+        "cooldown_until": None,
+        "force_actor": None,
+        "force_reason": None,
+        "registry_version": "1",
+        "registry_checksum": SOURCE_REGISTRY_V1_CHECKSUM,
+        "response_bytes": 100,
+    }
+    values.update(overrides)
+    return SourceAttempt(**values)
 
 
 def test_phase0_enums_are_exact() -> None:
@@ -149,6 +176,11 @@ def test_phase0_enums_are_exact() -> None:
         "cache_hit",
         "skipped_cooldown",
     ]
+    assert [item.value for item in ForceReasonCode] == [
+        "owner_approved_retry",
+        "verify_source_recovery",
+        "refresh_after_manual_supplement",
+    ]
     assert [item.value for item in SourceTier] == [
         "tier_1",
         "tier_2",
@@ -181,10 +213,8 @@ def test_phase0_enums_are_exact() -> None:
 def test_policy_and_registry_have_pinned_canonical_bytes() -> None:
     policy = EvidencePolicyV1()
     registry = SourceRegistryV1()
-    assert policy.checksum() == "bafaf188c31ce4912485856369397c423dece2dcc48ac3e19273845763dd1428"
-    assert registry.checksum() == "2aa479937c46d94e8b8dbc11695900bbebe9aa08765b3e09792d9428724085af"
-    assert len(policy.canonical_json()) == 5_862
-    assert len(registry.canonical_json()) == 18_961
+    assert policy.checksum() == EVIDENCE_POLICY_V1_CHECKSUM
+    assert registry.checksum() == SOURCE_REGISTRY_V1_CHECKSUM
     for item in (policy, registry):
         canonical = item.canonical_json()
         assert (
@@ -372,6 +402,16 @@ def test_fixed_freshness_with_announcement_invalidation_fails_closed() -> None:
             newer_announcement_checked_at=UTC_NOW,
         ),
     )
+    assert identity.freshness.integrity_check_max_age_seconds == 2 * 60 * 60
+    assert not identity.is_current(
+        data_as_of,
+        FreshnessContext(
+            now=UTC_NOW,
+            newer_announcement_check_complete=True,
+            newer_announcement_found=False,
+            newer_announcement_checked_at=UTC_NOW - timedelta(hours=3),
+        ),
+    )
 
 
 def test_dated_history_fallback_never_upgrades_to_current() -> None:
@@ -384,6 +424,45 @@ def test_dated_history_fallback_never_upgrades_to_current() -> None:
     )
     assert not market.is_current(data_as_of, context)
     assert market.is_usable(data_as_of, context)
+
+
+def test_dated_fallback_cannot_bypass_integrity_checks() -> None:
+    announcement = _field(
+        SourceRegistryV1(),
+        "fund_manager_official_documents",
+        "fund_manager_product_announcement",
+    )
+    data_as_of = UTC_NOW - timedelta(days=10)
+    query = FreshnessContext(
+        now=UTC_NOW,
+        query_window_start=UTC_NOW - timedelta(days=1),
+        query_window_end=UTC_NOW,
+    )
+    assert not announcement.is_usable(data_as_of, query)
+    assert announcement.is_usable(
+        data_as_of,
+        replace(
+            query,
+            correction_retraction_check_complete=True,
+            correction_retraction_checked_at=UTC_NOW,
+        ),
+    )
+    assert not announcement.is_usable(
+        data_as_of,
+        replace(
+            query,
+            correction_retraction_check_complete=True,
+            correction_retraction_checked_at=UTC_NOW - timedelta(hours=3),
+        ),
+    )
+    assert not announcement.is_usable(
+        data_as_of,
+        replace(
+            query,
+            correction_retraction_check_complete=True,
+            correction_retraction_checked_at=UTC_NOW + timedelta(seconds=1),
+        ),
+    )
 
 
 def test_effective_period_requires_explicit_open_or_closed_mode() -> None:
@@ -417,11 +496,42 @@ def test_policy_encodes_structured_d2_and_post_trade_fail_closed_rules() -> None
     assert policy.d2.fund_of_funds_lookthrough_requires_verified_inputs
     assert policy.d2.test_every_applicable_limit
     assert policy.d2.allocate_all_unknown_to_each_limit
+    assert policy.d2.candidate_identity_required_fields == (
+        "asset_class",
+        "portfolio_role",
+        "manager_team",
+        "exact_index_theme",
+    )
+    assert policy.d2.below_minimum_lookthrough_requires_worst_case_within_cap
+    assert policy.d2.failure_blocks_mature_risk_increase
+    assert policy.d2.failure_blocks_exact_amount
+    assert policy.d2.threshold_change_requires_independent_review
+    assert policy.d2.threshold_change_requires_owner_approval
     assert policy.post_trade.cap_scope == "all_linked_accounts_current_and_pending"
     assert policy.post_trade.requires_unlinked_account_affirmation
     assert policy.post_trade.requires_material_holding_completeness
     assert policy.post_trade.valuation_date_tolerance_days == 0
     assert policy.post_trade.block_exact_amount_on_failure
+    assert policy.post_trade.amount_uses_minimum_remaining_capacity
+    assert policy.post_trade.required_constraints == (
+        "d3",
+        "emergency_reserve",
+        "monthly_cash_flow",
+        "goal_horizon",
+        "asset_class",
+        "individual_fund",
+        "theme",
+        "manager",
+        "industry",
+        "security",
+        "known_exposure",
+        "unknown_exposure",
+        "pending_transactions",
+        "fees",
+        "minimum_purchase",
+        "minimum_remainder",
+        "channel_limits",
+    )
 
 
 def test_policy_and_registry_tampering_fail_closed() -> None:
@@ -456,57 +566,50 @@ def test_request_id_is_exact_lowercase_uuid_hex(request_id: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "subject_key,force_reason",
-    (
-        ("account:123456", "manual retry"),
-        ("fund:123456", "access_token=secret"),
-        ("fund:123456", "account balance 1000 CNY"),
-        ("fund:123456", "Bearer aaa.bbb.ccc"),
-    ),
+    "subject_key",
+    ("account:123456", "fund:12345", "fund:ABCDEF"),
 )
-def test_source_attempt_rejects_non_fund_subject_and_private_force_reason(
-    subject_key: str,
-    force_reason: str,
-) -> None:
-    attempt = SourceAttempt(
-        source_id="eastmoney_f10",
-        field_id="identity_active_status",
-        subject_key=subject_key,
-        attempt_number=1,
-        outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
-        started_at=UTC_NOW - timedelta(seconds=1),
-        finished_at=UTC_NOW,
-        data_as_of=None,
-        error_code="network_timeout",
-        cooldown_until=UTC_NOW + timedelta(minutes=30),
-        force_actor="local_owner",
-        force_reason=force_reason,
-        registry_version="1",
-        registry_checksum="a" * 64,
-        response_bytes=0,
-    )
+def test_source_attempt_rejects_non_fund_subject(subject_key: str) -> None:
+    attempt = _source_attempt(subject_key=subject_key)
     with pytest.raises(ValueError):
         attempt.validate()
 
 
-def test_source_attempt_accepts_safe_exact_identifiers() -> None:
-    attempt = SourceAttempt(
-        source_id="eastmoney_f10",
-        field_id="identity_active_status",
-        subject_key="fund:123456",
-        attempt_number=2,
-        outcome=SourceAttemptOutcome.SUCCESS,
-        started_at=UTC_NOW - timedelta(seconds=1),
-        finished_at=UTC_NOW,
-        data_as_of=UTC_NOW - timedelta(minutes=1),
-        error_code=None,
-        cooldown_until=None,
-        force_actor=None,
-        force_reason=None,
-        registry_version="1",
-        registry_checksum="a" * 64,
-        response_bytes=100,
+def test_source_attempt_rejects_free_force_reason_and_unknown_actor() -> None:
+    forced = _source_attempt(
+        outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+        data_as_of=None,
+        error_code="network_timeout",
+        cooldown_until=UTC_NOW + timedelta(minutes=30),
+        force_actor="local_owner",
+        force_reason="manual retry",
+        response_bytes=0,
     )
+    with pytest.raises(ValueError):
+        forced.validate()
+    with pytest.raises(ValueError):
+        replace(
+            forced,
+            force_actor="operator",
+            force_reason=ForceReasonCode.OWNER_APPROVED_RETRY,
+        ).validate()
+
+
+def test_source_attempt_accepts_allowlisted_force_reason() -> None:
+    attempt = _source_attempt(
+        outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+        data_as_of=None,
+        error_code="network_timeout",
+        cooldown_until=UTC_NOW + timedelta(minutes=30),
+        force_actor="local_owner",
+        force_reason=ForceReasonCode.OWNER_APPROVED_RETRY,
+        response_bytes=0,
+    )
+    attempt.validate()
+
+
+def test_source_attempt_accepts_safe_exact_identifiers() -> None:
+    attempt = _source_attempt(attempt_number=2)
     attempt.validate()
 
 
@@ -522,21 +625,11 @@ def test_source_attempt_rejects_invalid_public_identifiers(
     field_name: str,
     value: str,
 ) -> None:
-    attempt = SourceAttempt(
-        source_id="eastmoney_f10",
-        field_id="identity_active_status",
-        subject_key="fund:123456",
-        attempt_number=1,
+    attempt = _source_attempt(
         outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
-        started_at=UTC_NOW - timedelta(seconds=1),
-        finished_at=UTC_NOW,
         data_as_of=None,
         error_code="network_timeout",
         cooldown_until=UTC_NOW + timedelta(minutes=30),
-        force_actor=None,
-        force_reason=None,
-        registry_version="1",
-        registry_checksum="a" * 64,
         response_bytes=0,
     )
     invalid = replace(attempt, **{field_name: value})
@@ -576,6 +669,19 @@ def test_current_complete_tier1_requires_identity_date_and_lineage(overrides: di
         evidence.validate()
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"publication_times": (UTC_NOW + timedelta(seconds=1),)},
+        {"market_as_of": UTC_NOW + timedelta(seconds=1)},
+        {"report_as_of": UTC_NOW + timedelta(seconds=1)},
+    ),
+)
+def test_conclusion_evidence_dates_cannot_follow_retrieval(overrides: dict) -> None:
+    with pytest.raises(ValueError, match="retrieved"):
+        _complete_current_tier1(**overrides).validate()
+
+
 def test_conclusion_evidence_is_bounded() -> None:
     evidence = _complete_current_tier1()
     route = _route((evidence,) * 129)
@@ -596,29 +702,164 @@ def test_equal_datetime_instants_have_equal_utc_canonical_bytes() -> None:
     assert b"+00:00" in canonical_json_bytes(utc_evidence)
 
 
+def test_known_v1_versions_require_exact_golden_checksums() -> None:
+    with pytest.raises(ValueError, match="policy checksum"):
+        replace(_route(), policy_checksum="a" * 64).validate()
+    with pytest.raises(ValueError, match="registry checksum"):
+        replace(_route(), registry_checksum="b" * 64).validate()
+    with pytest.raises(ValueError, match="registry checksum"):
+        replace(_source_attempt(), registry_checksum="a" * 64).validate()
+
+
+def test_policy_and_registry_checksum_methods_fail_on_golden_drift(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "kunjin.decision.policy.EVIDENCE_POLICY_V1_GOLDEN_CHECKSUM",
+        "a" * 64,
+    )
+    with pytest.raises(ValueError, match="drifted"):
+        EvidencePolicyV1().checksum()
+    monkeypatch.setattr(
+        "kunjin.decision.source_registry.SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM",
+        "b" * 64,
+    )
+    with pytest.raises(ValueError, match="drifted"):
+        SourceRegistryV1().checksum()
+
+
+def test_decimal_canonicalization_ignores_ambient_context() -> None:
+    policy = EvidencePolicyV1()
+    evidence = _complete_current_tier1(coverage_percent=Decimal("99.9900"))
+    with localcontext() as context:
+        context.prec = 2
+        low_policy_bytes = policy.canonical_json()
+        low_policy_checksum = policy.checksum()
+        low_evidence_bytes = canonical_json_bytes(evidence)
+    with localcontext() as context:
+        context.prec = 50
+        high_policy_bytes = policy.canonical_json()
+        high_policy_checksum = policy.checksum()
+        high_evidence_bytes = canonical_json_bytes(evidence)
+    assert low_policy_bytes == high_policy_bytes
+    assert low_policy_checksum == high_policy_checksum
+    assert low_evidence_bytes == high_evidence_bytes
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    (
+        _source_attempt(),
+        _source_attempt(outcome=SourceAttemptOutcome.CACHE_HIT),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+            data_as_of=None,
+            error_code="network_timeout",
+            cooldown_until=UTC_NOW + timedelta(minutes=30),
+            response_bytes=0,
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.UNAVAILABLE,
+            data_as_of=None,
+            error_code="source_unavailable",
+            response_bytes=0,
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.UNSUPPORTED,
+            data_as_of=None,
+            error_code="field_unsupported",
+            response_bytes=0,
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.CANCELLED,
+            data_as_of=None,
+            error_code="request_cancelled",
+            response_bytes=0,
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.EXPIRED,
+            data_as_of=None,
+            error_code="request_expired",
+            response_bytes=0,
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.SKIPPED_COOLDOWN,
+            data_as_of=None,
+            error_code="cooldown_active",
+            cooldown_until=UTC_NOW + timedelta(minutes=1),
+            response_bytes=0,
+        ),
+    ),
+)
+def test_source_attempt_outcome_matrix_accepts_only_valid_shapes(
+    attempt: SourceAttempt,
+) -> None:
+    attempt.validate()
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    (
+        _source_attempt(data_as_of=None),
+        _source_attempt(outcome=SourceAttemptOutcome.CACHE_HIT, error_code="cache_error"),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+            error_code="network_timeout",
+            cooldown_until=UTC_NOW + timedelta(minutes=1),
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+            data_as_of=None,
+            error_code="network_timeout",
+            cooldown_until=None,
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.UNAVAILABLE,
+            data_as_of=None,
+            error_code="source_unavailable",
+            cooldown_until=UTC_NOW + timedelta(minutes=1),
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.UNSUPPORTED,
+            data_as_of=None,
+            error_code=None,
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.CANCELLED,
+            data_as_of=None,
+            error_code="other_error",
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.EXPIRED,
+            error_code="request_expired",
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.SKIPPED_COOLDOWN,
+            data_as_of=None,
+            error_code="cooldown_active",
+            cooldown_until=UTC_NOW,
+        ),
+        _source_attempt(data_as_of=UTC_NOW + timedelta(seconds=1)),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+            data_as_of=None,
+            error_code="network_timeout",
+            cooldown_until=UTC_NOW - timedelta(seconds=1),
+        ),
+    ),
+)
+def test_source_attempt_outcome_matrix_rejects_invalid_shapes(
+    attempt: SourceAttempt,
+) -> None:
+    with pytest.raises(ValueError):
+        attempt.validate()
+
+
 def test_v1_and_nested_records_reject_injected_state() -> None:
     registry = SourceRegistryV1()
     field = registry.sources[0].fields[0]
     context = FreshnessContext(now=UTC_NOW)
     evidence = _complete_current_tier1()
     route = _route((evidence,))
-    attempt = SourceAttempt(
-        source_id="eastmoney_f10",
-        field_id="identity_active_status",
-        subject_key="fund:123456",
-        attempt_number=1,
-        outcome=SourceAttemptOutcome.SUCCESS,
-        started_at=UTC_NOW - timedelta(seconds=1),
-        finished_at=UTC_NOW,
-        data_as_of=UTC_NOW - timedelta(minutes=1),
-        error_code=None,
-        cooldown_until=None,
-        force_actor=None,
-        force_reason=None,
-        registry_version="1",
-        registry_checksum="a" * 64,
-        response_bytes=100,
-    )
+    attempt = _source_attempt()
     records = (
         replace(EvidencePolicyV1()),
         replace(EvidencePolicyV1().requirements[0]),

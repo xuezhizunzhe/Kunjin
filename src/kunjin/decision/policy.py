@@ -6,9 +6,12 @@ from decimal import Decimal
 from typing import Tuple
 
 from kunjin.decision.models import (
+    EVIDENCE_POLICY_V1_GOLDEN_CHECKSUM,
+    canonical_decimal,
     canonical_json_bytes,
     validate_exact_dataclass_state,
     validate_identifier,
+    validate_identifier_tuple,
     validate_public_text,
 )
 
@@ -64,7 +67,7 @@ class CoverageGate:
         return {
             "denominator": self.denominator,
             "formula_id": self.formula_id,
-            "minimum_percent": format(self.minimum_percent.normalize(), "f"),
+            "minimum_percent": canonical_decimal(self.minimum_percent),
             "numerator": self.numerator,
         }
 
@@ -83,6 +86,12 @@ class D2EvidencePolicy:
     allocate_all_unknown_to_each_limit: bool
     unknown_exposure_consumes_capacity: bool
     insufficient_active_coverage_blocks_reassuring_conclusion: bool
+    candidate_identity_required_fields: Tuple[str, ...]
+    below_minimum_lookthrough_requires_worst_case_within_cap: bool
+    failure_blocks_mature_risk_increase: bool
+    failure_blocks_exact_amount: bool
+    threshold_change_requires_independent_review: bool
+    threshold_change_requires_owner_approval: bool
 
     def validate(self) -> None:
         validate_exact_dataclass_state(self, "D2 evidence policy")
@@ -110,6 +119,19 @@ class D2EvidencePolicy:
             gate.validate()
             if gate.formula_id != formula_id or gate.minimum_percent != minimum:
                 raise ValueError("D2 coverage gate differs from EvidencePolicy V1")
+        expected_identity_fields = (
+            "asset_class",
+            "portfolio_role",
+            "manager_team",
+            "exact_index_theme",
+        )
+        validate_identifier_tuple(
+            self.candidate_identity_required_fields,
+            "candidate identity required fields",
+            allow_empty=False,
+        )
+        if self.candidate_identity_required_fields != expected_identity_fields:
+            raise ValueError("D2 candidate identity fields differ from EvidencePolicy V1")
         for field_name in (
             "cash_excluded_from_denominators",
             "derivatives_leverage_shorts_residual_reported_separately",
@@ -119,6 +141,11 @@ class D2EvidencePolicy:
             "allocate_all_unknown_to_each_limit",
             "unknown_exposure_consumes_capacity",
             "insufficient_active_coverage_blocks_reassuring_conclusion",
+            "below_minimum_lookthrough_requires_worst_case_within_cap",
+            "failure_blocks_mature_risk_increase",
+            "failure_blocks_exact_amount",
+            "threshold_change_requires_independent_review",
+            "threshold_change_requires_owner_approval",
         ):
             if getattr(self, field_name) is not True:
                 raise ValueError(f"EvidencePolicy V1 {field_name} must be true")
@@ -131,12 +158,22 @@ class D2EvidencePolicy:
                 self.broad_index_candidate_asset_coverage.to_canonical_dict()
             ),
             "cash_excluded_from_denominators": self.cash_excluded_from_denominators,
+            "candidate_identity_required_fields": list(
+                self.candidate_identity_required_fields
+            ),
             "classification_coverage": self.classification_coverage.to_canonical_dict(),
             "derivatives_leverage_shorts_residual_reported_separately": (
                 self.derivatives_leverage_shorts_residual_reported_separately
             ),
             "fund_of_funds_lookthrough_requires_verified_inputs": (
                 self.fund_of_funds_lookthrough_requires_verified_inputs
+            ),
+            "below_minimum_lookthrough_requires_worst_case_within_cap": (
+                self.below_minimum_lookthrough_requires_worst_case_within_cap
+            ),
+            "failure_blocks_exact_amount": self.failure_blocks_exact_amount,
+            "failure_blocks_mature_risk_increase": (
+                self.failure_blocks_mature_risk_increase
             ),
             "insufficient_active_coverage_blocks_reassuring_conclusion": (
                 self.insufficient_active_coverage_blocks_reassuring_conclusion
@@ -145,6 +182,12 @@ class D2EvidencePolicy:
                 self.sector_candidate_asset_coverage.to_canonical_dict()
             ),
             "test_every_applicable_limit": self.test_every_applicable_limit,
+            "threshold_change_requires_independent_review": (
+                self.threshold_change_requires_independent_review
+            ),
+            "threshold_change_requires_owner_approval": (
+                self.threshold_change_requires_owner_approval
+            ),
             "transaction_after_lookthrough_coverage": (
                 self.transaction_after_lookthrough_coverage.to_canonical_dict()
             ),
@@ -174,6 +217,8 @@ class PostTradePolicy:
     tactical_sector_cap_requires_independent_review: bool
     tactical_sector_cap_requires_owner_approval: bool
     tactical_sector_cap_requires_version_and_effective_date: bool
+    required_constraints: Tuple[str, ...]
+    amount_uses_minimum_remaining_capacity: bool
 
     def validate(self) -> None:
         validate_exact_dataclass_state(self, "post-trade policy")
@@ -185,6 +230,32 @@ class PostTradePolicy:
             raise ValueError("valuation date tolerance must be an exact integer")
         if self.valuation_date_tolerance_days != 0:
             raise ValueError("EvidencePolicy V1 requires same-date valuations")
+        expected_constraints = (
+            "d3",
+            "emergency_reserve",
+            "monthly_cash_flow",
+            "goal_horizon",
+            "asset_class",
+            "individual_fund",
+            "theme",
+            "manager",
+            "industry",
+            "security",
+            "known_exposure",
+            "unknown_exposure",
+            "pending_transactions",
+            "fees",
+            "minimum_purchase",
+            "minimum_remainder",
+            "channel_limits",
+        )
+        validate_identifier_tuple(
+            self.required_constraints,
+            "post-trade required constraints",
+            allow_empty=False,
+        )
+        if self.required_constraints != expected_constraints:
+            raise ValueError("post-trade constraints differ from EvidencePolicy V1")
         for field_name in (
             "requires_unlinked_account_affirmation",
             "requires_material_holding_completeness",
@@ -200,6 +271,7 @@ class PostTradePolicy:
             "tactical_sector_cap_requires_independent_review",
             "tactical_sector_cap_requires_owner_approval",
             "tactical_sector_cap_requires_version_and_effective_date",
+            "amount_uses_minimum_remaining_capacity",
         ):
             if getattr(self, field_name) is not True:
                 raise ValueError(f"EvidencePolicy V1 {field_name} must be true")
@@ -209,6 +281,9 @@ class PostTradePolicy:
         return {
             "aggregate_matching_exposure_across_all_fund_labels": (
                 self.aggregate_matching_exposure_across_all_fund_labels
+            ),
+            "amount_uses_minimum_remaining_capacity": (
+                self.amount_uses_minimum_remaining_capacity
             ),
             "block_exact_amount_on_failure": self.block_exact_amount_on_failure,
             "cap_scope": self.cap_scope,
@@ -220,6 +295,7 @@ class PostTradePolicy:
             "requires_unlinked_account_affirmation": (
                 self.requires_unlinked_account_affirmation
             ),
+            "required_constraints": list(self.required_constraints),
             "split_transactions_cannot_bypass_cap": self.split_transactions_cannot_bypass_cap,
             "stale_or_misaligned_valuation_blocks_exact_amount": (
                 self.stale_or_misaligned_valuation_blocks_exact_amount
@@ -353,6 +429,17 @@ _D2_POLICY = D2EvidencePolicy(
     allocate_all_unknown_to_each_limit=True,
     unknown_exposure_consumes_capacity=True,
     insufficient_active_coverage_blocks_reassuring_conclusion=True,
+    candidate_identity_required_fields=(
+        "asset_class",
+        "portfolio_role",
+        "manager_team",
+        "exact_index_theme",
+    ),
+    below_minimum_lookthrough_requires_worst_case_within_cap=True,
+    failure_blocks_mature_risk_increase=True,
+    failure_blocks_exact_amount=True,
+    threshold_change_requires_independent_review=True,
+    threshold_change_requires_owner_approval=True,
 )
 
 _POST_TRADE_POLICY = PostTradePolicy(
@@ -373,6 +460,26 @@ _POST_TRADE_POLICY = PostTradePolicy(
     tactical_sector_cap_requires_independent_review=True,
     tactical_sector_cap_requires_owner_approval=True,
     tactical_sector_cap_requires_version_and_effective_date=True,
+    required_constraints=(
+        "d3",
+        "emergency_reserve",
+        "monthly_cash_flow",
+        "goal_horizon",
+        "asset_class",
+        "individual_fund",
+        "theme",
+        "manager",
+        "industry",
+        "security",
+        "known_exposure",
+        "unknown_exposure",
+        "pending_transactions",
+        "fees",
+        "minimum_purchase",
+        "minimum_remainder",
+        "channel_limits",
+    ),
+    amount_uses_minimum_remaining_capacity=True,
 )
 
 
@@ -419,9 +526,10 @@ class EvidencePolicyV1:
         return canonical_json_bytes(self)
 
     def checksum(self) -> str:
-        return hashlib.sha256(self.canonical_json()).hexdigest()
+        checksum = hashlib.sha256(self.canonical_json()).hexdigest()
+        if self.version == "1" and checksum != EVIDENCE_POLICY_V1_GOLDEN_CHECKSUM:
+            raise ValueError("EvidencePolicy V1 canonical checksum drifted")
+        return checksum
 
 
-EVIDENCE_POLICY_V1_CHECKSUM = (
-    "bafaf188c31ce4912485856369397c423dece2dcc48ac3e19273845763dd1428"
-)
+EVIDENCE_POLICY_V1_CHECKSUM = EVIDENCE_POLICY_V1_GOLDEN_CHECKSUM

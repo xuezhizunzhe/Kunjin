@@ -11,54 +11,19 @@ from enum import Enum
 from typing import Any, Optional, Tuple
 
 MAX_PUBLIC_TEXT_CHARS = 4_096
-MAX_FORCE_REASON_CHARS = 256
 MAX_TUPLE_ITEMS = 128
+EVIDENCE_POLICY_V1_GOLDEN_CHECKSUM = (
+    "ee39f6184bf92d5ac1c94a5a15a52e227f94f53a5ca2829872183314288fd57c"
+)
+SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM = (
+    "6afb3f967a682defa8c56570281e923a4c83cbb8d72350a00120aaf470a6bcb3"
+)
 
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _REQUEST_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _SUBJECT_KEY_PATTERN = re.compile(r"^fund:[0-9]{6}$")
 _CHECKSUM_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _VERSION_PATTERN = re.compile(r"^[1-9][0-9]{0,8}$")
-_PRIVATE_NUMBER_PATTERN = re.compile(r"[0-9]{3,}")
-_SECRET_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_=-]{24,}(?![A-Za-z0-9])")
-_PRIVATE_FORCE_REASON_TERMS = (
-    "access_token",
-    "api_key",
-    "authorization",
-    "bearer ",
-    "cookie",
-    "credential",
-    "password",
-    "secret",
-    "token",
-    "account",
-    "balance",
-    "email",
-    "phone",
-    "amount",
-    "portfolio value",
-    "position value",
-    "order_id",
-    "transaction_id",
-    "income",
-    "debt",
-    "reserve",
-    " cny",
-    " rmb",
-    " yuan",
-    "\u00a5",
-    "\uffe5",
-    "$",
-    "\u4f59\u989d",
-    "\u8d26\u6237",
-    "\u6536\u5165",
-    "\u8d1f\u503a",
-    "\u91d1\u989d",
-    "\u8ba2\u5355",
-    "\u624b\u673a\u53f7",
-    "\u8eab\u4efd\u8bc1",
-    "\u94f6\u884c\u5361",
-)
 
 
 class RequestMode(str, Enum):
@@ -126,6 +91,12 @@ class SourceAttemptOutcome(str, Enum):
     SKIPPED_COOLDOWN = "skipped_cooldown"
 
 
+class ForceReasonCode(str, Enum):
+    OWNER_APPROVED_RETRY = "owner_approved_retry"
+    VERIFY_SOURCE_RECOVERY = "verify_source_recovery"
+    REFRESH_AFTER_MANUAL_SUPPLEMENT = "refresh_after_manual_supplement"
+
+
 class SourceTier(str, Enum):
     TIER_1 = "tier_1"
     TIER_2 = "tier_2"
@@ -166,12 +137,10 @@ def validate_exact_dataclass_state(value: object, name: str) -> None:
 def validate_public_text(
     value: object,
     name: str,
-    *,
-    maximum_chars: int = MAX_PUBLIC_TEXT_CHARS,
 ) -> str:
     if type(value) is not str or not value.strip():
         raise ValueError(f"{name} must be a non-empty exact string")
-    if len(value) > maximum_chars:
+    if len(value) > MAX_PUBLIC_TEXT_CHARS:
         raise ValueError(f"{name} is too long")
     if any(
         ord(character) <= 0x1F
@@ -251,25 +220,31 @@ def validate_public_text_tuple(
     return value
 
 
-def validate_force_reason(value: object) -> str:
-    reason = validate_public_text(value, "force reason", maximum_chars=MAX_FORCE_REASON_CHARS)
-    lowered = reason.casefold()
-    if (
-        any(term in lowered for term in _PRIVATE_FORCE_REASON_TERMS)
-        or _PRIVATE_NUMBER_PATTERN.search(reason) is not None
-        or _SECRET_LIKE_PATTERN.search(reason) is not None
-        or "@" in reason
-    ):
-        raise ValueError("force reason contains secret-bearing or private account data")
-    return reason
-
-
-def _canonical_decimal(value: Decimal) -> str:
+def canonical_decimal(value: Decimal) -> str:
     if not value.is_finite():
         raise ValueError("canonical decimals must be finite")
     if value.is_zero():
         return "0"
-    return format(value.normalize(), "f")
+    decimal_tuple = value.as_tuple()
+    digits = "".join(str(digit) for digit in decimal_tuple.digits)
+    exponent = decimal_tuple.exponent
+    if type(exponent) is not int:
+        raise ValueError("finite Decimal exponent must be an integer")
+    if exponent >= 0:
+        rendered = digits + ("0" * exponent)
+    else:
+        point = len(digits) + exponent
+        if point <= 0:
+            rendered = "0." + ("0" * (-point)) + digits
+        else:
+            rendered = digits[:point] + "." + digits[point:]
+        rendered = rendered.rstrip("0").rstrip(".")
+    rendered = rendered.lstrip("0") or "0"
+    if rendered.startswith("."):
+        rendered = "0" + rendered
+    if len(rendered) > 1_024:
+        raise ValueError("canonical decimal representation is too long")
+    return ("-" if decimal_tuple.sign else "") + rendered
 
 
 def canonical_value(value: Any) -> Any:
@@ -281,7 +256,7 @@ def canonical_value(value: Any) -> Any:
     if type(value) is date:
         return value.isoformat()
     if type(value) is Decimal:
-        return _canonical_decimal(value)
+        return canonical_decimal(value)
     if type(value) in {tuple, list}:
         return [canonical_value(item) for item in value]
     if type(value) is dict:
@@ -404,6 +379,7 @@ class FreshnessRule:
     dated_history_fallback_seconds: Optional[int] = None
     requires_newer_announcement_check: bool = False
     requires_correction_retraction_check: bool = False
+    integrity_check_max_age_seconds: Optional[int] = None
 
     def validate(self) -> None:
         validate_exact_dataclass_state(self, "freshness rule")
@@ -412,6 +388,7 @@ class FreshnessRule:
         for value, name in (
             (self.maximum_age_seconds, "maximum age seconds"),
             (self.dated_history_fallback_seconds, "dated history fallback seconds"),
+            (self.integrity_check_max_age_seconds, "integrity check maximum age seconds"),
         ):
             if value is not None and (type(value) is not int or value <= 0):
                 raise ValueError(f"{name} must be a positive exact integer or None")
@@ -429,11 +406,45 @@ class FreshnessRule:
         ):
             if type(value) is not bool:
                 raise ValueError(f"{name} must be an exact boolean")
+        requires_integrity = (
+            self.requires_newer_announcement_check
+            or self.requires_correction_retraction_check
+        )
+        if requires_integrity != (self.integrity_check_max_age_seconds is not None):
+            raise ValueError(
+                "integrity check maximum age is required exactly when integrity checks apply"
+            )
     def _within_maximum_age(self, data_as_of: datetime, now: datetime) -> bool:
         age_seconds = (now - data_as_of).total_seconds()
         return age_seconds >= 0 and (
             self.maximum_age_seconds is None or age_seconds <= self.maximum_age_seconds
         )
+
+    def _integrity_checks_pass(
+        self,
+        data_as_of: datetime,
+        context: FreshnessContext,
+    ) -> bool:
+        maximum_age = self.integrity_check_max_age_seconds
+
+        def check_is_recent(check_time: Optional[datetime]) -> bool:
+            if maximum_age is None or check_time is None:
+                return False
+            age_seconds = (context.now - check_time).total_seconds()
+            return data_as_of <= check_time <= context.now and 0 <= age_seconds <= maximum_age
+
+        if self.requires_newer_announcement_check and not (
+            context.newer_announcement_check_complete is True
+            and context.newer_announcement_found is False
+            and check_is_recent(context.newer_announcement_checked_at)
+        ):
+            return False
+        if self.requires_correction_retraction_check and not (
+            context.correction_retraction_check_complete is True
+            and check_is_recent(context.correction_retraction_checked_at)
+        ):
+            return False
+        return True
 
     def is_current(self, data_as_of: Optional[datetime], context: FreshnessContext) -> bool:
         self.validate()
@@ -443,20 +454,9 @@ class FreshnessRule:
         if data_as_of is None:
             return False
         validate_aware_datetime(data_as_of, "data as of")
+        if not self._integrity_checks_pass(data_as_of, context):
+            return False
         if not self._within_maximum_age(data_as_of, context.now):
-            return False
-        if self.requires_newer_announcement_check and not (
-            context.newer_announcement_check_complete is True
-            and context.newer_announcement_found is False
-            and context.newer_announcement_checked_at is not None
-            and data_as_of <= context.newer_announcement_checked_at <= context.now
-        ):
-            return False
-        if self.requires_correction_retraction_check and (
-            context.correction_retraction_check_complete is not True
-            or context.correction_retraction_checked_at is None
-            or not data_as_of <= context.correction_retraction_checked_at <= context.now
-        ):
             return False
         if self.kind is FreshnessKind.FIXED_AGE:
             return True
@@ -499,6 +499,8 @@ class FreshnessRule:
         if fallback is None or data_as_of is None:
             return False
         validate_aware_datetime(data_as_of, "data as of")
+        if not self._integrity_checks_pass(data_as_of, context):
+            return False
         age_seconds = (context.now - data_as_of).total_seconds()
         return 0 <= age_seconds <= fallback
 
@@ -507,6 +509,7 @@ class FreshnessRule:
         return {
             "dated_history_fallback_seconds": self.dated_history_fallback_seconds,
             "kind": self.kind.value,
+            "integrity_check_max_age_seconds": self.integrity_check_max_age_seconds,
             "maximum_age_seconds": self.maximum_age_seconds,
             "requires_correction_retraction_check": (
                 self.requires_correction_retraction_check
@@ -677,6 +680,13 @@ class ConclusionEvidence:
             if value is not None:
                 validate_aware_datetime(value, name)
         validate_aware_datetime(self.retrieved_at, "retrieved at")
+        evidence_times = self.publication_times + tuple(
+            value for value in (self.market_as_of, self.report_as_of) if value is not None
+        )
+        if any(value > self.retrieved_at for value in evidence_times):
+            raise ValueError(
+                "evidence publication, market, and report times must not follow retrieved at"
+            )
         if type(self.independent_lineage_count) is not int or self.independent_lineage_count < 0:
             raise ValueError("independent lineage count must be a non-negative exact integer")
         validate_identifier_tuple(self.lineage_ids, "lineage ids")
@@ -831,6 +841,16 @@ class DecisionRoute:
         validate_checksum(self.policy_checksum, "policy checksum")
         validate_version(self.registry_version, "registry version")
         validate_checksum(self.registry_checksum, "registry checksum")
+        if (
+            self.policy_version == "1"
+            and self.policy_checksum != EVIDENCE_POLICY_V1_GOLDEN_CHECKSUM
+        ):
+            raise ValueError("policy checksum does not match known version 1")
+        if (
+            self.registry_version == "1"
+            and self.registry_checksum != SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM
+        ):
+            raise ValueError("registry checksum does not match known version 1")
 
     def to_canonical_dict(self) -> dict:
         self.validate()
@@ -870,7 +890,7 @@ class SourceAttempt:
     error_code: Optional[str]
     cooldown_until: Optional[datetime]
     force_actor: Optional[str]
-    force_reason: Optional[str]
+    force_reason: Optional[ForceReasonCode]
     registry_version: str
     registry_checksum: str
     response_bytes: int
@@ -897,6 +917,10 @@ class SourceAttempt:
         ):
             if value is not None:
                 validate_aware_datetime(value, name)
+        if self.data_as_of is not None and self.data_as_of > self.finished_at:
+            raise ValueError("data as of cannot follow finished at")
+        if self.cooldown_until is not None and self.cooldown_until < self.finished_at:
+            raise ValueError("cooldown cannot precede finished at")
         if self.error_code is not None:
             validate_identifier(self.error_code, "error code")
         if (self.force_actor is None) != (self.force_reason is None):
@@ -904,11 +928,68 @@ class SourceAttempt:
         if self.force_actor is not None:
             if self.force_actor != "local_owner":
                 raise ValueError("force actor must be local_owner")
-            validate_force_reason(self.force_reason)
+            if type(self.force_reason) is not ForceReasonCode:
+                raise ValueError("force reason must be an exact ForceReasonCode")
         validate_version(self.registry_version, "registry version")
         validate_checksum(self.registry_checksum, "registry checksum")
+        if (
+            self.registry_version == "1"
+            and self.registry_checksum != SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM
+        ):
+            raise ValueError("registry checksum does not match known version 1")
         if type(self.response_bytes) is not int or self.response_bytes < 0:
             raise ValueError("response bytes must be a non-negative exact integer")
+        success_outcomes = {
+            SourceAttemptOutcome.SUCCESS,
+            SourceAttemptOutcome.CACHE_HIT,
+        }
+        if self.outcome in success_outcomes:
+            if (
+                self.data_as_of is None
+                or self.error_code is not None
+                or self.cooldown_until is not None
+            ):
+                raise ValueError("successful attempt requires dated data and no error or cooldown")
+        elif self.outcome is SourceAttemptOutcome.TRANSIENT_FAILURE:
+            if (
+                self.data_as_of is not None
+                or self.error_code is None
+                or self.cooldown_until is None
+                or self.cooldown_until <= self.finished_at
+            ):
+                raise ValueError("transient failure requires error and future cooldown only")
+        elif self.outcome in {
+            SourceAttemptOutcome.UNAVAILABLE,
+            SourceAttemptOutcome.UNSUPPORTED,
+        }:
+            if (
+                self.data_as_of is not None
+                or self.error_code is None
+                or self.cooldown_until is not None
+            ):
+                raise ValueError("unavailable or unsupported attempt requires only an error")
+        elif self.outcome is SourceAttemptOutcome.CANCELLED:
+            if (
+                self.data_as_of is not None
+                or self.error_code != "request_cancelled"
+                or self.cooldown_until is not None
+            ):
+                raise ValueError("cancelled attempt requires request_cancelled only")
+        elif self.outcome is SourceAttemptOutcome.EXPIRED:
+            if (
+                self.data_as_of is not None
+                or self.error_code != "request_expired"
+                or self.cooldown_until is not None
+            ):
+                raise ValueError("expired attempt requires request_expired only")
+        elif self.outcome is SourceAttemptOutcome.SKIPPED_COOLDOWN:
+            if (
+                self.data_as_of is not None
+                or self.error_code != "cooldown_active"
+                or self.cooldown_until is None
+                or self.cooldown_until <= self.finished_at
+            ):
+                raise ValueError("skipped cooldown requires an active cooldown only")
 
 
 @dataclass(frozen=True)

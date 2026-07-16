@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Tuple
 
 from kunjin.decision.models import (
+    SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM,
     FreshnessKind,
     FreshnessRule,
     SourceFieldPolicy,
@@ -59,6 +60,7 @@ def _fixed(days: int, *, announcement_check: bool = False) -> FreshnessRule:
         kind=FreshnessKind.FIXED_AGE,
         maximum_age_seconds=days * _DAY,
         requires_newer_announcement_check=announcement_check,
+        integrity_check_max_age_seconds=2 * 60 * 60 if announcement_check else None,
     )
 
 
@@ -82,6 +84,7 @@ def _announcement() -> FreshnessRule:
         maximum_age_seconds=7 * _DAY,
         dated_history_fallback_seconds=5 * 365 * _DAY,
         requires_correction_retraction_check=True,
+        integrity_check_max_age_seconds=2 * 60 * 60,
     )
 
 
@@ -121,6 +124,7 @@ _SOURCES = (
                 FreshnessRule(
                     FreshnessKind.EFFECTIVE_PERIOD,
                     requires_newer_announcement_check=True,
+                    integrity_check_max_age_seconds=2 * 60 * 60,
                 ),
                 "published fees and share-class relationship",
                 (
@@ -262,6 +266,7 @@ _SOURCES = (
                 FreshnessRule(
                     FreshnessKind.EFFECTIVE_PERIOD,
                     requires_newer_announcement_check=True,
+                    integrity_check_max_age_seconds=2 * 60 * 60,
                 ),
                 "official effective fee schedule and share-class terms",
                 (_ref("eastmoney_f10", "fees_share_class_relationship"),),
@@ -443,9 +448,10 @@ class SourceRegistryV1:
         return canonical_json_bytes(self)
 
     def checksum(self) -> str:
-        return hashlib.sha256(self.canonical_json()).hexdigest()
+        checksum = hashlib.sha256(self.canonical_json()).hexdigest()
+        if self.version == "1" and checksum != SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM:
+            raise ValueError("SourceRegistry V1 canonical checksum drifted")
+        return checksum
 
 
-SOURCE_REGISTRY_V1_CHECKSUM = (
-    "2aa479937c46d94e8b8dbc11695900bbebe9aa08765b3e09792d9428724085af"
-)
+SOURCE_REGISTRY_V1_CHECKSUM = SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM
