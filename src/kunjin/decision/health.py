@@ -92,6 +92,48 @@ class ActionEvidenceRequirement:
         self.policy_requirement.validate()
 
 
+@dataclass(frozen=True)
+class ProjectedSourceField:
+    state: SourceFieldState
+    history: SourceFieldHistory
+
+    def validate(self) -> None:
+        validate_exact_dataclass_state(self, "projected source field")
+        if type(self.state) is not SourceFieldState:
+            raise ValueError("projected state must be an exact SourceFieldState")
+        if type(self.history) is not SourceFieldHistory:
+            raise ValueError("projected history must be an exact SourceFieldHistory")
+        self.history.validate()
+
+
+@dataclass(frozen=True)
+class SourceStatusSnapshot:
+    projections: tuple[ProjectedSourceField, ...]
+    resolutions: tuple[RequestFieldResolution, ...]
+
+    def validate(self) -> None:
+        validate_exact_dataclass_state(self, "source status snapshot")
+        if type(self.projections) is not tuple or not self.projections:
+            raise ValueError("source status projections must be a non-empty exact tuple")
+        references = []
+        for projection in self.projections:
+            if type(projection) is not ProjectedSourceField:
+                raise ValueError(
+                    "source status projections must contain exact projected fields"
+                )
+            projection.validate()
+            references.append(projection.history.reference)
+        if len(references) != len(set(references)):
+            raise ValueError("source status projections must have unique references")
+        if type(self.resolutions) is not tuple:
+            raise ValueError("source status resolutions must be an exact tuple")
+        for resolution in self.resolutions:
+            if type(resolution) is not RequestFieldResolution:
+                raise ValueError(
+                    "source status resolutions must contain exact resolution values"
+                )
+
+
 class SourceHealthService:
     def __init__(
         self,
@@ -192,6 +234,98 @@ class SourceHealthService:
         filtered.validate()
         return self._project_state(filtered, policy, trusted_context), filtered
 
+    def source_status_snapshot(
+        self,
+        subject_key: str,
+        context: FreshnessContext,
+        primary_references: tuple[SourceFieldRef, ...],
+        requirements: tuple[ActionEvidenceRequirement, ...],
+        *,
+        request_run_id: int,
+        budget: RequestBudget,
+    ) -> SourceStatusSnapshot:
+        if (
+            type(primary_references) is not tuple
+            or not primary_references
+            or len(primary_references) > 128
+            or len(primary_references) != len(requirements)
+        ):
+            raise ValueError("source status primary references are invalid")
+        if type(requirements) is not tuple:
+            raise ValueError("source status requirements must be an exact tuple")
+        for reference, requirement in zip(primary_references, requirements):
+            if type(reference) is not SourceFieldRef:
+                raise ValueError("source status primaries must contain exact references")
+            reference.validate()
+            if type(requirement) is not ActionEvidenceRequirement:
+                raise ValueError("source status requirements must be exact records")
+            requirement.validate()
+            if (
+                requirement.field_id != reference.field_id
+                or requirement.policy_requirement not in self.policy.requirements
+                or requirement.policy_requirement.field_id
+                != _REGISTRY_POLICY_REQUIREMENT_V1.get(reference.field_id)
+            ):
+                raise ValueError("source status requirement does not match its primary")
+            self._field_policy(reference.source_id, reference.field_id)
+        if len(primary_references) != len(set(primary_references)):
+            raise ValueError("source status primaries must be unique")
+
+        trusted_context = self._trusted_context(context, budget)
+        references = tuple(
+            SourceFieldRef(source.source_id, field.field_id)
+            for source in self.registry.sources
+            for field in source.fields
+        )
+        histories = self.audit_store.authenticated_source_attempt_histories(
+            request_run_id,
+            budget,
+            references,
+            subject_key,
+        )
+        filtered_histories = tuple(
+            SourceFieldHistory(
+                history.reference,
+                tuple(
+                    record
+                    for record in history.attempts
+                    if record.attempt.finished_at <= trusted_context.now
+                ),
+            )
+            for history in histories
+        )
+        projections = tuple(
+            ProjectedSourceField(
+                self._project_state(
+                    history,
+                    self._field_policy(
+                        history.reference.source_id,
+                        history.reference.field_id,
+                    ),
+                    trusted_context,
+                ),
+                history,
+            )
+            for history in filtered_histories
+        )
+        projected_by_reference = {
+            projection.history.reference: projection for projection in projections
+        }
+        resolutions = []
+        for primary_ref, requirement in zip(primary_references, requirements):
+            primary = self._field_policy(primary_ref.source_id, primary_ref.field_id)
+            projected = tuple(
+                (
+                    self._field_policy(reference.source_id, reference.field_id),
+                    projected_by_reference[reference].state,
+                )
+                for reference in (primary_ref, *primary.acceptable_alternatives)
+            )
+            resolutions.append(self._resolution_from_projected(projected, requirement))
+        snapshot = SourceStatusSnapshot(projections, tuple(resolutions))
+        snapshot.validate()
+        return snapshot
+
     def resolve_field(
         self,
         source_id: str,
@@ -233,6 +367,13 @@ class SourceHealthService:
             )
             for history in histories
         )
+        return self._resolution_from_projected(projected, requirement)
+
+    @staticmethod
+    def _resolution_from_projected(
+        projected: tuple[tuple[SourceFieldPolicy, SourceFieldState], ...],
+        requirement: ActionEvidenceRequirement,
+    ) -> RequestFieldResolution:
         if requirement.risk_effect is RiskEffect.INFORMATION:
             if any(state is SourceFieldState.HEALTHY for _, state in projected):
                 return RequestFieldResolution.USABLE

@@ -23,8 +23,21 @@ from kunjin.allocation.service import (
 )
 from kunjin.allocation.store import AllocationAssessmentStore, AllocationPolicyStore
 from kunjin.cli import ApplicationContext, build_context, run
-from kunjin.decision.models import ForceReasonCode
-from kunjin.decision.store import DecisionAuditStoreError
+from kunjin.decision.budget import RequestBudget
+from kunjin.decision.health import SourceHealthService
+from kunjin.decision.models import (
+    ForceReasonCode,
+    RequestFieldResolution,
+    RequestMode,
+    RequestTerminalStatus,
+    SourceAttempt,
+    SourceAttemptOutcome,
+    SourceFieldState,
+)
+from kunjin.decision.policy import EvidencePolicyV1
+from kunjin.decision.service import DecisionRoutingService
+from kunjin.decision.source_registry import SourceRegistryV1
+from kunjin.decision.store import DecisionAuditStore, DecisionAuditStoreError
 from kunjin.funds.models import DisclosureBundle, DocumentKind
 from kunjin.funds.peers.models import (
     MembershipKind,
@@ -511,6 +524,20 @@ class CliIntegrationTest(unittest.TestCase):
                 now=lambda: self.suitability_now,
             ),
         )
+        audit_store = DecisionAuditStore(repository)
+        evidence_policy = EvidencePolicyV1()
+        source_registry = SourceRegistryV1()
+        self.context.decision_service = DecisionRoutingService(
+            suitability_service,
+            audit_store,
+            policy=evidence_policy,
+            registry=source_registry,
+        )
+        self.context.source_health_service = SourceHealthService(
+            audit_store,
+            registry=source_registry,
+            policy=evidence_policy,
+        )
         self.payment_image = root / "payment.jpg"
         self.payment_image.write_bytes(b"synthetic payment screenshot")
 
@@ -526,6 +553,359 @@ class CliIntegrationTest(unittest.TestCase):
             set(payload),
             {"schema_version", "command", "as_of", "data", "warnings", "errors"},
         )
+
+    def test_phase0_decision_route_parser_and_json_contract(self) -> None:
+        payload, exit_code, json_output = run(
+            [
+                "--json",
+                "decision",
+                "route",
+                "--action",
+                "fact_research",
+                "--action",
+                "continue_holding",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "decision.route")
+        self.assertEqual(
+            set(payload["data"]),
+            {
+                "actions",
+                "conclusion_evidence",
+                "created_at",
+                "missing_fields",
+                "mode",
+                "opposing_evidence",
+                "policy_checksum",
+                "policy_version",
+                "registry_checksum",
+                "registry_version",
+                "request_id",
+                "result_checksum",
+                "workflow_level",
+            },
+        )
+        self.assertEqual(payload["data"]["mode"], "rapid")
+        self.assertEqual(payload["data"]["workflow_level"], "rapid_evidence")
+        self.assertEqual(
+            [item["action"] for item in payload["data"]["actions"]],
+            ["fact_research", "continue_holding"],
+        )
+        self.assertRegex(payload["data"]["request_id"], r"^[0-9a-f]{32}$")
+        for key in ("policy_checksum", "registry_checksum", "result_checksum"):
+            self.assertRegex(payload["data"][key], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            datetime.fromisoformat(payload["data"]["created_at"]).utcoffset(),
+            timedelta(0),
+        )
+
+    def test_phase0_decision_route_supports_deep_and_switch_legs(self) -> None:
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "decision",
+                "route",
+                "--mode",
+                "deep",
+                "--action",
+                "switch_funds",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["mode"], "deep")
+        self.assertEqual(payload["data"]["workflow_level"], "decision_evidence")
+        self.assertEqual(
+            [item["action_id"] for item in payload["data"]["actions"]],
+            ["switch_reduce", "switch_buy"],
+        )
+        self.assertEqual(
+            [item["risk_effect"] for item in payload["data"]["actions"]],
+            ["risk_reducing", "risk_increasing"],
+        )
+
+    def test_phase0_facts_survive_blocked_phase_b(self) -> None:
+        blocked_profile = replace(valid_profile(), emergency_reserve=Decimal("0.00"))
+        self.context.profile_service.confirm_profile(blocked_profile)
+        assessed, assessed_exit, _ = run(
+            ["--json", "suitability", "assess"], self.context
+        )
+        self.assertEqual(assessed_exit, 0)
+        self.assertEqual(assessed["data"]["status"], "blocked")
+
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "decision",
+                "route",
+                "--action",
+                "fact_research",
+                "--action",
+                "continue_holding",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        facts, holding = payload["data"]["actions"]
+        self.assertTrue(facts["research_available"])
+        self.assertEqual(facts["blocking_codes"], [])
+        self.assertEqual(holding["minimum_state"], "no_add")
+        self.assertIn("phase_b_blocked", holding["blocking_codes"])
+
+    def test_phase0_decision_route_rejects_non_json_and_invalid_actions(self) -> None:
+        cases = (
+            (["decision", "route", "--action", "fact_research"], "decision.route"),
+            (["--json", "decision", "route"], "decision.route"),
+            (
+                [
+                    "--json",
+                    "decision",
+                    "route",
+                    "--action",
+                    "fact_research",
+                    "--action",
+                    "fact_research",
+                ],
+                "decision.route",
+            ),
+            (
+                [
+                    "--json",
+                    "decision",
+                    "route",
+                    "--mode",
+                    "invalid",
+                    "--action",
+                    "fact_research",
+                ],
+                "decision.route",
+            ),
+        )
+        for argv, expected_command in cases:
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, expected_command)
+                self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
+    def test_phase0_source_status_is_read_only_and_separates_resolutions(self) -> None:
+        class SuitabilityMustNotRun:
+            def status(inner_self):
+                raise AssertionError("source status must not read Phase B")
+
+        original_suitability = self.context.suitability_service
+        self.context.suitability_service = SuitabilityMustNotRun()
+        try:
+            payload, exit_code, json_output = run(
+                ["--json", "source", "status", "--fund-code", "000000"],
+                self.context,
+            )
+        finally:
+            self.context.suitability_service = original_suitability
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "source.status")
+        self.assertEqual(
+            set(payload["data"]),
+            {
+                "fund_code",
+                "mode",
+                "policy_checksum",
+                "policy_version",
+                "registry_checksum",
+                "registry_version",
+                "request_field_resolutions",
+                "request_id",
+                "source_fields",
+            },
+        )
+        self.assertEqual(payload["data"]["fund_code"], "000000")
+        self.assertTrue(payload["data"]["source_fields"])
+        self.assertTrue(payload["data"]["request_field_resolutions"])
+        source_states = {item["state"] for item in payload["data"]["source_fields"]}
+        self.assertTrue(source_states <= {item.value for item in SourceFieldState})
+        resolutions = {
+            item["resolution"]
+            for item in payload["data"]["request_field_resolutions"]
+        }
+        self.assertTrue(
+            resolutions <= {item.value for item in RequestFieldResolution}
+        )
+        for item in payload["data"]["source_fields"]:
+            self.assertEqual(
+                set(item),
+                {
+                    "acceptable_alternatives",
+                    "consecutive_failures",
+                    "cooldown_until",
+                    "field_id",
+                    "field_scope",
+                    "last_failure_at",
+                    "last_failure_reason",
+                    "last_success_at",
+                    "last_success_data_as_of",
+                    "source_id",
+                    "source_kind",
+                    "source_scope",
+                    "source_tier",
+                    "state",
+                    "supplementation",
+                },
+            )
+
+    def test_phase0_source_status_optional_code_and_strict_validation(self) -> None:
+        payload, exit_code, _ = run(
+            ["--json", "source", "status"], self.context
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertIsNone(payload["data"]["fund_code"])
+
+        for invalid in ("12345", "1234567", "abcdef", "12345a"):
+            with self.subTest(invalid=invalid):
+                payload, exit_code, _ = run(
+                    ["--json", "source", "status", "--fund-code", invalid],
+                    self.context,
+                )
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, "source.status")
+                self.assertEqual(payload["errors"][0]["code"], "invalid_fund_code")
+
+    def test_phase0_source_status_without_code_never_inherits_fund_000000(self) -> None:
+        now = datetime.now(timezone.utc)
+        budget = RequestBudget.create(
+            RequestMode.RAPID,
+            wall_clock=lambda: now - timedelta(seconds=3),
+        )
+        store = self.context.source_health_service.audit_store
+        request_run_id = store.begin_request(budget)
+        attempt = SourceAttempt(
+            source_id="eastmoney_nav",
+            field_id="formal_nav",
+            subject_key="fund:000000",
+            attempt_number=1,
+            outcome=SourceAttemptOutcome.SUCCESS,
+            started_at=now - timedelta(seconds=2),
+            finished_at=now - timedelta(seconds=1),
+            data_as_of=now - timedelta(days=1),
+            error_code=None,
+            cooldown_until=None,
+            force_actor=None,
+            force_reason=None,
+            registry_version=self.context.source_health_service.registry.version,
+            registry_checksum=self.context.source_health_service.registry.checksum(),
+            response_bytes=10,
+        )
+        store.record_source_attempt(request_run_id, attempt)
+        store.finalize_request(
+            request_run_id,
+            RequestTerminalStatus.COMPLETE,
+            attempt.finished_at,
+            (),
+        )
+
+        unscoped, unscoped_exit, _ = run(
+            ["--json", "source", "status"], self.context
+        )
+        scoped, scoped_exit, _ = run(
+            ["--json", "source", "status", "--fund-code", "000000"],
+            self.context,
+        )
+
+        self.assertEqual((unscoped_exit, scoped_exit), (0, 0))
+        unscoped_nav = next(
+            item
+            for item in unscoped["data"]["source_fields"]
+            if item["source_id"] == "eastmoney_nav"
+            and item["field_id"] == "formal_nav"
+        )
+        scoped_nav = next(
+            item
+            for item in scoped["data"]["source_fields"]
+            if item["source_id"] == "eastmoney_nav"
+            and item["field_id"] == "formal_nav"
+        )
+        self.assertEqual(unscoped_nav["state"], "not_checked")
+        self.assertIsNone(unscoped_nav["last_success_at"])
+        self.assertIsNotNone(scoped_nav["last_success_at"])
+
+    def test_phase0_source_status_expiry_is_audited_as_expired(self) -> None:
+        class Clock:
+            value = 0.0
+
+            def __call__(inner_self):
+                return inner_self.value
+
+        clock = Clock()
+        now = datetime.now(timezone.utc)
+        budget = RequestBudget.create(
+            RequestMode.RAPID,
+            monotonic=clock,
+            wall_clock=lambda: now,
+        )
+        clock.value = budget.total_seconds
+
+        with patch("kunjin.cli.RequestBudget.create", return_value=budget):
+            payload, exit_code, _ = run(
+                ["--json", "source", "status", "--fund-code", "000000"],
+                self.context,
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["errors"][0]["code"], "source_status_failed")
+        with self.context.repository.connect() as connection:
+            row = connection.execute(
+                "SELECT status, finished_at, deadline_at FROM request_runs "
+                "WHERE request_id = ?",
+                (budget.request_id,),
+            ).fetchone()
+        self.assertEqual(row["status"], "expired")
+        self.assertEqual(row["finished_at"], row["deadline_at"])
+
+    def test_phase0_command_errors_never_publish_private_exception_details(self) -> None:
+        private_details = (
+            "access_token=never-print-this monthly_net_income=918273645001 "
+            f"managed_path={self.context.paths.database} worker_pid=4242"
+        )
+
+        class FailingDecisionService:
+            def route(inner_self, budget, actions):
+                raise RuntimeError(private_details)
+
+        class FailingSourceHealthService:
+            @property
+            def audit_store(inner_self):
+                raise RuntimeError(private_details)
+
+        self.context.decision_service = FailingDecisionService()
+        decision, decision_exit, _ = run(
+            ["--json", "decision", "route", "--action", "fact_research"],
+            self.context,
+        )
+        self.context.source_health_service = FailingSourceHealthService()
+        source, source_exit, _ = run(
+            ["--json", "source", "status"], self.context
+        )
+
+        self.assertEqual((decision_exit, source_exit), (1, 1))
+        self.assertEqual(decision["errors"][0]["code"], "decision_command_failed")
+        self.assertEqual(source["errors"][0]["code"], "source_status_failed")
+        self.assertEqual(decision["errors"][0]["message"], "decision routing failed")
+        self.assertEqual(source["errors"][0]["message"], "source status failed")
+        rendered = json.dumps({"decision": decision, "source": source})
+        for private in (
+            "never-print-this",
+            "918273645001",
+            str(self.context.paths.database),
+            "4242",
+        ):
+            self.assertNotIn(private, rendered)
 
     def test_profile_edit_rejects_json_with_stable_error(self) -> None:
         payload, exit_code, json_output = run(["--json", "profile", "edit"], self.context)
@@ -896,6 +1276,18 @@ class CliIntegrationTest(unittest.TestCase):
             context.fund_disclosure_store,
         )
         self.assertIs(context.fund_risk_service._repository, context.repository)
+        self.assertIs(
+            context.decision_service._store,
+            context.source_health_service.audit_store,
+        )
+        self.assertIs(
+            context.decision_service._policy,
+            context.source_health_service.policy,
+        )
+        self.assertIs(
+            context.decision_service._registry,
+            context.source_health_service.registry,
+        )
         for forbidden_dependency in (
             "_profile_service",
             "_suitability_service",

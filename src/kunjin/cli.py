@@ -34,13 +34,24 @@ from kunjin.allocation.service import (
 from kunjin.allocation.store import AllocationAssessmentStore, AllocationPolicyStore
 from kunjin.analytics.portfolio import analyze_portfolio
 from kunjin.analytics.research import analyze_fund_history, analyze_sectors
-from kunjin.decision.budget import RequestBudget
+from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.health import SourceHealthService
 from kunjin.decision.models import (
+    ActionKind,
     ForceReasonCode,
+    FreshnessContext,
+    RequestFieldResolution,
     RequestMode,
     RequestTerminalStatus,
+    RiskEffect,
+    SourceAttemptOutcome,
+    SourceFieldRef,
+    SourceFieldState,
+    SourceTier,
 )
+from kunjin.decision.policy import EvidencePolicyV1
+from kunjin.decision.service import DecisionRoutingService
+from kunjin.decision.source_registry import SourceRegistryV1
 from kunjin.decision.store import DecisionAuditStore
 from kunjin.funds.peers.analytics import PEER_CALCULATION_VERSION
 from kunjin.funds.peers.research import (
@@ -116,6 +127,7 @@ _COMMAND_PART = re.compile(r"^[a-z][a-z0-9_-]*$")
 _TOP_LEVEL_COMMANDS = {
     "allocation",
     "auth",
+    "decision",
     "fund",
     "ledger",
     "market",
@@ -123,6 +135,7 @@ _TOP_LEVEL_COMMANDS = {
     "profile",
     "report",
     "status",
+    "source",
     "suitability",
     "sync",
     "thesis",
@@ -240,6 +253,14 @@ class BoundedDisclosureSyncError(ValueError):
         super().__init__("bounded fund disclosure synchronization failed")
 
 
+class DecisionCliError(ValueError):
+    code = "decision_command_failed"
+
+
+class SourceStatusCliError(ValueError):
+    code = "source_status_failed"
+
+
 class KunjinArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise CliUsageError(message)
@@ -267,6 +288,8 @@ class ApplicationContext:
     allocation_service: Optional[AllocationService] = None
     fund_risk_store: Optional[FundRiskStore] = None
     fund_risk_service: Optional[FundRiskService] = None
+    decision_service: Optional[DecisionRoutingService] = None
+    source_health_service: Optional[SourceHealthService] = None
 
 
 def build_context() -> ApplicationContext:
@@ -304,6 +327,9 @@ def build_context() -> ApplicationContext:
         AssessmentCipher(profile_key_store),
         SuitabilityPolicyV1(),
     )
+    decision_audit_store = DecisionAuditStore(repository)
+    evidence_policy = EvidencePolicyV1()
+    source_registry = SourceRegistryV1()
     return ApplicationContext(
         paths=paths,
         repository=repository,
@@ -346,6 +372,17 @@ def build_context() -> ApplicationContext:
             document_client=OfficialDocumentClient(paths=paths),
             legacy_converter=legacy_converter,
             policy=ClassificationPolicyV1(),
+        ),
+        decision_service=DecisionRoutingService(
+            suitability_service,
+            decision_audit_store,
+            policy=evidence_policy,
+            registry=source_registry,
+        ),
+        source_health_service=SourceHealthService(
+            decision_audit_store,
+            registry=source_registry,
+            policy=evidence_policy,
         ),
     )
 
@@ -409,6 +446,28 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("version")
     subparsers.add_parser("status")
+
+    decision = subparsers.add_parser("decision")
+    decision_subparsers = decision.add_subparsers(
+        dest="decision_command", required=True
+    )
+    decision_route = decision_subparsers.add_parser("route")
+    decision_route.add_argument(
+        "--mode",
+        choices=[item.value for item in RequestMode],
+        default=RequestMode.RAPID.value,
+    )
+    decision_route.add_argument(
+        "--action",
+        action="append",
+        choices=[item.value for item in ActionKind],
+        required=True,
+    )
+
+    source = subparsers.add_parser("source")
+    source_subparsers = source.add_subparsers(dest="source_command", required=True)
+    source_status = source_subparsers.add_parser("status")
+    source_status.add_argument("--fund-code")
 
     profile = subparsers.add_parser("profile")
     profile_subparsers = profile.add_subparsers(dest="profile_command", required=True)
@@ -1492,9 +1551,535 @@ def _validate_public_risk_payload(value: object) -> None:
             raise ValueError("risk report contains local implementation details") from None
 
 
+_DECISION_ROUTE_DATA_KEYS = frozenset(
+    {
+        "actions",
+        "conclusion_evidence",
+        "created_at",
+        "missing_fields",
+        "mode",
+        "opposing_evidence",
+        "policy_checksum",
+        "policy_version",
+        "registry_checksum",
+        "registry_version",
+        "request_id",
+        "result_checksum",
+        "workflow_level",
+    }
+)
+_ACTION_ROUTE_DATA_KEYS = frozenset(
+    {
+        "action",
+        "action_id",
+        "action_maturity",
+        "blocking_codes",
+        "exact_amount_available",
+        "minimum_state",
+        "required_gates",
+        "research_available",
+        "risk_effect",
+    }
+)
+_SOURCE_STATUS_DATA_KEYS = frozenset(
+    {
+        "fund_code",
+        "mode",
+        "policy_checksum",
+        "policy_version",
+        "registry_checksum",
+        "registry_version",
+        "request_field_resolutions",
+        "request_id",
+        "source_fields",
+    }
+)
+_SOURCE_FIELD_DATA_KEYS = frozenset(
+    {
+        "acceptable_alternatives",
+        "consecutive_failures",
+        "cooldown_until",
+        "field_id",
+        "field_scope",
+        "last_failure_at",
+        "last_failure_reason",
+        "last_success_at",
+        "last_success_data_as_of",
+        "source_id",
+        "source_kind",
+        "source_scope",
+        "source_tier",
+        "state",
+        "supplementation",
+    }
+)
+_REQUEST_FIELD_RESOLUTION_KEYS = frozenset(
+    {"action", "field_id", "primary_source_id", "resolution", "risk_effect"}
+)
+_SUPPLEMENTATION_KEYS = frozenset(
+    {
+        "accepted_input",
+        "freshness_requirement",
+        "impact_if_missing",
+        "missing_item",
+        "suggested_location",
+        "supported_without_it",
+        "unsupported_without_it",
+        "why_required",
+    }
+)
+_PHASE0_PRIVATE_KEYS = frozenset(
+    {
+        "access_token",
+        "body",
+        "ciphertext",
+        "debt",
+        "emergency_reserve",
+        "exception",
+        "exception_chain",
+        "goal_amount",
+        "income",
+        "local_path",
+        "managed_path",
+        "nonce",
+        "pid",
+        "private_value",
+        "profile_key",
+        "raw_body",
+        "response_body",
+        "worker_id",
+        "worker_pid",
+    }
+)
+_CHECKSUM = re.compile(r"^[0-9a-f]{64}$")
+_REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("public timestamp must be timezone-aware")
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _validate_utc_iso(value: object, name: str, *, optional: bool = False) -> None:
+    if optional and value is None:
+        return
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an exact UTC timestamp") from None
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"{name} must be an exact UTC timestamp")
+
+
+def _validate_phase0_public_value(value: object) -> None:
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str or key.casefold() in _PHASE0_PRIVATE_KEYS:
+                raise ValueError("phase 0 output contains a private field")
+            _validate_phase0_public_value(item)
+        return
+    if type(value) is list:
+        for item in value:
+            _validate_phase0_public_value(item)
+        return
+    if type(value) is str:
+        lowered = value.casefold()
+        if any(
+            marker in lowered
+            for marker in (
+                "/users/",
+                "/private/",
+                "traceback (most recent call last)",
+                "access_token=",
+            )
+        ):
+            raise ValueError("phase 0 output contains local implementation details")
+        return
+    if value is not None and type(value) not in {bool, int, float}:
+        raise ValueError("phase 0 output contains an unsupported value")
+
+
+def _decision_route_response(
+    context: ApplicationContext,
+    mode: RequestMode,
+    actions: Tuple[ActionKind, ...],
+) -> Dict[str, Any]:
+    if context.decision_service is None:
+        raise CliUsageError("decision routing service is unavailable")
+    budget = RequestBudget.create(mode)
+    try:
+        snapshot = context.decision_service.route(budget, actions)
+        route = snapshot.route
+        route.validate()
+        data = route.to_canonical_dict()
+        data["created_at"] = _utc_iso(snapshot.created_at)
+        data["result_checksum"] = route.checksum()
+        _validate_decision_route_data(data)
+        return data
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        raise DecisionCliError("decision routing failed") from None
+
+
+def _validate_decision_route_data(data: object) -> None:
+    if type(data) is not dict or set(data) != _DECISION_ROUTE_DATA_KEYS:
+        raise ValueError("decision route output keys are invalid")
+    if data["mode"] not in {item.value for item in RequestMode}:
+        raise ValueError("decision route mode is invalid")
+    expected_workflow = (
+        "rapid_evidence" if data["mode"] == RequestMode.RAPID.value else "decision_evidence"
+    )
+    if data["workflow_level"] != expected_workflow:
+        raise ValueError("decision route workflow level is invalid")
+    if type(data["request_id"]) is not str or not _REQUEST_ID.fullmatch(
+        data["request_id"]
+    ):
+        raise ValueError("decision route request id is invalid")
+    for key in ("policy_checksum", "registry_checksum", "result_checksum"):
+        if type(data[key]) is not str or not _CHECKSUM.fullmatch(data[key]):
+            raise ValueError("decision route checksum is invalid")
+    _validate_utc_iso(data["created_at"], "decision route creation")
+    if type(data["actions"]) is not list or not data["actions"]:
+        raise ValueError("decision route actions are invalid")
+    action_ids = []
+    for action in data["actions"]:
+        if type(action) is not dict or set(action) != _ACTION_ROUTE_DATA_KEYS:
+            raise ValueError("decision action output keys are invalid")
+        ActionKind(action["action"])
+        RiskEffect(action["risk_effect"])
+        action_ids.append(action["action_id"])
+    if len(action_ids) != len(set(action_ids)):
+        raise ValueError("decision action ids are invalid")
+    _validate_phase0_public_value(data)
+
+
+def _source_status_response(
+    context: ApplicationContext,
+    fund_code: Optional[str],
+) -> Dict[str, Any]:
+    if fund_code is not None:
+        _validate_fund_code(fund_code)
+    if context.source_health_service is None:
+        raise CliUsageError("source health service is unavailable")
+    try:
+        service = context.source_health_service
+        store = service.audit_store
+        budget = RequestBudget.create(RequestMode.RAPID)
+        request_run_id = store.begin_request(budget)
+    except Exception:
+        raise SourceStatusCliError("source status failed") from None
+    finalized = False
+    subject_key = None if fund_code is None else f"fund:{fund_code}"
+    try:
+        context_value = FreshnessContext(now=budget.started_at)
+        source_fields = []
+        primary_by_field: Dict[str, Tuple[int, str]] = {}
+        tier_priority = {
+            SourceTier.TIER_1: 0,
+            SourceTier.TIER_2: 1,
+            SourceTier.PRIVATE_OBSERVATION: 2,
+            SourceTier.USER_PROVIDED: 3,
+        }
+        for source in service.registry.sources:
+            for field in source.fields:
+                candidate = (tier_priority[field.source_tier], source.source_id)
+                if field.field_id not in primary_by_field or (
+                    candidate < primary_by_field[field.field_id]
+                ):
+                    primary_by_field[field.field_id] = candidate
+
+        ordered_field_ids = tuple(sorted(primary_by_field))
+        primary_references = tuple(
+            SourceFieldRef(primary_by_field[field_id][1], field_id)
+            for field_id in ordered_field_ids
+        )
+        requirements = tuple(
+            service.action_requirement(
+                field_id,
+                ActionKind.FACT_RESEARCH,
+                RiskEffect.INFORMATION,
+            )
+            for field_id in ordered_field_ids
+        )
+        snapshot = (
+            None
+            if subject_key is None
+            else service.source_status_snapshot(
+                subject_key,
+                context_value,
+                primary_references,
+                requirements,
+                request_run_id=request_run_id,
+                budget=budget,
+            )
+        )
+        projected_by_reference = (
+            {}
+            if snapshot is None
+            else {
+                projection.history.reference: projection
+                for projection in snapshot.projections
+            }
+        )
+
+        for source in service.registry.sources:
+            for field in source.fields:
+                if subject_key is None:
+                    state = SourceFieldState.NOT_CHECKED
+                    attempts = ()
+                else:
+                    projection = projected_by_reference[
+                        SourceFieldRef(source.source_id, field.field_id)
+                    ]
+                    state = projection.state
+                    attempts = tuple(
+                        record.attempt for record in projection.history.attempts
+                    )
+                successful = tuple(
+                    attempt
+                    for attempt in attempts
+                    if attempt.outcome
+                    in {SourceAttemptOutcome.SUCCESS, SourceAttemptOutcome.CACHE_HIT}
+                )
+                failed = tuple(
+                    attempt
+                    for attempt in attempts
+                    if attempt.outcome
+                    not in {SourceAttemptOutcome.SUCCESS, SourceAttemptOutcome.CACHE_HIT}
+                )
+                consecutive_failures = 0
+                for attempt in attempts:
+                    if attempt.outcome in {
+                        SourceAttemptOutcome.SUCCESS,
+                        SourceAttemptOutcome.CACHE_HIT,
+                    }:
+                        break
+                    consecutive_failures += 1
+                latest = attempts[0] if attempts else None
+                last_success = successful[0] if successful else None
+                last_failure = failed[0] if failed else None
+                source_fields.append(
+                    {
+                        "acceptable_alternatives": [
+                            item.to_canonical_dict()
+                            for item in field.acceptable_alternatives
+                        ],
+                        "consecutive_failures": consecutive_failures,
+                        "cooldown_until": (
+                            _utc_iso(latest.cooldown_until)
+                            if state is SourceFieldState.COOLDOWN
+                            and latest is not None
+                            and latest.cooldown_until is not None
+                            else None
+                        ),
+                        "field_id": field.field_id,
+                        "field_scope": field.scope,
+                        "last_failure_at": (
+                            None
+                            if last_failure is None
+                            else _utc_iso(last_failure.finished_at)
+                        ),
+                        "last_failure_reason": (
+                            None
+                            if last_failure is None or last_failure.error_code is None
+                            else last_failure.error_code.value
+                        ),
+                        "last_success_at": (
+                            None
+                            if last_success is None
+                            else _utc_iso(last_success.finished_at)
+                        ),
+                        "last_success_data_as_of": (
+                            None
+                            if last_success is None or last_success.data_as_of is None
+                            else _utc_iso(last_success.data_as_of)
+                        ),
+                        "source_id": source.source_id,
+                        "source_kind": source.source_kind,
+                        "source_scope": source.scope,
+                        "source_tier": field.source_tier.value,
+                        "state": state.value,
+                        "supplementation": field.supplementation.to_canonical_dict(),
+                    }
+                )
+        request_field_resolutions = []
+        snapshot_resolutions = (
+            (RequestFieldResolution.PARTIAL,) * len(ordered_field_ids)
+            if snapshot is None
+            else snapshot.resolutions
+        )
+        for field_id, resolution in zip(ordered_field_ids, snapshot_resolutions):
+            source_id = primary_by_field[field_id][1]
+            request_field_resolutions.append(
+                {
+                    "action": ActionKind.FACT_RESEARCH.value,
+                    "field_id": field_id,
+                    "primary_source_id": source_id,
+                    "resolution": resolution.value,
+                    "risk_effect": RiskEffect.INFORMATION.value,
+                }
+            )
+
+        data = {
+            "fund_code": fund_code,
+            "mode": RequestMode.RAPID.value,
+            "policy_checksum": service.policy.checksum(),
+            "policy_version": service.policy.version,
+            "registry_checksum": service.registry.checksum(),
+            "registry_version": service.registry.version,
+            "request_field_resolutions": request_field_resolutions,
+            "request_id": budget.request_id,
+            "source_fields": source_fields,
+        }
+        _validate_source_status_data(data)
+        budget.require_publishable()
+        finished_at = _request_finish_now()
+        if finished_at < budget.started_at or finished_at > budget.deadline_at:
+            raise ValueError("source status request time is invalid")
+        store.finalize_request(
+            request_run_id,
+            RequestTerminalStatus.COMPLETE,
+            finished_at,
+            (),
+            budget=budget,
+        )
+        finalized = True
+        return data
+    except KeyboardInterrupt:
+        _finalize_source_status_failure(
+            store,
+            request_run_id,
+            budget,
+            RequestTerminalStatus.CANCELLED,
+        )
+        raise
+    except BudgetExpired:
+        terminal_status = (
+            RequestTerminalStatus.CANCELLED
+            if budget.cancelled
+            else RequestTerminalStatus.EXPIRED
+        )
+        _finalize_source_status_failure(
+            store,
+            request_run_id,
+            budget,
+            terminal_status,
+        )
+        raise SourceStatusCliError("source status failed") from None
+    except Exception:
+        if not finalized:
+            _finalize_source_status_failure(
+                store,
+                request_run_id,
+                budget,
+                RequestTerminalStatus.FAILED,
+            )
+        raise SourceStatusCliError("source status failed") from None
+
+
+def _finalize_source_status_failure(
+    store: DecisionAuditStore,
+    request_run_id: int,
+    budget: RequestBudget,
+    status: RequestTerminalStatus,
+) -> None:
+    finished_at = (
+        budget.deadline_at
+        if status is RequestTerminalStatus.EXPIRED
+        else min(max(_request_finish_now(), budget.started_at), budget.deadline_at)
+    )
+    try:
+        store.finalize_request(request_run_id, status, finished_at, ())
+    except Exception:
+        pass
+
+
+def _validate_source_status_data(data: object) -> None:
+    if type(data) is not dict or set(data) != _SOURCE_STATUS_DATA_KEYS:
+        raise ValueError("source status output keys are invalid")
+    if data["mode"] != RequestMode.RAPID.value:
+        raise ValueError("source status mode is invalid")
+    if data["fund_code"] is not None:
+        _validate_fund_code(data["fund_code"])
+    if type(data["request_id"]) is not str or not _REQUEST_ID.fullmatch(
+        data["request_id"]
+    ):
+        raise ValueError("source status request id is invalid")
+    for key in ("policy_checksum", "registry_checksum"):
+        if type(data[key]) is not str or not _CHECKSUM.fullmatch(data[key]):
+            raise ValueError("source status checksum is invalid")
+    if type(data["source_fields"]) is not list or not data["source_fields"]:
+        raise ValueError("source status fields are invalid")
+    identities = []
+    for item in data["source_fields"]:
+        if type(item) is not dict or set(item) != _SOURCE_FIELD_DATA_KEYS:
+            raise ValueError("source field output keys are invalid")
+        SourceFieldState(item["state"])
+        SourceTier(item["source_tier"])
+        identities.append((item["source_id"], item["field_id"]))
+        for key in (
+            "cooldown_until",
+            "last_failure_at",
+            "last_success_at",
+            "last_success_data_as_of",
+        ):
+            _validate_utc_iso(item[key], key, optional=True)
+        if (
+            type(item["supplementation"]) is not dict
+            or set(item["supplementation"]) != _SUPPLEMENTATION_KEYS
+        ):
+            raise ValueError("source supplementation output keys are invalid")
+    if len(identities) != len(set(identities)):
+        raise ValueError("source status identities are invalid")
+    if (
+        type(data["request_field_resolutions"]) is not list
+        or not data["request_field_resolutions"]
+    ):
+        raise ValueError("request field resolutions are invalid")
+    fields = []
+    for item in data["request_field_resolutions"]:
+        if type(item) is not dict or set(item) != _REQUEST_FIELD_RESOLUTION_KEYS:
+            raise ValueError("request field resolution output keys are invalid")
+        RequestFieldResolution(item["resolution"])
+        ActionKind(item["action"])
+        RiskEffect(item["risk_effect"])
+        fields.append(item["field_id"])
+    if fields != sorted(set(fields)):
+        raise ValueError("request field resolutions are not canonical")
+    _validate_phase0_public_value(data)
+
+
 def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, Any]:
     if args.command == "version":
         return envelope("version", {"version": __version__})
+
+    if args.command == "decision" and args.decision_command == "route":
+        if not args.json_output:
+            raise CliUsageError("decision route requires JSON mode")
+        action_values = tuple(args.action)
+        if len(action_values) != len(set(action_values)):
+            raise CliUsageError("decision route actions must be unique")
+        actions = tuple(ActionKind(value) for value in action_values)
+        return envelope(
+            "decision.route",
+            _decision_route_response(
+                context,
+                RequestMode(args.mode),
+                actions,
+            ),
+        )
+
+    if args.command == "source" and args.source_command == "status":
+        if not args.json_output:
+            raise CliUsageError("source status requires JSON mode")
+        return envelope(
+            "source.status",
+            _source_status_response(context, args.fund_code),
+        )
 
     if args.command == "profile":
         if args.profile_command == "edit" and args.json_output:
@@ -2246,6 +2831,7 @@ def _command_name_from_argv(argv: Sequence[str]) -> str:
     if command not in {
         "auth",
         "allocation",
+        "decision",
         "fund",
         "ledger",
         "market",
@@ -2253,6 +2839,7 @@ def _command_name_from_argv(argv: Sequence[str]) -> str:
         "profile",
         "report",
         "suitability",
+        "source",
         "sync",
         "thesis",
     }:

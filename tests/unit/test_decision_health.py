@@ -22,6 +22,7 @@ from kunjin.decision.models import (
     SourceAttempt,
     SourceAttemptOutcome,
     SourceErrorCode,
+    SourceFieldRef,
     SourceFieldState,
     StoredSourceAttempt,
 )
@@ -223,6 +224,65 @@ def test_manual_supplement_is_only_a_request_resolution() -> None:
         "manual_supplement_required"
     )
     assert "manual_supplement_required" not in {item.value for item in SourceFieldState}
+
+
+def test_source_status_snapshot_uses_one_authenticated_sqlite_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(
+        identity=PRIMARY,
+        finished_at=NOW + timedelta(minutes=1),
+        data_as_of=NOW,
+    )
+    harness.record(
+        identity=PRIMARY,
+        outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+        finished_at=NOW + timedelta(minutes=2),
+        data_as_of=None,
+        error_code=SourceErrorCode.NETWORK_TIMEOUT,
+        cooldown_until=NOW + INITIAL_COOLDOWN,
+    )
+    request_run_id, budget = harness.begin()
+    primary = SourceFieldRef(*PRIMARY)
+    requirement = harness.service.action_requirement(
+        PRIMARY[1],
+        ActionKind.FACT_RESEARCH,
+        RiskEffect.INFORMATION,
+    )
+    original = harness.store.authenticated_source_attempt_histories
+    calls = 0
+
+    def interleaved_read(*args, **kwargs):
+        nonlocal calls
+        result = original(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            harness.record(identity=PRIMARY)
+        return result
+
+    monkeypatch.setattr(
+        harness.store,
+        "authenticated_source_attempt_histories",
+        interleaved_read,
+    )
+
+    snapshot = harness.service.source_status_snapshot(
+        SUBJECT,
+        _context(budget),
+        (primary,),
+        (requirement,),
+        request_run_id=request_run_id,
+        budget=budget,
+    )
+
+    assert calls == 1
+    projection = next(
+        item for item in snapshot.projections if item.history.reference == primary
+    )
+    assert projection.state is SourceFieldState.NOT_CHECKED
+    assert projection.history.attempts == ()
+    assert snapshot.resolutions == (RequestFieldResolution.PARTIAL,)
 
 
 def test_every_registry_field_has_an_explicit_policy_requirement_binding(tmp_path) -> None:

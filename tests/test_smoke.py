@@ -21,6 +21,18 @@ class OcrMustNotRun:
 
 
 class SmokeTest(unittest.TestCase):
+    def test_phase0_commands_are_top_level_json_contracts(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cli = (root / "src/kunjin/cli.py").read_text(encoding="utf-8")
+
+        for command in ('"decision"', '"source"'):
+            self.assertIn(command, cli)
+        for command_name in ("decision.route", "source.status"):
+            self.assertIn(command_name, cli)
+        self.assertIn("decision route requires JSON mode", cli)
+        self.assertNotIn("sync daily completes within 90 seconds", cli)
+        self.assertNotIn("fund peers completes within 480 seconds", cli)
+
     def _run_build_script_with_iidfile_bytes(
         self,
         iidfile_bytes: bytes,
