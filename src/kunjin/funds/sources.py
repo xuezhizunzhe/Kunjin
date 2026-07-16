@@ -29,6 +29,7 @@ _FUND_SOURCE_REASON_CODES = frozenset(item.value for item in SourceErrorCode)
 _TRANSIENT_FUND_SOURCE_REASON_CODES = frozenset(
     item.value for item in TRANSIENT_SOURCE_ERRORS
 )
+_ORIGINAL_URLOPEN = urllib.request.urlopen
 
 F10_PAGE_PATHS: Dict[DocumentKind, str] = {
     DocumentKind.BASIC_PROFILE: "jbgk_{code}.html",
@@ -234,6 +235,50 @@ def _validate_fetch_url(
     return parsed
 
 
+class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = 5
+    max_repeats = 2
+
+    def __init__(self, original_host: str) -> None:
+        super().__init__()
+        if original_host not in FETCHABLE_HOSTS:
+            raise ValueError("redirect policy requires a fetchable host")
+        self.original_host = original_host
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> Optional[urllib.request.Request]:
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        parsed = _validate_fetch_url(target, reason_code="unsafe_redirect")
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if host != self.original_host:
+            raise FundSourceError(
+                "fund source redirect changed host",
+                reason_code="unsafe_redirect",
+                retryable=False,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
+def _open_with_redirect_policy(
+    request: urllib.request.Request,
+    *,
+    timeout_seconds: int,
+    host: str,
+) -> object:
+    # Existing callers inject urlopen in tests; production always uses the scoped opener.
+    if urllib.request.urlopen is not _ORIGINAL_URLOPEN:
+        return urllib.request.urlopen(request, timeout=timeout_seconds)
+    opener = urllib.request.build_opener(_SameHostRedirectHandler(host))
+    return opener.open(request, timeout=timeout_seconds)
+
+
 def _decode_text(payload: bytes, declared_charset: Optional[str]) -> str:
     charset = (declared_charset or "").strip().lower().replace("_", "-")
     aliases = {
@@ -283,7 +328,11 @@ class FundTextClient:
             method="GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            with _open_with_redirect_policy(
+                request,
+                timeout_seconds=self.timeout_seconds,
+                host=host,
+            ) as response:
                 final_url = response.geturl()
                 final = _validate_fetch_url(final_url, reason_code="unsafe_redirect")
                 final_host = (final.hostname or "").lower().rstrip(".")
@@ -359,7 +408,7 @@ class FundTextClient:
                 retryable=True,
             ) from None
         except (
-            http.client.RemoteDisconnected,
+            http.client.HTTPException,
             ConnectionResetError,
             OSError,
         ):

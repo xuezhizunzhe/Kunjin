@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
-def _response(request: dict, *, text: str = "fixture result") -> bytes:
+def _response(
+    request: dict,
+    *,
+    text: str = "fixture result",
+    final_url: str | None = None,
+    retrieved_at: datetime | None = None,
+    text_checksum: str | None = None,
+) -> bytes:
+    text_bytes = text.encode("utf-8")
     payload = {
         "schema_version": 1,
         "request_id": request["request_id"],
@@ -20,9 +30,10 @@ def _response(request: dict, *, text: str = "fixture result") -> bytes:
         "ok": True,
         "payload": {
             "requested_url": request["arguments"]["url"],
-            "final_url": request["arguments"]["url"],
-            "text_base64": base64.b64encode(text.encode("utf-8")).decode("ascii"),
-            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "final_url": final_url or request["arguments"]["url"],
+            "text_base64": base64.b64encode(text_bytes).decode("ascii"),
+            "text_checksum": text_checksum or hashlib.sha256(text_bytes).hexdigest(),
+            "retrieved_at": (retrieved_at or datetime.now(timezone.utc)).isoformat(),
             "checksum": "a" * 64,
             "content_type": "text/plain; charset=utf-8",
         },
@@ -32,6 +43,10 @@ def _response(request: dict, *, text: str = "fixture result") -> bytes:
 
 def main() -> int:
     mode = sys.argv[1]
+    if mode == "grandchild":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(10)
+        return 0
     request = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     if mode == "malformed":
         sys.stdout.buffer.write(b"not-json")
@@ -41,7 +56,9 @@ def main() -> int:
     elif mode == "wrong_schema":
         response = json.loads(_response(request).decode("utf-8"))
         response["schema_version"] = 2
-        sys.stdout.buffer.write(json.dumps(response).encode("utf-8"))
+        sys.stdout.buffer.write(
+            json.dumps(response, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        )
     elif mode.startswith("wrong_"):
         field = mode.removeprefix("wrong_")
         replacements = {
@@ -53,7 +70,9 @@ def main() -> int:
         key, value = replacements[field]
         response = json.loads(_response(request).decode("utf-8"))
         response[key] = value
-        sys.stdout.buffer.write(json.dumps(response).encode("utf-8"))
+        sys.stdout.buffer.write(
+            json.dumps(response, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        )
     elif mode == "sleep":
         time.sleep(10)
     elif mode == "slow_output":
@@ -72,6 +91,25 @@ def main() -> int:
     elif mode == "late_output":
         time.sleep(0.45)
         sys.stdout.buffer.write(_response(request))
+    elif mode == "orphan_grandchild":
+        pid_path = sys.argv[2]
+        child = subprocess.Popen(
+            (sys.executable, __file__, "grandchild"),
+            stdin=subprocess.DEVNULL,
+            stdout=sys.stdout,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        with open(pid_path, "w", encoding="ascii") as handle:
+            handle.write(str(child.pid))
+    elif mode == "bad_text_checksum":
+        sys.stdout.buffer.write(_response(request, text_checksum="f" * 64))
+    elif mode == "unsafe_final":
+        sys.stdout.buffer.write(_response(request, final_url="https://example.com/stolen"))
+    elif mode == "future_time":
+        sys.stdout.buffer.write(
+            _response(request, retrieved_at=datetime.now(timezone.utc) + timedelta(days=3650))
+        )
     elif mode == "inspect_env":
         sys.stdout.buffer.write(_response(request, text="\n".join(sorted(os.environ))))
     elif mode == "success":

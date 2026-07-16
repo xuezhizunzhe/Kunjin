@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -50,8 +52,8 @@ def _budget(worker_seconds: float = 2.0) -> RequestBudget:
     return budget
 
 
-def _argv(mode: str) -> tuple[str, ...]:
-    return (sys.executable, str(FIXTURE), mode)
+def _argv(mode: str, *arguments: str) -> tuple[str, ...]:
+    return (sys.executable, str(FIXTURE), mode, *arguments)
 
 
 def _run_fixture(
@@ -68,6 +70,21 @@ def _pid_is_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+def _process_group_is_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _kill_process_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def test_protocol_binds_exact_identity_schema_and_sizes() -> None:
@@ -120,6 +137,26 @@ def test_response_decoder_rejects_trailing_or_oversized_bytes() -> None:
         decode_worker_response(b"[" * 2_000 + b"]" * 2_000, _request())
 
 
+def test_protocol_requires_canonical_json_bytes() -> None:
+    request = _request()
+    noncanonical = json.dumps(request.to_dict(), sort_keys=False).encode("utf-8")
+    with pytest.raises(ValueError, match="canonical JSON"):
+        decode_worker_request(noncanonical)
+
+
+def test_transport_text_checksum_is_bound_to_utf8_text() -> None:
+    with pytest.raises(WorkerExecutionError) as error:
+        _run_fixture("bad_text_checksum", _budget())
+    assert error.value.reason_code == "worker_protocol_error"
+
+
+@pytest.mark.parametrize("mode", ("unsafe_final", "future_time"))
+def test_parent_rejects_untrusted_payload_metadata(mode: str) -> None:
+    with pytest.raises(WorkerExecutionError) as error:
+        _run_fixture(mode, _budget())
+    assert error.value.reason_code == "worker_protocol_error"
+
+
 @pytest.mark.parametrize("mode", ("sleep", "slow_output", "late_output"))
 def test_deadline_returns_bounded_and_reaps_worker(mode: str) -> None:
     processes: list[subprocess.Popen] = []
@@ -167,6 +204,64 @@ def test_ignored_sigterm_is_killed_and_reaped_inside_cleanup_reserve() -> None:
     assert time.monotonic() - started < 0.8
     assert processes[0].poll() is not None
     assert not _pid_is_alive(processes[0].pid)
+
+
+def test_slow_popen_cannot_recreate_worker_deadline() -> None:
+    processes: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def slow_capture(*args, **kwargs):
+        time.sleep(0.55)
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    started = time.monotonic()
+    try:
+        with (
+            patch("kunjin.decision.worker.subprocess.Popen", side_effect=slow_capture),
+            patch("kunjin.decision.worker._default_worker_argv", return_value=_argv("success")),
+        ):
+            with pytest.raises(WorkerExecutionError) as error:
+                run_public_worker(_request(), _budget(0.4))
+        assert error.value.reason_code == "worker_timeout"
+        assert time.monotonic() - started < 0.8
+        assert processes and not _process_group_is_alive(processes[0].pid)
+    finally:
+        for process in processes:
+            _kill_process_group(process.pid)
+            process.wait(timeout=1)
+
+
+def test_leader_exit_still_reaps_ignored_term_grandchild(tmp_path: Path) -> None:
+    pid_path = tmp_path / "grandchild.pid"
+    processes: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def capture(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    try:
+        with (
+            patch("kunjin.decision.worker.subprocess.Popen", side_effect=capture),
+            patch(
+                "kunjin.decision.worker._default_worker_argv",
+                return_value=_argv("orphan_grandchild", str(pid_path)),
+            ),
+        ):
+            with pytest.raises(WorkerExecutionError) as error:
+                run_public_worker(_request(), _budget(0.4))
+        assert error.value.reason_code == "worker_timeout"
+        child_pid = int(pid_path.read_text(encoding="ascii"))
+        assert processes[0].poll() is not None
+        assert not _pid_is_alive(child_pid)
+        assert not _process_group_is_alive(processes[0].pid)
+    finally:
+        for process in processes:
+            _kill_process_group(process.pid)
+            process.wait(timeout=1)
 
 
 def test_oversized_output_cancels_kills_and_reaps_worker() -> None:
@@ -249,6 +344,35 @@ def test_keyboard_interrupt_cancels_terminates_and_reaps() -> None:
     assert budget.cancelled
     assert process.poll() is not None
     assert not _pid_is_alive(process.pid)
+
+
+def test_system_exit_cancels_terminates_group_and_is_reraised() -> None:
+    process = subprocess.Popen(
+        _argv("sleep"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    budget = _budget()
+    try:
+        with (
+            patch("kunjin.decision.worker.subprocess.Popen", return_value=process),
+            patch("kunjin.decision.worker._default_worker_argv", return_value=_argv("sleep")),
+            patch(
+                "kunjin.decision.worker.selectors.DefaultSelector.select",
+                side_effect=SystemExit(17),
+            ),
+        ):
+            with pytest.raises(SystemExit) as raised:
+                run_public_worker(_request(), budget)
+        assert raised.value.code == 17
+        assert budget.cancelled
+        assert process.poll() is not None
+        assert not _process_group_is_alive(process.pid)
+    finally:
+        _kill_process_group(process.pid)
+        process.wait(timeout=1)
 
 
 def test_worker_module_import_boundary_excludes_private_and_storage_modules() -> None:

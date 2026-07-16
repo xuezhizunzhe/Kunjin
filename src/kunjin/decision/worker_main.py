@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 
 from kunjin.decision.worker_protocol import (
@@ -35,6 +36,7 @@ def main() -> int:
                 requested_url=response.requested_url,
                 final_url=response.final_url,
                 text=response.text,
+                text_checksum=hashlib.sha256(response.text.encode("utf-8")).hexdigest(),
                 retrieved_at=response.retrieved_at,
                 checksum=response.checksum,
                 content_type=response.content_type,

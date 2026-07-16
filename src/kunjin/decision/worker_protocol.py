@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ _PAYLOAD_KEYS = frozenset(
         "requested_url",
         "final_url",
         "text_base64",
+        "text_checksum",
         "retrieved_at",
         "checksum",
         "content_type",
@@ -76,6 +78,8 @@ def _load_json_frame(frame: bytes, *, maximum: int, name: str) -> Dict[str, Any]
         raise ValueError(f"worker {name} is not canonical JSON") from None
     if type(value) is not dict:
         raise ValueError(f"worker {name} must be a JSON object")
+    if _canonical_json_bytes(value) != frame:
+        raise ValueError(f"worker {name} is not canonical JSON")
     return value
 
 
@@ -156,6 +160,7 @@ class WorkerTextPayload:
     requested_url: str
     final_url: str
     text: str
+    text_checksum: str
     retrieved_at: datetime
     checksum: str
     content_type: str
@@ -230,6 +235,12 @@ def encode_worker_success(request: WorkerRequest, payload: WorkerTextPayload) ->
     if payload.retrieved_at.utcoffset() != timedelta(0):
         raise ValueError("worker retrieval time must be UTC")
     checksum = validate_checksum(payload.checksum, "worker payload checksum")
+    text_checksum = validate_checksum(
+        payload.text_checksum,
+        "worker payload text checksum",
+    )
+    if text_checksum != hashlib.sha256(text_bytes).hexdigest():
+        raise ValueError("worker payload text checksum does not match text")
     content_type = _validate_content_type(payload.content_type)
     value = _identity_dict(request)
     value.update(
@@ -242,6 +253,7 @@ def encode_worker_success(request: WorkerRequest, payload: WorkerTextPayload) ->
                 "requested_url": requested_url,
                 "retrieved_at": payload.retrieved_at.astimezone(timezone.utc).isoformat(),
                 "text_base64": base64.b64encode(text_bytes).decode("ascii"),
+                "text_checksum": text_checksum,
             },
         }
     )
@@ -305,6 +317,12 @@ def decode_worker_response(frame: bytes, request: WorkerRequest) -> WorkerRespon
             text = text_bytes.decode("utf-8")
         except (TypeError, ValueError, binascii.Error, UnicodeDecodeError):
             raise ValueError("worker response text encoding is invalid") from None
+        text_checksum = validate_checksum(
+            raw_payload["text_checksum"],
+            "worker payload text checksum",
+        )
+        if text_checksum != hashlib.sha256(text_bytes).hexdigest():
+            raise ValueError("worker payload text checksum does not match text")
         try:
             retrieved_at = datetime.fromisoformat(raw_payload["retrieved_at"])
         except (TypeError, ValueError):
@@ -315,6 +333,7 @@ def decode_worker_response(frame: bytes, request: WorkerRequest) -> WorkerRespon
             requested_url=_validate_url_argument(raw_payload["requested_url"], "requested url"),
             final_url=_validate_url_argument(raw_payload["final_url"], "final url"),
             text=text,
+            text_checksum=text_checksum,
             retrieved_at=retrieved_at.astimezone(timezone.utc),
             checksum=validate_checksum(raw_payload["checksum"], "worker payload checksum"),
             content_type=_validate_content_type(raw_payload["content_type"]),

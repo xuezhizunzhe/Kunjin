@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import http.client
 import socket
 import unittest
 import urllib.error
+import urllib.request
 from datetime import timezone
 from email.message import Message
 from unittest.mock import MagicMock, patch
@@ -17,6 +19,7 @@ from kunjin.funds.sources import (
     MAX_RESPONSE_BYTES,
     FundSourceError,
     FundTextClient,
+    _SameHostRedirectHandler,
     build_disclosure_url,
     build_f10_url,
     classify_source,
@@ -221,12 +224,52 @@ class FundTextClientTest(unittest.TestCase):
                         "https://fundf10.eastmoney.com/",
                     )
 
+    def test_redirect_handler_rejects_malicious_second_hop_before_open(self) -> None:
+        handler = _SameHostRedirectHandler("fundf10.eastmoney.com")
+        request = urllib.request.Request("https://fundf10.eastmoney.com/start")
+        with patch.object(
+            urllib.request.HTTPRedirectHandler,
+            "redirect_request",
+        ) as delegated:
+            with self.assertRaises(FundSourceError) as raised:
+                handler.redirect_request(
+                    request,
+                    None,
+                    302,
+                    "redirect",
+                    {},
+                    "https://example.com/private",
+                )
+        self.assertEqual(raised.exception.reason_code, "unsafe_redirect")
+        delegated.assert_not_called()
+
+    def test_redirect_handler_allows_same_host_https_target(self) -> None:
+        handler = _SameHostRedirectHandler("fundf10.eastmoney.com")
+        request = urllib.request.Request("https://fundf10.eastmoney.com/start")
+        with patch.object(
+            urllib.request.HTTPRedirectHandler,
+            "redirect_request",
+            return_value="allowed",
+        ) as delegated:
+            result = handler.redirect_request(
+                request,
+                None,
+                302,
+                "redirect",
+                {},
+                "/next",
+            )
+        self.assertEqual(result, "allowed")
+        delegated.assert_called_once()
+
     def test_failure_reasons_are_stable_and_retryable_only_when_transient(self) -> None:
         url = "https://fundf10.eastmoney.com/jbgk_519755.html"
         cases = (
             (socket.gaierror("private host detail"), "dns_failure", True),
             (TimeoutError("private timeout detail"), "network_timeout", True),
             (ConnectionResetError("private reset detail"), "transient_network_failure", True),
+            (http.client.IncompleteRead(b"partial"), "transient_network_failure", True),
+            (http.client.BadStatusLine("private status"), "transient_network_failure", True),
             (urllib.error.HTTPError(url, 404, "private header", {}, None), "http_4xx", False),
         )
         for exception, reason_code, retryable in cases:
