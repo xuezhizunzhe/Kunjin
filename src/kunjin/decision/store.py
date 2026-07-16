@@ -551,16 +551,24 @@ class DecisionAuditStore:
         status: RequestTerminalStatus,
         finished_at: datetime,
         omitted_work: Tuple[str, ...],
+        *,
+        budget: Optional[RequestBudget] = None,
     ) -> None:
         _positive_id(request_run_id, "request run id")
         if type(status) is not RequestTerminalStatus:
             raise ValueError("status must be an exact RequestTerminalStatus")
+        if budget is not None and type(budget) is not RequestBudget:
+            raise ValueError("budget must be an exact RequestBudget or None")
+        if budget is not None:
+            budget.require_publishable()
         finished_text = _utc_text(finished_at, "request finish")
         validate_identifier_tuple(omitted_work, "omitted work")
         omitted_json = canonical_json_bytes(omitted_work).decode("ascii")
         try:
             with self.repository.connect() as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
+                if budget is not None:
+                    self._authenticate_budget_request(connection, request_run_id, budget)
                 pending_fields = {
                     str(row["field_id"])
                     for row in connection.execute(
@@ -609,7 +617,10 @@ class DecisionAuditStore:
                 )
                 if cursor.rowcount != 1:
                     raise DecisionAuditStoreError("request was not finalized exactly once")
-        except DecisionAuditStoreError:
+                if budget is not None:
+                    budget.require_publishable()
+                connection.commit()
+        except (DecisionAuditStoreError, BudgetExpired):
             raise
         except sqlite3.DatabaseError:
             raise DecisionAuditStoreError("request finalization failed") from None
@@ -621,6 +632,8 @@ class DecisionAuditStore:
         policy: EvidencePolicyV1,
         registry: SourceRegistryV1,
         created_at: datetime,
+        *,
+        budget: Optional[RequestBudget] = None,
     ) -> StoredDecisionSnapshot:
         _positive_id(request_run_id, "request run id")
         if type(route) is not DecisionRoute:
@@ -629,6 +642,10 @@ class DecisionAuditStore:
             raise ValueError("policy must be an exact EvidencePolicyV1")
         if type(registry) is not SourceRegistryV1:
             raise ValueError("registry must be an exact SourceRegistryV1")
+        if budget is not None and type(budget) is not RequestBudget:
+            raise ValueError("budget must be an exact RequestBudget or None")
+        if budget is not None:
+            budget.require_publishable()
         policy.validate()
         registry.validate()
         policy_checksum = policy.checksum()
@@ -669,6 +686,8 @@ class DecisionAuditStore:
                     raise DecisionAuditStoreError("request run does not exist")
                 if run["status"] != "running":
                     raise DecisionAuditStoreError("request run is not running")
+                if budget is not None:
+                    self._authenticate_budget_request(connection, request_run_id, budget)
                 request_start = _stored_datetime(run["started_at"], "request start")
                 request_deadline = _stored_datetime(run["deadline_at"], "request deadline")
                 snapshot_created = _stored_datetime(created_text, "snapshot creation")
@@ -701,11 +720,15 @@ class DecisionAuditStore:
                         created_text,
                     ),
                 )
-                return self._load_decision_snapshot(
+                snapshot = self._load_decision_snapshot(
                     request_run_id,
                     connection=connection,
                 )
-        except DecisionAuditStoreError:
+                if budget is not None:
+                    budget.require_publishable()
+                connection.commit()
+                return snapshot
+        except (DecisionAuditStoreError, BudgetExpired):
             raise
         except sqlite3.DatabaseError:
             raise DecisionAuditStoreError("decision snapshot insert failed") from None
