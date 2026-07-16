@@ -24,27 +24,27 @@ _REQUEST_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _SUBJECT_KEY_PATTERN = re.compile(r"^fund:[0-9]{6}$")
 _CHECKSUM_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _VERSION_PATTERN = re.compile(r"^[1-9][0-9]{0,8}$")
-_PRIVATE_MARKERS = (
-    "access_token",
-    "authorization: bearer",
-    "authorization=bearer",
-    "bearer ",
-    "cookie=",
+_NORMALIZED_PRIVATE_MARKERS = (
+    "access token",
+    "authorization bearer",
+    "bearer",
+    "cookie",
+    "session",
     "password",
     "secret",
-    "api_key",
+    "api key",
     "credential",
     "ciphertext",
     "nonce",
-    "private_value",
-    "monthly_net_income",
-    "account_balance",
-    "account_number",
-    "order_id",
-    "transaction_id",
-    "transaction_identifier",
-    "phone_number",
-    "email_address",
+    "private value",
+    "monthly net income",
+    "account balance",
+    "account number",
+    "order id",
+    "transaction id",
+    "transaction identifier",
+    "phone number",
+    "email address",
 )
 
 
@@ -89,6 +89,13 @@ class ActionMaturity(str, Enum):
     EXPERIMENTAL_SHADOW = "experimental_shadow"
 
 
+class ActionState(str, Enum):
+    RESEARCH_ONLY = "research_only"
+    NO_ADD = "no_add"
+    EXPERIMENTAL_SHADOW = "experimental_shadow"
+    ACTIONABLE = "actionable"
+
+
 class WorkflowLevel(str, Enum):
     RAPID_EVIDENCE = "rapid_evidence"
     DECISION_EVIDENCE = "decision_evidence"
@@ -111,6 +118,60 @@ class SourceAttemptOutcome(str, Enum):
     EXPIRED = "expired"
     CACHE_HIT = "cache_hit"
     SKIPPED_COOLDOWN = "skipped_cooldown"
+
+
+class SourceErrorCode(str, Enum):
+    DNS_FAILURE = "dns_failure"
+    TRANSIENT_NETWORK_FAILURE = "transient_network_failure"
+    NETWORK_TIMEOUT = "network_timeout"
+    SOURCE_UNAVAILABLE = "source_unavailable"
+    HTTP_4XX = "http_4xx"
+    UNSAFE_URL = "unsafe_url"
+    UNSAFE_REDIRECT = "unsafe_redirect"
+    OVERSIZED_RESPONSE = "oversized_response"
+    DECODE_FAILURE = "decode_failure"
+    VALIDATION_FAILURE = "validation_failure"
+    PARSE_FAILURE = "parse_failure"
+    IDENTITY_CONFLICT = "identity_conflict"
+    PAYWALL_OR_AUTH_REQUIRED = "paywall_or_auth_required"
+    FIELD_UNSUPPORTED = "field_unsupported"
+    SOURCE_CONTRACT_UNSUPPORTED = "source_contract_unsupported"
+    HTTP_NOT_FOUND = "http_not_found"
+    HTTP_GONE = "http_gone"
+    REQUEST_CANCELLED = "request_cancelled"
+    REQUEST_EXPIRED = "request_expired"
+    COOLDOWN_ACTIVE = "cooldown_active"
+
+
+TRANSIENT_SOURCE_ERRORS = frozenset(
+    (
+        SourceErrorCode.DNS_FAILURE,
+        SourceErrorCode.TRANSIENT_NETWORK_FAILURE,
+        SourceErrorCode.NETWORK_TIMEOUT,
+    )
+)
+UNAVAILABLE_SOURCE_ERRORS = frozenset(
+    (
+        SourceErrorCode.SOURCE_UNAVAILABLE,
+        SourceErrorCode.HTTP_4XX,
+        SourceErrorCode.UNSAFE_URL,
+        SourceErrorCode.UNSAFE_REDIRECT,
+        SourceErrorCode.OVERSIZED_RESPONSE,
+        SourceErrorCode.DECODE_FAILURE,
+        SourceErrorCode.VALIDATION_FAILURE,
+        SourceErrorCode.PARSE_FAILURE,
+        SourceErrorCode.IDENTITY_CONFLICT,
+        SourceErrorCode.PAYWALL_OR_AUTH_REQUIRED,
+    )
+)
+UNSUPPORTED_SOURCE_ERRORS = frozenset(
+    (
+        SourceErrorCode.FIELD_UNSUPPORTED,
+        SourceErrorCode.SOURCE_CONTRACT_UNSUPPORTED,
+        SourceErrorCode.HTTP_NOT_FOUND,
+        SourceErrorCode.HTTP_GONE,
+    )
+)
 
 
 class ForceReasonCode(str, Enum):
@@ -205,6 +266,14 @@ def validate_exact_dataclass_state(value: object, name: str) -> None:
         raise ValueError(f"{name} has unexpected instance state")
 
 
+def _contains_private_marker(value: str) -> bool:
+    normalized = " ".join(
+        part for part in re.split(r"[\W_]+", value.casefold()) if part
+    )
+    padded = f" {normalized} "
+    return any(f" {marker} " in padded for marker in _NORMALIZED_PRIVATE_MARKERS)
+
+
 def validate_public_text(
     value: object,
     name: str,
@@ -220,7 +289,7 @@ def validate_public_text(
         for character in value
     ):
         raise ValueError(f"{name} contains unsupported characters")
-    if any(marker in value.casefold() for marker in _PRIVATE_MARKERS):
+    if _contains_private_marker(value):
         raise ValueError(f"{name} contains a secret or private marker")
     return value
 
@@ -228,7 +297,7 @@ def validate_public_text(
 def validate_identifier(value: object, name: str) -> str:
     if type(value) is not str or _IDENTIFIER_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{name} must be a lowercase public identifier")
-    if any(marker in value.casefold() for marker in _PRIVATE_MARKERS):
+    if _contains_private_marker(value):
         raise ValueError(f"{name} contains a secret or private marker")
     return value
 
@@ -860,7 +929,7 @@ class ActionRoute:
     blocking_codes: Tuple[str, ...]
     research_available: bool
     exact_amount_available: bool
-    minimum_state: str
+    minimum_state: ActionState
     action_maturity: ActionMaturity
 
     def validate(self) -> None:
@@ -876,7 +945,8 @@ class ActionRoute:
             raise ValueError("research available must be an exact boolean")
         if type(self.exact_amount_available) is not bool:
             raise ValueError("exact amount available must be an exact boolean")
-        validate_identifier(self.minimum_state, "minimum state")
+        if type(self.minimum_state) is not ActionState:
+            raise ValueError("minimum state must be an exact ActionState")
         if type(self.action_maturity) is not ActionMaturity:
             raise ValueError("action maturity must be an exact ActionMaturity")
         contracts = {
@@ -905,10 +975,22 @@ class ActionRoute:
             raise ValueError("action risk effect does not match the canonical action contract")
         if not set(minimum_gates).issubset(self.required_gates):
             raise ValueError("action route is missing mandatory minimum gates")
-        if self.blocking_codes and self.exact_amount_available:
-            raise ValueError("blocked action route cannot expose an exact amount")
-        if self.action is ActionKind.FACT_RESEARCH and self.exact_amount_available:
-            raise ValueError("fact research never exposes an exact amount")
+        if self.exact_amount_available:
+            transaction_actions = {
+                ActionKind.BUY_OR_ADD,
+                ActionKind.REDUCE_TO_CASH,
+                ActionKind.FULL_EXIT,
+            }
+            if self.action not in transaction_actions:
+                raise ValueError("exact amount is allowed only for transaction actions")
+            if not self.research_available:
+                raise ValueError("exact amount requires research to be available")
+            if self.blocking_codes:
+                raise ValueError("blocked action route cannot expose an exact amount")
+            if self.action_maturity is not ActionMaturity.MATURE:
+                raise ValueError("exact amount requires mature action interpretation")
+            if self.minimum_state is not ActionState.ACTIONABLE:
+                raise ValueError("exact amount requires actionable state")
 
     def to_canonical_dict(self) -> dict:
         self.validate()
@@ -918,7 +1000,7 @@ class ActionRoute:
             "action_maturity": self.action_maturity.value,
             "blocking_codes": list(self.blocking_codes),
             "exact_amount_available": self.exact_amount_available,
-            "minimum_state": self.minimum_state,
+            "minimum_state": self.minimum_state.value,
             "required_gates": list(self.required_gates),
             "research_available": self.research_available,
             "risk_effect": self.risk_effect.value,
@@ -1021,7 +1103,7 @@ class SourceAttempt:
     started_at: datetime
     finished_at: datetime
     data_as_of: Optional[datetime]
-    error_code: Optional[str]
+    error_code: Optional[SourceErrorCode]
     cooldown_until: Optional[datetime]
     force_actor: Optional[str]
     force_reason: Optional[ForceReasonCode]
@@ -1055,13 +1137,8 @@ class SourceAttempt:
             raise ValueError("data as of cannot follow finished at")
         if self.cooldown_until is not None and self.cooldown_until < self.finished_at:
             raise ValueError("cooldown cannot precede finished at")
-        if self.error_code is not None:
-            validate_identifier(self.error_code, "error code")
-            if (
-                self.error_code == "network_timeout"
-                and self.outcome is not SourceAttemptOutcome.TRANSIENT_FAILURE
-            ):
-                raise ValueError("network_timeout is valid only for transient failure")
+        if self.error_code is not None and type(self.error_code) is not SourceErrorCode:
+            raise ValueError("error code must be an exact SourceErrorCode or None")
         if (self.force_actor is None) != (self.force_reason is None):
             raise ValueError("force actor and force reason must be present together")
         if self.force_actor is not None:
@@ -1102,44 +1179,43 @@ class SourceAttempt:
         elif self.outcome is SourceAttemptOutcome.TRANSIENT_FAILURE:
             if (
                 self.data_as_of is not None
-                or self.error_code is None
+                or self.error_code not in TRANSIENT_SOURCE_ERRORS
                 or self.cooldown_until is None
                 or self.cooldown_until <= self.finished_at
             ):
                 raise ValueError("transient failure requires error and future cooldown only")
-        elif self.outcome in {
-            SourceAttemptOutcome.UNAVAILABLE,
-            SourceAttemptOutcome.UNSUPPORTED,
-        }:
+        elif self.outcome is SourceAttemptOutcome.UNAVAILABLE:
             if (
                 self.data_as_of is not None
-                or self.error_code is None
+                or self.error_code not in UNAVAILABLE_SOURCE_ERRORS
                 or self.cooldown_until is not None
             ):
-                raise ValueError("unavailable or unsupported attempt requires only an error")
-            if self.outcome is SourceAttemptOutcome.UNSUPPORTED and self.error_code not in {
-                "field_unsupported",
-                "source_contract_unsupported",
-            }:
-                raise ValueError("unsupported outcome requires a semantic unsupported error")
+                raise ValueError("unavailable attempt requires a nonretry unavailable error")
+        elif self.outcome is SourceAttemptOutcome.UNSUPPORTED:
+            if (
+                self.data_as_of is not None
+                or self.error_code not in UNSUPPORTED_SOURCE_ERRORS
+                or self.cooldown_until is not None
+            ):
+                raise ValueError("unsupported attempt requires a permanent unsupported error")
         elif self.outcome is SourceAttemptOutcome.CANCELLED:
             if (
                 self.data_as_of is not None
-                or self.error_code != "request_cancelled"
+                or self.error_code is not SourceErrorCode.REQUEST_CANCELLED
                 or self.cooldown_until is not None
             ):
                 raise ValueError("cancelled attempt requires request_cancelled only")
         elif self.outcome is SourceAttemptOutcome.EXPIRED:
             if (
                 self.data_as_of is not None
-                or self.error_code != "request_expired"
+                or self.error_code is not SourceErrorCode.REQUEST_EXPIRED
                 or self.cooldown_until is not None
             ):
                 raise ValueError("expired attempt requires request_expired only")
         elif self.outcome is SourceAttemptOutcome.SKIPPED_COOLDOWN:
             if (
                 self.data_as_of is not None
-                or self.error_code != "cooldown_active"
+                or self.error_code is not SourceErrorCode.COOLDOWN_ACTIVE
                 or self.cooldown_until is None
                 or self.cooldown_until <= self.finished_at
             ):

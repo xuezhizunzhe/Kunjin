@@ -7,9 +7,13 @@ from decimal import Decimal, localcontext
 import pytest
 
 from kunjin.decision.models import (
+    TRANSIENT_SOURCE_ERRORS,
+    UNAVAILABLE_SOURCE_ERRORS,
+    UNSUPPORTED_SOURCE_ERRORS,
     ActionKind,
     ActionMaturity,
     ActionRoute,
+    ActionState,
     ConclusionEvidence,
     DecisionRoute,
     EvidenceCompleteness,
@@ -23,6 +27,7 @@ from kunjin.decision.models import (
     RiskEffect,
     SourceAttempt,
     SourceAttemptOutcome,
+    SourceErrorCode,
     SourceFieldRef,
     SourceFieldState,
     SourceTier,
@@ -64,7 +69,7 @@ def _route(evidence: tuple = ()) -> DecisionRoute:
                 blocking_codes=(),
                 research_available=True,
                 exact_amount_available=False,
-                minimum_state="research_only",
+                minimum_state=ActionState.RESEARCH_ONLY,
                 action_maturity=ActionMaturity.MATURE,
             ),
         ),
@@ -159,6 +164,12 @@ def test_phase0_enums_are_exact() -> None:
         "mature",
         "experimental_shadow",
     ]
+    assert [item.value for item in ActionState] == [
+        "research_only",
+        "no_add",
+        "experimental_shadow",
+        "actionable",
+    ]
     assert [item.value for item in RequestTerminalStatus] == [
         "complete",
         "partial",
@@ -175,6 +186,28 @@ def test_phase0_enums_are_exact() -> None:
         "expired",
         "cache_hit",
         "skipped_cooldown",
+    ]
+    assert [item.value for item in SourceErrorCode] == [
+        "dns_failure",
+        "transient_network_failure",
+        "network_timeout",
+        "source_unavailable",
+        "http_4xx",
+        "unsafe_url",
+        "unsafe_redirect",
+        "oversized_response",
+        "decode_failure",
+        "validation_failure",
+        "parse_failure",
+        "identity_conflict",
+        "paywall_or_auth_required",
+        "field_unsupported",
+        "source_contract_unsupported",
+        "http_not_found",
+        "http_gone",
+        "request_cancelled",
+        "request_expired",
+        "cooldown_active",
     ]
     assert [item.value for item in ForceReasonCode] == [
         "owner_approved_retry",
@@ -695,6 +728,45 @@ def test_action_route_accepts_exact_risk_and_minimum_gates(
     route.validate()
 
 
+@pytest.mark.parametrize(
+    "action,risk_effect,required_gates",
+    (
+        (
+            ActionKind.BUY_OR_ADD,
+            RiskEffect.RISK_INCREASING,
+            ("phase_b", "phase_c", "d1", "d2", "d3", "post_trade"),
+        ),
+        (
+            ActionKind.REDUCE_TO_CASH,
+            RiskEffect.RISK_REDUCING,
+            ("position", "fees", "settlement", "minimum_remainder"),
+        ),
+        (
+            ActionKind.FULL_EXIT,
+            RiskEffect.RISK_REDUCING,
+            ("exit_reason", "position", "fees", "settlement", "use_of_proceeds"),
+        ),
+    ),
+)
+def test_action_route_accepts_exact_amount_only_for_actionable_transactions(
+    action: ActionKind,
+    risk_effect: RiskEffect,
+    required_gates: tuple,
+) -> None:
+    route = replace(
+        _route().actions[0],
+        action_id=action.value,
+        action=action,
+        risk_effect=risk_effect,
+        required_gates=required_gates,
+        research_available=True,
+        exact_amount_available=True,
+        minimum_state=ActionState.ACTIONABLE,
+        action_maturity=ActionMaturity.MATURE,
+    )
+    route.validate()
+
+
 def test_action_route_rejects_cross_invariant_bypasses() -> None:
     fact = _route().actions[0]
     invalid_routes = (
@@ -719,6 +791,57 @@ def test_action_route_rejects_cross_invariant_bypasses() -> None:
             risk_effect=RiskEffect.RISK_INCREASING,
         ),
         replace(fact, blocking_codes=("blocked",), exact_amount_available=True),
+        replace(
+            fact,
+            action=ActionKind.CONTINUE_HOLDING,
+            risk_effect=RiskEffect.RISK_MAINTAINING,
+            required_gates=("phase_b_context", "phase_e_policy"),
+            exact_amount_available=True,
+            minimum_state=ActionState.ACTIONABLE,
+        ),
+        replace(
+            fact,
+            action=ActionKind.BUY_OR_ADD,
+            risk_effect=RiskEffect.RISK_INCREASING,
+            required_gates=("phase_b", "phase_c", "d1", "d2", "d3", "post_trade"),
+            research_available=False,
+            exact_amount_available=True,
+            minimum_state=ActionState.ACTIONABLE,
+        ),
+        replace(
+            fact,
+            action=ActionKind.BUY_OR_ADD,
+            risk_effect=RiskEffect.RISK_INCREASING,
+            required_gates=("phase_b", "phase_c", "d1", "d2", "d3", "post_trade"),
+            exact_amount_available=True,
+            minimum_state=ActionState.ACTIONABLE,
+            action_maturity=ActionMaturity.EXPERIMENTAL_SHADOW,
+        ),
+        replace(
+            fact,
+            action=ActionKind.BUY_OR_ADD,
+            risk_effect=RiskEffect.RISK_INCREASING,
+            required_gates=("phase_b", "phase_c", "d1", "d2", "d3", "post_trade"),
+            exact_amount_available=True,
+            minimum_state=ActionState.NO_ADD,
+        ),
+        replace(
+            fact,
+            action=ActionKind.BUY_OR_ADD,
+            risk_effect=RiskEffect.RISK_INCREASING,
+            required_gates=("phase_b", "phase_c", "d1", "d2", "d3", "post_trade"),
+            exact_amount_available=True,
+            minimum_state=ActionState.RESEARCH_ONLY,
+        ),
+        replace(
+            fact,
+            action=ActionKind.BUY_OR_ADD,
+            risk_effect=RiskEffect.RISK_INCREASING,
+            required_gates=("phase_b", "phase_c", "d1", "d2", "d3", "post_trade"),
+            blocking_codes=("blocked",),
+            exact_amount_available=True,
+            minimum_state=ActionState.ACTIONABLE,
+        ),
     )
     for route in invalid_routes:
         with pytest.raises(ValueError):
@@ -739,7 +862,7 @@ def test_source_attempt_rejects_free_force_reason_and_unknown_actor() -> None:
     forced = _source_attempt(
         outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
         data_as_of=None,
-        error_code="network_timeout",
+        error_code=SourceErrorCode.NETWORK_TIMEOUT,
         cooldown_until=UTC_NOW + timedelta(minutes=30),
         force_actor="local_owner",
         force_reason="manual retry",
@@ -759,7 +882,7 @@ def test_source_attempt_accepts_allowlisted_force_reason() -> None:
     attempt = _source_attempt(
         outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
         data_as_of=None,
-        error_code="network_timeout",
+        error_code=SourceErrorCode.NETWORK_TIMEOUT,
         cooldown_until=UTC_NOW + timedelta(minutes=30),
         force_actor="local_owner",
         force_reason=ForceReasonCode.OWNER_APPROVED_RETRY,
@@ -788,7 +911,7 @@ def test_source_attempt_rejects_invalid_public_identifiers(
     attempt = _source_attempt(
         outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
         data_as_of=None,
-        error_code="network_timeout",
+        error_code=SourceErrorCode.NETWORK_TIMEOUT,
         cooldown_until=UTC_NOW + timedelta(minutes=30),
         response_bytes=0,
     )
@@ -821,6 +944,10 @@ def test_conclusion_evidence_rejects_untyped_quality_values(
         "private_value=100",
         "nonce=abc",
         "api_key=abc",
+        "account   balance",
+        "monthly-net_income",
+        "cookie/session",
+        "transaction.id",
     ),
 )
 def test_public_runtime_text_rejects_secret_or_private_markers(publisher: str) -> None:
@@ -830,6 +957,14 @@ def test_public_runtime_text_rejects_secret_or_private_markers(publisher: str) -
     )
     with pytest.raises(ValueError, match="private marker"):
         evidence.validate()
+
+
+def test_public_runtime_text_allows_ordinary_numeric_context() -> None:
+    evidence = replace(
+        _complete_current_tier1(),
+        publishers=("fund manager research 2026",),
+    )
+    evidence.validate()
 
 
 @pytest.mark.parametrize(
@@ -936,38 +1071,38 @@ def test_decimal_canonicalization_rejects_huge_output_before_allocation(value: D
         _source_attempt(
             outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
             data_as_of=None,
-            error_code="network_timeout",
+            error_code=SourceErrorCode.NETWORK_TIMEOUT,
             cooldown_until=UTC_NOW + timedelta(minutes=30),
             response_bytes=0,
         ),
         _source_attempt(
             outcome=SourceAttemptOutcome.UNAVAILABLE,
             data_as_of=None,
-            error_code="source_unavailable",
+            error_code=SourceErrorCode.SOURCE_UNAVAILABLE,
             response_bytes=0,
         ),
         _source_attempt(
             outcome=SourceAttemptOutcome.UNSUPPORTED,
             data_as_of=None,
-            error_code="field_unsupported",
+            error_code=SourceErrorCode.FIELD_UNSUPPORTED,
             response_bytes=0,
         ),
         _source_attempt(
             outcome=SourceAttemptOutcome.CANCELLED,
             data_as_of=None,
-            error_code="request_cancelled",
+            error_code=SourceErrorCode.REQUEST_CANCELLED,
             response_bytes=0,
         ),
         _source_attempt(
             outcome=SourceAttemptOutcome.EXPIRED,
             data_as_of=None,
-            error_code="request_expired",
+            error_code=SourceErrorCode.REQUEST_EXPIRED,
             response_bytes=0,
         ),
         _source_attempt(
             outcome=SourceAttemptOutcome.SKIPPED_COOLDOWN,
             data_as_of=None,
-            error_code="cooldown_active",
+            error_code=SourceErrorCode.COOLDOWN_ACTIVE,
             cooldown_until=UTC_NOW + timedelta(minutes=1),
             response_bytes=0,
         ),
@@ -979,6 +1114,23 @@ def test_source_attempt_outcome_matrix_accepts_only_valid_shapes(
     attempt.validate()
 
 
+def test_source_error_sets_are_disjoint_and_complete() -> None:
+    assert TRANSIENT_SOURCE_ERRORS.isdisjoint(UNAVAILABLE_SOURCE_ERRORS)
+    assert TRANSIENT_SOURCE_ERRORS.isdisjoint(UNSUPPORTED_SOURCE_ERRORS)
+    assert UNAVAILABLE_SOURCE_ERRORS.isdisjoint(UNSUPPORTED_SOURCE_ERRORS)
+    lifecycle_errors = {
+        SourceErrorCode.REQUEST_CANCELLED,
+        SourceErrorCode.REQUEST_EXPIRED,
+        SourceErrorCode.COOLDOWN_ACTIVE,
+    }
+    assert (
+        TRANSIENT_SOURCE_ERRORS
+        | UNAVAILABLE_SOURCE_ERRORS
+        | UNSUPPORTED_SOURCE_ERRORS
+        | lifecycle_errors
+    ) == set(SourceErrorCode)
+
+
 @pytest.mark.parametrize(
     "attempt",
     (
@@ -986,19 +1138,19 @@ def test_source_attempt_outcome_matrix_accepts_only_valid_shapes(
         _source_attempt(outcome=SourceAttemptOutcome.CACHE_HIT, error_code="cache_error"),
         _source_attempt(
             outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
-            error_code="network_timeout",
+            error_code=SourceErrorCode.NETWORK_TIMEOUT,
             cooldown_until=UTC_NOW + timedelta(minutes=1),
         ),
         _source_attempt(
             outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
             data_as_of=None,
-            error_code="network_timeout",
+            error_code=SourceErrorCode.NETWORK_TIMEOUT,
             cooldown_until=None,
         ),
         _source_attempt(
             outcome=SourceAttemptOutcome.UNAVAILABLE,
             data_as_of=None,
-            error_code="source_unavailable",
+            error_code=SourceErrorCode.SOURCE_UNAVAILABLE,
             cooldown_until=UTC_NOW + timedelta(minutes=1),
         ),
         _source_attempt(
@@ -1013,19 +1165,19 @@ def test_source_attempt_outcome_matrix_accepts_only_valid_shapes(
         ),
         _source_attempt(
             outcome=SourceAttemptOutcome.EXPIRED,
-            error_code="request_expired",
+            error_code=SourceErrorCode.REQUEST_EXPIRED,
         ),
         _source_attempt(
             outcome=SourceAttemptOutcome.SKIPPED_COOLDOWN,
             data_as_of=None,
-            error_code="cooldown_active",
+            error_code=SourceErrorCode.COOLDOWN_ACTIVE,
             cooldown_until=UTC_NOW,
         ),
         _source_attempt(data_as_of=UTC_NOW + timedelta(seconds=1)),
         _source_attempt(
             outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
             data_as_of=None,
-            error_code="network_timeout",
+            error_code=SourceErrorCode.NETWORK_TIMEOUT,
             cooldown_until=UTC_NOW - timedelta(seconds=1),
         ),
     ),
@@ -1040,15 +1192,36 @@ def test_source_attempt_outcome_matrix_rejects_invalid_shapes(
 def test_source_attempt_rejects_semantic_error_and_force_bypasses() -> None:
     invalid = (
         _source_attempt(
+            outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+            data_as_of=None,
+            error_code=SourceErrorCode.FIELD_UNSUPPORTED,
+            cooldown_until=UTC_NOW + timedelta(minutes=1),
+            response_bytes=0,
+        ),
+        _source_attempt(
             outcome=SourceAttemptOutcome.UNSUPPORTED,
             data_as_of=None,
-            error_code="network_timeout",
+            error_code=SourceErrorCode.NETWORK_TIMEOUT,
             response_bytes=0,
+        ),
+        *(
+            _source_attempt(
+                outcome=SourceAttemptOutcome.UNAVAILABLE,
+                data_as_of=None,
+                error_code=error_code,
+                response_bytes=0,
+            )
+            for error_code in (
+                SourceErrorCode.FIELD_UNSUPPORTED,
+                SourceErrorCode.REQUEST_CANCELLED,
+                SourceErrorCode.REQUEST_EXPIRED,
+                SourceErrorCode.COOLDOWN_ACTIVE,
+            )
         ),
         _source_attempt(
             outcome=SourceAttemptOutcome.UNAVAILABLE,
             data_as_of=None,
-            error_code="network_timeout",
+            error_code=SourceErrorCode.NETWORK_TIMEOUT,
             response_bytes=0,
         ),
         _source_attempt(
@@ -1059,7 +1232,7 @@ def test_source_attempt_rejects_semantic_error_and_force_bypasses() -> None:
         _source_attempt(
             outcome=SourceAttemptOutcome.SKIPPED_COOLDOWN,
             data_as_of=None,
-            error_code="cooldown_active",
+            error_code=SourceErrorCode.COOLDOWN_ACTIVE,
             cooldown_until=UTC_NOW + timedelta(minutes=1),
             force_actor="local_owner",
             force_reason=ForceReasonCode.VERIFY_SOURCE_RECOVERY,
