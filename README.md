@@ -32,10 +32,19 @@ personal holding is hard-coded. The script uses a fresh private data/state
 runtime, performs one rapid public profile synchronization, checks the pre/post
 source state and fact/buy routes, and writes only validated amount-free JSON and
 a summary. One global 90-second deadline covers all five CLI commands, strict
-schema projection, private staging, and atomic publication; a command that
-leaves a child process behind fails closed. It does not read the personal profile or database, synchronize
-Yangjibao, use Docker, poll a failed source, or authorize a mature purchase or
-exact amount. The output directory must not already exist.
+schema projection, private staging, and exclusive atomic publication without
+overwriting an existing directory. A non-secret per-run marker and bounded
+stable scan detect workers that detach from the CLI; the marker is not written
+to result JSON or logs. Publication and rollback open the renamed directory and
+verify its inode before deleting anything. A command that leaves a child behind
+or encounters a mismatched concurrent directory fails closed and reports that
+residue may remain. These controls support cooperative same-UID local
+concurrency and prevent accidental overwrite or deletion; they are not a
+security boundary against a malicious process running as the same user, which
+can modify the code, process environment, or output directory. The acceptance
+does not read the personal profile or database, synchronize Yangjibao, use
+Docker, poll a failed source, or authorize a mature purchase or exact amount.
+The output directory must not already exist.
 
 ## Requirements
 

@@ -766,6 +766,7 @@ def test_cleanup_failure_overrides_and_chains_original_timeout() -> None:
 
 def test_launch_isolated_with_anonymous_pipes_and_allowlisted_environment(monkeypatch) -> None:
     monkeypatch.setenv("KUNJIN_PRIVATE_TOKEN", "must-not-cross")
+    monkeypatch.setenv("KUNJIN_PHASE0_RUN_ID", "a" * 32)
     calls = []
     real_popen = subprocess.Popen
 
@@ -786,8 +787,17 @@ def test_launch_isolated_with_anonymous_pipes_and_allowlisted_environment(monkey
     assert kwargs["stderr"] is subprocess.DEVNULL
     assert kwargs["close_fds"] is True
     assert kwargs["start_new_session"] is True
+    assert kwargs["env"]["KUNJIN_PHASE0_RUN_ID"] == "a" * 32
     assert result.payload is not None
     assert "KUNJIN_PRIVATE_TOKEN" not in result.payload.text
+    assert "KUNJIN_PHASE0_RUN_ID" in result.payload.text
+
+
+def test_launch_rejects_invalid_phase0_run_identity(monkeypatch) -> None:
+    monkeypatch.setenv("KUNJIN_PHASE0_RUN_ID", "A" * 32)
+    with pytest.raises(WorkerExecutionError) as raised:
+        run_public_worker(_request(), _budget())
+    assert raised.value.reason_code == "worker_launch_failed"
 
 
 def test_finalization_signals_group_before_the_only_wait() -> None:

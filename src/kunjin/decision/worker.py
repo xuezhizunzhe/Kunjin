@@ -29,6 +29,7 @@ _KILL_GRACE_SECONDS = 0.05
 _REAP_GRACE_SECONDS = 0.10
 _SELECT_SLICE_SECONDS = 0.05
 _AUDIT_CLOCK_SKEW = timedelta(seconds=1)
+_PHASE0_RUN_ID_ENV = "KUNJIN_PHASE0_RUN_ID"
 _WORKER_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
     {
         "LANG": "C.UTF-8",
@@ -38,6 +39,16 @@ _WORKER_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
         "PYTHONUTF8": "1",
     }
 )
+
+
+def _worker_environment() -> Mapping[str, str]:
+    environment = dict(_WORKER_ENVIRONMENT)
+    run_id = os.environ.get(_PHASE0_RUN_ID_ENV)
+    if run_id is not None:
+        if len(run_id) != 32 or any(character not in "0123456789abcdef" for character in run_id):
+            raise ValueError("Phase 0 run identity is invalid")
+        environment[_PHASE0_RUN_ID_ENV] = run_id
+    return environment
 
 
 class WorkerExecutionError(RuntimeError):
@@ -292,7 +303,7 @@ def run_public_worker(
             close_fds=True,
             restore_signals=True,
             start_new_session=True,
-            env=dict(_WORKER_ENVIRONMENT),
+            env=dict(_worker_environment()),
         )
     except (OSError, ValueError):
         raise _worker_error(

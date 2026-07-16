@@ -180,9 +180,15 @@ class SmokeTest(unittest.TestCase):
             "signal.sigwait",
             "renameatx_np",
             "RENAME_EXCL",
+            "target_fd = os.open(",
+            "quarantine_name",
             "PROC_PIDT_BSDINFOWITHUNIQID",
+            "KERN_PROCARGS2",
+            "KUNJIN_PHASE0_RUN_ID",
             "p_uniqueid",
             "p_puniqueid",
+            "ctypes.sizeof(ctypes.c_int)",
+            "stabilize_descendants",
             "stable_key",
             "os.O_NOFOLLOW",
             "dir_fd=parent_fd",
@@ -241,30 +247,64 @@ if scenario == "global_slow":
     time.sleep(0.24)
 
 if scenario in {
-    "residual_process", "detached_worker", "detached_worker_immediate"
+    "residual_process", "detached_worker", "detached_worker_immediate",
+    "detached_worker_double_fork"
 } and argv == [
     "--json", "version"
 ]:
-    residual = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import signal,time;"
-                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
-                "time.sleep(4)"
-            ),
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=scenario.startswith("detached_worker"),
+    worker_code = (
+        "import signal,time;"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+        "time.sleep(4)"
     )
-    Path(os.environ["FAKE_KUNJIN_PID"]).write_text(
-        str(residual.pid), encoding="ascii"
-    )
+    if scenario == "detached_worker_double_fork":
+        launcher_code = (
+            "import os,subprocess,sys;from pathlib import Path;"
+            f"worker=subprocess.Popen([sys.executable,'-c',{worker_code!r}],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+            "stderr=subprocess.DEVNULL,start_new_session=True);"
+            "Path(os.environ['FAKE_KUNJIN_PID']).write_text("
+            "str(worker.pid),encoding='ascii');"
+            "Path(os.environ['FAKE_KUNJIN_WORKER_READY']).write_text("
+            "'ready',encoding='ascii')"
+        )
+        launcher = subprocess.Popen(
+            [sys.executable, "-c", launcher_code],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        launcher.wait(timeout=1)
+    else:
+        residual = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os;from pathlib import Path;"
+                    "ready=os.environ.get('FAKE_KUNJIN_WORKER_READY');"
+                    "ready and Path(ready).write_text('ready',encoding='ascii');"
+                    + worker_code
+                ),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=scenario.startswith("detached_worker"),
+        )
+        Path(os.environ["FAKE_KUNJIN_PID"]).write_text(
+            str(residual.pid), encoding="ascii"
+        )
     if scenario == "detached_worker":
         time.sleep(0.1)
+    if scenario in {"detached_worker_immediate", "detached_worker_double_fork"}:
+        ready = Path(os.environ["FAKE_KUNJIN_WORKER_READY"])
+        deadline = time.monotonic() + 1
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        if not ready.exists():
+            raise SystemExit("detached worker did not reach exec-ready state")
 
 if scenario in {"stalled", "interrupted"} and argv[:3] == [
     "--json", "sync", "fund-profile"
@@ -817,10 +857,15 @@ print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
             self.assertFalse(residual_output.exists())
             self.assertFalse(residual_still_alive, residual.stderr.decode())
 
-            for scenario in ("detached_worker", "detached_worker_immediate"):
+            for scenario in (
+                "detached_worker",
+                "detached_worker_immediate",
+                "detached_worker_double_fork",
+            ):
                 with self.subTest(detached_scenario=scenario):
                     detached_output = temporary_root / f"output-{scenario}"
                     detached_pid = temporary_root / f"{scenario}.pid"
+                    detached_ready = temporary_root / f"{scenario}.ready"
                     detached = subprocess.run(
                         [
                             str(scripts_directory / source_script.name),
@@ -831,7 +876,11 @@ print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
                             "PATH": "/usr/bin:/bin",
                             "FAKE_KUNJIN_LOG": str(log_path),
                             "FAKE_KUNJIN_PID": str(detached_pid),
+                            "FAKE_KUNJIN_WORKER_READY": str(detached_ready),
                             "FAKE_KUNJIN_SCENARIO": scenario,
+                            "KUNJIN_PHASE0_TEST_SKIP_LIVE_DESCENDANT_SCAN": (
+                                "1" if scenario == "detached_worker_double_fork" else "0"
+                            ),
                         },
                         stdin=subprocess.DEVNULL,
                         capture_output=True,
@@ -874,6 +923,60 @@ print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
                     self.assertEqual(hooked.returncode, 0, hooked.stderr.decode())
                     self.assertTrue(hook_output.is_dir())
 
+            replacement_source = temporary_root / "replacement-source"
+            replacement_source.mkdir()
+            replacement_sentinel = replacement_source / "must-remain.txt"
+            replacement_sentinel.write_text("unrelated", encoding="ascii")
+            replaced_output = temporary_root / "output-replaced-after-rename"
+            replaced = subprocess.run(
+                [
+                    str(scripts_directory / source_script.name),
+                    "000001",
+                    str(replaced_output),
+                ],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "FAKE_KUNJIN_LOG": str(log_path),
+                    "FAKE_KUNJIN_SCENARIO": "complete",
+                    "KUNJIN_PHASE0_TEST_RENAME_HOOK": "replace_after_rename",
+                    "KUNJIN_PHASE0_TEST_REPLACEMENT_SOURCE": str(
+                        replacement_source
+                    ),
+                },
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(replaced.returncode, 0)
+            self.assertTrue(replaced_output.is_dir())
+            self.assertEqual(
+                (replaced_output / replacement_sentinel.name).read_text(
+                    encoding="ascii"
+                ),
+                "unrelated",
+            )
+            self.assertIn(
+                "concurrent publication residue may remain",
+                replaced.stderr.decode(),
+            )
+            self.assertEqual(
+                [
+                    item
+                    for item in temporary_root.iterdir()
+                    if item.name.startswith(".kunjin-phase0-quarantine-")
+                ],
+                [],
+            )
+            displaced = [
+                item
+                for item in temporary_root.iterdir()
+                if item.name.startswith(".kunjin-phase0-displaced-")
+            ]
+            self.assertEqual(len(displaced), 1)
+            for child in displaced[0].iterdir():
+                child.unlink()
+            displaced[0].rmdir()
+
             for hook in ("expire_after_rename", "expire_after_fsync"):
                 with self.subTest(expired_publish_hook=hook):
                     expired_publish = temporary_root / f"output-{hook}"
@@ -905,6 +1008,54 @@ print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
                         ],
                         [],
                     )
+
+            post_quarantine_source = temporary_root / "post-quarantine-source"
+            post_quarantine_source.mkdir()
+            post_quarantine_sentinel = post_quarantine_source / "must-remain.txt"
+            post_quarantine_sentinel.write_text("unrelated", encoding="ascii")
+            post_quarantine_output = temporary_root / "output-post-quarantine"
+            post_quarantine = subprocess.run(
+                [
+                    str(scripts_directory / source_script.name),
+                    "000001",
+                    str(post_quarantine_output),
+                ],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "FAKE_KUNJIN_LOG": str(log_path),
+                    "FAKE_KUNJIN_SCENARIO": "complete",
+                    "KUNJIN_PHASE0_ACCEPTANCE_TIMEOUT_SECONDS": "1",
+                    "KUNJIN_PHASE0_TEST_RENAME_HOOK": (
+                        "replace_after_quarantine_removal"
+                    ),
+                    "KUNJIN_PHASE0_TEST_REPLACEMENT_SOURCE": str(
+                        post_quarantine_source
+                    ),
+                },
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=3,
+            )
+            self.assertNotEqual(post_quarantine.returncode, 0)
+            self.assertEqual(
+                (post_quarantine_output / post_quarantine_sentinel.name).read_text(
+                    encoding="ascii"
+                ),
+                "unrelated",
+            )
+            self.assertIn(
+                "concurrent publication residue may remain",
+                post_quarantine.stderr.decode(),
+            )
+            self.assertEqual(
+                [
+                    item
+                    for item in temporary_root.iterdir()
+                    if item.name.startswith(".kunjin-phase0-quarantine-")
+                ],
+                [],
+            )
 
             slow_output = temporary_root / "output-global-slow"
             slow_started = time.monotonic()

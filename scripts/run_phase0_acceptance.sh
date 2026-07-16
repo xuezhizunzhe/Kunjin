@@ -121,6 +121,8 @@ timeout_seconds = int(timeout_text)
 runtime = Path(runtime_path)
 
 started = time.monotonic()
+started_epoch_seconds = int(time.time())
+run_identity = secrets.token_hex(16)
 hard_deadline = started + timeout_seconds
 publish_deadline = hard_deadline - min(0.25, timeout_seconds / 4)
 command_deadline = publish_deadline - min(0.25, timeout_seconds / 4)
@@ -292,6 +294,11 @@ RENAME_EXCL = 0x00000004
 PROC_PIDPATHINFO_MAXSIZE = 4096
 PROC_PIDT_BSDINFOWITHUNIQID = 18
 PROC_UID_ONLY = 4
+CTL_KERN = 1
+KERN_PROCARGS2 = 49
+MAX_PROCARGS_BYTES = 1024 * 1024
+RUN_ID_ENVIRONMENT = "KUNJIN_PHASE0_RUN_ID"
+STABLE_SCAN_QUIET_SECONDS = 0.03
 
 
 class ProcBSDInfo(ctypes.Structure):
@@ -363,6 +370,7 @@ class ProcessIdentity:
         )
 
 
+libc = ctypes.CDLL(None, use_errno=True)
 libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
 proc_listchildpids = libproc.proc_listchildpids
 proc_listchildpids.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
@@ -387,6 +395,16 @@ proc_listpids.argtypes = [
     ctypes.c_int,
 ]
 proc_listpids.restype = ctypes.c_int
+sysctl = libc.sysctl
+sysctl.argtypes = [
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_uint,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+]
+sysctl.restype = ctypes.c_int
 
 
 class AcceptanceFailure(Exception):
@@ -398,6 +416,10 @@ class AcceptanceDeadline(BaseException):
 
 
 class AcceptanceInterrupted(BaseException):
+    pass
+
+
+class ProcessObservationTransient(Exception):
     pass
 
 
@@ -498,15 +520,20 @@ def child_pids(parent_pid):
 
 
 def same_uid_pids(uid):
-    estimated = proc_listpids(PROC_UID_ONLY, uid, None, 0)
-    if estimated <= 0:
+    pid_size = ctypes.sizeof(ctypes.c_int)
+    estimated_bytes = proc_listpids(PROC_UID_ONLY, uid, None, 0)
+    if estimated_bytes <= 0 or estimated_bytes % pid_size != 0:
         raise AcceptanceFailure("system process enumeration failed")
-    capacity = max(1024, estimated + 256)
+    estimated_count = estimated_bytes // pid_size
+    capacity = max(1024, estimated_count + 256)
     buffer = (ctypes.c_int * capacity)()
     ctypes.set_errno(0)
-    count = proc_listpids(PROC_UID_ONLY, uid, buffer, ctypes.sizeof(buffer))
-    if count <= 0:
+    returned_bytes = proc_listpids(
+        PROC_UID_ONLY, uid, buffer, ctypes.sizeof(buffer)
+    )
+    if returned_bytes <= 0 or returned_bytes % pid_size != 0:
         raise AcceptanceFailure("system process enumeration failed")
+    count = returned_bytes // pid_size
     if count >= capacity:
         raise AcceptanceFailure("system process enumeration was truncated")
     return [pid for pid in buffer[:count] if pid > 0]
@@ -578,6 +605,73 @@ def process_identity(pid):
     raise AcceptanceFailure("process identity did not stabilize after exec")
 
 
+def process_environment(pid):
+    mib = (ctypes.c_int * 3)(CTL_KERN, KERN_PROCARGS2, pid)
+    size = ctypes.c_size_t(0)
+    ctypes.set_errno(0)
+    if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.ESRCH or not process_is_present(pid):
+            return None
+        if error_number in {errno.EIO, errno.ENOMEM}:
+            raise ProcessObservationTransient()
+        raise AcceptanceFailure("process environment size query failed")
+    if size.value <= ctypes.sizeof(ctypes.c_int) or size.value > MAX_PROCARGS_BYTES:
+        raise AcceptanceFailure("process environment size is invalid")
+    buffer = ctypes.create_string_buffer(size.value)
+    ctypes.set_errno(0)
+    if sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.ESRCH or not process_is_present(pid):
+            return None
+        if error_number in {errno.EIO, errno.ENOMEM}:
+            raise ProcessObservationTransient()
+        raise AcceptanceFailure("process environment query failed")
+    raw = bytes(buffer.raw[: size.value])
+    integer_size = ctypes.sizeof(ctypes.c_int)
+    argument_count = int.from_bytes(
+        raw[:integer_size], byteorder=sys.byteorder, signed=True
+    )
+    if argument_count < 0 or argument_count > 4096:
+        raise AcceptanceFailure("process argument count is invalid")
+    cursor = integer_size
+    executable_end = raw.find(b"\0", cursor)
+    if executable_end < 0:
+        raise AcceptanceFailure("process executable arguments are invalid")
+    cursor = executable_end + 1
+    while cursor < len(raw) and raw[cursor] == 0:
+        cursor += 1
+    for _ in range(argument_count):
+        argument_end = raw.find(b"\0", cursor)
+        if argument_end < 0:
+            raise AcceptanceFailure("process arguments are truncated")
+        cursor = argument_end + 1
+    environment = []
+    while cursor < len(raw):
+        entry_end = raw.find(b"\0", cursor)
+        if entry_end < 0:
+            raise AcceptanceFailure("process environment is truncated")
+        entry = raw[cursor:entry_end]
+        cursor = entry_end + 1
+        if entry:
+            environment.append(entry)
+    return environment
+
+
+def process_has_run_identity(pid, expected_identity, run_identity):
+    before = process_identity(pid)
+    if before is None or before.stable_key() != expected_identity.stable_key():
+        return False
+    environment = process_environment(pid)
+    if environment is None:
+        return False
+    after = process_identity(pid)
+    if after is None or after.stable_key() != before.stable_key():
+        return False
+    marker = (RUN_ID_ENVIRONMENT + "=" + run_identity).encode("ascii")
+    return environment.count(marker) == 1
+
+
 def remember_descendant(identity, observed):
     previous = observed.get(identity.unique_id)
     if previous is not None and previous.stable_key() != identity.stable_key():
@@ -600,12 +694,20 @@ def observe_descendants(root_identity, observed, *, full_scan=False):
             remember_descendant(identity, observed)
             pending.append(identity)
     if not full_scan:
-        return
+        return False
     metadata_by_parent = {}
+    recent_metadata = []
     for pid in same_uid_pids(root_identity.uid):
         metadata = process_metadata(pid)
         if metadata is not None:
             metadata_by_parent.setdefault(metadata[7], []).append(metadata)
+            if metadata[3] >= started_epoch_seconds - 1:
+                recent_metadata.append(metadata)
+    active_unique_ids = {
+        metadata[6]
+        for values in metadata_by_parent.values()
+        for metadata in values
+    }
     pending_unique_ids = [root_identity.unique_id, *observed]
     visited = set()
     while pending_unique_ids:
@@ -619,6 +721,43 @@ def observe_descendants(root_identity, observed, *, full_scan=False):
                 continue
             remember_descendant(identity, observed)
             pending_unique_ids.append(identity.unique_id)
+    uncertain = False
+    for metadata in recent_metadata:
+        if metadata[6] == root_identity.unique_id:
+            continue
+        if metadata[6] not in observed and metadata[7] in active_unique_ids:
+            continue
+        identity = process_identity(metadata[0])
+        if identity is not None:
+            try:
+                matches_run = process_has_run_identity(
+                    identity.pid, identity, run_identity
+                )
+            except ProcessObservationTransient:
+                uncertain = True
+                continue
+            if matches_run:
+                remember_descendant(identity, observed)
+    return uncertain
+
+
+def stabilize_descendants(root_identity, observed, deadline):
+    quiet_since = None
+    while True:
+        before = frozenset(observed)
+        uncertain = observe_descendants(root_identity, observed, full_scan=True)
+        now = time.monotonic()
+        if uncertain:
+            quiet_since = None
+        elif frozenset(observed) != before:
+            quiet_since = now
+        elif quiet_since is None:
+            quiet_since = now
+        elif now - quiet_since >= STABLE_SCAN_QUIET_SECONDS:
+            return
+        if now >= deadline:
+            raise AcceptanceFailure("descendant scan did not become stable")
+        time.sleep(min(0.005, max(0, deadline - now)))
 
 
 def observed_process_exists(pid, expected_identity):
@@ -714,10 +853,12 @@ def run_command(name, arguments):
     stderr_path = runtime / (name + ".stderr")
     command_started = time.monotonic()
     remaining = command_deadline - command_started
-    cleanup_reserve = min(0.2, max(0.05, remaining / 4))
+    cleanup_reserve = min(0.5, max(0.05, remaining / 4))
     child = None
     root_identity = None
     observed_descendants = {}
+    cli_environment = dict(os.environ)
+    cli_environment[RUN_ID_ENVIRONMENT] = run_identity
     try:
         with raw_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
             os.chmod(raw_path, 0o600)
@@ -728,19 +869,26 @@ def run_command(name, arguments):
                 stdout=stdout,
                 stderr=stderr,
                 start_new_session=True,
+                env=cli_environment,
             )
             root_identity = process_identity(child.pid)
             if root_identity is None:
                 raise AcceptanceFailure(name + " process identity is unavailable")
             wait_deadline = command_started + max(0, remaining - cleanup_reserve)
             while True:
-                observe_descendants(root_identity, observed_descendants)
+                if os.environ.get(
+                    "KUNJIN_PHASE0_TEST_SKIP_LIVE_DESCENDANT_SCAN"
+                ) != "1":
+                    observe_descendants(root_identity, observed_descendants)
                 exit_code = child.poll()
                 if exit_code is not None:
-                    observe_descendants(
+                    stabilize_descendants(
                         root_identity,
                         observed_descendants,
-                        full_scan=True,
+                        min(
+                            command_deadline,
+                            time.monotonic() + cleanup_reserve,
+                        ),
                     )
                     break
                 if time.monotonic() >= wait_deadline:
@@ -756,6 +904,15 @@ def run_command(name, arguments):
                 terminate_process_tree(
                     child,
                     root_identity,
+                    observed_descendants,
+                    min(command_deadline, time.monotonic() + cleanup_reserve),
+                )
+                stabilize_descendants(
+                    root_identity,
+                    observed_descendants,
+                    min(command_deadline, time.monotonic() + cleanup_reserve),
+                )
+                terminate_observed_descendants(
                     observed_descendants,
                     min(command_deadline, time.monotonic() + cleanup_reserve),
                 )
@@ -795,6 +952,18 @@ def run_command(name, arguments):
                 terminate_process_tree(
                     child,
                     root_identity,
+                    observed_descendants,
+                    min(command_deadline, time.monotonic() + cleanup_reserve),
+                )
+            except AcceptanceFailure:
+                pass
+            try:
+                stabilize_descendants(
+                    root_identity,
+                    observed_descendants,
+                    min(command_deadline, time.monotonic() + cleanup_reserve),
+                )
+                terminate_observed_descendants(
                     observed_descendants,
                     min(command_deadline, time.monotonic() + cleanup_reserve),
                 )
@@ -1255,7 +1424,6 @@ def remove_staging(parent_fd, staging_fd, staging_name):
 
 
 def exclusive_rename(parent_fd, staging_name, target_name):
-    libc = ctypes.CDLL(None, use_errno=True)
     renameatx_np = libc.renameatx_np
     renameatx_np.argtypes = [
         ctypes.c_int,
@@ -1288,7 +1456,12 @@ def drain_pending_alarm():
         signal.sigwait({signal.SIGALRM})
 
 
+def mark_publication_residual():
+    (runtime / "publication-residual").write_text("1\n", encoding="ascii")
+
+
 def run_rename_test_hook(position):
+    global staging_name
     hook = os.environ.get("KUNJIN_PHASE0_TEST_RENAME_HOOK")
     if hook == "pending_before_rename" and position == "before_rename":
         os.kill(os.getpid(), signal.SIGALRM)
@@ -1298,6 +1471,28 @@ def run_rename_test_hook(position):
         time.sleep(max(0, hard_deadline - time.monotonic()) + 0.01)
     elif hook == "expire_after_fsync" and position == "after_fsync":
         time.sleep(max(0, hard_deadline - time.monotonic()) + 0.01)
+    elif hook == "replace_after_quarantine_removal" and position == "after_fsync":
+        time.sleep(max(0, hard_deadline - time.monotonic()) + 0.01)
+    elif hook == "replace_after_rename" and position == "after_rename":
+        replacement = Path(
+            os.environ["KUNJIN_PHASE0_TEST_REPLACEMENT_SOURCE"]
+        ).resolve()
+        if replacement.parent != Path(output_parent_path).resolve():
+            raise AcceptanceFailure("test replacement parent is invalid")
+        displaced_name = ".kunjin-phase0-displaced-" + secrets.token_hex(16)
+        exclusive_rename(parent_fd, output_basename, displaced_name)
+        exclusive_rename(parent_fd, replacement.name, output_basename)
+        staging_name = displaced_name
+    elif (
+        hook == "replace_after_quarantine_removal"
+        and position == "after_quarantine_removal"
+    ):
+        replacement = Path(
+            os.environ["KUNJIN_PHASE0_TEST_REPLACEMENT_SOURCE"]
+        ).resolve()
+        if replacement.parent != Path(output_parent_path).resolve():
+            raise AcceptanceFailure("test replacement parent is invalid")
+        exclusive_rename(parent_fd, replacement.name, output_basename)
 
 
 def commit_staging():
@@ -1313,15 +1508,19 @@ def commit_staging():
         staging_name = output_basename
         run_rename_test_hook("after_rename")
 
-        target_identity = os.stat(
+        target_fd = os.open(
             output_basename,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
             dir_fd=parent_fd,
-            follow_symlinks=False,
         )
-        if not stat.S_ISDIR(target_identity.st_mode) or not same_file_identity(
-            staging_identity, target_identity
-        ):
-            raise AcceptanceFailure("published output identity changed")
+        try:
+            target_identity = os.fstat(target_fd)
+            if not stat.S_ISDIR(target_identity.st_mode) or not same_file_identity(
+                staging_identity, target_identity
+            ):
+                raise AcceptanceFailure("published output identity changed")
+        finally:
+            os.close(target_fd)
         if time.monotonic() >= hard_deadline:
             raise AcceptanceDeadline()
         os.fsync(parent_fd)
@@ -1338,40 +1537,66 @@ def commit_staging():
         signal.setitimer(signal.ITIMER_REAL, 0)
         drain_pending_alarm()
         if renamed and not published:
-            target_identity = os.stat(
-                output_basename,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
+            staging_name = None
+            quarantine_name = (
+                ".kunjin-phase0-quarantine-" + secrets.token_hex(16)
             )
-            if not same_file_identity(staging_identity, target_identity):
+            try:
+                exclusive_rename(parent_fd, output_basename, quarantine_name)
+            except AcceptanceFailure:
+                mark_publication_residual()
+                raise
+            try:
+                quarantine_fd = os.open(
+                    quarantine_name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+            except OSError:
+                mark_publication_residual()
+                try:
+                    exclusive_rename(parent_fd, quarantine_name, output_basename)
+                except AcceptanceFailure:
+                    raise AcceptanceFailure(
+                        "unverified concurrent output remains quarantined"
+                    ) from None
                 raise AcceptanceFailure(
-                    "expired output could not be safely withdrawn"
+                    "unverified concurrent output was restored"
                 ) from None
-            rollback_name = ".kunjin-phase0-rollback-" + secrets.token_hex(16)
-            exclusive_rename(parent_fd, output_basename, rollback_name)
-            rollback_identity = os.stat(
-                rollback_name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-            if not same_file_identity(staging_identity, rollback_identity):
-                raise AcceptanceFailure("withdrawn output identity changed") from None
-            staging_name = rollback_name
-            remove_staging(parent_fd, staging_fd, staging_name)
+            try:
+                quarantine_identity = os.fstat(quarantine_fd)
+            finally:
+                os.close(quarantine_fd)
+            if not same_file_identity(staging_identity, quarantine_identity):
+                mark_publication_residual()
+                try:
+                    exclusive_rename(parent_fd, quarantine_name, output_basename)
+                except AcceptanceFailure:
+                    raise AcceptanceFailure(
+                        "concurrent output remains quarantined"
+                    ) from None
+                raise AcceptanceFailure(
+                    "concurrent output identity was restored"
+                ) from None
+            staging_name = quarantine_name
+            remove_staging(parent_fd, staging_fd, quarantine_name)
             staging_fd = None
             staging_name = None
+            run_rename_test_hook("after_quarantine_removal")
             try:
                 os.stat(output_basename, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
                 pass
             else:
+                mark_publication_residual()
                 raise AcceptanceFailure("expired output remains published") from None
             try:
-                os.stat(rollback_name, dir_fd=parent_fd, follow_symlinks=False)
+                os.stat(quarantine_name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
                 pass
             else:
-                raise AcceptanceFailure("expired output rollback remains") from None
+                mark_publication_residual()
+                raise AcceptanceFailure("expired output quarantine remains") from None
             os.fsync(parent_fd)
         raise
     finally:
@@ -1562,6 +1787,9 @@ DRIVER_EXIT_CODE=$?
 set -e
 /bin/chmod 600 "${RUNTIME_DIR}/driver.stderr"
 if [[ "${DRIVER_EXIT_CODE}" -ne 0 ]]; then
+    if [[ -e "${RUNTIME_DIR}/publication-residual" ]]; then
+        printf 'Phase 0 acceptance failed closed; concurrent publication residue may remain in OUTPUT_DIR parent.\n' >&2
+    fi
     printf 'Phase 0 acceptance failed closed.\n' >&2
     exit "${DRIVER_EXIT_CODE}"
 fi
