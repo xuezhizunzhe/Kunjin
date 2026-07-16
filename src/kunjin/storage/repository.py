@@ -90,6 +90,9 @@ _DECISION_AUDIT_OBJECT_NAMESPACES = (
 _DECISION_AUDIT_OBJECT_ROOTS = frozenset(
     ("request_run", "source_attempt", "decision_snapshot")
 )
+_DECISION_AUDIT_ACCESS_ACTIONS = frozenset(
+    (sqlite3.SQLITE_READ, sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE)
+)
 _LEGACY_V8_POLICY_TABLE = "__kunjin_legacy_v8_policy_versions"
 _LEGACY_V8_ASSESSMENT_TABLE = "__kunjin_legacy_v8_assessments"
 _WAL_RETRY_TIMEOUT_SECONDS = 5.0
@@ -216,83 +219,6 @@ def _owned_d1_objects(
     }
 
 
-def _is_sqlite_identifier_character(character: str) -> bool:
-    return (
-        character in {"_", "$"}
-        or "0" <= character <= "9"
-        or "A" <= character <= "Z"
-        or "a" <= character <= "z"
-        or ord(character) >= 0x80
-    )
-
-
-def _consume_sqlite_doubled_quote(
-    sql: str,
-    start: int,
-    quote: str,
-) -> Tuple[int, str]:
-    index = start + 1
-    decoded: List[str] = []
-    while index < len(sql):
-        character = sql[index]
-        if character != quote:
-            decoded.append(character)
-            index += 1
-            continue
-        if index + 1 < len(sql) and sql[index + 1] == quote:
-            decoded.append(quote)
-            index += 2
-            continue
-        return index + 1, "".join(decoded)
-    return len(sql), "".join(decoded)
-
-
-def _iter_sqlite_ddl_identifiers(sql: str) -> Iterator[str]:
-    index = 0
-    while index < len(sql):
-        if sql.startswith("--", index):
-            newline = sql.find("\n", index + 2)
-            index = len(sql) if newline < 0 else newline + 1
-            continue
-        if sql.startswith("/*", index):
-            closing = sql.find("*/", index + 2)
-            index = len(sql) if closing < 0 else closing + 2
-            continue
-
-        character = sql[index]
-        if character == "'":
-            index, _ = _consume_sqlite_doubled_quote(sql, index, character)
-            continue
-        if character in {'"', "`"}:
-            index, identifier = _consume_sqlite_doubled_quote(sql, index, character)
-            yield _ascii_identifier(identifier)
-            continue
-        if character == "[":
-            # SQLite bracket quoting ends at the first closing bracket; ]] is not an escape.
-            closing = sql.find("]", index + 1)
-            if closing < 0:
-                yield _ascii_identifier(sql[index + 1 :])
-                return
-            yield _ascii_identifier(sql[index + 1 : closing])
-            index = closing + 1
-            continue
-        if _is_sqlite_identifier_character(character):
-            start = index
-            index += 1
-            while index < len(sql) and _is_sqlite_identifier_character(sql[index]):
-                index += 1
-            yield _ascii_identifier(sql[start:index])
-            continue
-        index += 1
-
-
-def _references_decision_audit_table(sql: str) -> bool:
-    return any(
-        identifier in _DECISION_AUDIT_TABLES
-        for identifier in _iter_sqlite_ddl_identifiers(sql)
-    )
-
-
 def _owned_decision_audit_objects(
     objects: Dict[str, Tuple[str, str, str]],
 ) -> Dict[str, Tuple[str, str, str]]:
@@ -302,8 +228,146 @@ def _owned_decision_audit_objects(
         if _ascii_identifier(value[1]) in _DECISION_AUDIT_TABLES
         or _ascii_identifier(name) in _DECISION_AUDIT_OBJECT_ROOTS
         or _ascii_identifier(name).startswith(_DECISION_AUDIT_OBJECT_NAMESPACES)
-        or _references_decision_audit_table(value[2])
     }
+
+
+def _quote_sqlite_identifier(value: str) -> str:
+    escaped = value.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def _trigger_probe_statements(
+    connection: sqlite3.Connection,
+    target: str,
+) -> Tuple[str, ...]:
+    quoted_target = _quote_sqlite_identifier(target)
+    columns = tuple(
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_xinfo({quoted_target})").fetchall()
+        if int(row["hidden"]) in {0, 1}
+    )
+    statements = [
+        f"EXPLAIN INSERT INTO {quoted_target} DEFAULT VALUES",
+        f"EXPLAIN DELETE FROM {quoted_target} WHERE 0",
+    ]
+    if columns:
+        assignments = ", ".join(
+            f"{_quote_sqlite_identifier(column)} = {_quote_sqlite_identifier(column)}"
+            for column in columns
+        )
+        statements.append(f"EXPLAIN UPDATE {quoted_target} SET {assignments} WHERE 0")
+    return tuple(statements)
+
+
+def _reject_unexpected_decision_audit_dependencies(
+    connection: sqlite3.Connection,
+    expected: Dict[str, Tuple[str, str, str]],
+    actual: Dict[str, Tuple[str, str, str]],
+) -> None:
+    extras = {name: value for name, value in actual.items() if name not in expected}
+    if not extras:
+        return
+    main_database = next(
+        (
+            str(row["file"])
+            for row in connection.execute("PRAGMA database_list").fetchall()
+            if str(row["name"]) == "main"
+        ),
+        "",
+    )
+    if not main_database:
+        raise sqlite3.DatabaseError("decision audit schema does not match V14")
+    probe = sqlite3.connect(main_database)
+    probe.row_factory = sqlite3.Row
+
+    extra_triggers = {
+        _ascii_identifier(name): str(value[1])
+        for name, value in extras.items()
+        if value[0] == "trigger"
+    }
+    extra_views = {
+        _ascii_identifier(name): str(name)
+        for name, value in extras.items()
+        if value[0] == "view"
+    }
+
+    monitored_sources = set(extra_triggers) | set(extra_views)
+    observed_sources = set()
+    dependency_sources = set()
+
+    def authorize(
+        action: int,
+        arg1: Optional[str],
+        arg2: Optional[str],
+        database_name: Optional[str],
+        source: Optional[str],
+    ) -> int:
+        del arg2, database_name
+        normalized_source = None if source is None else _ascii_identifier(source)
+        if normalized_source in monitored_sources:
+            observed_sources.add(normalized_source)
+            if (
+                action in _DECISION_AUDIT_ACCESS_ACTIONS
+                and arg1 is not None
+                and _ascii_identifier(arg1) in _DECISION_AUDIT_TABLES
+            ):
+                dependency_sources.add(normalized_source)
+        return sqlite3.SQLITE_OK
+
+    compiled_trigger_targets = set()
+    compiled_views = set()
+    try:
+        for name, value in extras.items():
+            if value[0] != "table":
+                continue
+            quoted_name = _quote_sqlite_identifier(str(name))
+            foreign_keys = probe.execute(
+                f"PRAGMA foreign_key_list({quoted_name})"
+            ).fetchall()
+            if any(
+                _ascii_identifier(str(row["table"])) in _DECISION_AUDIT_TABLES
+                for row in foreign_keys
+            ):
+                raise sqlite3.DatabaseError("decision audit schema does not match V14")
+
+        probe.set_authorizer(authorize)
+        try:
+            for target in sorted(set(extra_triggers.values()), key=_ascii_identifier):
+                target_compiled = False
+                for statement in _trigger_probe_statements(probe, target):
+                    try:
+                        probe.execute(statement).close()
+                    except sqlite3.Error:
+                        continue
+                    target_compiled = True
+                if target_compiled:
+                    compiled_trigger_targets.add(_ascii_identifier(target))
+
+            for normalized_name, name in sorted(extra_views.items()):
+                statement = f"EXPLAIN SELECT * FROM {_quote_sqlite_identifier(name)}"
+                try:
+                    probe.execute(statement).close()
+                except sqlite3.Error:
+                    continue
+                compiled_views.add(normalized_name)
+        finally:
+            probe.set_authorizer(None)
+    finally:
+        probe.close()
+
+    if dependency_sources:
+        raise sqlite3.DatabaseError("decision audit schema does not match V14")
+    if any(
+        _ascii_identifier(target) not in compiled_trigger_targets
+        or normalized_name not in observed_sources
+        for normalized_name, target in extra_triggers.items()
+    ):
+        raise sqlite3.DatabaseError("decision audit schema does not match V14")
+    if any(
+        normalized_name not in compiled_views or normalized_name not in observed_sources
+        for normalized_name in extra_views
+    ):
+        raise sqlite3.DatabaseError("decision audit schema does not match V14")
 
 
 def _ascii_identifier(value: str) -> str:
@@ -725,6 +789,7 @@ def _validate_applied_schema(
     expected_v14 = _owned_decision_audit_objects(expected)
     if _owned_decision_audit_objects(actual) != expected_v14:
         raise sqlite3.DatabaseError("decision audit schema does not match V14")
+    _reject_unexpected_decision_audit_dependencies(connection, expected, actual)
 
 
 _FUND_MANDATE_FACT_NO_UPDATE = """

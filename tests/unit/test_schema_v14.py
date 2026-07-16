@@ -354,6 +354,56 @@ class SchemaV14Test(unittest.TestCase):
                 SELECT count(*) FROM `decision_snapshots`;
             END;
             """,
+            """
+            CREATE TRIGGER single_quoted_audit_writer
+            AFTER INSERT ON sync_runs
+            BEGIN
+                INSERT INTO 'request_runs'(
+                    request_id, mode, status, started_at, deadline_at,
+                    finished_at, omitted_work_json
+                ) VALUES (
+                    'ffffffffffffffffffffffffffffffff', 'rapid', 'running',
+                    '2026-07-16T00:00:00+00:00',
+                    '2026-07-16T00:01:30+00:00', NULL, '[]'
+                );
+            END;
+            """,
+            """
+            CREATE TRIGGER single_quoted_audit_reader
+            AFTER INSERT ON sync_runs
+            BEGIN
+                SELECT count(*) FROM 'source_attempts';
+            END;
+            """,
+            """
+            CREATE TRIGGER single_quoted_audit_updater
+            AFTER INSERT ON sync_runs
+            BEGIN
+                UPDATE 'source_attempts'
+                SET response_byte_count = response_byte_count
+                WHERE 0;
+            END;
+            """,
+            """
+            CREATE TRIGGER update_only_audit_reader
+            AFTER UPDATE OF source ON sync_runs
+            BEGIN
+                SELECT count(*) FROM request_runs;
+            END;
+            """,
+            """
+            CREATE TRIGGER delete_only_audit_reader
+            AFTER DELETE ON sync_runs
+            BEGIN
+                SELECT count(*) FROM decision_snapshots;
+            END;
+            """,
+            "CREATE VIEW single_quoted_audit_view AS SELECT * FROM 'decision_snapshots';",
+            """
+            CREATE TABLE single_quoted_audit_fk(
+                id INTEGER REFERENCES 'request_runs'(id)
+            );
+            """,
         )
         for index, hostile_script in enumerate(hostile_scripts):
             with self.subTest(index=index):
@@ -396,6 +446,16 @@ class SchemaV14Test(unittest.TestCase):
 
         repository.migrate()
 
+    def test_double_quoted_default_text_does_not_bind_audit_tables(self) -> None:
+        repository = self.repository("double-quoted-default.db")
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            connection.execute(
+                'CREATE TABLE dqs_defaults(value TEXT DEFAULT "request_runs")'
+            )
+
+        repository.migrate()
+
     def test_string_literals_and_comments_do_not_bind_audit_tables(self) -> None:
         repository = self.repository("literal-and-comment-identifiers.db")
         repository.migrate()
@@ -417,6 +477,8 @@ class SchemaV14Test(unittest.TestCase):
                     -- request_runs remains prose here
                     SELECT 1 /* source_attempts and decision_snapshots */;
                 END;
+                CREATE VIEW narrative_literal_view AS
+                SELECT 'decision_snapshots' AS label;
                 """
             )
 
