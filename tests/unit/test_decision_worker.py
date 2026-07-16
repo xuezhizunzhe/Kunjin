@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import signal
@@ -1054,6 +1055,31 @@ def test_worker_module_import_boundary_excludes_private_and_storage_modules() ->
     forbidden = ("storage", "paths", "keychain", "yangjibao", "docker", "legacy_doc")
     assert all(name not in source.casefold() for name in forbidden)
     assert "str(exc)" not in source
+
+
+def test_all_worker_modules_have_an_ast_enforced_storage_boundary() -> None:
+    decision_package = Path(__file__).parents[2] / "src" / "kunjin" / "decision"
+    forbidden = (
+        "kunjin.storage",
+        "kunjin.paths",
+        "kunjin.security",
+        "kunjin.adapters.yangjibao",
+    )
+    worker_modules = sorted(decision_package.glob("worker*.py"))
+    assert worker_modules
+    for worker_module in worker_modules:
+        tree = ast.parse(worker_module.read_text(encoding="utf-8"))
+        imports = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imports.append(node.module)
+        assert not any(
+            imported == blocked or imported.startswith(f"{blocked}.")
+            for imported in imports
+            for blocked in forbidden
+        ), f"{worker_module.name} crosses the parent storage boundary"
 
 
 def test_production_worker_entrypoint_rejects_unbound_url_before_launch() -> None:
