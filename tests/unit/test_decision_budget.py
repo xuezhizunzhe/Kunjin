@@ -1,3 +1,4 @@
+import math
 import re
 from datetime import datetime, timedelta, timezone, tzinfo
 
@@ -381,6 +382,25 @@ def test_audit_deadline_overflow_fails_as_a_validation_error() -> None:
             monotonic=lambda: 1.0,
             wall_clock=lambda: datetime.max.replace(tzinfo=timezone.utc),
         )
+
+
+def test_normal_fractional_start_rounds_deadline_inside_policy_total() -> None:
+    monotonic_start = 38.009
+    uncorrected_deadline = monotonic_start + 90.0
+    assert uncorrected_deadline - monotonic_start == 90.00000000000001
+
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id="c" * 32,
+        monotonic=lambda: monotonic_start,
+        wall_clock=lambda: UTC_START,
+    )
+
+    represented_span = budget.monotonic_deadline - budget.monotonic_start
+    assert budget.monotonic_deadline == math.nextafter(
+        uncorrected_deadline, -math.inf
+    )
+    assert 0.0 < represented_span <= budget.total_seconds
 
 
 @pytest.mark.parametrize(
