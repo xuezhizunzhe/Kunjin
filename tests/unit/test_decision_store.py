@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 
@@ -31,7 +34,12 @@ from kunjin.decision.source_registry import (
     SOURCE_REGISTRY_V1_CHECKSUM,
     SourceRegistryV1,
 )
-from kunjin.decision.store import DecisionAuditStore, DecisionAuditStoreError
+from kunjin.decision.store import (
+    MAX_CANONICAL_ROUTE_BYTES,
+    MAX_CANONICAL_ROUTE_DEPTH,
+    DecisionAuditStore,
+    DecisionAuditStoreError,
+)
 from kunjin.storage.repository import Repository
 
 NOW = datetime(2026, 7, 16, 6, 0, tzinfo=timezone.utc)
@@ -42,6 +50,157 @@ def _store(tmp_path) -> tuple[Repository, DecisionAuditStore]:
     repository = Repository(tmp_path / "kunjin.db")
     repository.migrate()
     return repository, DecisionAuditStore(repository)
+
+
+class _PausingRepository(Repository):
+    def __init__(
+        self,
+        database,
+        *,
+        function_name: str,
+        entered: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        super().__init__(database)
+        self.function_name = function_name
+        self.entered = entered
+        self.release = release
+
+    @contextmanager
+    def connect(self):
+        with super().connect() as connection:
+            connection.create_function(self.function_name, 0, self._pause)
+            yield connection
+
+    def _pause(self) -> int:
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError("test transaction pause timed out")
+        return 0
+
+
+class _SelectPausingCursor:
+    def __init__(
+        self,
+        cursor,
+        *,
+        entered: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        self.cursor = cursor
+        self.entered = entered
+        self.release = release
+
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        if row is not None and row["status"] == "running":
+            self.entered.set()
+            if not self.release.wait(timeout=5):
+                raise RuntimeError("test select pause timed out")
+        return row
+
+    def __getattr__(self, name: str):
+        return getattr(self.cursor, name)
+
+
+class _SelectPausingConnection:
+    def __init__(
+        self,
+        connection,
+        *,
+        entered: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        self.connection = connection
+        self.entered = entered
+        self.release = release
+
+    def execute(self, sql: str, parameters=()):
+        cursor = self.connection.execute(sql, parameters)
+        normalized = " ".join(sql.split()).casefold()
+        if normalized.startswith("select ") and " from request_runs where id = ?" in normalized:
+            return _SelectPausingCursor(
+                cursor,
+                entered=self.entered,
+                release=self.release,
+            )
+        return cursor
+
+    def __enter__(self):
+        self.connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self.connection.__exit__(exc_type, exc_value, traceback)
+
+    def __getattr__(self, name: str):
+        return getattr(self.connection, name)
+
+
+class _SelectPausingRepository(Repository):
+    def __init__(
+        self,
+        database,
+        *,
+        entered: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        super().__init__(database)
+        self.entered = entered
+        self.release = release
+
+    @contextmanager
+    def connect(self):
+        with super().connect() as connection:
+            yield _SelectPausingConnection(
+                connection,
+                entered=self.entered,
+                release=self.release,
+            )
+
+
+def _pausing_store(tmp_path, *, operation: str, table: str):
+    entered = threading.Event()
+    release = threading.Event()
+    function_name = "kunjin_test_pause"
+    repository = _PausingRepository(
+        tmp_path / "kunjin.db",
+        function_name=function_name,
+        entered=entered,
+        release=release,
+    )
+    repository.migrate()
+    with repository.connect() as connection, connection:
+        connection.execute(
+            f"CREATE TRIGGER kunjin_test_pause_trigger "  # noqa: S608
+            f"BEFORE {operation} ON {table} "
+            f"BEGIN SELECT {function_name}(); END"
+        )
+    return repository, DecisionAuditStore(repository), entered, release
+
+
+def _select_pausing_store(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+    repository = _SelectPausingRepository(
+        tmp_path / "kunjin.db",
+        entered=entered,
+        release=release,
+    )
+    repository.migrate()
+    return repository, DecisionAuditStore(repository), entered, release
+
+
+def _capture_thread_result(results: dict, key: str, action) -> None:
+    try:
+        results[key] = action()
+    except BaseException as exc:  # test boundary records the exact thread outcome
+        results[key] = exc
+
+
+def _join_thread(thread: threading.Thread) -> None:
+    thread.join(timeout=5)
+    assert not thread.is_alive()
 
 
 def _budget(
@@ -128,6 +287,23 @@ def _attempt(number: int = 1, **overrides) -> SourceAttempt:
     }
     values.update(overrides)
     return SourceAttempt(**values)
+
+
+def _write_child(
+    store: DecisionAuditStore,
+    request_run_id: int,
+    child_kind: str,
+):
+    if child_kind == "attempt":
+        return store.record_source_attempt(request_run_id, _attempt())
+    assert child_kind == "snapshot"
+    return store.save_decision_snapshot(
+        request_run_id,
+        _route(),
+        EvidencePolicyV1(),
+        SourceRegistryV1(),
+        NOW + timedelta(seconds=3),
+    )
 
 
 def test_request_attempt_snapshot_lifecycle_and_canonical_round_trip(tmp_path) -> None:
@@ -243,6 +419,125 @@ def test_terminal_request_is_immutable_and_rejects_more_children(tmp_path) -> No
         )
 
 
+@pytest.mark.parametrize("child_kind", ("attempt", "snapshot"))
+def test_child_transaction_commits_before_waiting_finalize_transaction(
+    tmp_path, child_kind: str
+) -> None:
+    repository, store, child_entered, release_child = _select_pausing_store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+    results = {}
+    child_done = threading.Event()
+    finalize_done = threading.Event()
+
+    def write_child() -> None:
+        _capture_thread_result(
+            results,
+            "child",
+            lambda: _write_child(store, request_run_id, child_kind),
+        )
+        child_done.set()
+
+    def finalize() -> None:
+        _capture_thread_result(
+            results,
+            "finalize",
+            lambda: store.finalize_request(
+                request_run_id,
+                RequestTerminalStatus.COMPLETE,
+                NOW + timedelta(seconds=4),
+                (),
+            ),
+        )
+        finalize_done.set()
+
+    child_thread = threading.Thread(target=write_child, daemon=True)
+    finalize_thread = threading.Thread(target=finalize, daemon=True)
+    child_thread.start()
+    assert child_entered.wait(timeout=2)
+    finalize_thread.start()
+    try:
+        assert not finalize_done.wait(timeout=0.1)
+    finally:
+        release_child.set()
+    _join_thread(child_thread)
+    _join_thread(finalize_thread)
+
+    assert child_done.is_set()
+    assert not isinstance(results["child"], BaseException)
+    assert results["finalize"] is None
+    child_table = "source_attempts" if child_kind == "attempt" else "decision_snapshots"
+    with repository.connect() as connection:
+        status = connection.execute(
+            "SELECT status FROM request_runs WHERE id = ?", (request_run_id,)
+        ).fetchone()[0]
+        child_count = connection.execute(
+            f"SELECT count(*) FROM {child_table}"  # noqa: S608
+        ).fetchone()[0]
+    assert status == "complete"
+    assert child_count == 1
+
+
+@pytest.mark.parametrize("child_kind", ("attempt", "snapshot"))
+def test_finalize_transaction_commits_before_waiting_child_is_rejected(
+    tmp_path, child_kind: str
+) -> None:
+    repository, store, finalize_entered, release_finalize = _pausing_store(
+        tmp_path, operation="UPDATE", table="request_runs"
+    )
+    request_run_id = store.begin_request(_budget())
+    results = {}
+    child_done = threading.Event()
+    finalize_done = threading.Event()
+
+    def finalize() -> None:
+        _capture_thread_result(
+            results,
+            "finalize",
+            lambda: store.finalize_request(
+                request_run_id,
+                RequestTerminalStatus.COMPLETE,
+                NOW + timedelta(seconds=4),
+                (),
+            ),
+        )
+        finalize_done.set()
+
+    def write_child() -> None:
+        _capture_thread_result(
+            results,
+            "child",
+            lambda: _write_child(store, request_run_id, child_kind),
+        )
+        child_done.set()
+
+    finalize_thread = threading.Thread(target=finalize, daemon=True)
+    child_thread = threading.Thread(target=write_child, daemon=True)
+    finalize_thread.start()
+    assert finalize_entered.wait(timeout=2)
+    child_thread.start()
+    try:
+        assert not child_done.wait(timeout=0.1)
+    finally:
+        release_finalize.set()
+    _join_thread(finalize_thread)
+    _join_thread(child_thread)
+
+    assert finalize_done.is_set()
+    assert results["finalize"] is None
+    assert isinstance(results["child"], DecisionAuditStoreError)
+    assert "not running" in str(results["child"])
+    child_table = "source_attempts" if child_kind == "attempt" else "decision_snapshots"
+    with repository.connect() as connection:
+        status = connection.execute(
+            "SELECT status FROM request_runs WHERE id = ?", (request_run_id,)
+        ).fetchone()[0]
+        child_count = connection.execute(
+            f"SELECT count(*) FROM {child_table}"  # noqa: S608
+        ).fetchone()[0]
+    assert status == "complete"
+    assert child_count == 0
+
+
 def test_attempt_insert_requires_exact_request_owner_and_record_type(tmp_path) -> None:
     _, store = _store(tmp_path)
     request_run_id = store.begin_request(_budget())
@@ -302,6 +597,67 @@ def test_aware_non_utc_api_times_are_canonicalized_for_storage(tmp_path) -> None
             "SELECT finished_at FROM request_runs WHERE id = ?", (request_run_id,)
         ).fetchone()
     assert run["finished_at"] == (NOW + timedelta(seconds=4)).isoformat()
+
+
+@pytest.mark.parametrize(
+    "created_at",
+    (NOW - timedelta(microseconds=1), NOW + timedelta(seconds=90, microseconds=1)),
+)
+def test_snapshot_creation_must_be_inside_request_lifetime(
+    tmp_path, created_at: datetime
+) -> None:
+    repository, store = _store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+
+    with pytest.raises(DecisionAuditStoreError, match="request lifetime"):
+        store.save_decision_snapshot(
+            request_run_id,
+            _route(),
+            EvidencePolicyV1(),
+            SourceRegistryV1(),
+            created_at,
+        )
+
+    with repository.connect() as connection:
+        count = connection.execute("SELECT count(*) FROM decision_snapshots").fetchone()[0]
+    assert count == 0
+
+
+@pytest.mark.parametrize("child_kind", ("attempt", "snapshot"))
+def test_finalize_cannot_precede_latest_child_evidence(
+    tmp_path, child_kind: str
+) -> None:
+    repository, store = _store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+    _write_child(store, request_run_id, child_kind)
+
+    with pytest.raises(DecisionAuditStoreError, match="exactly once"):
+        store.finalize_request(
+            request_run_id,
+            RequestTerminalStatus.COMPLETE,
+            NOW + timedelta(seconds=1),
+            (),
+        )
+
+    with repository.connect() as connection:
+        run = connection.execute(
+            "SELECT status, finished_at FROM request_runs WHERE id = ?",
+            (request_run_id,),
+        ).fetchone()
+    assert tuple(run) == ("running", None)
+
+
+def test_expired_cleanup_may_finalize_after_request_deadline(tmp_path) -> None:
+    _, store = _store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+    store.record_source_attempt(request_run_id, _attempt())
+
+    store.finalize_request(
+        request_run_id,
+        RequestTerminalStatus.EXPIRED,
+        NOW + timedelta(seconds=91),
+        ("market_context",),
+    )
 
 
 def test_snapshot_requires_request_mode_policy_and_registry_binding(tmp_path) -> None:
@@ -544,6 +900,94 @@ def test_snapshot_read_fails_closed_on_invalid_evidence_decimal(tmp_path) -> Non
 
     with pytest.raises(DecisionAuditStoreError, match="snapshot authentication"):
         store._load_decision_snapshot(request_run_id)
+
+
+def test_static_policy_and_registry_bytes_are_authenticated_before_route_json_parse(
+    tmp_path,
+) -> None:
+    _, store = _store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+    store.save_decision_snapshot(
+        request_run_id, _route(), EvidencePolicyV1(), SourceRegistryV1(), NOW
+    )
+
+    with patch("kunjin.decision.store.json.loads", wraps=json.loads) as loads:
+        store._load_decision_snapshot(request_run_id)
+
+    assert loads.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "tampered",
+    (
+        '{"padding":"' + ("x" * MAX_CANONICAL_ROUTE_BYTES) + '"}',
+        '{"nested":' + ("[" * (MAX_CANONICAL_ROUTE_DEPTH + 1)) + "0"
+        + ("]" * (MAX_CANONICAL_ROUTE_DEPTH + 1)) + "}",
+    ),
+    ids=("oversized", "too_deep"),
+)
+def test_snapshot_read_rejects_oversized_or_too_deep_route_before_json_parse(
+    tmp_path, tampered: str
+) -> None:
+    repository, store = _store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+    store.save_decision_snapshot(
+        request_run_id, _route(), EvidencePolicyV1(), SourceRegistryV1(), NOW
+    )
+    with repository.connect() as connection, connection:
+        connection.execute("DROP TRIGGER decision_snapshot_no_update")
+        connection.execute(
+            """
+            UPDATE decision_snapshots
+            SET canonical_route_json = ?, result_checksum = ?
+            """,
+            (tampered, hashlib.sha256(tampered.encode("ascii")).hexdigest()),
+        )
+
+    with (
+        patch(
+            "kunjin.decision.store.json.loads",
+            side_effect=AssertionError("bounded route reached JSON parser"),
+        ),
+        pytest.raises(DecisionAuditStoreError, match="snapshot authentication"),
+    ):
+        store._load_decision_snapshot(request_run_id)
+
+
+def test_snapshot_read_wraps_unexpected_json_recursion(tmp_path) -> None:
+    _, store = _store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+    store.save_decision_snapshot(
+        request_run_id, _route(), EvidencePolicyV1(), SourceRegistryV1(), NOW
+    )
+
+    with (
+        patch("kunjin.decision.store.json.loads", side_effect=RecursionError),
+        pytest.raises(DecisionAuditStoreError, match="snapshot authentication"),
+    ):
+        store._load_decision_snapshot(request_run_id)
+
+
+def test_snapshot_write_rejects_oversized_canonical_route(tmp_path) -> None:
+    repository, store = _store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+    oversized = b"{" + (b"x" * MAX_CANONICAL_ROUTE_BYTES) + b"}"
+
+    with (
+        patch.object(DecisionRoute, "canonical_json", return_value=oversized),
+        pytest.raises(DecisionAuditStoreError, match="route is too large"),
+    ):
+        store.save_decision_snapshot(
+            request_run_id,
+            _route(),
+            EvidencePolicyV1(),
+            SourceRegistryV1(),
+            NOW,
+        )
+
+    with repository.connect() as connection:
+        count = connection.execute("SELECT count(*) FROM decision_snapshots").fetchone()[0]
+    assert count == 0
 
 
 def test_attempt_history_fails_closed_on_registry_tampering(tmp_path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import sqlite3
@@ -31,15 +32,19 @@ from kunjin.decision.models import (
     WorkflowLevel,
     canonical_json_bytes,
     validate_aware_datetime,
+    validate_checksum,
     validate_identifier,
     validate_identifier_tuple,
     validate_request_id,
 )
 from kunjin.decision.policy import EvidencePolicyV1
 from kunjin.decision.source_registry import SourceRegistryV1
+from kunjin.decision.worker_protocol import MAX_RESPONSE_BYTES
 from kunjin.storage.repository import Repository
 
 _SUBJECT_KEY_PATTERN = re.compile(r"^fund:[0-9]{6}$")
+MAX_CANONICAL_ROUTE_BYTES = MAX_RESPONSE_BYTES
+MAX_CANONICAL_ROUTE_DEPTH = 64
 
 
 class DecisionAuditStoreError(RuntimeError):
@@ -105,6 +110,7 @@ class DecisionAuditStore:
             raise DecisionAuditStoreError("source attempt registry binding failed")
         try:
             with self.repository.connect() as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
                 run = connection.execute(
                     "SELECT status, started_at, deadline_at FROM request_runs WHERE id = ?",
                     (request_run_id,),
@@ -196,13 +202,33 @@ class DecisionAuditStore:
         omitted_json = canonical_json_bytes(omitted_work).decode("ascii")
         try:
             with self.repository.connect() as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
                 cursor = connection.execute(
                     """
                     UPDATE request_runs
                     SET status = ?, finished_at = ?, omitted_work_json = ?
                     WHERE id = ? AND status = 'running'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM source_attempts
+                          WHERE request_run_id = ?
+                            AND finished_at COLLATE BINARY > ? COLLATE BINARY
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM decision_snapshots
+                          WHERE request_run_id = ?
+                            AND created_at COLLATE BINARY > ? COLLATE BINARY
+                      )
                     """,
-                    (status.value, finished_text, omitted_json, request_run_id),
+                    (
+                        status.value,
+                        finished_text,
+                        omitted_json,
+                        request_run_id,
+                        request_run_id,
+                        finished_text,
+                        request_run_id,
+                        finished_text,
+                    ),
                 )
                 if cursor.rowcount != 1:
                     raise DecisionAuditStoreError("request was not finalized exactly once")
@@ -242,19 +268,37 @@ class DecisionAuditStore:
             raise DecisionAuditStoreError("snapshot registry binding failed")
         route.validate()
         created_text = _utc_text(created_at, "snapshot creation")
-        policy_json = policy.canonical_json().decode("ascii")
-        registry_json = registry.canonical_json().decode("ascii")
-        route_json = route.canonical_json().decode("ascii")
+        policy_json_bytes = policy.canonical_json()
+        registry_json_bytes = registry.canonical_json()
+        route_json_bytes = route.canonical_json()
+        try:
+            _validate_route_frame_bounds(route_json_bytes)
+        except ValueError as exc:
+            raise DecisionAuditStoreError(str(exc)) from None
+        policy_json = policy_json_bytes.decode("ascii")
+        registry_json = registry_json_bytes.decode("ascii")
+        route_json = route_json_bytes.decode("ascii")
         try:
             with self.repository.connect() as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
                 run = connection.execute(
-                    "SELECT request_id, mode, status FROM request_runs WHERE id = ?",
+                    """
+                    SELECT request_id, mode, status, started_at, deadline_at
+                    FROM request_runs WHERE id = ?
+                    """,
                     (request_run_id,),
                 ).fetchone()
                 if run is None:
                     raise DecisionAuditStoreError("request run does not exist")
                 if run["status"] != "running":
                     raise DecisionAuditStoreError("request run is not running")
+                request_start = _stored_datetime(run["started_at"], "request start")
+                request_deadline = _stored_datetime(run["deadline_at"], "request deadline")
+                snapshot_created = _stored_datetime(created_text, "snapshot creation")
+                if not request_start <= snapshot_created <= request_deadline:
+                    raise DecisionAuditStoreError(
+                        "snapshot creation is outside its request lifetime"
+                    )
                 if route.request_id != run["request_id"] or route.mode.value != run["mode"]:
                     raise DecisionAuditStoreError("snapshot request binding failed")
                 connection.execute(
@@ -276,7 +320,7 @@ class DecisionAuditStore:
                         registry_json,
                         registry_checksum,
                         route_json,
-                        route.checksum(),
+                        hashlib.sha256(route_json_bytes).hexdigest(),
                         created_text,
                     ),
                 )
@@ -361,34 +405,44 @@ def _stored_snapshot(row: sqlite3.Row, request_run_id: int) -> StoredDecisionSna
     if stored_request_run_id != request_run_id:
         raise DecisionAuditStoreError("snapshot request binding failed")
 
-    policy_json = _canonical_object_bytes(row["evidence_policy_json"], "policy")
-    policy_checksum = _required_text(row["evidence_policy_checksum"], "policy checksum")
-    if hashlib.sha256(policy_json).hexdigest() != policy_checksum:
-        raise DecisionAuditStoreError("snapshot authentication failed")
     policy = EvidencePolicyV1()
+    policy_checksum = _required_checksum(
+        row["evidence_policy_checksum"], "policy checksum"
+    )
+    _authenticated_static_json_bytes(
+        row["evidence_policy_json"],
+        policy_checksum,
+        expected=policy.canonical_json(),
+        expected_checksum=policy.checksum(),
+        label="policy",
+    )
     if (
         row["evidence_policy_version"] != policy.version
         or policy_checksum != policy.checksum()
-        or policy_json != policy.canonical_json()
     ):
         raise DecisionAuditStoreError("snapshot authentication failed")
 
-    registry_json = _canonical_object_bytes(row["source_registry_json"], "registry")
-    registry_checksum = _required_text(row["source_registry_checksum"], "registry checksum")
-    if hashlib.sha256(registry_json).hexdigest() != registry_checksum:
-        raise DecisionAuditStoreError("snapshot authentication failed")
     registry = SourceRegistryV1()
+    registry_checksum = _required_checksum(
+        row["source_registry_checksum"], "registry checksum"
+    )
+    _authenticated_static_json_bytes(
+        row["source_registry_json"],
+        registry_checksum,
+        expected=registry.canonical_json(),
+        expected_checksum=registry.checksum(),
+        label="registry",
+    )
     if (
         row["source_registry_version"] != registry.version
         or registry_checksum != registry.checksum()
-        or registry_json != registry.canonical_json()
     ):
         raise DecisionAuditStoreError("snapshot authentication failed")
 
-    route_json = _canonical_object_bytes(row["canonical_route_json"], "route")
-    result_checksum = _required_text(row["result_checksum"], "result checksum")
-    if hashlib.sha256(route_json).hexdigest() != result_checksum:
-        raise DecisionAuditStoreError("snapshot authentication failed")
+    result_checksum = _required_checksum(row["result_checksum"], "result checksum")
+    route_json = _authenticated_route_json_bytes(
+        row["canonical_route_json"], result_checksum
+    )
     route = _decision_route_from_bytes(route_json)
     request_id = validate_request_id(row["request_id"])
     request_mode = RequestMode(row["request_mode"])
@@ -448,10 +502,13 @@ def _stored_attempt(row: sqlite3.Row) -> StoredSourceAttempt:
 
 
 def _decision_route_from_bytes(value: bytes) -> DecisionRoute:
-    payload = json.loads(
-        value.decode("ascii"),
-        parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
-    )
+    try:
+        payload = json.loads(
+            value.decode("ascii"),
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+        )
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+        raise ValueError("decision route JSON is invalid") from None
     _exact_keys(
         payload,
         {
@@ -568,16 +625,68 @@ def _conclusion_evidence(value: object) -> ConclusionEvidence:
     )
 
 
-def _canonical_object_bytes(value: object, label: str) -> bytes:
+def _authenticated_static_json_bytes(
+    value: object,
+    checksum: str,
+    *,
+    expected: bytes,
+    expected_checksum: str,
+    label: str,
+) -> bytes:
     text = _required_text(value, f"{label} JSON")
+    if len(text) != len(expected):
+        raise ValueError(f"{label} JSON length is invalid")
     encoded = text.encode("ascii")
-    parsed = json.loads(
-        text,
-        parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
-    )
-    if type(parsed) is not dict or canonical_json_bytes(parsed) != encoded:
-        raise ValueError(f"{label} JSON is not a canonical object")
+    if (
+        len(encoded) != len(expected)
+        or not hmac.compare_digest(encoded, expected)
+        or not hmac.compare_digest(checksum, expected_checksum)
+        or not hmac.compare_digest(hashlib.sha256(encoded).hexdigest(), checksum)
+    ):
+        raise ValueError(f"{label} JSON authentication failed")
     return encoded
+
+
+def _authenticated_route_json_bytes(value: object, checksum: str) -> bytes:
+    text = _required_text(value, "route JSON")
+    if len(text) > MAX_CANONICAL_ROUTE_BYTES:
+        raise ValueError("decision route is too large")
+    encoded = text.encode("ascii")
+    _validate_route_frame_bounds(encoded)
+    if not hmac.compare_digest(hashlib.sha256(encoded).hexdigest(), checksum):
+        raise ValueError("decision route checksum is invalid")
+    return encoded
+
+
+def _validate_route_frame_bounds(value: object) -> bytes:
+    if type(value) is not bytes or not value:
+        raise ValueError("decision route must be non-empty bytes")
+    if len(value) > MAX_CANONICAL_ROUTE_BYTES:
+        raise ValueError("decision route is too large")
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+        elif byte == 0x22:
+            in_string = True
+        elif byte in (0x5B, 0x7B):
+            depth += 1
+            if depth > MAX_CANONICAL_ROUTE_DEPTH:
+                raise ValueError("decision route nesting is too deep")
+        elif byte in (0x5D, 0x7D):
+            depth -= 1
+            if depth < 0:
+                raise ValueError("decision route nesting is invalid")
+    if depth != 0 or in_string or escaped:
+        raise ValueError("decision route nesting is invalid")
+    return value
 
 
 def _optional_decimal(value: Optional[str]) -> Optional[Decimal]:
@@ -623,6 +732,10 @@ def _required_text(value: object, label: str) -> str:
     if type(value) is not str or not value:
         raise ValueError(f"{label} must be a non-empty exact string")
     return value
+
+
+def _required_checksum(value: object, label: str) -> str:
+    return validate_checksum(value, label)
 
 
 def _utc_text(value: object, label: str) -> str:
