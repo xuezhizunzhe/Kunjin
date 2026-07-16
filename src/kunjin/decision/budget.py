@@ -39,7 +39,10 @@ def _validate_monotonic_time(value: object) -> float:
 
 
 class RequestBudget:
-    """A request lifetime governed exclusively by a monotonic deadline."""
+    """A single-parent request lifetime governed by a monotonic deadline.
+
+    The controlling parent path owns the instance; it is not shared across threads.
+    """
 
     __slots__ = (
         "_cancel_reason",
@@ -73,7 +76,7 @@ class RequestBudget:
         if type(mode) is not RequestMode:
             raise ValueError("mode must be an exact RequestMode")
         validate_request_id(request_id)
-        expected_total = _TOTAL_SECONDS[mode]
+        expected_total = 90.0 if mode is RequestMode.RAPID else 480.0
         if (
             type(total_seconds) is not float
             or not math.isfinite(total_seconds)
@@ -85,7 +88,7 @@ class RequestBudget:
             or not math.isfinite(cleanup_reserve_seconds)
             or cleanup_reserve_seconds <= 0.0
             or cleanup_reserve_seconds >= total_seconds
-            or cleanup_reserve_seconds != CLEANUP_RESERVE_SECONDS
+            or cleanup_reserve_seconds != 2.0
         ):
             raise ValueError("cleanup reserve must be the positive bounded policy value")
         if not callable(monotonic):
@@ -98,6 +101,10 @@ class RequestBudget:
         monotonic_deadline = monotonic_start + total_seconds
         if not math.isfinite(monotonic_deadline) or monotonic_deadline <= monotonic_start:
             raise ValueError("monotonic deadline must be finite and after its start")
+        try:
+            deadline_at = started_at + timedelta(seconds=total_seconds)
+        except OverflowError:
+            raise ValueError("audit deadline is outside the datetime range") from None
 
         object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "request_id", request_id)
@@ -108,7 +115,7 @@ class RequestBudget:
         object.__setattr__(self, "monotonic_deadline", monotonic_deadline)
         object.__setattr__(self, "_last_monotonic", monotonic_start)
         object.__setattr__(self, "started_at", started_at)
-        object.__setattr__(self, "deadline_at", started_at + timedelta(seconds=total_seconds))
+        object.__setattr__(self, "deadline_at", deadline_at)
         object.__setattr__(self, "_cancelled", False)
         object.__setattr__(self, "_cancel_reason", None)
 
@@ -132,6 +139,10 @@ class RequestBudget:
         if request_id is None:
             request_id = uuid.uuid4().hex
         validate_request_id(request_id)
+        if not callable(monotonic):
+            raise ValueError("monotonic clock must be callable")
+        if not callable(wall_clock):
+            raise ValueError("wall clock must be callable")
 
         monotonic_start = _validate_monotonic_time(monotonic())
         started_at = validate_aware_datetime(wall_clock(), "wall clock").astimezone(
@@ -141,8 +152,8 @@ class RequestBudget:
             _token=_CONSTRUCTION_TOKEN,
             mode=mode,
             request_id=request_id,
-            total_seconds=_TOTAL_SECONDS[mode],
-            cleanup_reserve_seconds=CLEANUP_RESERVE_SECONDS,
+            total_seconds=90.0 if mode is RequestMode.RAPID else 480.0,
+            cleanup_reserve_seconds=2.0,
             monotonic=monotonic,
             monotonic_start=monotonic_start,
             started_at=started_at,
@@ -167,7 +178,11 @@ class RequestBudget:
         object.__setattr__(self, "_cancelled", True)
 
     def _read_monotonic(self) -> float:
-        current = _validate_monotonic_time(self.monotonic())
+        try:
+            current = _validate_monotonic_time(self.monotonic())
+        except Exception:
+            self._cancel("monotonic_clock_invalid")
+            raise BudgetExpired("monotonic clock returned an invalid reading") from None
         if current < self._last_monotonic:
             self._cancel("monotonic_clock_regressed")
             raise BudgetExpired("monotonic clock regressed")

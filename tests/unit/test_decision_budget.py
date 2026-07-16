@@ -292,3 +292,86 @@ def test_monotonic_clock_regression_fails_closed_without_expanding_budget() -> N
     ticks[0] = 120.0
     with pytest.raises(BudgetExpired, match="cancelled"):
         budget.require_publishable()
+
+
+def test_rebinding_module_policy_names_cannot_change_fixed_budget_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        budget_module,
+        "_TOTAL_SECONDS",
+        {RequestMode.RAPID: 480.0, RequestMode.DEEP: 90.0},
+    )
+    monkeypatch.setattr(budget_module, "CLEANUP_RESERVE_SECONDS", 3.0)
+
+    rapid = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id="6" * 32,
+        monotonic=lambda: 100.0,
+        wall_clock=lambda: UTC_START,
+    )
+    deep = RequestBudget.create(
+        RequestMode.DEEP,
+        request_id="7" * 32,
+        monotonic=lambda: 100.0,
+        wall_clock=lambda: UTC_START,
+    )
+
+    assert (rapid.total_seconds, rapid.cleanup_reserve_seconds) == (90.0, 2.0)
+    assert (deep.total_seconds, deep.cleanup_reserve_seconds) == (480.0, 2.0)
+    with pytest.raises(ValueError, match="total seconds"):
+        RequestBudget(**_constructor_values(total_seconds=480.0))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="cleanup reserve"):
+        RequestBudget(  # type: ignore[arg-type]
+            **_constructor_values(cleanup_reserve_seconds=3.0)
+        )
+
+
+@pytest.mark.parametrize("invalid_tick", [float("nan"), float("inf"), float("-inf"), 1, True])
+def test_invalid_runtime_monotonic_reading_permanently_cancels_budget(
+    invalid_tick: object,
+) -> None:
+    ticks = [100.0]
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id="8" * 32,
+        monotonic=lambda: ticks[0],  # type: ignore[return-value]
+        wall_clock=lambda: UTC_START,
+    )
+
+    ticks[0] = invalid_tick
+    with pytest.raises(BudgetExpired, match="invalid"):
+        budget.worker_seconds()
+
+    assert budget.cancelled is True
+    assert budget.cancel_reason == "monotonic_clock_invalid"
+    ticks[0] = 110.0
+    assert budget.worker_seconds() == 0.0
+    with pytest.raises(BudgetExpired, match="cancelled: monotonic_clock_invalid"):
+        budget.require_publishable()
+
+
+@pytest.mark.parametrize("clock_name", ["monotonic", "wall_clock"])
+def test_create_rejects_non_callable_clocks_as_validation_errors(clock_name: str) -> None:
+    arguments = {
+        "monotonic": lambda: 1.0,
+        "wall_clock": lambda: UTC_START,
+    }
+    arguments[clock_name] = None
+
+    with pytest.raises(ValueError, match=f"{clock_name.replace('_', ' ')}.*callable"):
+        RequestBudget.create(  # type: ignore[arg-type]
+            RequestMode.RAPID,
+            request_id="9" * 32,
+            **arguments,
+        )
+
+
+def test_audit_deadline_overflow_fails_as_a_validation_error() -> None:
+    with pytest.raises(ValueError, match="audit deadline"):
+        RequestBudget.create(
+            RequestMode.RAPID,
+            request_id="a" * 32,
+            monotonic=lambda: 1.0,
+            wall_clock=lambda: datetime.max.replace(tzinfo=timezone.utc),
+        )
