@@ -375,3 +375,89 @@ def test_audit_deadline_overflow_fails_as_a_validation_error() -> None:
             monotonic=lambda: 1.0,
             wall_clock=lambda: datetime.max.replace(tzinfo=timezone.utc),
         )
+
+
+@pytest.mark.parametrize(
+    "mode,monotonic_start,represented_span",
+    [
+        (RequestMode.RAPID, float(2**59), 128.0),
+        (RequestMode.DEEP, float(2**58), 512.0),
+    ],
+)
+def test_represented_monotonic_span_cannot_exceed_policy_total(
+    mode: RequestMode,
+    monotonic_start: float,
+    represented_span: float,
+) -> None:
+    total_seconds = 90.0 if mode is RequestMode.RAPID else 480.0
+    assert monotonic_start + total_seconds - monotonic_start == represented_span
+    assert represented_span > total_seconds
+
+    with pytest.raises(ValueError, match="span exceeds"):
+        RequestBudget.create(
+            mode,
+            request_id="b" * 32,
+            monotonic=lambda: monotonic_start,
+            wall_clock=lambda: UTC_START,
+        )
+
+
+def test_conservatively_shortened_represented_span_is_allowed() -> None:
+    monotonic_start = float(2**58)
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id="e" * 32,
+        monotonic=lambda: monotonic_start,
+        wall_clock=lambda: UTC_START,
+    )
+
+    assert budget.monotonic_deadline - budget.monotonic_start == 64.0
+    assert budget.worker_seconds() == 62.0
+
+
+@pytest.mark.parametrize("clock_name", ["monotonic", "wall_clock"])
+def test_create_sanitizes_injected_clock_exceptions(clock_name: str) -> None:
+    def failing_clock():
+        raise RuntimeError("sensitive injected clock detail")
+
+    arguments = {
+        "monotonic": lambda: 1.0,
+        "wall_clock": lambda: UTC_START,
+    }
+    arguments[clock_name] = failing_clock
+    clock_label = "monotonic clock" if clock_name == "monotonic" else "wall clock"
+
+    with pytest.raises(ValueError, match=f"^{clock_label} failed$") as raised:
+        RequestBudget.create(
+            RequestMode.RAPID,
+            request_id="c" * 32,
+            **arguments,
+        )
+
+    assert "sensitive" not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "clock_name,exception",
+    [("monotonic", KeyboardInterrupt()), ("wall_clock", SystemExit())],
+)
+def test_create_does_not_swallow_control_flow_exceptions(
+    clock_name: str,
+    exception: BaseException,
+) -> None:
+    def interrupted_clock():
+        raise exception
+
+    arguments = {
+        "monotonic": lambda: 1.0,
+        "wall_clock": lambda: UTC_START,
+    }
+    arguments[clock_name] = interrupted_clock
+
+    with pytest.raises(type(exception)):
+        RequestBudget.create(
+            RequestMode.RAPID,
+            request_id="d" * 32,
+            **arguments,
+        )

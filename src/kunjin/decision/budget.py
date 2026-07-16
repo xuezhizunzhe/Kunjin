@@ -101,6 +101,8 @@ class RequestBudget:
         monotonic_deadline = monotonic_start + total_seconds
         if not math.isfinite(monotonic_deadline) or monotonic_deadline <= monotonic_start:
             raise ValueError("monotonic deadline must be finite and after its start")
+        if monotonic_deadline - monotonic_start > total_seconds:
+            raise ValueError("represented monotonic deadline span exceeds total seconds")
         try:
             deadline_at = started_at + timedelta(seconds=total_seconds)
         except OverflowError:
@@ -144,10 +146,19 @@ class RequestBudget:
         if not callable(wall_clock):
             raise ValueError("wall clock must be callable")
 
-        monotonic_start = _validate_monotonic_time(monotonic())
-        started_at = validate_aware_datetime(wall_clock(), "wall clock").astimezone(
-            timezone.utc
-        )
+        try:
+            monotonic_value = monotonic()
+        except Exception:
+            raise ValueError("monotonic clock failed") from None
+        monotonic_start = _validate_monotonic_time(monotonic_value)
+        try:
+            wall_clock_value = wall_clock()
+        except Exception:
+            raise ValueError("wall clock failed") from None
+        started_at = validate_aware_datetime(
+            wall_clock_value,
+            "wall clock",
+        ).astimezone(timezone.utc)
         return cls(
             _token=_CONSTRUCTION_TOKEN,
             mode=mode,
