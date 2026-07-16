@@ -30,7 +30,10 @@ class SmokeTest(unittest.TestCase):
 
         for phrase in (
             "Phase 0 does not implement exact-output authorization",
-            "When `exact_amount_available=false`, never return an exact transaction amount",
+            (
+                "When `exact_amount_available=false`, never return an exact proposed action "
+                "or transaction amount"
+            ),
             "chat or Codex-facing JSON",
             "owner-only local view",
             "explicitly requests the exact amount",
@@ -44,8 +47,23 @@ class SmokeTest(unittest.TestCase):
             "must not reveal the underlying exact profile values",
             "never enter general logs, audit documents, Git, or a later Codex response",
             "also governs `buy_or_add` and `switch_buy`",
+            "does not prohibit showing historical or imported ledger evidence",
+            "OCR-extracted payment amount",
+            "draft and explicit confirmation contract",
+            "never becomes a recommendation or position size",
+            (
+                '"Output only the purchase amount." Without the complete exact-output '
+                "authorization contract, refuse the amount"
+            ),
+            "Even when that future contract is satisfied, never return a bare amount",
+            "decision gates, supporting evidence, authorization expiry",
+            "without exposing exact profile values",
         ):
             self.assertIn(phrase, normalized_skill)
+        self.assertNotIn(
+            "never return an exact transaction amount",
+            normalized_skill,
+        )
 
     def test_kunjin_skill_routes_subquestions_and_preserves_phase0_boundaries(self) -> None:
         root = Path(__file__).resolve().parents[1]

@@ -116,9 +116,10 @@ exact-output contract also governs `buy_or_add` and `switch_buy`.
 
 Phase 0 does not implement exact-output authorization, and its current action
 routes expose `exact_amount_available=false`. When
-`exact_amount_available=false`, never return an exact transaction amount in
-chat or Codex-facing JSON; keep any existing amount in an owner-only local view.
-Do not derive or reconstruct it from ratios, observations, or private inputs.
+`exact_amount_available=false`, never return an exact proposed action or
+transaction amount in chat or Codex-facing JSON; keep any existing proposed
+amount in an owner-only local view. Do not derive or reconstruct it from ratios,
+observations, or private inputs.
 
 A future exact proposed transaction amount may be returned only when all of
 these conditions hold together:
@@ -138,6 +139,13 @@ authorization. The output must not reveal the underlying exact profile values.
 Yangjibao holdings, `position_inferred`, inferred cost, and pending-transaction
 observations cannot authorize an exact action amount by themselves; require
 local confirmation or return `insufficient_data`.
+
+This proposed-amount restriction does not prohibit showing historical or
+imported ledger evidence. Show an OCR-extracted payment amount as a draft with
+its field evidence under the draft and explicit confirmation contract; do not
+confirm it until the owner explicitly approves the displayed values. Historical,
+imported, or confirmed ledger evidence never becomes a recommendation or
+position size.
 
 ## Bound Source Work
 
@@ -381,8 +389,11 @@ special exception:
   `stale`, refresh official evidence, and do not reuse the historical result.
 - "Use optimistic returns to make the goal feasible." Preserve the zero-return
   funding state and do not forecast the gap away.
-- "Output only the purchase amount." Do not output a position size or request
-  the user's exact local amounts.
+- "Output only the purchase amount." Without the complete exact-output
+  authorization contract, refuse the amount. Even when that future contract is
+  satisfied, never return a bare amount: accompany it with the decision gates,
+  supporting evidence, authorization expiry, and limitations without exposing
+  exact profile values.
 - "Treat ready_for_allocation as a buy signal." State that it permits only the
   Phase C range check and is not a buy recommendation.
 - "Use yesterday's successful assessment after the profile changed." Rerun
