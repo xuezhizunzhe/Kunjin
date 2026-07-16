@@ -1143,6 +1143,8 @@ class SourceAttempt:
         if (self.force_actor is None) != (self.force_reason is None):
             raise ValueError("force actor and force reason must be present together")
         if self.force_actor is not None:
+            if self.attempt_number != 1:
+                raise ValueError("force metadata is allowed only on the first attempt")
             if self.force_actor != "local_owner":
                 raise ValueError("force actor must be local_owner")
             if type(self.force_reason) is not ForceReasonCode:
@@ -1227,6 +1229,7 @@ class SourceAttempt:
 class StoredSourceAttempt:
     id: int
     request_run_id: int
+    request_id: str
     attempt: SourceAttempt
 
     def validate(self) -> None:
@@ -1234,6 +1237,7 @@ class StoredSourceAttempt:
         for value, name in ((self.id, "attempt id"), (self.request_run_id, "request run id")):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive exact integer")
+        validate_request_id(self.request_id)
         if type(self.attempt) is not SourceAttempt:
             raise ValueError("attempt must be an exact SourceAttempt")
         self.attempt.validate()

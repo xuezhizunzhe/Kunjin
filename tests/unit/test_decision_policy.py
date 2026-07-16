@@ -913,6 +913,17 @@ def test_source_attempt_accepts_allowlisted_force_reason() -> None:
     attempt.validate()
 
 
+def test_source_attempt_rejects_force_metadata_after_first_attempt() -> None:
+    attempt = _source_attempt(
+        attempt_number=2,
+        force_actor="local_owner",
+        force_reason=ForceReasonCode.OWNER_APPROVED_RETRY,
+    )
+
+    with pytest.raises(ValueError, match="first attempt"):
+        attempt.validate()
+
+
 def test_source_attempt_accepts_safe_exact_identifiers() -> None:
     attempt = _source_attempt(attempt_number=2)
     attempt.validate()
@@ -1290,7 +1301,12 @@ def test_v1_and_nested_records_reject_injected_state() -> None:
         replace(route),
         replace(route.actions[0]),
         replace(attempt),
-        StoredSourceAttempt(id=1, request_run_id=1, attempt=attempt),
+        StoredSourceAttempt(
+            id=1,
+            request_run_id=1,
+            request_id="0123456789abcdef0123456789abcdef",
+            attempt=attempt,
+        ),
     )
     for record in records:
         object.__setattr__(record, "unexpected", "state")

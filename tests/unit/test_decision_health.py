@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from kunjin.decision.budget import RequestBudget
+from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.health import (
     INITIAL_COOLDOWN,
     ForceAuthorization,
@@ -49,6 +50,8 @@ class _Harness:
 
     def record(self, **overrides) -> SourceAttempt:
         self.sequence += 1
+        mode = overrides.pop("mode", RequestMode.RAPID)
+        request_id = overrides.pop("request_id", f"{self.sequence:032x}")
         finished_at = overrides.pop(
             "finished_at", NOW - timedelta(minutes=20 - self.sequence)
         )
@@ -73,8 +76,8 @@ class _Harness:
         values.update(overrides)
         attempt = SourceAttempt(**values)
         budget = RequestBudget.create(
-            RequestMode.RAPID,
-            request_id=f"{self.sequence:032x}",
+            mode,
+            request_id=request_id,
             monotonic=lambda: 10.0,
             wall_clock=lambda: attempt.started_at,
         )
@@ -122,6 +125,22 @@ def _attempt(**overrides) -> SourceAttempt:
     return attempt
 
 
+def _budget(
+    mode: RequestMode,
+    request_id: str,
+    *,
+    clock: _Clock | None = None,
+) -> RequestBudget:
+    if clock is None:
+        clock = _Clock(10.0)
+    return RequestBudget.create(
+        mode,
+        request_id=request_id,
+        monotonic=clock,
+        wall_clock=lambda: NOW,
+    )
+
+
 def test_manual_supplement_is_only_a_request_resolution() -> None:
     assert RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED.value == (
         "manual_supplement_required"
@@ -161,6 +180,86 @@ def test_cache_hit_is_success_evidence(tmp_path) -> None:
 
     assert harness.service.source_field_state(*PRIMARY, SUBJECT, _context()) is (
         SourceFieldState.HEALTHY
+    )
+
+
+def test_same_request_uses_authenticated_run_request_id(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    identity = ("yangjibao_portfolio_observation", "personal_position_observation")
+    actual_request_id = "c" * 32
+    claimed_request_id = "d" * 32
+    harness.record(
+        identity=identity,
+        request_id=actual_request_id,
+        finished_at=NOW,
+        data_as_of=NOW - timedelta(minutes=1),
+    )
+
+    state = harness.service.source_field_state(
+        *identity,
+        SUBJECT,
+        _context(
+            request_id=claimed_request_id,
+            data_request_id=claimed_request_id,
+        ),
+    )
+
+    assert state is SourceFieldState.DEGRADED
+
+
+def test_same_request_can_be_current_from_authenticated_run(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    identity = ("yangjibao_portfolio_observation", "personal_position_observation")
+    request_id = "e" * 32
+    harness.record(
+        identity=identity,
+        request_id=request_id,
+        finished_at=NOW,
+        data_as_of=NOW - timedelta(minutes=1),
+    )
+
+    state = harness.service.source_field_state(
+        *identity,
+        SUBJECT,
+        _context(request_id=request_id, data_request_id="f" * 32),
+    )
+
+    assert state is SourceFieldState.HEALTHY
+
+
+def test_same_trading_day_is_derived_from_attempt_data_date(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    identity = (
+        "fund_manager_official_documents",
+        "transaction_availability_limits_cutoff",
+    )
+    harness.record(
+        identity=identity,
+        finished_at=NOW,
+        data_as_of=NOW - timedelta(minutes=1),
+    )
+
+    state = harness.service.source_field_state(
+        *identity,
+        SUBJECT,
+        _context(
+            trading_day=NOW.date(),
+            data_trading_day=(NOW - timedelta(days=1)).date(),
+        ),
+    )
+
+    assert state is SourceFieldState.HEALTHY
+
+
+def test_future_attempts_are_ignored(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(
+        finished_at=NOW + timedelta(minutes=1),
+        data_as_of=NOW,
+    )
+
+    assert harness.service.source_field_state(*PRIMARY, SUBJECT, _context()) is (
+        SourceFieldState.NOT_CHECKED
     )
 
 
@@ -252,6 +351,22 @@ def test_dated_alternative_is_partial_without_promoting_it(tmp_path) -> None:
     )
 
 
+def test_lower_tier_healthy_alternative_cannot_satisfy_tier_one_field(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(
+        identity=ALTERNATIVE,
+        outcome=SourceAttemptOutcome.UNSUPPORTED,
+        data_as_of=None,
+        error_code=SourceErrorCode.HTTP_NOT_FOUND,
+        response_bytes=0,
+    )
+    harness.record(identity=PRIMARY, data_as_of=NOW - timedelta(days=1))
+
+    assert harness.service.resolve_field(*ALTERNATIVE, SUBJECT, _context()) is (
+        RequestFieldResolution.PARTIAL
+    )
+
+
 def test_manual_supplement_requires_all_alternatives_to_be_exhausted(tmp_path) -> None:
     harness = _Harness(tmp_path)
     harness.record(
@@ -310,6 +425,9 @@ def test_only_first_retryable_transient_attempt_with_budget_can_retry(tmp_path) 
         _attempt(), budget, minimum_worker_seconds=5.0
     )
     assert not harness.service.retry_allowed(
+        _attempt(), budget, minimum_worker_seconds=5.0
+    )
+    assert not harness.service.retry_allowed(
         _attempt(attempt_number=2), budget, minimum_worker_seconds=5.0
     )
 
@@ -317,6 +435,33 @@ def test_only_first_retryable_transient_attempt_with_budget_can_retry(tmp_path) 
     assert not harness.service.retry_allowed(
         _attempt(), budget, minimum_worker_seconds=5.0
     )
+
+
+def test_retry_authorization_is_atomic_under_concurrency(tmp_path) -> None:
+    service = _Harness(tmp_path).service
+    budget = _budget(RequestMode.RAPID, "1" * 32)
+    barrier = threading.Barrier(3)
+    results: list[bool] = []
+
+    def attempt_retry() -> None:
+        barrier.wait()
+        results.append(
+            service.retry_allowed(
+                _attempt(),
+                budget,
+                minimum_worker_seconds=5.0,
+            )
+        )
+
+    threads = [threading.Thread(target=attempt_retry) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(results) == [False, True]
 
 
 @pytest.mark.parametrize(
@@ -366,31 +511,153 @@ def test_deterministic_failures_never_retry(tmp_path, attempt: SourceAttempt) ->
 def test_force_requires_deep_mode_allowlisted_reason_and_first_attempt(tmp_path) -> None:
     service = _Harness(tmp_path).service
     reason = ForceReasonCode.OWNER_APPROVED_RETRY
+    rapid_budget = _budget(RequestMode.RAPID, "2" * 32)
+    deep_budget = _budget(RequestMode.DEEP, "3" * 32)
 
     with pytest.raises(ValueError, match="deep"):
-        service.force_authorization(RequestMode.RAPID, reason, attempt_number=1)
+        service.force_authorization(
+            rapid_budget,
+            *PRIMARY,
+            SUBJECT,
+            NOW + timedelta(seconds=1),
+            reason,
+            attempt_number=1,
+        )
     with pytest.raises(ValueError, match="force reason"):
-        service.force_authorization(RequestMode.DEEP, "", attempt_number=1)
+        service.force_authorization(
+            deep_budget,
+            *PRIMARY,
+            SUBJECT,
+            NOW + timedelta(seconds=1),
+            "",
+            attempt_number=1,
+        )
+    with pytest.raises(ValueError, match="first attempt"):
+        service.force_authorization(
+            deep_budget,
+            *PRIMARY,
+            SUBJECT,
+            NOW + timedelta(seconds=1),
+            reason,
+            attempt_number=2,
+        )
 
     assert service.force_authorization(
-        RequestMode.DEEP, reason, attempt_number=1
-    ) == ForceAuthorization(actor="local_owner", reason=reason)
+        deep_budget,
+        *PRIMARY,
+        SUBJECT,
+        NOW + timedelta(seconds=1),
+        reason,
+        attempt_number=1,
+    ) == ForceAuthorization(
+        actor="local_owner",
+        reason=reason,
+        request_id=deep_budget.request_id,
+        source_id=PRIMARY[0],
+        field_id=PRIMARY[1],
+        subject_key=SUBJECT,
+        authorized_at=NOW + timedelta(seconds=1),
+        deadline_at=deep_budget.deadline_at,
+    )
     assert service.force_authorization(
-        RequestMode.DEEP, reason, attempt_number=2
+        deep_budget,
+        *PRIMARY,
+        SUBJECT,
+        NOW + timedelta(seconds=2),
+        reason,
+        attempt_number=1,
     ) is None
+
+
+def test_force_requires_publishable_budget_and_bounded_wall_time(tmp_path) -> None:
+    service = _Harness(tmp_path).service
+    clock = _Clock(10.0)
+    budget = _budget(RequestMode.DEEP, "4" * 32, clock=clock)
+    reason = ForceReasonCode.VERIFY_SOURCE_RECOVERY
+
+    with pytest.raises(ValueError, match="request lifetime"):
+        service.force_authorization(
+            budget,
+            *PRIMARY,
+            SUBJECT,
+            NOW - timedelta(microseconds=1),
+            reason,
+            attempt_number=1,
+        )
+
+    clock.value = 490.0
+    with pytest.raises(BudgetExpired, match="deadline"):
+        service.force_authorization(
+            budget,
+            *PRIMARY,
+            SUBJECT,
+            NOW + timedelta(seconds=1),
+            reason,
+            attempt_number=1,
+        )
+
+
+def test_force_authorization_is_atomic_under_concurrency(tmp_path) -> None:
+    service = _Harness(tmp_path).service
+    budget = _budget(RequestMode.DEEP, "9" * 32)
+    barrier = threading.Barrier(3)
+    results: list[ForceAuthorization | None] = []
+
+    def authorize_force() -> None:
+        barrier.wait()
+        results.append(
+            service.force_authorization(
+                budget,
+                *PRIMARY,
+                SUBJECT,
+                NOW + timedelta(seconds=1),
+                ForceReasonCode.OWNER_APPROVED_RETRY,
+                attempt_number=1,
+            )
+        )
+
+    threads = [threading.Thread(target=authorize_force) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sum(result is not None for result in results) == 1
+    assert sum(result is None for result in results) == 1
 
 
 def test_ordinary_request_never_inherits_prior_force(tmp_path) -> None:
     service = _Harness(tmp_path).service
+    deep_budget = _budget(RequestMode.DEEP, "5" * 32)
     forced = service.force_authorization(
-        RequestMode.DEEP,
+        deep_budget,
+        *PRIMARY,
+        SUBJECT,
+        NOW + timedelta(seconds=1),
         ForceReasonCode.VERIFY_SOURCE_RECOVERY,
         attempt_number=1,
     )
     assert forced is not None
 
+    rapid_budget = _budget(RequestMode.RAPID, "6" * 32)
     assert service.force_authorization(
-        RequestMode.RAPID,
+        rapid_budget,
+        *PRIMARY,
+        SUBJECT,
+        NOW + timedelta(seconds=1),
         None,
         attempt_number=1,
     ) is None
+
+
+def test_health_service_requires_exact_audit_store_type(tmp_path) -> None:
+    repository = Repository(tmp_path / "kunjin.db")
+    repository.migrate()
+
+    class DerivedStore(DecisionAuditStore):
+        pass
+
+    with pytest.raises(ValueError, match="exact DecisionAuditStore"):
+        SourceHealthService(DerivedStore(repository))

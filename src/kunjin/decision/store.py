@@ -112,13 +112,18 @@ class DecisionAuditStore:
             with self.repository.connect() as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
                 run = connection.execute(
-                    "SELECT status, started_at, deadline_at FROM request_runs WHERE id = ?",
+                    """
+                    SELECT mode, status, started_at, deadline_at
+                    FROM request_runs WHERE id = ?
+                    """,
                     (request_run_id,),
                 ).fetchone()
                 if run is None:
                     raise DecisionAuditStoreError("request run does not exist")
                 if run["status"] != "running":
                     raise DecisionAuditStoreError("request run is not running")
+                if attempt.force_actor is not None and run["mode"] != RequestMode.DEEP.value:
+                    raise DecisionAuditStoreError("force attempt requires a deep request")
                 request_start = _stored_datetime(run["started_at"], "request start")
                 request_deadline = _stored_datetime(run["deadline_at"], "request deadline")
                 if (
@@ -347,7 +352,7 @@ class DecisionAuditStore:
             with self.repository.connect() as connection:
                 rows = connection.execute(
                     """
-                    SELECT source_attempts.*
+                    SELECT source_attempts.*, request_runs.request_id AS request_id
                     FROM source_attempts
                     JOIN request_runs ON request_runs.id = source_attempts.request_run_id
                     WHERE source_id = ? AND field_id = ? AND subject_key = ?
@@ -571,6 +576,7 @@ def _stored_attempt(row: sqlite3.Row) -> StoredSourceAttempt:
     record = StoredSourceAttempt(
         id=_positive_id(row["id"], "attempt id"),
         request_run_id=_positive_id(row["request_run_id"], "request run id"),
+        request_id=validate_request_id(row["request_id"]),
         attempt=attempt,
     )
     record.validate()

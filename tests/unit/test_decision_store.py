@@ -21,6 +21,7 @@ from kunjin.decision.models import (
     DecisionRoute,
     EvidenceCompleteness,
     EvidenceFreshness,
+    ForceReasonCode,
     RequestMode,
     RequestTerminalStatus,
     RiskEffect,
@@ -386,8 +387,39 @@ def test_attempts_are_sequential_bounded_and_history_is_newest_first(tmp_path) -
 
     assert [item.id for item in history] == [second_id, first_id]
     assert [item.attempt.attempt_number for item in history] == [2, 1]
+    assert [item.request_id for item in history] == [REQUEST_ID, REQUEST_ID]
     with pytest.raises(DecisionAuditStoreError, match="attempt sequence"):
         store.record_source_attempt(request_run_id, _attempt(2))
+
+
+def test_force_attempt_requires_deep_run_and_round_trips_once(tmp_path) -> None:
+    _, store = _store(tmp_path)
+    forced = replace(
+        _attempt(),
+        force_actor="local_owner",
+        force_reason=ForceReasonCode.OWNER_APPROVED_RETRY,
+    )
+    rapid_run_id = store.begin_request(_budget(request_id="7" * 32))
+
+    with pytest.raises(DecisionAuditStoreError, match="deep"):
+        store.record_source_attempt(rapid_run_id, forced)
+
+    deep_request_id = "8" * 32
+    deep_run_id = store.begin_request(
+        _budget(request_id=deep_request_id, mode=RequestMode.DEEP)
+    )
+    attempt_id = store.record_source_attempt(deep_run_id, forced)
+    history = store.source_attempt_history(
+        forced.source_id,
+        forced.field_id,
+        forced.subject_key,
+    )
+
+    assert [(item.id, item.request_id) for item in history] == [
+        (attempt_id, deep_request_id)
+    ]
+    assert history[0].attempt.force_actor == "local_owner"
+    assert history[0].attempt.force_reason is ForceReasonCode.OWNER_APPROVED_RETRY
 
 
 def test_terminal_request_is_immutable_and_rejects_more_children(tmp_path) -> None:
