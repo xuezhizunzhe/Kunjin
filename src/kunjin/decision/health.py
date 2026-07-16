@@ -39,6 +39,13 @@ _SUCCESS_OUTCOMES = frozenset(
 _EXHAUSTED_STATES = frozenset(
     (SourceFieldState.UNAVAILABLE, SourceFieldState.UNSUPPORTED)
 )
+_REQUEST_LIFECYCLE_OUTCOMES = frozenset(
+    (
+        SourceAttemptOutcome.CANCELLED,
+        SourceAttemptOutcome.EXPIRED,
+        SourceAttemptOutcome.SKIPPED_COOLDOWN,
+    )
+)
 _SUBJECT_KEY_PATTERN = re.compile(r"^fund:[0-9]{6}$")
 _ACTION_RISK = {
     ActionKind.FACT_RESEARCH: RiskEffect.INFORMATION,
@@ -222,6 +229,7 @@ class SourceHealthService:
             budget,
             (reference,),
             subject_key,
+            trusted_context.now,
         )
         filtered = SourceFieldHistory(
             reference,
@@ -282,6 +290,7 @@ class SourceHealthService:
             budget,
             references,
             subject_key,
+            trusted_context.now,
         )
         filtered_histories = tuple(
             SourceFieldHistory(
@@ -290,6 +299,7 @@ class SourceHealthService:
                     record
                     for record in history.attempts
                     if record.attempt.finished_at <= trusted_context.now
+                    and record.attempt.outcome not in _REQUEST_LIFECYCLE_OUTCOMES
                 ),
             )
             for history in histories
@@ -356,6 +366,7 @@ class SourceHealthService:
             budget,
             references,
             subject_key,
+            trusted_context.now,
         )
         projected = tuple(
             (
@@ -559,6 +570,7 @@ class SourceHealthService:
             record
             for record in history.attempts
             if record.attempt.finished_at <= context.now
+            and record.attempt.outcome not in _REQUEST_LIFECYCLE_OUTCOMES
         )
         if not records:
             return SourceFieldState.NOT_CHECKED

@@ -22,7 +22,14 @@ from kunjin.allocation.service import (
     EncryptedProfileUnavailableError,
 )
 from kunjin.allocation.store import AllocationAssessmentStore, AllocationPolicyStore
-from kunjin.cli import ApplicationContext, build_context, run
+from kunjin.cli import (
+    ApplicationContext,
+    _conclusion_evidence_from_public,
+    _validate_decision_route_data,
+    _validate_source_status_data,
+    build_context,
+    run,
+)
 from kunjin.decision.budget import RequestBudget
 from kunjin.decision.health import SourceHealthService
 from kunjin.decision.models import (
@@ -32,6 +39,7 @@ from kunjin.decision.models import (
     RequestTerminalStatus,
     SourceAttempt,
     SourceAttemptOutcome,
+    SourceErrorCode,
     SourceFieldState,
 )
 from kunjin.decision.policy import EvidencePolicyV1
@@ -603,6 +611,84 @@ class CliIntegrationTest(unittest.TestCase):
             timedelta(0),
         )
 
+    def test_phase0_decision_route_validator_rejects_deep_shape_and_private_values(
+        self,
+    ) -> None:
+        payload, exit_code, _ = run(
+            ["--json", "decision", "route", "--action", "fact_research"],
+            self.context,
+        )
+        self.assertEqual(exit_code, 0)
+        valid = payload["data"]
+        _validate_decision_route_data(valid)
+
+        mutations = (
+            ("action_maturity", 7),
+            ("minimum_state", "target_amount"),
+            ("exact_amount_available", 1),
+            ("research_available", "true"),
+            ("required_gates", [918273645001]),
+            ("blocking_codes", {"monthly_net_income": 918273645001}),
+        )
+        for key, private_value in mutations:
+            with self.subTest(key=key):
+                changed = json.loads(json.dumps(valid))
+                changed["actions"][0][key] = private_value
+                with self.assertRaises(ValueError):
+                    _validate_decision_route_data(changed)
+
+        top_level_mutations = (
+            ("opposing_evidence", [918273645001]),
+            ("missing_fields", {"target_amount": 918273645001}),
+            ("conclusion_evidence", [{"monthly_net_income": 918273645001}]),
+        )
+        for key, private_value in top_level_mutations:
+            with self.subTest(key=key):
+                changed = json.loads(json.dumps(valid))
+                changed[key] = private_value
+                with self.assertRaises(ValueError):
+                    _validate_decision_route_data(changed)
+
+        changed = json.loads(json.dumps(valid))
+        changed["created_at"] = changed["created_at"].replace("+00:00", "Z")
+        with self.assertRaises(ValueError):
+            _validate_decision_route_data(changed)
+
+        conclusion = {
+            "completeness": "partial",
+            "conflicts": [],
+            "coverage_percent": None,
+            "freshness": "dated_history",
+            "independent_lineage_count": 0,
+            "inferred": False,
+            "lineage_ids": [],
+            "market_as_of": None,
+            "missing_critical_fields": ["identity_active_status"],
+            "publication_times": [],
+            "publishers": ["owner supplied public document"],
+            "report_as_of": None,
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "source_ids": [],
+            "source_tier": "user_provided",
+        }
+        _conclusion_evidence_from_public(conclusion)
+        for private_publisher in (
+            "target_amount=918273645001",
+            f"managed_path={self.context.paths.database}",
+            "failed at /private/tmp/output.log",
+            "runtime traceback: line 7",
+        ):
+            with self.subTest(private_publisher=private_publisher):
+                changed = json.loads(json.dumps(conclusion))
+                changed["publishers"] = [private_publisher]
+                with self.assertRaises(ValueError):
+                    _conclusion_evidence_from_public(changed)
+        changed = json.loads(json.dumps(conclusion))
+        changed["independent_lineage_count"] = 1
+        changed["lineage_ids"] = ["target_amount"]
+        with self.assertRaises(ValueError):
+            _conclusion_evidence_from_public(changed)
+
     def test_phase0_decision_route_supports_deep_and_switch_legs(self) -> None:
         payload, exit_code, _ = run(
             [
@@ -760,6 +846,66 @@ class CliIntegrationTest(unittest.TestCase):
                 },
             )
 
+    def test_phase0_source_status_validator_rejects_nested_private_values(self) -> None:
+        payload, exit_code, _ = run(
+            ["--json", "source", "status", "--fund-code", "000000"],
+            self.context,
+        )
+        self.assertEqual(exit_code, 0)
+        valid = payload["data"]
+        _validate_source_status_data(valid)
+
+        mutations = (
+            ("consecutive_failures", True),
+            ("field_scope", "monthly_net_income=918273645001"),
+            ("last_failure_reason", "target_amount"),
+            ("acceptable_alternatives", [{"monthly_net_income": 918273645001}]),
+            ("supplementation", {"target_amount": 918273645001}),
+        )
+        for key, private_value in mutations:
+            with self.subTest(key=key):
+                changed = json.loads(json.dumps(valid))
+                changed["source_fields"][0][key] = private_value
+                with self.assertRaises(ValueError):
+                    _validate_source_status_data(changed)
+
+        changed = json.loads(json.dumps(valid))
+        changed["source_fields"][0]["state"] = "healthy"
+        with self.assertRaises(ValueError):
+            _validate_source_status_data(changed)
+
+        now_text = datetime.now(timezone.utc).isoformat()
+        future_text = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        state_mutations = (
+            ("unsupported", "network_timeout", 1, None),
+            ("cooldown", "field_unsupported", 1, future_text),
+            ("unsupported", "field_unsupported", 0, None),
+            ("cooldown", "network_timeout", 0, future_text),
+        )
+        for state, reason, count, cooldown in state_mutations:
+            with self.subTest(state=state, reason=reason, count=count):
+                changed = json.loads(json.dumps(valid))
+                row = changed["source_fields"][0]
+                row["state"] = state
+                row["last_failure_at"] = now_text
+                row["last_failure_reason"] = reason
+                row["consecutive_failures"] = count
+                row["cooldown_until"] = cooldown
+                with self.assertRaises(ValueError):
+                    _validate_source_status_data(changed)
+
+        resolution_mutations = (
+            ("field_id", 918273645001),
+            ("resolution", "target_amount"),
+            ("primary_source_id", {"monthly_net_income": 918273645001}),
+        )
+        for key, private_value in resolution_mutations:
+            with self.subTest(key=key):
+                changed = json.loads(json.dumps(valid))
+                changed["request_field_resolutions"][0][key] = private_value
+                with self.assertRaises(ValueError):
+                    _validate_source_status_data(changed)
+
     def test_phase0_source_status_optional_code_and_strict_validation(self) -> None:
         payload, exit_code, _ = run(
             ["--json", "source", "status"], self.context
@@ -867,6 +1013,134 @@ class CliIntegrationTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row["status"], "expired")
         self.assertEqual(row["finished_at"], row["deadline_at"])
+
+    def test_phase0_source_status_does_not_count_scheduler_skip_as_failure(self) -> None:
+        now = datetime.now(timezone.utc)
+        store = self.context.source_health_service.audit_store
+        registry = self.context.source_health_service.registry
+
+        def record(attempt, request_started_at):
+            budget = RequestBudget.create(
+                RequestMode.RAPID,
+                wall_clock=lambda: request_started_at,
+            )
+            request_run_id = store.begin_request(budget)
+            store.record_source_attempt(request_run_id, attempt)
+            store.finalize_request(
+                request_run_id,
+                RequestTerminalStatus.COMPLETE,
+                attempt.finished_at,
+                (),
+            )
+
+        cooldown_until = now + timedelta(minutes=25)
+        failure = SourceAttempt(
+            source_id="eastmoney_nav",
+            field_id="formal_nav",
+            subject_key="fund:000000",
+            attempt_number=1,
+            outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+            started_at=now - timedelta(seconds=5),
+            finished_at=now - timedelta(seconds=4),
+            data_as_of=None,
+            error_code=SourceErrorCode.NETWORK_TIMEOUT,
+            cooldown_until=cooldown_until,
+            force_actor=None,
+            force_reason=None,
+            registry_version=registry.version,
+            registry_checksum=registry.checksum(),
+            response_bytes=0,
+        )
+        skipped = replace(
+            failure,
+            outcome=SourceAttemptOutcome.SKIPPED_COOLDOWN,
+            started_at=now - timedelta(seconds=3),
+            finished_at=now - timedelta(seconds=2),
+            error_code=SourceErrorCode.COOLDOWN_ACTIVE,
+        )
+        record(failure, now - timedelta(seconds=6))
+        record(skipped, now - timedelta(seconds=4))
+
+        payload, exit_code, _ = run(
+            ["--json", "source", "status", "--fund-code", "000000"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        nav = next(
+            item
+            for item in payload["data"]["source_fields"]
+            if item["source_id"] == "eastmoney_nav"
+            and item["field_id"] == "formal_nav"
+        )
+        self.assertEqual(nav["state"], "cooldown")
+        self.assertEqual(nav["last_failure_reason"], "network_timeout")
+        self.assertEqual(nav["consecutive_failures"], 1)
+
+    def test_phase0_source_status_allows_current_success_with_newer_failure(self) -> None:
+        now = datetime.now(timezone.utc)
+        store = self.context.source_health_service.audit_store
+        registry = self.context.source_health_service.registry
+
+        def record(attempt, request_started_at):
+            budget = RequestBudget.create(
+                RequestMode.RAPID,
+                wall_clock=lambda: request_started_at,
+            )
+            request_run_id = store.begin_request(budget)
+            store.record_source_attempt(request_run_id, attempt)
+            store.finalize_request(
+                request_run_id,
+                RequestTerminalStatus.COMPLETE,
+                attempt.finished_at,
+                (),
+            )
+
+        success = SourceAttempt(
+            source_id="eastmoney_nav",
+            field_id="formal_nav",
+            subject_key="fund:000000",
+            attempt_number=1,
+            outcome=SourceAttemptOutcome.SUCCESS,
+            started_at=now - timedelta(seconds=10),
+            finished_at=now - timedelta(seconds=9),
+            data_as_of=now - timedelta(days=1),
+            error_code=None,
+            cooldown_until=None,
+            force_actor=None,
+            force_reason=None,
+            registry_version=registry.version,
+            registry_checksum=registry.checksum(),
+            response_bytes=10,
+        )
+        failure = replace(
+            success,
+            outcome=SourceAttemptOutcome.UNAVAILABLE,
+            started_at=now - timedelta(seconds=4),
+            finished_at=now - timedelta(seconds=3),
+            data_as_of=None,
+            error_code=SourceErrorCode.PARSE_FAILURE,
+            response_bytes=0,
+        )
+        record(success, now - timedelta(seconds=11))
+        record(failure, now - timedelta(seconds=5))
+
+        payload, exit_code, _ = run(
+            ["--json", "source", "status", "--fund-code", "000000"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        nav = next(
+            item
+            for item in payload["data"]["source_fields"]
+            if item["source_id"] == "eastmoney_nav"
+            and item["field_id"] == "formal_nav"
+        )
+        self.assertIn(nav["state"], {"healthy", "degraded"})
+        self.assertEqual(nav["consecutive_failures"], 1)
+        self.assertEqual(nav["last_failure_reason"], "parse_failure")
+        self.assertIsNotNone(nav["last_success_at"])
 
     def test_phase0_command_errors_never_publish_private_exception_details(self) -> None:
         private_details = (

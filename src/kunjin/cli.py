@@ -37,7 +37,16 @@ from kunjin.analytics.research import analyze_fund_history, analyze_sectors
 from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.health import SourceHealthService
 from kunjin.decision.models import (
+    TRANSIENT_SOURCE_ERRORS,
+    UNSUPPORTED_SOURCE_ERRORS,
     ActionKind,
+    ActionMaturity,
+    ActionRoute,
+    ActionState,
+    ConclusionEvidence,
+    DecisionRoute,
+    EvidenceCompleteness,
+    EvidenceFreshness,
     ForceReasonCode,
     FreshnessContext,
     RequestFieldResolution,
@@ -45,9 +54,14 @@ from kunjin.decision.models import (
     RequestTerminalStatus,
     RiskEffect,
     SourceAttemptOutcome,
+    SourceErrorCode,
     SourceFieldRef,
     SourceFieldState,
     SourceTier,
+    WorkflowLevel,
+    validate_identifier,
+    validate_public_text,
+    validate_version,
 )
 from kunjin.decision.policy import EvidencePolicyV1
 from kunjin.decision.service import DecisionRoutingService
@@ -109,6 +123,7 @@ from kunjin.suitability.crypto import (
     ProfileKeyStore,
 )
 from kunjin.suitability.editor import ProfileEditor
+from kunjin.suitability.models import BlockReason, ConstraintReason
 from kunjin.suitability.policy import SuitabilityPolicyV1
 from kunjin.suitability.service import (
     ProfileService,
@@ -1581,6 +1596,25 @@ _ACTION_ROUTE_DATA_KEYS = frozenset(
         "risk_effect",
     }
 )
+_CONCLUSION_EVIDENCE_DATA_KEYS = frozenset(
+    {
+        "completeness",
+        "conflicts",
+        "coverage_percent",
+        "freshness",
+        "independent_lineage_count",
+        "inferred",
+        "lineage_ids",
+        "market_as_of",
+        "missing_critical_fields",
+        "publication_times",
+        "publishers",
+        "report_as_of",
+        "retrieved_at",
+        "source_ids",
+        "source_tier",
+    }
+)
 _SOURCE_STATUS_DATA_KEYS = frozenset(
     {
         "fund_code",
@@ -1616,43 +1650,100 @@ _SOURCE_FIELD_DATA_KEYS = frozenset(
 _REQUEST_FIELD_RESOLUTION_KEYS = frozenset(
     {"action", "field_id", "primary_source_id", "resolution", "risk_effect"}
 )
-_SUPPLEMENTATION_KEYS = frozenset(
+_REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
+_ACTION_REQUIRED_GATES = {
+    ActionKind.FACT_RESEARCH: (),
+    ActionKind.CONTINUE_HOLDING: ("phase_b_context", "phase_e_policy"),
+    ActionKind.REDUCE_TO_CASH: ("position", "fees", "settlement", "minimum_remainder"),
+    ActionKind.FULL_EXIT: (
+        "exit_reason",
+        "position",
+        "fees",
+        "settlement",
+        "use_of_proceeds",
+    ),
+    ActionKind.BUY_OR_ADD: ("phase_b", "phase_c", "d1", "d2", "d3", "post_trade"),
+}
+_ROUTE_FIELDS = frozenset(
     {
-        "accepted_input",
-        "freshness_requirement",
-        "impact_if_missing",
-        "missing_item",
-        "suggested_location",
-        "supported_without_it",
-        "unsupported_without_it",
-        "why_required",
+        "phase_b",
+        "phase_c",
+        "d1",
+        "d2",
+        "d3",
+        "post_trade",
+        "phase_e_policy",
+        "position",
+        "fees",
+        "settlement",
+        "minimum_remainder",
+        "exit_reason",
+        "use_of_proceeds",
     }
 )
-_PHASE0_PRIVATE_KEYS = frozenset(
+_ROUTE_BLOCKING_CODES = frozenset(
+    {
+        "phase_b_blocked",
+        "phase_e_policy_missing",
+        "financial_safety_not_current",
+        *(f"{field}_missing" for field in _ROUTE_FIELDS),
+        *(item.value for item in BlockReason),
+    }
+)
+_ROUTE_OPPOSING_CODES = frozenset(
+    {
+        "continued_exposure_is_not_risk_free",
+        "financial_safety_conflicts_with_continued_exposure",
+        "reduction_may_create_transaction_costs",
+        "full_exit_may_change_portfolio_balance",
+        "new_money_increases_risk",
+        *(item.value for item in ConstraintReason),
+    }
+)
+_SOURCE_FAILURE_OUTCOMES = frozenset(
+    {
+        SourceAttemptOutcome.TRANSIENT_FAILURE,
+        SourceAttemptOutcome.UNAVAILABLE,
+        SourceAttemptOutcome.UNSUPPORTED,
+    }
+)
+_PHASE0_FORBIDDEN_IDENTIFIERS = _RISK_PRIVATE_OUTPUT_KEYS | frozenset(
     {
         "access_token",
-        "body",
-        "ciphertext",
-        "debt",
-        "emergency_reserve",
-        "exception",
-        "exception_chain",
-        "goal_amount",
-        "income",
-        "local_path",
+        "account_balance",
+        "account_number",
+        "api_key",
+        "cookie",
         "managed_path",
-        "nonce",
-        "pid",
+        "monthly_net_income",
+        "order_id",
+        "password",
         "private_value",
-        "profile_key",
-        "raw_body",
-        "response_body",
+        "raw_exception",
+        "session_token",
+        "transaction_id",
         "worker_id",
         "worker_pid",
     }
 )
-_CHECKSUM = re.compile(r"^[0-9a-f]{64}$")
-_REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
+_PHASE0_PRIVATE_TEXT_MARKERS = (
+    "access token",
+    "account balance",
+    "account number",
+    "api key",
+    "emergency reserve",
+    "goal amount",
+    "managed path",
+    "maximum tolerable loss",
+    "monthly essential expenses",
+    "monthly net income",
+    "monthly required debt service",
+    "obligation amount",
+    "private value",
+    "target amount",
+    "transaction identifier",
+    "worker pid",
+)
 
 
 def _utc_iso(value: datetime) -> str:
@@ -1661,9 +1752,14 @@ def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
-def _validate_utc_iso(value: object, name: str, *, optional: bool = False) -> None:
+def _parse_utc_iso(
+    value: object,
+    name: str,
+    *,
+    optional: bool = False,
+) -> Optional[datetime]:
     if optional and value is None:
-        return
+        return None
     if type(value) is not str:
         raise ValueError(f"{name} must be an exact UTC timestamp")
     try:
@@ -1672,34 +1768,57 @@ def _validate_utc_iso(value: object, name: str, *, optional: bool = False) -> No
         raise ValueError(f"{name} must be an exact UTC timestamp") from None
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         raise ValueError(f"{name} must be an exact UTC timestamp")
+    if _utc_iso(parsed) != value:
+        raise ValueError(f"{name} must use canonical UTC representation")
+    return parsed
 
 
-def _validate_phase0_public_value(value: object) -> None:
-    if type(value) is dict:
-        for key, item in value.items():
-            if type(key) is not str or key.casefold() in _PHASE0_PRIVATE_KEYS:
-                raise ValueError("phase 0 output contains a private field")
-            _validate_phase0_public_value(item)
-        return
-    if type(value) is list:
-        for item in value:
-            _validate_phase0_public_value(item)
-        return
-    if type(value) is str:
-        lowered = value.casefold()
-        if any(
-            marker in lowered
-            for marker in (
-                "/users/",
-                "/private/",
-                "traceback (most recent call last)",
-                "access_token=",
-            )
-        ):
-            raise ValueError("phase 0 output contains local implementation details")
-        return
-    if value is not None and type(value) not in {bool, int, float}:
-        raise ValueError("phase 0 output contains an unsupported value")
+def _validate_utc_iso(value: object, name: str, *, optional: bool = False) -> None:
+    _parse_utc_iso(value, name, optional=optional)
+
+
+def _identifier_list(
+    value: object,
+    name: str,
+    *,
+    allow_empty: bool = True,
+) -> Tuple[str, ...]:
+    if type(value) is not list or len(value) > 128 or (not allow_empty and not value):
+        raise ValueError(f"{name} must be a bounded exact list")
+    result = tuple(_public_identifier(item, name) for item in value)
+    if len(result) != len(set(result)):
+        raise ValueError(f"{name} must not contain duplicates")
+    return result
+
+
+def _public_text_list(value: object, name: str) -> Tuple[str, ...]:
+    if type(value) is not list or len(value) > 128:
+        raise ValueError(f"{name} must be a bounded exact list")
+    result = tuple(_phase0_public_text(item, name) for item in value)
+    if len(result) != len(set(result)):
+        raise ValueError(f"{name} must not contain duplicates")
+    return result
+
+
+def _public_identifier(value: object, name: str) -> str:
+    result = validate_identifier(value, name)
+    if result in _PHASE0_FORBIDDEN_IDENTIFIERS:
+        raise ValueError(f"{name} is a private identifier")
+    return result
+
+
+def _phase0_public_text(value: object, name: str) -> str:
+    result = validate_public_text(value, name)
+    normalized = " ".join(
+        part for part in re.split(r"[\W_]+", result.casefold()) if part
+    )
+    if any(marker in normalized for marker in _PHASE0_PRIVATE_TEXT_MARKERS):
+        raise ValueError(f"{name} contains a private value")
+    try:
+        validate_public_risk_string(result)
+    except ValueError:
+        raise ValueError(f"{name} contains local implementation details")
+    return result
 
 
 def _decision_route_response(
@@ -1728,33 +1847,138 @@ def _decision_route_response(
 def _validate_decision_route_data(data: object) -> None:
     if type(data) is not dict or set(data) != _DECISION_ROUTE_DATA_KEYS:
         raise ValueError("decision route output keys are invalid")
-    if data["mode"] not in {item.value for item in RequestMode}:
-        raise ValueError("decision route mode is invalid")
-    expected_workflow = (
-        "rapid_evidence" if data["mode"] == RequestMode.RAPID.value else "decision_evidence"
-    )
-    if data["workflow_level"] != expected_workflow:
-        raise ValueError("decision route workflow level is invalid")
-    if type(data["request_id"]) is not str or not _REQUEST_ID.fullmatch(
-        data["request_id"]
-    ):
-        raise ValueError("decision route request id is invalid")
-    for key in ("policy_checksum", "registry_checksum", "result_checksum"):
-        if type(data[key]) is not str or not _CHECKSUM.fullmatch(data[key]):
-            raise ValueError("decision route checksum is invalid")
-    _validate_utc_iso(data["created_at"], "decision route creation")
     if type(data["actions"]) is not list or not data["actions"]:
         raise ValueError("decision route actions are invalid")
-    action_ids = []
-    for action in data["actions"]:
-        if type(action) is not dict or set(action) != _ACTION_ROUTE_DATA_KEYS:
-            raise ValueError("decision action output keys are invalid")
-        ActionKind(action["action"])
-        RiskEffect(action["risk_effect"])
-        action_ids.append(action["action_id"])
-    if len(action_ids) != len(set(action_ids)):
-        raise ValueError("decision action ids are invalid")
-    _validate_phase0_public_value(data)
+    if type(data["conclusion_evidence"]) is not list:
+        raise ValueError("decision conclusion evidence is invalid")
+    actions = tuple(_action_route_from_public(item) for item in data["actions"])
+    action_ids = tuple(action.action_id for action in actions)
+    has_switch_reduce = "switch_reduce" in action_ids
+    has_switch_buy = "switch_buy" in action_ids
+    if has_switch_reduce != has_switch_buy:
+        raise ValueError("decision switch route must contain both legs")
+    if has_switch_reduce:
+        reduce_index = action_ids.index("switch_reduce")
+        if (
+            reduce_index + 1 >= len(action_ids)
+            or action_ids[reduce_index + 1] != "switch_buy"
+        ):
+            raise ValueError("decision switch route legs are not adjacent and ordered")
+    conclusion_evidence = tuple(
+        _conclusion_evidence_from_public(item) for item in data["conclusion_evidence"]
+    )
+    route = DecisionRoute(
+        request_id=data["request_id"],
+        mode=RequestMode(data["mode"]),
+        workflow_level=WorkflowLevel(data["workflow_level"]),
+        actions=actions,
+        conclusion_evidence=conclusion_evidence,
+        opposing_evidence=_identifier_list(
+            data["opposing_evidence"], "opposing evidence"
+        ),
+        missing_fields=_identifier_list(data["missing_fields"], "missing fields"),
+        policy_version=validate_version(data["policy_version"], "policy version"),
+        policy_checksum=data["policy_checksum"],
+        registry_version=validate_version(
+            data["registry_version"], "registry version"
+        ),
+        registry_checksum=data["registry_checksum"],
+    )
+    route.validate()
+    if not set(route.opposing_evidence).issubset(_ROUTE_OPPOSING_CODES):
+        raise ValueError("decision route opposing evidence is invalid")
+    if not set(route.missing_fields).issubset(_ROUTE_FIELDS):
+        raise ValueError("decision route missing fields are invalid")
+    canonical = route.to_canonical_dict()
+    published_route = {key: data[key] for key in canonical}
+    if published_route != canonical:
+        raise ValueError("decision route output is not canonical")
+    _validate_utc_iso(data["created_at"], "decision route creation")
+    if type(data["result_checksum"]) is not str or (
+        data["result_checksum"] != route.checksum()
+    ):
+        raise ValueError("decision route result checksum is invalid")
+
+
+def _action_route_from_public(value: object) -> ActionRoute:
+    if type(value) is not dict or set(value) != _ACTION_ROUTE_DATA_KEYS:
+        raise ValueError("decision action output keys are invalid")
+    action = ActionKind(value["action"])
+    required_gates = _identifier_list(value["required_gates"], "required gates")
+    blocking_codes = _identifier_list(value["blocking_codes"], "blocking codes")
+    if required_gates != _ACTION_REQUIRED_GATES[action]:
+        raise ValueError("decision action required gates are invalid")
+    if not set(blocking_codes).issubset(_ROUTE_BLOCKING_CODES):
+        raise ValueError("decision action blocking codes are invalid")
+    action_id = _public_identifier(value["action_id"], "action id")
+    allowed_action_ids = {
+        ActionKind.REDUCE_TO_CASH: {"reduce_to_cash", "switch_reduce"},
+        ActionKind.BUY_OR_ADD: {"buy_or_add", "switch_buy"},
+    }.get(action, {action.value})
+    if action_id not in allowed_action_ids:
+        raise ValueError("decision action id is invalid")
+    route = ActionRoute(
+        action_id=action_id,
+        action=action,
+        risk_effect=RiskEffect(value["risk_effect"]),
+        required_gates=required_gates,
+        blocking_codes=blocking_codes,
+        research_available=value["research_available"],
+        exact_amount_available=value["exact_amount_available"],
+        minimum_state=ActionState(value["minimum_state"]),
+        action_maturity=ActionMaturity(value["action_maturity"]),
+    )
+    route.validate()
+    if route.to_canonical_dict() != value:
+        raise ValueError("decision action output is not canonical")
+    return route
+
+
+def _conclusion_evidence_from_public(value: object) -> ConclusionEvidence:
+    if type(value) is not dict or set(value) != _CONCLUSION_EVIDENCE_DATA_KEYS:
+        raise ValueError("decision conclusion evidence keys are invalid")
+    if type(value["publication_times"]) is not list or len(
+        value["publication_times"]
+    ) > 128:
+        raise ValueError("publication times must be a bounded exact list")
+    coverage = value["coverage_percent"]
+    if coverage is not None:
+        if type(coverage) is not str:
+            raise ValueError("coverage percent must be a canonical decimal string")
+        try:
+            coverage = Decimal(coverage)
+        except Exception:
+            raise ValueError("coverage percent must be a canonical decimal string") from None
+    evidence = ConclusionEvidence(
+        source_tier=SourceTier(value["source_tier"]),
+        publishers=_public_text_list(value["publishers"], "publishers"),
+        source_ids=_identifier_list(value["source_ids"], "source ids"),
+        publication_times=tuple(
+            _parse_utc_iso(item, "publication time")
+            for item in value["publication_times"]
+        ),
+        market_as_of=_parse_utc_iso(
+            value["market_as_of"], "market as of", optional=True
+        ),
+        report_as_of=_parse_utc_iso(
+            value["report_as_of"], "report as of", optional=True
+        ),
+        retrieved_at=_parse_utc_iso(value["retrieved_at"], "retrieved at"),
+        independent_lineage_count=value["independent_lineage_count"],
+        lineage_ids=_identifier_list(value["lineage_ids"], "lineage ids"),
+        completeness=EvidenceCompleteness(value["completeness"]),
+        coverage_percent=coverage,
+        freshness=EvidenceFreshness(value["freshness"]),
+        conflicts=_identifier_list(value["conflicts"], "conflicts"),
+        inferred=value["inferred"],
+        missing_critical_fields=_identifier_list(
+            value["missing_critical_fields"], "missing critical fields"
+        ),
+    )
+    evidence.validate()
+    if evidence.to_canonical_dict() != value:
+        raise ValueError("decision conclusion evidence is not canonical")
+    return evidence
 
 
 def _source_status_response(
@@ -1848,8 +2072,7 @@ def _source_status_response(
                 failed = tuple(
                     attempt
                     for attempt in attempts
-                    if attempt.outcome
-                    not in {SourceAttemptOutcome.SUCCESS, SourceAttemptOutcome.CACHE_HIT}
+                    if attempt.outcome in _SOURCE_FAILURE_OUTCOMES
                 )
                 consecutive_failures = 0
                 for attempt in attempts:
@@ -1858,7 +2081,8 @@ def _source_status_response(
                         SourceAttemptOutcome.CACHE_HIT,
                     }:
                         break
-                    consecutive_failures += 1
+                    if attempt.outcome in _SOURCE_FAILURE_OUTCOMES:
+                        consecutive_failures += 1
                 latest = attempts[0] if attempts else None
                 last_success = successful[0] if successful else None
                 last_failure = failed[0] if failed else None
@@ -2004,36 +2228,133 @@ def _validate_source_status_data(data: object) -> None:
     if data["mode"] != RequestMode.RAPID.value:
         raise ValueError("source status mode is invalid")
     if data["fund_code"] is not None:
+        if type(data["fund_code"]) is not str:
+            raise ValueError("source status fund code is invalid")
         _validate_fund_code(data["fund_code"])
     if type(data["request_id"]) is not str or not _REQUEST_ID.fullmatch(
         data["request_id"]
     ):
         raise ValueError("source status request id is invalid")
-    for key in ("policy_checksum", "registry_checksum"):
-        if type(data[key]) is not str or not _CHECKSUM.fullmatch(data[key]):
-            raise ValueError("source status checksum is invalid")
+    policy = EvidencePolicyV1()
+    registry = SourceRegistryV1()
+    if (
+        data["policy_version"] != policy.version
+        or data["policy_checksum"] != policy.checksum()
+        or data["registry_version"] != registry.version
+        or data["registry_checksum"] != registry.checksum()
+    ):
+        raise ValueError("source status policy or registry binding is invalid")
     if type(data["source_fields"]) is not list or not data["source_fields"]:
         raise ValueError("source status fields are invalid")
+    registry_fields = {
+        (source.source_id, field.field_id): (source, field)
+        for source in registry.sources
+        for field in source.fields
+    }
     identities = []
     for item in data["source_fields"]:
         if type(item) is not dict or set(item) != _SOURCE_FIELD_DATA_KEYS:
             raise ValueError("source field output keys are invalid")
-        SourceFieldState(item["state"])
-        SourceTier(item["source_tier"])
-        identities.append((item["source_id"], item["field_id"]))
-        for key in (
-            "cooldown_until",
-            "last_failure_at",
-            "last_success_at",
-            "last_success_data_as_of",
-        ):
-            _validate_utc_iso(item[key], key, optional=True)
+        source_id = _public_identifier(item["source_id"], "source id")
+        field_id = _public_identifier(item["field_id"], "field id")
+        identity = (source_id, field_id)
+        if identity not in registry_fields:
+            raise ValueError("source field is not declared by the active registry")
+        source, field = registry_fields[identity]
+        state = SourceFieldState(item["state"])
+        if SourceTier(item["source_tier"]) is not field.source_tier:
+            raise ValueError("source field tier differs from the active registry")
         if (
-            type(item["supplementation"]) is not dict
-            or set(item["supplementation"]) != _SUPPLEMENTATION_KEYS
+            item["source_kind"] != source.source_kind
+            or item["source_scope"] != source.scope
+            or item["field_scope"] != field.scope
+            or item["acceptable_alternatives"]
+            != [reference.to_canonical_dict() for reference in field.acceptable_alternatives]
+            or item["supplementation"] != field.supplementation.to_canonical_dict()
         ):
-            raise ValueError("source supplementation output keys are invalid")
-    if len(identities) != len(set(identities)):
+            raise ValueError("source field static contract differs from the registry")
+        if (
+            type(item["consecutive_failures"]) is not int
+            or not 0 <= item["consecutive_failures"] <= 64
+        ):
+            raise ValueError("source consecutive failures are invalid")
+        cooldown_until = _parse_utc_iso(
+            item["cooldown_until"], "cooldown until", optional=True
+        )
+        last_failure_at = _parse_utc_iso(
+            item["last_failure_at"], "last failure at", optional=True
+        )
+        last_success_at = _parse_utc_iso(
+            item["last_success_at"], "last success at", optional=True
+        )
+        last_success_data_as_of = _parse_utc_iso(
+            item["last_success_data_as_of"],
+            "last success data as of",
+            optional=True,
+        )
+        failure_reason = item["last_failure_reason"]
+        if failure_reason is not None:
+            failure_reason = SourceErrorCode(failure_reason)
+            if failure_reason in {
+                SourceErrorCode.COOLDOWN_ACTIVE,
+                SourceErrorCode.REQUEST_CANCELLED,
+                SourceErrorCode.REQUEST_EXPIRED,
+            }:
+                raise ValueError("source failure reason is not a true source failure")
+        if (last_failure_at is None) != (failure_reason is None):
+            raise ValueError("source failure time and reason must be paired")
+        if item["consecutive_failures"] > 0 and last_failure_at is None:
+            raise ValueError("source consecutive failures require a failure record")
+        if (last_success_at is None) != (last_success_data_as_of is None):
+            raise ValueError("source success time and data date must be paired")
+        if (
+            last_success_at is not None
+            and last_success_data_as_of is not None
+            and last_success_data_as_of > last_success_at
+        ):
+            raise ValueError("source data date cannot follow its successful retrieval")
+        if (state is SourceFieldState.COOLDOWN) != (cooldown_until is not None):
+            raise ValueError("source cooldown state and expiry must be paired")
+        if state is SourceFieldState.NOT_CHECKED and any(
+            value is not None
+            for value in (
+                last_failure_at,
+                last_success_at,
+                cooldown_until,
+            )
+        ):
+            raise ValueError("not checked source cannot expose attempt history")
+        if state is SourceFieldState.NOT_CHECKED and item["consecutive_failures"] != 0:
+            raise ValueError("not checked source cannot have consecutive failures")
+        if state in {SourceFieldState.HEALTHY, SourceFieldState.DEGRADED} and (
+            last_success_at is None
+        ):
+            raise ValueError("usable source state requires a successful retrieval")
+        if state in {SourceFieldState.COOLDOWN, SourceFieldState.UNSUPPORTED} and (
+            last_failure_at is None
+        ):
+            raise ValueError("failed source state requires a true source failure")
+        if state is SourceFieldState.COOLDOWN and (
+            failure_reason not in TRANSIENT_SOURCE_ERRORS
+            or item["consecutive_failures"] <= 0
+            or cooldown_until is None
+            or cooldown_until <= _request_finish_now()
+        ):
+            raise ValueError("cooldown state requires an active transient failure")
+        if state is SourceFieldState.UNSUPPORTED and (
+            failure_reason not in UNSUPPORTED_SOURCE_ERRORS
+            or item["consecutive_failures"] <= 0
+            or cooldown_until is not None
+        ):
+            raise ValueError("unsupported state requires a permanent source failure")
+        if state is SourceFieldState.UNAVAILABLE and (
+            last_failure_at is None and last_success_at is None
+        ):
+            raise ValueError("unavailable source requires failure or stale evidence")
+        identities.append(identity)
+    if len(identities) != len(set(identities)) or set(identities) != set(
+        registry_fields
+    ):
         raise ValueError("source status identities are invalid")
     if (
         type(data["request_field_resolutions"]) is not list
@@ -2041,16 +2362,41 @@ def _validate_source_status_data(data: object) -> None:
     ):
         raise ValueError("request field resolutions are invalid")
     fields = []
+    tier_priority = {
+        SourceTier.TIER_1: 0,
+        SourceTier.TIER_2: 1,
+        SourceTier.PRIVATE_OBSERVATION: 2,
+        SourceTier.USER_PROVIDED: 3,
+    }
+    expected_primary = {}
+    for identity, (_source, field) in registry_fields.items():
+        candidate = (tier_priority[field.source_tier], identity[0])
+        if field.field_id not in expected_primary or candidate < expected_primary[
+            field.field_id
+        ]:
+            expected_primary[field.field_id] = candidate
     for item in data["request_field_resolutions"]:
         if type(item) is not dict or set(item) != _REQUEST_FIELD_RESOLUTION_KEYS:
             raise ValueError("request field resolution output keys are invalid")
+        field_id = _public_identifier(item["field_id"], "resolution field id")
+        primary_source_id = _public_identifier(
+            item["primary_source_id"], "resolution primary source id"
+        )
         RequestFieldResolution(item["resolution"])
-        ActionKind(item["action"])
-        RiskEffect(item["risk_effect"])
-        fields.append(item["field_id"])
+        if item["action"] != ActionKind.FACT_RESEARCH.value or (
+            item["risk_effect"] != RiskEffect.INFORMATION.value
+        ):
+            raise ValueError("request field resolution action contract is invalid")
+        if (
+            field_id not in expected_primary
+            or primary_source_id != expected_primary[field_id][1]
+        ):
+            raise ValueError("request field resolution primary is invalid")
+        fields.append(field_id)
     if fields != sorted(set(fields)):
         raise ValueError("request field resolutions are not canonical")
-    _validate_phase0_public_value(data)
+    if set(fields) != set(expected_primary):
+        raise ValueError("request field resolutions are incomplete")
 
 
 def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, Any]:

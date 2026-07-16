@@ -809,6 +809,7 @@ class DecisionAuditStore:
         budget: RequestBudget,
         references: Tuple[SourceFieldRef, ...],
         subject_key: str,
+        cutoff_at: datetime,
     ) -> Tuple[SourceFieldHistory, ...]:
         _positive_id(request_run_id, "request run id")
         if type(budget) is not RequestBudget:
@@ -823,6 +824,11 @@ class DecisionAuditStore:
             reference.validate()
         if type(subject_key) is not str or _SUBJECT_KEY_PATTERN.fullmatch(subject_key) is None:
             raise ValueError("subject key must be fund: followed by exactly six digits")
+        validate_aware_datetime(cutoff_at, "source history cutoff")
+        cutoff_at = cutoff_at.astimezone(timezone.utc)
+        if not budget.started_at <= cutoff_at <= budget.deadline_at:
+            raise ValueError("source history cutoff is outside the request lifetime")
+        cutoff_text = _utc_text(cutoff_at, "source history cutoff")
         budget.require_publishable()
         predicates = " OR ".join(
             "(source_attempts.source_id = ? AND source_attempts.field_id = ?)"
@@ -851,13 +857,19 @@ class DecisionAuditStore:
                         FROM source_attempts
                         JOIN request_runs
                           ON request_runs.id = source_attempts.request_run_id
-                        WHERE source_attempts.subject_key = ? AND ({predicates})
+                        WHERE source_attempts.subject_key = ?
+                          AND source_attempts.finished_at COLLATE BINARY
+                              <= ? COLLATE BINARY
+                          AND source_attempts.outcome NOT IN (
+                              'cancelled', 'expired', 'skipped_cooldown'
+                          )
+                          AND ({predicates})
                     )
                     SELECT * FROM ranked
                     WHERE history_rank <= ?
                     ORDER BY source_id, field_id, finished_at DESC, id DESC
                     """,  # noqa: S608 - placeholders bind every dynamic value
-                    (subject_key, *parameters, SOURCE_HISTORY_LIMIT),
+                    (subject_key, cutoff_text, *parameters, SOURCE_HISTORY_LIMIT),
                 ).fetchall()
                 budget.require_publishable()
                 grouped = {reference: [] for reference in references}

@@ -285,6 +285,165 @@ def test_source_status_snapshot_uses_one_authenticated_sqlite_snapshot(
     assert snapshot.resolutions == (RequestFieldResolution.PARTIAL,)
 
 
+def test_future_attempts_cannot_evict_past_success_before_history_limit(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(
+        identity=PRIMARY,
+        finished_at=NOW - timedelta(minutes=1),
+        data_as_of=NOW - timedelta(days=1),
+    )
+    for offset in range(1, 65):
+        harness.record(
+            identity=PRIMARY,
+            finished_at=NOW + timedelta(minutes=offset),
+            data_as_of=NOW,
+        )
+
+    request_run_id, budget = harness.begin()
+    requirement = harness.service.action_requirement(
+        PRIMARY[1],
+        ActionKind.FACT_RESEARCH,
+        RiskEffect.INFORMATION,
+    )
+    snapshot = harness.service.source_status_snapshot(
+        SUBJECT,
+        _context(budget),
+        (SourceFieldRef(*PRIMARY),),
+        (requirement,),
+        request_run_id=request_run_id,
+        budget=budget,
+    )
+
+    projection = next(
+        item
+        for item in snapshot.projections
+        if item.history.reference == SourceFieldRef(*PRIMARY)
+    )
+    assert len(projection.history.attempts) == 1
+    assert projection.state is SourceFieldState.HEALTHY
+    assert snapshot.resolutions == (RequestFieldResolution.USABLE,)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error_code"),
+    (
+        (SourceAttemptOutcome.CANCELLED, SourceErrorCode.REQUEST_CANCELLED),
+        (SourceAttemptOutcome.EXPIRED, SourceErrorCode.REQUEST_EXPIRED),
+    ),
+)
+def test_request_lifecycle_outcome_is_not_a_source_state(
+    tmp_path,
+    outcome: SourceAttemptOutcome,
+    error_code: SourceErrorCode,
+) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(
+        outcome=outcome,
+        data_as_of=None,
+        error_code=error_code,
+        response_bytes=0,
+    )
+
+    assert harness.state() is SourceFieldState.NOT_CHECKED
+
+
+def test_request_lifecycle_outcomes_do_not_override_source_state(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(
+        outcome=SourceAttemptOutcome.UNSUPPORTED,
+        data_as_of=None,
+        error_code=SourceErrorCode.FIELD_UNSUPPORTED,
+        response_bytes=0,
+    )
+    harness.record(
+        outcome=SourceAttemptOutcome.CANCELLED,
+        data_as_of=None,
+        error_code=SourceErrorCode.REQUEST_CANCELLED,
+        response_bytes=0,
+    )
+
+    assert harness.state() is SourceFieldState.UNSUPPORTED
+
+
+def test_cooldown_skip_does_not_replace_transient_failure_state(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(
+        outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+        data_as_of=None,
+        error_code=SourceErrorCode.NETWORK_TIMEOUT,
+        cooldown_until=NOW + INITIAL_COOLDOWN,
+        response_bytes=0,
+    )
+    harness.record(
+        outcome=SourceAttemptOutcome.SKIPPED_COOLDOWN,
+        data_as_of=None,
+        error_code=SourceErrorCode.COOLDOWN_ACTIVE,
+        cooldown_until=NOW + INITIAL_COOLDOWN,
+        response_bytes=0,
+    )
+
+    assert harness.state() is SourceFieldState.COOLDOWN
+
+
+def test_lifecycle_attempts_cannot_evict_source_failure_before_history_limit(
+    tmp_path,
+) -> None:
+    harness = _Harness(tmp_path)
+    cooldown_until = NOW + timedelta(days=1)
+    harness.record(
+        outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+        data_as_of=None,
+        error_code=SourceErrorCode.NETWORK_TIMEOUT,
+        cooldown_until=cooldown_until,
+        response_bytes=0,
+    )
+    for index in range(64):
+        finished_at = NOW - timedelta(seconds=64 - index)
+        if index % 2 == 0:
+            harness.record(
+                outcome=SourceAttemptOutcome.SKIPPED_COOLDOWN,
+                data_as_of=None,
+                error_code=SourceErrorCode.COOLDOWN_ACTIVE,
+                cooldown_until=cooldown_until,
+                finished_at=finished_at,
+                response_bytes=0,
+            )
+        else:
+            harness.record(
+                outcome=SourceAttemptOutcome.CANCELLED,
+                data_as_of=None,
+                error_code=SourceErrorCode.REQUEST_CANCELLED,
+                finished_at=finished_at,
+                response_bytes=0,
+            )
+
+    request_run_id, budget = harness.begin()
+    requirement = harness.service.action_requirement(
+        PRIMARY[1],
+        ActionKind.FACT_RESEARCH,
+        RiskEffect.INFORMATION,
+    )
+    snapshot = harness.service.source_status_snapshot(
+        SUBJECT,
+        _context(budget),
+        (SourceFieldRef(*PRIMARY),),
+        (requirement,),
+        request_run_id=request_run_id,
+        budget=budget,
+    )
+    projection = next(
+        item
+        for item in snapshot.projections
+        if item.history.reference == SourceFieldRef(*PRIMARY)
+    )
+
+    assert len(projection.history.attempts) == 1
+    assert projection.history.attempts[0].attempt.outcome is (
+        SourceAttemptOutcome.TRANSIENT_FAILURE
+    )
+    assert projection.state is SourceFieldState.COOLDOWN
+
+
 def test_every_registry_field_has_an_explicit_policy_requirement_binding(tmp_path) -> None:
     service = _Harness(tmp_path).service
     expected = {
