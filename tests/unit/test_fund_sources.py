@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import unittest
+import urllib.error
 from datetime import timezone
 from email.message import Message
 from unittest.mock import MagicMock, patch
@@ -219,6 +220,70 @@ class FundTextClientTest(unittest.TestCase):
                         "https://fundf10.eastmoney.com/jbgk_519755.html",
                         "https://fundf10.eastmoney.com/",
                     )
+
+    def test_failure_reasons_are_stable_and_retryable_only_when_transient(self) -> None:
+        url = "https://fundf10.eastmoney.com/jbgk_519755.html"
+        cases = (
+            (socket.gaierror("private host detail"), "dns_failure", True),
+            (TimeoutError("private timeout detail"), "network_timeout", True),
+            (ConnectionResetError("private reset detail"), "transient_network_failure", True),
+            (urllib.error.HTTPError(url, 404, "private header", {}, None), "http_4xx", False),
+        )
+        for exception, reason_code, retryable in cases:
+            with (
+                self.subTest(reason_code=reason_code),
+                patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
+                patch("kunjin.funds.sources.urllib.request.urlopen", side_effect=exception),
+            ):
+                with self.assertRaises(FundSourceError) as raised:
+                    self.client.fetch(url, "https://fundf10.eastmoney.com/")
+                self.assertEqual(raised.exception.code, "fund_source_error")
+                self.assertEqual(raised.exception.reason_code, reason_code)
+                self.assertIs(raised.exception.retryable, retryable)
+                self.assertNotIn("private", str(raised.exception))
+
+    def test_deterministic_failures_have_specific_nonretryable_reason_codes(self) -> None:
+        url = "https://fundf10.eastmoney.com/jbgk_519755.html"
+        cases = (
+            ("unsafe_url", lambda: self.client.fetch("http://example.com", url)),
+            (
+                "unsafe_redirect",
+                lambda: self.client.fetch(url, "https://fundf10.eastmoney.com/"),
+            ),
+            (
+                "oversized_response",
+                lambda: self.client.fetch(url, "https://fundf10.eastmoney.com/"),
+            ),
+            (
+                "decode_failure",
+                lambda: self.client.fetch(url, "https://fundf10.eastmoney.com/"),
+            ),
+        )
+        responses = (
+            None,
+            make_response(b"ok", "https://example.com/redirect"),
+            make_response(b"x" * (MAX_RESPONSE_BYTES + 1)),
+            make_response(b"\xff\xfe\xfd", content_type="text/plain; charset=utf-8"),
+        )
+        for (reason_code, action), response in zip(cases, responses):
+            with self.subTest(reason_code=reason_code):
+                if response is None:
+                    context = patch("kunjin.funds.sources.urllib.request.urlopen")
+                else:
+                    context = patch(
+                        "kunjin.funds.sources.urllib.request.urlopen", return_value=response
+                    )
+                with (
+                    patch(
+                        "kunjin.funds.sources.socket.getaddrinfo",
+                        return_value=PUBLIC_DNS_RESULT,
+                    ),
+                    context,
+                ):
+                    with self.assertRaises(FundSourceError) as raised:
+                        action()
+                self.assertEqual(raised.exception.reason_code, reason_code)
+                self.assertIs(raised.exception.retryable, False)
 
 
 class OfficialSourceClassificationTest(unittest.TestCase):

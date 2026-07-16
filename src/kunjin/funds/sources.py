@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Optional, Union
 
+from kunjin.decision.models import TRANSIENT_SOURCE_ERRORS, SourceErrorCode
 from kunjin.funds.models import DocumentKind
 from kunjin.funds.official_domains import (
     FUND_COMPANY_DOMAINS,
@@ -24,6 +25,10 @@ FETCHABLE_HOSTS = frozenset(
     {"fund.eastmoney.com", "fundf10.eastmoney.com", "api.fund.eastmoney.com"}
 )
 FUND_CODE_PATTERN = re.compile(r"^\d{6}$")
+_FUND_SOURCE_REASON_CODES = frozenset(item.value for item in SourceErrorCode)
+_TRANSIENT_FUND_SOURCE_REASON_CODES = frozenset(
+    item.value for item in TRANSIENT_SOURCE_ERRORS
+)
 
 F10_PAGE_PATHS: Dict[DocumentKind, str] = {
     DocumentKind.BASIC_PROFILE: "jbgk_{code}.html",
@@ -38,6 +43,23 @@ F10_PAGE_PATHS: Dict[DocumentKind, str] = {
 
 class FundSourceError(RuntimeError):
     code = "fund_source_error"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "source_unavailable",
+        retryable: bool = False,
+    ) -> None:
+        if reason_code not in _FUND_SOURCE_REASON_CODES:
+            raise ValueError("fund source reason code is not supported")
+        if type(retryable) is not bool or retryable != (
+            reason_code in _TRANSIENT_FUND_SOURCE_REASON_CODES
+        ):
+            raise ValueError("fund source retryability does not match its reason code")
+        self.reason_code = reason_code
+        self.retryable = retryable
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -162,27 +184,53 @@ def _is_disallowed_address(address: IpAddress) -> bool:
 def _validate_public_dns(host: str, port: int) -> None:
     try:
         results = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise FundSourceError("fund source DNS lookup failed") from exc
+    except socket.gaierror:
+        raise FundSourceError(
+            "fund source DNS lookup failed",
+            reason_code="dns_failure",
+            retryable=True,
+        ) from None
     if not results:
-        raise FundSourceError("fund source DNS lookup returned no addresses")
+        raise FundSourceError(
+            "fund source DNS lookup returned no addresses",
+            reason_code="dns_failure",
+            retryable=True,
+        )
     for result in results:
         sockaddr = result[4]
         try:
             address = ipaddress.ip_address(sockaddr[0])
-        except (ValueError, IndexError, TypeError) as exc:
-            raise FundSourceError("fund source DNS returned an invalid address") from exc
+        except (ValueError, IndexError, TypeError):
+            raise FundSourceError(
+                "fund source DNS returned an invalid address",
+                reason_code="unsafe_url",
+                retryable=False,
+            ) from None
         if _is_disallowed_address(address):
-            raise FundSourceError("fund source DNS resolved to a non-public address")
+            raise FundSourceError(
+                "fund source DNS resolved to a non-public address",
+                reason_code="unsafe_url",
+                retryable=False,
+            )
 
 
-def _validate_fetch_url(url: str) -> urllib.parse.ParseResult:
+def _validate_fetch_url(
+    url: str, *, reason_code: str = "unsafe_url"
+) -> urllib.parse.ParseResult:
     parsed = _parsed_https_url(url)
     if parsed is None:
-        raise FundSourceError("fund source URL must be a safe HTTPS URL")
+        raise FundSourceError(
+            "fund source URL must be a safe HTTPS URL",
+            reason_code=reason_code,
+            retryable=False,
+        )
     host = (parsed.hostname or "").lower().rstrip(".")
     if host not in FETCHABLE_HOSTS:
-        raise FundSourceError("fund source host is not fetchable")
+        raise FundSourceError(
+            "fund source host is not fetchable",
+            reason_code=reason_code,
+            retryable=False,
+        )
     return parsed
 
 
@@ -200,7 +248,11 @@ def _decode_text(payload: bytes, declared_charset: Optional[str]) -> str:
             return payload.decode(encoding)
         except UnicodeDecodeError:
             continue
-    raise FundSourceError("fund source response text could not be decoded")
+    raise FundSourceError(
+        "fund source response text could not be decoded",
+        reason_code="decode_failure",
+        retryable=False,
+    )
 
 
 class FundTextClient:
@@ -213,7 +265,11 @@ class FundTextClient:
         requested = _validate_fetch_url(url)
         referer_url = _parsed_https_url(referer)
         if referer_url is None:
-            raise FundSourceError("fund source referer must use safe HTTPS")
+            raise FundSourceError(
+                "fund source referer must use safe HTTPS",
+                reason_code="unsafe_url",
+                retryable=False,
+            )
         host = (requested.hostname or "").lower().rstrip(".")
         _validate_public_dns(host, requested.port or 443)
 
@@ -229,10 +285,14 @@ class FundTextClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 final_url = response.geturl()
-                final = _validate_fetch_url(final_url)
+                final = _validate_fetch_url(final_url, reason_code="unsafe_redirect")
                 final_host = (final.hostname or "").lower().rstrip(".")
                 if final_host != host:
-                    raise FundSourceError("fund source redirect changed host")
+                    raise FundSourceError(
+                        "fund source redirect changed host",
+                        reason_code="unsafe_redirect",
+                        retryable=False,
+                    )
                 content_length = response.headers.get("Content-Length")
                 if content_length is not None:
                     try:
@@ -240,28 +300,74 @@ class FundTextClient:
                         if parsed_length < 0:
                             raise ValueError
                         if parsed_length > MAX_RESPONSE_BYTES:
-                            raise FundSourceError("fund source response exceeds size limit")
-                    except ValueError as exc:
+                            raise FundSourceError(
+                                "fund source response exceeds size limit",
+                                reason_code="oversized_response",
+                                retryable=False,
+                            )
+                    except ValueError:
                         raise FundSourceError(
-                            "fund source returned invalid content length"
-                        ) from exc
+                            "fund source returned invalid content length",
+                            reason_code="validation_failure",
+                            retryable=False,
+                        ) from None
                 payload = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(payload) > MAX_RESPONSE_BYTES:
-                    raise FundSourceError("fund source response exceeds size limit")
+                    raise FundSourceError(
+                        "fund source response exceeds size limit",
+                        reason_code="oversized_response",
+                        retryable=False,
+                    )
                 content_type = response.headers.get("Content-Type", "")
                 declared_charset = response.headers.get_content_charset()
         except FundSourceError:
             raise
         except urllib.error.HTTPError as exc:
-            raise FundSourceError(f"fund source HTTP error: {exc.code}") from exc
+            if 400 <= exc.code < 500:
+                raise FundSourceError(
+                    "fund source returned an HTTP client error",
+                    reason_code="http_4xx",
+                    retryable=False,
+                ) from None
+            raise FundSourceError(
+                "fund source returned a temporary HTTP error",
+                reason_code="transient_network_failure",
+                retryable=True,
+            ) from None
+        except (TimeoutError, socket.timeout):
+            raise FundSourceError(
+                "fund source network request timed out",
+                reason_code="network_timeout",
+                retryable=True,
+            ) from None
+        except socket.gaierror:
+            raise FundSourceError(
+                "fund source DNS lookup failed",
+                reason_code="dns_failure",
+                retryable=True,
+            ) from None
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, socket.gaierror):
+                reason_code = "dns_failure"
+            elif isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                reason_code = "network_timeout"
+            else:
+                reason_code = "transient_network_failure"
+            raise FundSourceError(
+                "fund source network request failed",
+                reason_code=reason_code,
+                retryable=True,
+            ) from None
         except (
-            urllib.error.URLError,
-            TimeoutError,
             http.client.RemoteDisconnected,
             ConnectionResetError,
             OSError,
-        ) as exc:
-            raise FundSourceError("fund source network request failed") from exc
+        ):
+            raise FundSourceError(
+                "fund source network request failed",
+                reason_code="transient_network_failure",
+                retryable=True,
+            ) from None
 
         return TextResponse(
             requested_url=url,
