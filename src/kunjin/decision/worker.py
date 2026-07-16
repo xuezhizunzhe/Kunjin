@@ -19,6 +19,7 @@ from kunjin.decision.worker_protocol import (
     WorkerResponse,
     decode_worker_response,
     encode_worker_request,
+    validate_worker_result_url,
 )
 from kunjin.funds.sources import FETCHABLE_HOSTS
 
@@ -182,10 +183,10 @@ def _validate_parent_payload(
     payload = result.payload
     if payload is None:
         raise ValueError("worker success payload is missing")
-    requested_host = _safe_https_host(payload.requested_url)
-    final_host = _safe_https_host(payload.final_url)
-    if payload.requested_url != request.arguments["url"] or final_host != requested_host:
+    _safe_https_host(payload.requested_url)
+    if payload.requested_url != request.arguments["url"]:
         raise ValueError("worker payload URL does not match request")
+    validate_worker_result_url(request, payload.final_url)
     if not (
         budget.started_at - _AUDIT_CLOCK_SKEW
         <= payload.retrieved_at

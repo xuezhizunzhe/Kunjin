@@ -59,7 +59,7 @@ def main() -> int:
         sys.stdout.buffer.write(
             json.dumps(response, separators=(",", ":"), sort_keys=True).encode("utf-8")
         )
-    elif mode.startswith("wrong_"):
+    elif mode in {"wrong_source", "wrong_field", "wrong_subject", "wrong_operation"}:
         field = mode.removeprefix("wrong_")
         replacements = {
             "source": ("source_id", "eastmoney_nav"),
@@ -117,6 +117,40 @@ def main() -> int:
         sys.stdout.buffer.write(_response(request, text_checksum="f" * 64))
     elif mode == "unsafe_final":
         sys.stdout.buffer.write(_response(request, final_url="https://example.com/stolen"))
+    elif mode == "wrong_final_code":
+        sys.stdout.buffer.write(
+            _response(
+                request,
+                final_url="https://fundf10.eastmoney.com/jbgk_000001.html",
+            )
+        )
+    elif mode == "wrong_final_field":
+        sys.stdout.buffer.write(
+            _response(
+                request,
+                final_url="https://fundf10.eastmoney.com/jjjl_519755.html",
+            )
+        )
+    elif mode == "wrong_final_dynamic_code":
+        sys.stdout.buffer.write(
+            _response(
+                request,
+                final_url=(
+                    "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+                    "?type=gmbd&mode=0&code=000001"
+                ),
+            )
+        )
+    elif mode == "wrong_final_dynamic_query":
+        sys.stdout.buffer.write(
+            _response(
+                request,
+                final_url=(
+                    "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+                    "?type=gmbd&mode=1&code=519755"
+                ),
+            )
+        )
     elif mode == "future_time":
         sys.stdout.buffer.write(
             _response(request, retrieved_at=datetime.now(timezone.utc) + timedelta(days=3650))

@@ -51,6 +51,12 @@ _PAYLOAD_KEYS = frozenset(
 )
 _SOURCE_ERROR_CODES = frozenset(item.value for item in SourceErrorCode)
 _TRANSIENT_ERROR_CODES = frozenset(item.value for item in TRANSIENT_SOURCE_ERRORS)
+_SAFE_WORKER_ERROR_MESSAGES: Mapping[str, str] = MappingProxyType(
+    {
+        reason_code: f"public source error: {reason_code}"
+        for reason_code in sorted(_SOURCE_ERROR_CODES)
+    }
+)
 _F10_FIELD_HOSTS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         "announcement": frozenset(
@@ -209,7 +215,7 @@ def _validate_bound_fund_url(url: str, field_id: str, fund_code: str) -> None:
     host = (parsed.hostname or "").lower().rstrip(".")
     static_prefix = _F10_STATIC_PATH_PREFIXES[field_id]
     if host == "fundf10.eastmoney.com":
-        if parsed.path == f"/{static_prefix}_{fund_code}.html" and not parsed.query:
+        if url == f"https://fundf10.eastmoney.com/{static_prefix}_{fund_code}.html":
             return
         if parsed.path != "/FundArchivesDatas.aspx":
             raise ValueError("worker request binding path does not match its field")
@@ -228,7 +234,17 @@ def _validate_bound_fund_url(url: str, field_id: str, fund_code: str) -> None:
                 "type": "gmbd",
             },
         }.get(field_id)
-        if expected_query is None or values != expected_query:
+        expected_query_text = {
+            "quarterly_holdings": (
+                f"type=jjcc&code={fund_code}&topline=10&year=&month="
+            ),
+            "size_history": f"type=gmbd&mode=0&code={fund_code}",
+        }.get(field_id)
+        if (
+            expected_query is None
+            or values != expected_query
+            or parsed.query != expected_query_text
+        ):
             raise ValueError("worker request binding query does not match its subject")
         return
     values = _exact_query(parsed)
@@ -238,6 +254,7 @@ def _validate_bound_fund_url(url: str, field_id: str, fund_code: str) -> None:
         and field_id == "industry_exposure"
         and parsed.path == "/f10/HYPZ/"
         and values == {"fundCode": fund_code, "year": year}
+        and parsed.query == f"fundCode={fund_code}&year={year}"
         and re.fullmatch(r"[0-9]{4}", year) is not None
         and 1900 <= int(year) <= 9999
     ):
@@ -253,6 +270,8 @@ def _validate_bound_fund_url(url: str, field_id: str, fund_code: str) -> None:
             "pageSize": "20",
             "type": "0",
         }
+        and parsed.query
+        == f"fundcode={fund_code}&pageIndex=1&pageSize=20&type=0"
     ):
         return
     raise ValueError("worker request binding URL does not match its field and subject")
@@ -286,6 +305,30 @@ def _validate_worker_binding(
         field_id,
         subject_key.removeprefix("fund:"),
     )
+
+
+def validate_worker_result_url(request: WorkerRequest, final_url: str) -> str:
+    if type(request) is not WorkerRequest:
+        raise ValueError("worker result URL requires the exact request type")
+    request.validate()
+    validated_url = _validate_url_argument(final_url, "result URL")
+    _validate_worker_binding(
+        request.operation,
+        request.source_id,
+        request.field_id,
+        request.subject_key,
+        {
+            "url": validated_url,
+            "referer": "https://fundf10.eastmoney.com/",
+        },
+    )
+    return validated_url
+
+
+def worker_error_message(reason_code: str) -> str:
+    if type(reason_code) is not str or reason_code not in _SAFE_WORKER_ERROR_MESSAGES:
+        raise ValueError("worker reason code is not supported")
+    return _SAFE_WORKER_ERROR_MESSAGES[reason_code]
 
 
 @dataclass(frozen=True)
@@ -399,7 +442,7 @@ def encode_worker_success(request: WorkerRequest, payload: WorkerTextPayload) ->
     if type(payload) is not WorkerTextPayload:
         raise ValueError("worker payload must use the exact protocol type")
     requested_url = _validate_url_argument(payload.requested_url, "requested url")
-    final_url = _validate_url_argument(payload.final_url, "final url")
+    final_url = validate_worker_result_url(request, payload.final_url)
     if type(payload.text) is not str:
         raise ValueError("worker response text must be text")
     try:
@@ -457,6 +500,8 @@ def encode_worker_error(
     validate_public_text(message, "worker error message")
     if len(message) > MAX_ERROR_MESSAGE_CHARS:
         raise ValueError("worker error message exceeds limit")
+    if message != worker_error_message(reason_code):
+        raise ValueError("worker error message does not match its reason code")
     value = _identity_dict(request)
     value.update(
         {
@@ -516,6 +561,7 @@ def decode_worker_response(frame: bytes, request: WorkerRequest) -> WorkerRespon
         )
         if payload.requested_url != request.arguments["url"]:
             raise ValueError("worker response identity does not match request URL")
+        validate_worker_result_url(request, payload.final_url)
         return WorkerResponse(
             **expected_response_identity(request),
             ok=True,
@@ -537,6 +583,8 @@ def decode_worker_response(frame: bytes, request: WorkerRequest) -> WorkerRespon
     message = validate_public_text(value["message"], "worker error message")
     if len(message) > MAX_ERROR_MESSAGE_CHARS:
         raise ValueError("worker error message exceeds limit")
+    if message != worker_error_message(reason_code):
+        raise ValueError("worker error message does not match its reason code")
     return WorkerResponse(
         **expected_response_identity(request),
         ok=False,

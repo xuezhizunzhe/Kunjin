@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from kunjin.decision.budget import RequestBudget
-from kunjin.decision.models import RequestMode
+from kunjin.decision.models import TRANSIENT_SOURCE_ERRORS, RequestMode, SourceErrorCode
 from kunjin.decision.worker import (
     WorkerExecutionError,
     _close_worker_pipes,
@@ -26,7 +26,10 @@ from kunjin.decision.worker_protocol import (
     WorkerRequest,
     decode_worker_request,
     decode_worker_response,
+    encode_worker_error,
     encode_worker_request,
+    validate_worker_result_url,
+    worker_error_message,
 )
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "decision" / "worker_fixture.py"
@@ -68,6 +71,15 @@ def _run_fixture(
 ):
     with patch("kunjin.decision.worker._default_worker_argv", return_value=_argv(mode)):
         return run_public_worker(_request(), budget)
+
+
+def _run_fixture_request(
+    mode: str,
+    request: WorkerRequest,
+    budget: RequestBudget,
+):
+    with patch("kunjin.decision.worker._default_worker_argv", return_value=_argv(mode)):
+        return run_public_worker(request, budget)
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -296,6 +308,30 @@ def test_worker_contract_accepts_exact_fund_field_templates(
             "https://api.fund.eastmoney.com/f10/JJGG"
             "?fundcode=519755&pageIndex=2&pageSize=20&type=0",
         ),
+        (
+            "basic_profile",
+            "https://fundf10.eastmoney.com/jbgk_519755.html?",
+        ),
+        (
+            "size_history",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?code=519755&type=gmbd&mode=0",
+        ),
+        (
+            "size_history",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?type=gmbd&&mode=0&code=519755",
+        ),
+        (
+            "size_history",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?&type=gmbd&mode=0&code=519755&",
+        ),
+        (
+            "industry_exposure",
+            "https://api.fund.eastmoney.com/f10/HYPZ/"
+            "?%66undCode=519755&year=2026",
+        ),
     ),
 )
 def test_worker_contract_rejects_nonexact_query_templates(
@@ -325,6 +361,143 @@ def test_worker_contract_requires_exact_referer() -> None:
     )
     with pytest.raises(ValueError, match="worker.*binding"):
         encode_worker_request(request)
+
+
+def test_worker_result_url_allows_only_same_subject_field_templates() -> None:
+    static_request = replace(
+        _request(),
+        subject_key="fund:519755",
+        field_id="size_history",
+        arguments={
+            "url": "https://fundf10.eastmoney.com/gmbd_519755.html",
+            "referer": "https://fundf10.eastmoney.com/",
+        },
+    )
+    dynamic_url = (
+        "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+        "?type=gmbd&mode=0&code=519755"
+    )
+    assert validate_worker_result_url(static_request, dynamic_url) == dynamic_url
+    dynamic_request = replace(
+        static_request,
+        arguments={
+            "url": dynamic_url,
+            "referer": "https://fundf10.eastmoney.com/",
+        },
+    )
+    static_url = "https://fundf10.eastmoney.com/gmbd_519755.html"
+    assert validate_worker_result_url(dynamic_request, static_url) == static_url
+    industry_request = replace(
+        static_request,
+        field_id="industry_exposure",
+        arguments={
+            "url": "https://fundf10.eastmoney.com/hytz_519755.html",
+            "referer": "https://fundf10.eastmoney.com/",
+        },
+    )
+    api_url = (
+        "https://api.fund.eastmoney.com/f10/HYPZ/"
+        "?fundCode=519755&year=2026"
+    )
+    assert validate_worker_result_url(industry_request, api_url) == api_url
+
+
+@pytest.mark.parametrize(
+    ("mode", "dynamic"),
+    (
+        ("wrong_final_code", False),
+        ("wrong_final_field", False),
+        ("wrong_final_dynamic_code", True),
+        ("wrong_final_dynamic_query", True),
+    ),
+)
+def test_parent_rejects_bound_host_with_wrong_final_url_and_reaps(
+    mode: str,
+    dynamic: bool,
+) -> None:
+    request = _request()
+    if dynamic:
+        request = replace(
+            request,
+            subject_key="fund:519755",
+            field_id="size_history",
+            arguments={
+                "url": (
+                    "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+                    "?type=gmbd&mode=0&code=519755"
+                ),
+                "referer": "https://fundf10.eastmoney.com/",
+            },
+        )
+    processes: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def capture(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    try:
+        with patch("kunjin.decision.worker.subprocess.Popen", side_effect=capture):
+            with pytest.raises(WorkerExecutionError) as raised:
+                _run_fixture_request(mode, request, _budget())
+        assert raised.value.reason_code == "worker_protocol_error"
+        assert processes[0].poll() is not None
+        assert not _process_group_is_alive(processes[0].pid)
+    finally:
+        for process in processes:
+            _kill_process_group(process.pid)
+            process.wait(timeout=1)
+
+
+def test_all_source_error_codes_roundtrip_only_their_safe_message() -> None:
+    transient = frozenset(item.value for item in TRANSIENT_SOURCE_ERRORS)
+    for error_code in SourceErrorCode:
+        reason_code = error_code.value
+        message = worker_error_message(reason_code)
+        frame = encode_worker_error(
+            _request(),
+            reason_code=reason_code,
+            retryable=reason_code in transient,
+            message=message,
+        )
+        result = decode_worker_response(frame, _request())
+        assert result.reason_code == reason_code
+        assert result.message == message
+        assert len(message) <= 512
+
+
+@pytest.mark.parametrize(
+    "unsafe_message",
+    (
+        "/Users/alice/private/token.txt",
+        "Authorization: Bearer secret-token",
+        "Traceback: raw exception from upstream",
+    ),
+)
+def test_error_encoder_and_decoder_reject_noncanonical_messages(
+    unsafe_message: str,
+) -> None:
+    reason_code = "source_unavailable"
+    with pytest.raises(ValueError, match="message"):
+        encode_worker_error(
+            _request(),
+            reason_code=reason_code,
+            retryable=False,
+            message=unsafe_message,
+        )
+    value = json.loads(
+        encode_worker_error(
+            _request(),
+            reason_code=reason_code,
+            retryable=False,
+            message=worker_error_message(reason_code),
+        ).decode("utf-8")
+    )
+    value["message"] = unsafe_message
+    tampered = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    with pytest.raises(ValueError, match="message"):
+        decode_worker_response(tampered, _request())
 
 
 @pytest.mark.parametrize(
@@ -880,6 +1053,7 @@ def test_worker_module_import_boundary_excludes_private_and_storage_modules() ->
     source = worker_main.read_text(encoding="utf-8")
     forbidden = ("storage", "paths", "keychain", "yangjibao", "docker", "legacy_doc")
     assert all(name not in source.casefold() for name in forbidden)
+    assert "str(exc)" not in source
 
 
 def test_production_worker_entrypoint_rejects_unbound_url_before_launch() -> None:

@@ -9,6 +9,7 @@ from kunjin.decision.worker_protocol import (
     decode_worker_request,
     encode_worker_error,
     encode_worker_success,
+    worker_error_message,
 )
 from kunjin.funds.sources import FundSourceError, FundTextClient
 
@@ -47,14 +48,14 @@ def main() -> int:
             request,
             reason_code=exc.reason_code,
             retryable=exc.retryable,
-            message=str(exc),
+            message=worker_error_message(exc.reason_code),
         )
     except (TypeError, ValueError):
         frame = encode_worker_error(
             request,
             reason_code="validation_failure",
             retryable=False,
-            message="fund source result failed validation",
+            message=worker_error_message("validation_failure"),
         )
     sys.stdout.buffer.write(frame)
     sys.stdout.buffer.flush()
