@@ -16,6 +16,7 @@ from kunjin.decision.budget import RequestBudget
 from kunjin.decision.models import RequestMode
 from kunjin.decision.worker import (
     WorkerExecutionError,
+    _close_worker_pipes,
     _finalize_process_group,
     run_public_worker,
 )
@@ -88,7 +89,7 @@ def _process_group_is_alive(pgid: int) -> bool:
 def _kill_process_group(pgid: int) -> None:
     try:
         os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (PermissionError, ProcessLookupError):
         pass
 
 
@@ -175,7 +176,10 @@ def test_worker_contract_allows_controlled_api_disclosures() -> None:
         _request(),
         field_id="announcement",
         arguments={
-            "url": "https://api.fund.eastmoney.com/f10/JJGG?fundcode=000000",
+            "url": (
+                "https://api.fund.eastmoney.com/f10/JJGG"
+                "?fundcode=000000&pageIndex=1&pageSize=20&type=0"
+            ),
             "referer": "https://fundf10.eastmoney.com/",
         },
     )
@@ -224,6 +228,103 @@ def test_worker_contract_accepts_exact_fund_field_templates(
         },
     )
     assert decode_worker_request(encode_worker_request(request)) == request
+
+
+@pytest.mark.parametrize(
+    ("field_id", "url"),
+    (
+        (
+            "basic_profile",
+            "https://fundf10.eastmoney.com/jbgk_519755.html?unknown=1",
+        ),
+        (
+            "size_history",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?type=gmbd&mode=0&code=519755&unknown=1",
+        ),
+        (
+            "size_history",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?type=gmbd&mode=0&code=519755&unknown=1&unknown=2",
+        ),
+        (
+            "size_history",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?type=gmbd&code=519755",
+        ),
+        (
+            "size_history",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?type=gmbd&mode=1&code=519755",
+        ),
+        (
+            "quarterly_holdings",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?type=jjcc&code=519755&topline=20&year=&month=",
+        ),
+        (
+            "quarterly_holdings",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?type=jjcc&code=519755&topline=10&year=2026&month=",
+        ),
+        (
+            "industry_exposure",
+            "https://api.fund.eastmoney.com/f10/HYPZ/?fundCode=519755",
+        ),
+        (
+            "industry_exposure",
+            "https://api.fund.eastmoney.com/f10/HYPZ/"
+            "?fundCode=519755&year=1899",
+        ),
+        (
+            "industry_exposure",
+            "https://api.fund.eastmoney.com/f10/HYPZ/"
+            "?fundCode=519755&year=02026",
+        ),
+        (
+            "announcement",
+            "https://api.fund.eastmoney.com/f10/JJGG"
+            "?fundcode=519755&pageIndex=1&pageindex=1&pageSize=20&type=0",
+        ),
+        (
+            "announcement",
+            "https://api.fund.eastmoney.com/f10/JJGG"
+            "?fundcode=519755&pageIndex=1&type=0",
+        ),
+        (
+            "announcement",
+            "https://api.fund.eastmoney.com/f10/JJGG"
+            "?fundcode=519755&pageIndex=2&pageSize=20&type=0",
+        ),
+    ),
+)
+def test_worker_contract_rejects_nonexact_query_templates(
+    field_id: str,
+    url: str,
+) -> None:
+    request = replace(
+        _request(),
+        subject_key="fund:519755",
+        field_id=field_id,
+        arguments={
+            "url": url,
+            "referer": "https://fundf10.eastmoney.com/",
+        },
+    )
+    with pytest.raises(ValueError, match="worker.*binding"):
+        encode_worker_request(request)
+
+
+def test_worker_contract_requires_exact_referer() -> None:
+    request = replace(
+        _request(),
+        arguments={
+            "url": "https://fundf10.eastmoney.com/",
+            "referer": "https://fundf10.eastmoney.com/?from=worker",
+        },
+    )
+    with pytest.raises(ValueError, match="worker.*binding"):
+        encode_worker_request(request)
 
 
 @pytest.mark.parametrize(
@@ -565,6 +666,72 @@ def test_finalization_continues_to_kill_and_wait_after_grace_interruption() -> N
     assert raised.value.reason_code == "worker_cleanup_failed"
     assert isinstance(raised.value.__cause__, SystemExit)
     assert events == [signal.SIGTERM, signal.SIGKILL, "wait"]
+
+
+def test_pipe_closer_records_first_base_exception_and_continues() -> None:
+    process = MagicMock()
+    first_error = SystemExit(31)
+    process.stdin.closed = False
+    process.stdin.close.side_effect = first_error
+    process.stdout.closed = False
+    process.stdout.close.side_effect = MemoryError("second close failure")
+
+    assert _close_worker_pipes(process) is first_error
+    process.stdin.close.assert_called_once()
+    process.stdout.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("mode", "close_error", "expected_cause"),
+    (
+        ("success", SystemExit(41), None),
+        ("malformed", MemoryError("close interrupted"), "worker_protocol_error"),
+    ),
+)
+def test_close_interrupt_still_finalizes_group_before_reraising(
+    mode: str,
+    close_error: BaseException,
+    expected_cause: str | None,
+) -> None:
+    processes: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def capture(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    budget = _budget()
+    try:
+        with (
+            patch("kunjin.decision.worker.subprocess.Popen", side_effect=capture),
+            patch("kunjin.decision.worker._default_worker_argv", return_value=_argv(mode)),
+            patch(
+                "kunjin.decision.worker._close_worker_pipes",
+                side_effect=close_error,
+            ),
+            patch(
+                "kunjin.decision.worker._finalize_process_group",
+                wraps=_finalize_process_group,
+            ) as finalize,
+        ):
+            with pytest.raises(type(close_error)) as raised:
+                run_public_worker(_request(), budget)
+        assert raised.value is close_error
+        if expected_cause is None:
+            assert raised.value.__cause__ is None
+        else:
+            assert isinstance(raised.value.__cause__, WorkerExecutionError)
+            assert raised.value.__cause__.reason_code == expected_cause
+        assert budget.cancelled
+        assert budget.cancel_reason == "worker_aborted"
+        finalize.assert_called_once()
+        assert processes[0].poll() is not None
+        assert not _process_group_is_alive(processes[0].pid)
+    finally:
+        for process in processes:
+            _kill_process_group(process.pid)
+            process.wait(timeout=1)
 
 
 def test_keyboard_interrupt_cancels_terminates_and_reaps() -> None:

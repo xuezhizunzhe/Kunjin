@@ -86,7 +86,6 @@ _F10_STATIC_PATH_PREFIXES: Mapping[str, str] = MappingProxyType(
         "size_history": "gmbd",
     }
 )
-_IDENTITY_QUERY_KEYS = frozenset({"code", "fundcode", "type"})
 
 
 def _reject_duplicate_pairs(pairs: list) -> Dict[str, Any]:
@@ -177,7 +176,7 @@ def _binding_host(url: object) -> str:
     return host
 
 
-def _identity_query(parsed: urllib.parse.ParseResult) -> tuple[Dict[str, str], frozenset[str]]:
+def _exact_query(parsed: urllib.parse.ParseResult) -> Dict[str, str]:
     try:
         pairs = urllib.parse.parse_qsl(
             parsed.query,
@@ -190,13 +189,11 @@ def _identity_query(parsed: urllib.parse.ParseResult) -> tuple[Dict[str, str], f
     normalized_keys = set()
     for key, value in pairs:
         normalized = key.casefold()
-        if normalized not in _IDENTITY_QUERY_KEYS:
-            continue
         if normalized in normalized_keys:
-            raise ValueError("worker request binding query repeats identity")
+            raise ValueError("worker request binding query repeats a key")
         normalized_keys.add(normalized)
         values[key] = value
-    return values, frozenset(normalized_keys)
+    return values
 
 
 def _validate_bound_fund_url(url: str, field_id: str, fund_code: str) -> None:
@@ -216,35 +213,46 @@ def _validate_bound_fund_url(url: str, field_id: str, fund_code: str) -> None:
             return
         if parsed.path != "/FundArchivesDatas.aspx":
             raise ValueError("worker request binding path does not match its field")
-        values, normalized_keys = _identity_query(parsed)
-        expected_type = {
-            "quarterly_holdings": "jjcc",
-            "size_history": "gmbd",
+        values = _exact_query(parsed)
+        expected_query = {
+            "quarterly_holdings": {
+                "code": fund_code,
+                "month": "",
+                "topline": "10",
+                "type": "jjcc",
+                "year": "",
+            },
+            "size_history": {
+                "code": fund_code,
+                "mode": "0",
+                "type": "gmbd",
+            },
         }.get(field_id)
-        if (
-            expected_type is None
-            or normalized_keys != {"code", "type"}
-            or values.get("code") != fund_code
-            or values.get("type") != expected_type
-        ):
+        if expected_query is None or values != expected_query:
             raise ValueError("worker request binding query does not match its subject")
         return
-    values, normalized_keys = _identity_query(parsed)
+    values = _exact_query(parsed)
+    year = values.get("year", "")
     if (
         host == "api.fund.eastmoney.com"
         and field_id == "industry_exposure"
         and parsed.path == "/f10/HYPZ/"
-        and normalized_keys == {"fundcode"}
-        and values.get("fundCode") == fund_code
+        and values == {"fundCode": fund_code, "year": year}
+        and re.fullmatch(r"[0-9]{4}", year) is not None
+        and 1900 <= int(year) <= 9999
     ):
         return
     if (
         host == "api.fund.eastmoney.com"
         and field_id == "announcement"
         and parsed.path == "/f10/JJGG"
-        and normalized_keys in ({"fundcode"}, {"fundcode", "type"})
-        and values.get("fundcode") == fund_code
-        and ("type" not in normalized_keys or values.get("type") == "0")
+        and values
+        == {
+            "fundcode": fund_code,
+            "pageIndex": "1",
+            "pageSize": "20",
+            "type": "0",
+        }
     ):
         return
     raise ValueError("worker request binding URL does not match its field and subject")
@@ -271,7 +279,7 @@ def _validate_worker_binding(
         raise ValueError("worker request binding is not allowed")
     if _binding_host(arguments.get("url")) not in allowed_hosts:
         raise ValueError("worker request binding host is not allowed")
-    if _binding_host(arguments.get("referer")) != "fundf10.eastmoney.com":
+    if arguments.get("referer") != "https://fundf10.eastmoney.com/":
         raise ValueError("worker request binding referer is not allowed")
     _validate_bound_fund_url(
         arguments["url"],

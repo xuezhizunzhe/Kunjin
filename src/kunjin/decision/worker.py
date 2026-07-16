@@ -194,14 +194,19 @@ def _validate_parent_payload(
         raise ValueError("worker retrieval time is outside request audit window")
 
 
-def _close_worker_pipes(process: subprocess.Popen) -> None:
+def _close_worker_pipes(process: subprocess.Popen) -> Optional[BaseException]:
+    first_error: Optional[BaseException] = None
     for pipe in (process.stdin, process.stdout):
-        if pipe is None or pipe.closed:
-            continue
         try:
+            if pipe is None or pipe.closed:
+                continue
             pipe.close()
         except OSError:
             pass
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    return first_error
 
 
 def _exchange_frames(
@@ -319,20 +324,31 @@ def run_public_worker(
         )
     except BaseException as exc:
         primary_error = exc
-    if primary_error is not None:
+    close_error: Optional[BaseException]
+    try:
+        close_error = _close_worker_pipes(process)
+    except BaseException as exc:
+        close_error = exc
+    if close_error is not None:
+        budget.cancel("worker_aborted")
+    elif primary_error is not None:
         reason = (
             primary_error.reason_code
             if isinstance(primary_error, WorkerExecutionError)
             else "worker_aborted"
         )
         budget.cancel(reason)
-    _close_worker_pipes(process)
     try:
         return_code = _finalize_process_group(process, pgid)
     except WorkerExecutionError as cleanup_error:
-        if primary_error is not None:
-            raise cleanup_error from primary_error
+        cause = close_error if close_error is not None else primary_error
+        if cause is not None:
+            raise cleanup_error from cause
         raise
+    if close_error is not None:
+        if primary_error is not None:
+            raise close_error from primary_error
+        raise close_error from None
     if return_code != 0 and (
         primary_error is None
         or (
