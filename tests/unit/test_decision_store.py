@@ -990,6 +990,49 @@ def test_snapshot_write_rejects_oversized_canonical_route(tmp_path) -> None:
     assert count == 0
 
 
+@pytest.mark.parametrize(
+    ("json_column", "checksum_column"),
+    (
+        ("evidence_policy_json", "evidence_policy_checksum"),
+        ("source_registry_json", "source_registry_checksum"),
+        ("canonical_route_json", "result_checksum"),
+    ),
+)
+def test_snapshot_preflight_rejects_oversized_body_before_materializing_json(
+    tmp_path, json_column: str, checksum_column: str
+) -> None:
+    repository, store = _store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+    store.save_decision_snapshot(
+        request_run_id, _route(), EvidencePolicyV1(), SourceRegistryV1(), NOW
+    )
+    oversized = '{"padding":"' + ("x" * MAX_CANONICAL_ROUTE_BYTES) + '"}'
+    checksum = hashlib.sha256(oversized.encode("ascii")).hexdigest()
+    with repository.connect() as connection, connection:
+        connection.execute("DROP TRIGGER decision_snapshot_no_update")
+        connection.execute(
+            f"UPDATE decision_snapshots "  # noqa: S608
+            f"SET {json_column} = ?, {checksum_column} = ?",
+            (oversized, checksum),
+        )
+
+    traced_sql = []
+    with repository.connect() as connection:
+        connection.set_trace_callback(traced_sql.append)
+        with pytest.raises(DecisionAuditStoreError, match="snapshot authentication"):
+            store._load_decision_snapshot(request_run_id, connection=connection)
+
+    normalized = [" ".join(statement.split()).casefold() for statement in traced_sql]
+    assert any("length(cast(evidence_policy_json as blob))" in item for item in normalized)
+    assert all("decision_snapshots.*" not in item for item in normalized)
+    assert not any(
+        item.startswith(
+            "select evidence_policy_json, source_registry_json, canonical_route_json"
+        )
+        for item in normalized
+    )
+
+
 def test_attempt_history_fails_closed_on_registry_tampering(tmp_path) -> None:
     repository, store = _store(tmp_path)
     request_run_id = store.begin_request(_budget())

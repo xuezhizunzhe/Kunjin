@@ -8,7 +8,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, DecimalException
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple
 
 from kunjin.decision.budget import RequestBudget
 from kunjin.decision.models import (
@@ -380,18 +380,46 @@ class DecisionAuditStore:
             except sqlite3.DatabaseError:
                 raise DecisionAuditStoreError("snapshot authentication failed") from None
         try:
-            row = connection.execute(
+            metadata = connection.execute(
                 """
-                SELECT decision_snapshots.*, request_runs.request_id,
-                       request_runs.mode AS request_mode
+                SELECT decision_snapshots.id,
+                       decision_snapshots.request_run_id,
+                       decision_snapshots.evidence_policy_version,
+                       decision_snapshots.evidence_policy_checksum,
+                       decision_snapshots.source_registry_version,
+                       decision_snapshots.source_registry_checksum,
+                       decision_snapshots.result_checksum,
+                       decision_snapshots.created_at,
+                       request_runs.request_id,
+                       request_runs.mode AS request_mode,
+                       length(CAST(evidence_policy_json AS BLOB))
+                           AS evidence_policy_byte_count,
+                       length(CAST(source_registry_json AS BLOB))
+                           AS source_registry_byte_count,
+                       length(CAST(canonical_route_json AS BLOB))
+                           AS route_byte_count
                 FROM decision_snapshots
                 JOIN request_runs ON request_runs.id = decision_snapshots.request_run_id
                 WHERE decision_snapshots.request_run_id = ?
                 """,
                 (request_run_id,),
             ).fetchone()
-            if row is None:
+            if metadata is None:
                 raise DecisionAuditStoreError("decision snapshot does not exist")
+            snapshot_id = _validate_snapshot_preflight(metadata, request_run_id)
+            body = connection.execute(
+                """
+                SELECT evidence_policy_json, source_registry_json,
+                       canonical_route_json
+                FROM decision_snapshots
+                WHERE request_run_id = ? AND id = ?
+                """,
+                (request_run_id, snapshot_id),
+            ).fetchone()
+            if body is None:
+                raise DecisionAuditStoreError("decision snapshot does not exist")
+            row = dict(metadata)
+            row.update(dict(body))
             return _stored_snapshot(row, request_run_id)
         except DecisionAuditStoreError:
             raise
@@ -399,7 +427,55 @@ class DecisionAuditStore:
             raise DecisionAuditStoreError("snapshot authentication failed") from None
 
 
-def _stored_snapshot(row: sqlite3.Row, request_run_id: int) -> StoredDecisionSnapshot:
+def _validate_snapshot_preflight(row: sqlite3.Row, request_run_id: int) -> int:
+    snapshot_id = _positive_id(row["id"], "snapshot id")
+    stored_request_run_id = _positive_id(row["request_run_id"], "request run id")
+    if stored_request_run_id != request_run_id:
+        raise DecisionAuditStoreError("snapshot request binding failed")
+
+    policy = EvidencePolicyV1()
+    policy_bytes = policy.canonical_json()
+    policy_checksum = _required_checksum(
+        row["evidence_policy_checksum"], "policy checksum"
+    )
+    policy_byte_count = _required_int(
+        row["evidence_policy_byte_count"], "policy JSON byte count"
+    )
+    if (
+        policy_byte_count != len(policy_bytes)
+        or row["evidence_policy_version"] != policy.version
+        or policy_checksum != policy.checksum()
+    ):
+        raise DecisionAuditStoreError("snapshot authentication failed")
+
+    registry = SourceRegistryV1()
+    registry_bytes = registry.canonical_json()
+    registry_checksum = _required_checksum(
+        row["source_registry_checksum"], "registry checksum"
+    )
+    registry_byte_count = _required_int(
+        row["source_registry_byte_count"], "registry JSON byte count"
+    )
+    if (
+        registry_byte_count != len(registry_bytes)
+        or row["source_registry_version"] != registry.version
+        or registry_checksum != registry.checksum()
+    ):
+        raise DecisionAuditStoreError("snapshot authentication failed")
+
+    _required_checksum(row["result_checksum"], "result checksum")
+    route_byte_count = _required_int(row["route_byte_count"], "route JSON byte count")
+    if not 0 < route_byte_count <= MAX_CANONICAL_ROUTE_BYTES:
+        raise DecisionAuditStoreError("snapshot authentication failed")
+    validate_request_id(row["request_id"])
+    RequestMode(row["request_mode"])
+    _stored_datetime(row["created_at"], "snapshot creation")
+    return snapshot_id
+
+
+def _stored_snapshot(
+    row: Mapping[str, object], request_run_id: int
+) -> StoredDecisionSnapshot:
     snapshot_id = _positive_id(row["id"], "snapshot id")
     stored_request_run_id = _positive_id(row["request_run_id"], "request run id")
     if stored_request_run_id != request_run_id:

@@ -1082,24 +1082,44 @@ def _resolve_import_from(module_name: str, node: ast.ImportFrom) -> set[str]:
 def _ast_import_names(source: str, module_name: str) -> set[str]:
     names = set()
     for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Import):
+        if isinstance(node, ast.Name) and node.id in {"__import__", "import_module"}:
+            names.add(_DYNAMIC_IMPORT)
+        elif isinstance(node, ast.Attribute) and node.attr in {
+            "__import__",
+            "import_module",
+        }:
+            names.add(_DYNAMIC_IMPORT)
+        elif isinstance(node, ast.Constant) and node.value in {
+            "__import__",
+            "import_module",
+        }:
+            names.add(_DYNAMIC_IMPORT)
+        elif isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
+            if any(alias.name in {"builtins", "importlib"} for alias in node.names):
+                names.add(_DYNAMIC_IMPORT)
         elif isinstance(node, ast.ImportFrom):
             names.update(_resolve_import_from(module_name, node))
+            if node.module in {"builtins", "importlib"}:
+                names.add(_DYNAMIC_IMPORT)
         elif isinstance(node, ast.Call):
             is_dynamic_import = (
-                isinstance(node.func, ast.Name) and node.func.id == "__import__"
+                isinstance(node.func, ast.Name)
+                and node.func.id in {"__import__", "import_module"}
             ) or (
                 isinstance(node.func, ast.Attribute)
-                and node.func.attr == "import_module"
+                and node.func.attr in {"__import__", "import_module"}
+            ) or (
+                isinstance(node.func, ast.Call)
+                and isinstance(node.func.func, ast.Name)
+                and node.func.func.id == "getattr"
             )
             if is_dynamic_import:
+                names.add(_DYNAMIC_IMPORT)
                 if node.args and isinstance(node.args[0], ast.Constant) and isinstance(
                     node.args[0].value, str
                 ):
                     names.add(node.args[0].value)
-                else:
-                    names.add(_DYNAMIC_IMPORT)
     return names
 
 
@@ -1117,10 +1137,19 @@ def _local_module_path(source_root: Path, module_name: str):
 def _worker_local_dependency_closure(
     source_root: Path, worker_modules: list[Path]
 ) -> tuple[set[str], set[str]]:
-    pending = [
-        ".".join(module.relative_to(source_root).with_suffix("").parts)
-        for module in worker_modules
-    ]
+    pending = []
+
+    def enqueue_module_and_parents(module_name: str) -> None:
+        parts = module_name.split(".")
+        for count in range(1, len(parts) + 1):
+            candidate = ".".join(parts[:count])
+            if _local_module_path(source_root, candidate) is not None:
+                pending.append(candidate)
+
+    for module in worker_modules:
+        enqueue_module_and_parents(
+            ".".join(module.relative_to(source_root).with_suffix("").parts)
+        )
     reachable = set()
     all_imports = set()
     while pending:
@@ -1137,7 +1166,7 @@ def _worker_local_dependency_closure(
         for imported_name in imported:
             imported_path = _local_module_path(source_root, imported_name)
             if imported_path is not None and imported_name not in reachable:
-                pending.append(imported_name)
+                enqueue_module_and_parents(imported_name)
     return reachable, all_imports
 
 
@@ -1158,6 +1187,24 @@ def test_worker_ast_import_detector_catches_boundary_bypasses(source: str) -> No
     )
 
 
+@pytest.mark.parametrize(
+    "source",
+    (
+        'import importlib as loader\nloader.import_module("kunjin.storage")',
+        'from importlib import import_module as load\nload("kunjin.storage")',
+        'import builtins\nbuiltins.__import__("kunjin.storage")',
+        'from builtins import __import__ as load\nload("kunjin.storage")',
+        'import importlib\ngetattr(importlib, "import_module")("kunjin.storage")',
+        'getattr(target, dynamic_name)("kunjin.storage")',
+    ),
+)
+def test_worker_ast_import_detector_rejects_alias_and_getattr_bypasses(
+    source: str,
+) -> None:
+    imports = _ast_import_names(source, "kunjin.decision.worker_probe")
+    assert _DYNAMIC_IMPORT in imports
+
+
 def test_all_worker_reachable_local_modules_use_strict_allowlist() -> None:
     source_root = Path(__file__).parents[2] / "src"
     worker_modules = sorted((source_root / "kunjin" / "decision").glob("worker*.py"))
@@ -1170,11 +1217,16 @@ def test_all_worker_reachable_local_modules_use_strict_allowlist() -> None:
         "kunjin.adapters.yangjibao",
     )
     allowed = {
+        "kunjin",
+        "kunjin.decision",
         "kunjin.decision.budget",
         "kunjin.decision.models",
+        "kunjin.decision.policy",
+        "kunjin.decision.source_registry",
         "kunjin.decision.worker",
         "kunjin.decision.worker_main",
         "kunjin.decision.worker_protocol",
+        "kunjin.funds",
         "kunjin.funds.models",
         "kunjin.funds.official_domains",
         "kunjin.funds.sources",
@@ -1185,7 +1237,7 @@ def test_all_worker_reachable_local_modules_use_strict_allowlist() -> None:
         for name in imported
         for blocked in forbidden
     )
-    assert reachable <= allowed
+    assert reachable == allowed
 
 
 def test_production_worker_entrypoint_rejects_unbound_url_before_launch() -> None:
