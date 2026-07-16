@@ -1305,6 +1305,7 @@ def test_v1_and_nested_records_reject_injected_state() -> None:
             id=1,
             request_run_id=1,
             request_id="0123456789abcdef0123456789abcdef",
+            authorization_id=None,
             attempt=attempt,
         ),
     )

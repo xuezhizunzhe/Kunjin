@@ -2,31 +2,33 @@ from __future__ import annotations
 
 import math
 import re
-import threading
-from dataclasses import dataclass
-from dataclasses import replace as dataclass_replace
-from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional
 
 from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.models import (
-    TRANSIENT_SOURCE_ERRORS,
+    ActionKind,
+    ForceAuthorization,
     ForceReasonCode,
     FreshnessContext,
+    FreshnessKind,
     RequestFieldResolution,
     RequestMode,
-    SourceAttempt,
+    RiskEffect,
     SourceAttemptOutcome,
+    SourceFieldHistory,
     SourceFieldPolicy,
     SourceFieldRef,
     SourceFieldState,
     SourceTier,
+    SourceWorkAuthorization,
     StoredSourceAttempt,
     validate_aware_datetime,
     validate_exact_dataclass_state,
     validate_identifier,
-    validate_request_id,
 )
+from kunjin.decision.policy import EvidencePolicyV1, EvidenceRequirement
 from kunjin.decision.source_registry import SourceRegistryV1
 from kunjin.decision.store import DecisionAuditStore
 
@@ -38,43 +40,39 @@ _EXHAUSTED_STATES = frozenset(
     (SourceFieldState.UNAVAILABLE, SourceFieldState.UNSUPPORTED)
 )
 _SUBJECT_KEY_PATTERN = re.compile(r"^fund:[0-9]{6}$")
-_SOURCE_TIER_RANK = {
-    SourceTier.TIER_1: 3,
-    SourceTier.TIER_2: 2,
-    SourceTier.PRIVATE_OBSERVATION: 1,
-    SourceTier.USER_PROVIDED: 1,
+_ACTION_RISK = {
+    ActionKind.FACT_RESEARCH: RiskEffect.INFORMATION,
+    ActionKind.CONTINUE_HOLDING: RiskEffect.RISK_MAINTAINING,
+    ActionKind.REDUCE_TO_CASH: RiskEffect.RISK_REDUCING,
+    ActionKind.FULL_EXIT: RiskEffect.RISK_REDUCING,
+    ActionKind.BUY_OR_ADD: RiskEffect.RISK_INCREASING,
+    ActionKind.SWITCH_FUNDS: RiskEffect.RISK_INCREASING,
 }
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 @dataclass(frozen=True)
-class ForceAuthorization:
-    actor: str
-    reason: ForceReasonCode
-    request_id: str
-    source_id: str
-    field_id: str
-    subject_key: str
-    authorized_at: datetime
-    deadline_at: datetime
+class ActionEvidenceRequirement:
+    action: ActionKind
+    risk_effect: RiskEffect
+    policy_requirement: EvidenceRequirement
 
     def validate(self) -> None:
-        validate_exact_dataclass_state(self, "force authorization")
-        if self.actor != "local_owner":
-            raise ValueError("force actor must be local_owner")
-        if type(self.reason) is not ForceReasonCode:
-            raise ValueError("force reason must be an exact ForceReasonCode")
-        validate_request_id(self.request_id)
-        validate_identifier(self.source_id, "source id")
-        validate_identifier(self.field_id, "field id")
-        if (
-            type(self.subject_key) is not str
-            or _SUBJECT_KEY_PATTERN.fullmatch(self.subject_key) is None
-        ):
-            raise ValueError("subject key must be fund: followed by exactly six digits")
-        validate_aware_datetime(self.authorized_at, "force authorization time")
-        validate_aware_datetime(self.deadline_at, "force authorization deadline")
-        if self.authorized_at > self.deadline_at:
-            raise ValueError("force authorization cannot follow its deadline")
+        validate_exact_dataclass_state(self, "action evidence requirement")
+        if type(self) is not ActionEvidenceRequirement:
+            raise ValueError("action evidence requirement subclasses are not accepted")
+        if type(self.action) is not ActionKind:
+            raise ValueError("action must be an exact ActionKind")
+        if type(self.risk_effect) is not RiskEffect:
+            raise ValueError("risk effect must be an exact RiskEffect")
+        if _ACTION_RISK[self.action] is not self.risk_effect:
+            raise ValueError("action and risk effect do not match")
+        if type(self.policy_requirement) is not EvidenceRequirement:
+            raise ValueError("policy requirement must be an exact EvidenceRequirement")
+        self.policy_requirement.validate()
 
 
 class SourceHealthService:
@@ -82,6 +80,9 @@ class SourceHealthService:
         self,
         audit_store: DecisionAuditStore,
         registry: Optional[SourceRegistryV1] = None,
+        policy: Optional[EvidencePolicyV1] = None,
+        *,
+        wall_clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         if type(audit_store) is not DecisionAuditStore:
             raise ValueError("audit store must be an exact DecisionAuditStore")
@@ -90,11 +91,35 @@ class SourceHealthService:
         if type(registry) is not SourceRegistryV1:
             raise ValueError("registry must be an exact SourceRegistryV1")
         registry.validate()
+        if policy is None:
+            policy = EvidencePolicyV1()
+        if type(policy) is not EvidencePolicyV1:
+            raise ValueError("policy must be an exact EvidencePolicyV1")
+        policy.validate()
+        if not callable(wall_clock):
+            raise ValueError("wall clock must be callable")
         self.audit_store = audit_store
         self.registry = registry
-        self._consumption_lock = threading.Lock()
-        self._consumed_retries: set[tuple[str, str, str, str]] = set()
-        self._consumed_forces: set[tuple[str, str, str, str]] = set()
+        self.policy = policy
+        self.wall_clock = wall_clock
+
+    def action_requirement(
+        self,
+        field_id: str,
+        action: ActionKind,
+        risk_effect: RiskEffect,
+    ) -> ActionEvidenceRequirement:
+        validate_identifier(field_id, "field id")
+        matches = tuple(
+            requirement
+            for requirement in self.policy.requirements
+            if requirement.field_id == field_id
+        )
+        if len(matches) != 1:
+            raise ValueError("field has no executable EvidencePolicy V1 requirement")
+        requirement = ActionEvidenceRequirement(action, risk_effect, matches[0])
+        requirement.validate()
+        return requirement
 
     def source_field_state(
         self,
@@ -102,17 +127,20 @@ class SourceHealthService:
         field_id: str,
         subject_key: str,
         context: FreshnessContext,
+        *,
+        request_run_id: int,
+        budget: RequestBudget,
     ) -> SourceFieldState:
+        reference = SourceFieldRef(source_id, field_id)
         policy = self._field_policy(source_id, field_id)
-        if type(context) is not FreshnessContext:
-            raise ValueError("freshness context must be an exact FreshnessContext")
-        context.validate()
-        history = self.audit_store.source_attempt_history(
-            source_id,
-            field_id,
+        trusted_context = self._trusted_context(context, budget)
+        histories = self.audit_store.authenticated_source_attempt_histories(
+            request_run_id,
+            budget,
+            (reference,),
             subject_key,
         )
-        return self._project_state(history, policy, context)
+        return self._project_state(histories[0], policy, trusted_context)
 
     def resolve_field(
         self,
@@ -120,38 +148,48 @@ class SourceHealthService:
         field_id: str,
         subject_key: str,
         context: FreshnessContext,
+        requirement: ActionEvidenceRequirement,
+        *,
+        request_run_id: int,
+        budget: RequestBudget,
     ) -> RequestFieldResolution:
+        if type(requirement) is not ActionEvidenceRequirement:
+            raise ValueError("requirement must be an exact ActionEvidenceRequirement")
+        requirement.validate()
+        if requirement.policy_requirement not in self.policy.requirements:
+            raise ValueError("requirement is not bound to the active evidence policy")
+        if requirement.policy_requirement.field_id != field_id:
+            raise ValueError("requirement does not match the requested field")
         primary_ref = SourceFieldRef(source_id, field_id)
         primary = self._field_policy(source_id, field_id)
         references = (primary_ref, *primary.acceptable_alternatives)
-        primary_state = self.source_field_state(
-            primary_ref.source_id,
-            primary_ref.field_id,
+        trusted_context = self._trusted_context(context, budget)
+        histories = self.audit_store.authenticated_source_attempt_histories(
+            request_run_id,
+            budget,
+            references,
             subject_key,
-            context,
         )
-        if primary_state is SourceFieldState.HEALTHY:
-            return RequestFieldResolution.USABLE
-        alternative_states = tuple(
+        projected = tuple(
             (
-                self._field_policy(reference.source_id, reference.field_id),
-                self.source_field_state(
-                    reference.source_id,
-                    reference.field_id,
-                    subject_key,
-                    context,
-                ),
+                self._field_policy(history.reference.source_id, history.reference.field_id),
+                self._project_state(history, self._field_policy(
+                    history.reference.source_id,
+                    history.reference.field_id,
+                ), trusted_context),
             )
-            for reference in references[1:]
+            for history in histories
         )
-        if any(
-            state is SourceFieldState.HEALTHY
-            and _SOURCE_TIER_RANK[policy.source_tier]
-            >= _SOURCE_TIER_RANK[primary.source_tier]
-            for policy, state in alternative_states
+        if requirement.risk_effect is RiskEffect.INFORMATION:
+            if any(state is SourceFieldState.HEALTHY for _, state in projected):
+                return RequestFieldResolution.USABLE
+        elif any(
+            policy.source_tier is SourceTier.TIER_1
+            and state is SourceFieldState.HEALTHY
+            for policy, state in projected
         ):
             return RequestFieldResolution.USABLE
-        states = (primary_state, *(state for _, state in alternative_states))
+        states = tuple(state for _, state in projected)
         if any(
             state in {SourceFieldState.HEALTHY, SourceFieldState.DEGRADED}
             for state in states
@@ -163,14 +201,16 @@ class SourceHealthService:
 
     def retry_allowed(
         self,
-        attempt: SourceAttempt,
+        parent: StoredSourceAttempt,
         budget: RequestBudget,
         *,
+        request_run_id: int,
+        reserved_at: datetime,
         minimum_worker_seconds: float,
-    ) -> bool:
-        if type(attempt) is not SourceAttempt:
-            raise ValueError("attempt must be an exact SourceAttempt")
-        attempt.validate()
+    ) -> Optional[SourceWorkAuthorization]:
+        if type(parent) is not StoredSourceAttempt:
+            raise ValueError("retry parent must be an exact StoredSourceAttempt")
+        parent.validate()
         if type(budget) is not RequestBudget:
             raise ValueError("budget must be an exact RequestBudget")
         if (
@@ -180,28 +220,25 @@ class SourceHealthService:
         ):
             raise ValueError("minimum worker seconds must be a positive finite exact float")
         if (
-            attempt.attempt_number != 1
-            or attempt.outcome is not SourceAttemptOutcome.TRANSIENT_FAILURE
-            or attempt.error_code not in TRANSIENT_SOURCE_ERRORS
+            parent.request_run_id != request_run_id
+            or parent.request_id != budget.request_id
+            or parent.attempt.attempt_number != 1
+            or parent.attempt.outcome is not SourceAttemptOutcome.TRANSIENT_FAILURE
         ):
-            return False
+            return None
         try:
             enough_budget = budget.worker_seconds() >= minimum_worker_seconds
         except BudgetExpired:
-            return False
+            return None
         if not enough_budget:
-            return False
-        key = (
-            budget.request_id,
-            attempt.source_id,
-            attempt.field_id,
-            attempt.subject_key,
+            return None
+        return self.audit_store.reserve_retry(
+            request_run_id,
+            budget,
+            parent,
+            reserved_at,
+            minimum_worker_seconds=minimum_worker_seconds,
         )
-        with self._consumption_lock:
-            if key in self._consumed_retries:
-                return False
-            self._consumed_retries.add(key)
-            return True
 
     @staticmethod
     def cooldown_until(finished_at: datetime) -> datetime:
@@ -217,6 +254,7 @@ class SourceHealthService:
         authorized_at: datetime,
         force_reason: Optional[ForceReasonCode],
         *,
+        request_run_id: int,
         attempt_number: int,
     ) -> Optional[ForceAuthorization]:
         if type(budget) is not RequestBudget:
@@ -227,7 +265,10 @@ class SourceHealthService:
             or _SUBJECT_KEY_PATTERN.fullmatch(subject_key) is None
         ):
             raise ValueError("subject key must be fund: followed by exactly six digits")
-        validate_aware_datetime(authorized_at, "force authorization time")
+        authorized_at = validate_aware_datetime(
+            authorized_at,
+            "force authorization time",
+        ).astimezone(timezone.utc)
         if type(attempt_number) is not int or attempt_number not in {1, 2}:
             raise ValueError("attempt number must be exactly 1 or 2")
         if force_reason is None:
@@ -238,26 +279,42 @@ class SourceHealthService:
             raise ValueError("force requires deep mode")
         if attempt_number != 1:
             raise ValueError("force is allowed only on the first attempt")
-        budget.require_publishable()
-        if not budget.started_at <= authorized_at <= budget.deadline_at:
-            raise ValueError("force authorization is outside the request lifetime")
-        key = (budget.request_id, source_id, field_id, subject_key)
-        with self._consumption_lock:
-            if key in self._consumed_forces:
-                return None
-            self._consumed_forces.add(key)
-        authorization = ForceAuthorization(
-            actor="local_owner",
-            reason=force_reason,
-            request_id=budget.request_id,
-            source_id=source_id,
-            field_id=field_id,
-            subject_key=subject_key,
-            authorized_at=authorized_at,
-            deadline_at=budget.deadline_at,
+        authorization = self.audit_store.reserve_force(
+            request_run_id,
+            budget,
+            source_id,
+            field_id,
+            subject_key,
+            authorized_at,
+            force_reason,
         )
+        if authorization is None:
+            return None
         authorization.validate()
         return authorization
+
+    def _trusted_context(
+        self,
+        context: FreshnessContext,
+        budget: RequestBudget,
+    ) -> FreshnessContext:
+        if type(context) is not FreshnessContext:
+            raise ValueError("freshness context must be an exact FreshnessContext")
+        context.validate()
+        if type(budget) is not RequestBudget:
+            raise ValueError("budget must be an exact RequestBudget")
+        budget.require_publishable()
+        try:
+            now = validate_aware_datetime(self.wall_clock(), "health wall clock").astimezone(
+                timezone.utc
+            )
+        except Exception:
+            raise ValueError("health wall clock failed") from None
+        if not budget.started_at <= now <= budget.deadline_at:
+            raise ValueError("health wall clock is outside the request lifetime")
+        if context.data_request_id is not None or context.data_trading_day is not None:
+            raise ValueError("data lineage fields are derived from authenticated attempts")
+        return replace(context, now=now, request_id=budget.request_id)
 
     def _field_policy(self, source_id: str, field_id: str) -> SourceFieldPolicy:
         validate_identifier(source_id, "source id")
@@ -271,47 +328,49 @@ class SourceHealthService:
 
     @staticmethod
     def _project_state(
-        history: Tuple[StoredSourceAttempt, ...],
+        history: SourceFieldHistory,
         field_policy: SourceFieldPolicy,
         context: FreshnessContext,
     ) -> SourceFieldState:
-        if type(history) is not tuple:
-            raise ValueError("source attempt history must be an exact tuple")
-        for record in history:
-            if type(record) is not StoredSourceAttempt:
-                raise ValueError("source attempt history contains an invalid record")
-            record.validate()
-        history = tuple(
-            record for record in history if record.attempt.finished_at <= context.now
+        if type(history) is not SourceFieldHistory:
+            raise ValueError("history must be an exact SourceFieldHistory")
+        history.validate()
+        records = tuple(
+            record
+            for record in history.attempts
+            if record.attempt.finished_at <= context.now
         )
-        if not history:
+        if not records:
             return SourceFieldState.NOT_CHECKED
-        latest = history[0].attempt
+        latest = records[0].attempt
         if latest.outcome is SourceAttemptOutcome.UNSUPPORTED:
             return SourceFieldState.UNSUPPORTED
         if latest.cooldown_until is not None and context.now < latest.cooldown_until:
             return SourceFieldState.COOLDOWN
         successful = tuple(
-            record
-            for record in history
-            if record.attempt.outcome in _SUCCESS_OUTCOMES
+            record for record in records if record.attempt.outcome in _SUCCESS_OUTCOMES
         )
-        if successful:
-            successful_attempt = successful[0].attempt
-            authenticated_context = dataclass_replace(
-                context,
-                data_request_id=successful[0].request_id,
-                data_trading_day=successful_attempt.data_as_of.date(),
-            )
-        else:
-            successful_attempt = None
-            authenticated_context = context
-        if successful_attempt is not None and field_policy.is_current(
+        if not successful:
+            return SourceFieldState.UNAVAILABLE
+        successful_record = successful[0]
+        successful_attempt = successful_record.attempt
+        data_request_id = (
+            None
+            if successful_attempt.outcome is SourceAttemptOutcome.CACHE_HIT
+            else successful_record.request_id
+        )
+        authenticated_context = replace(
+            context,
+            data_request_id=data_request_id,
+            data_trading_day=None,
+        )
+        can_be_current = field_policy.freshness.kind is not FreshnessKind.SAME_TRADING_DAY
+        if can_be_current and field_policy.is_current(
             successful_attempt.data_as_of,
             authenticated_context,
         ):
             return SourceFieldState.HEALTHY
-        if successful_attempt is not None and field_policy.is_usable(
+        if field_policy.is_usable(
             successful_attempt.data_as_of,
             authenticated_context,
         ):

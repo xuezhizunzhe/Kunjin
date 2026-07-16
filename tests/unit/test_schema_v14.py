@@ -236,7 +236,7 @@ class SchemaV14Test(unittest.TestCase):
                         if version >= 13
                         else None
                     )
-                self.assertEqual(versions, tuple(range(1, 15)))
+                self.assertEqual(versions, tuple(range(1, 16)))
                 self.assertEqual(tuple(classification_after), tuple(classification_before))
                 if selection_before is not None:
                     self.assertEqual(tuple(selection_after), tuple(selection_before))
@@ -250,8 +250,8 @@ class SchemaV14Test(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             )
-        self.assertEqual(SCHEMA_VERSION, 14)
-        self.assertEqual(versions, tuple(range(1, 15)))
+        self.assertEqual(SCHEMA_VERSION, 15)
+        self.assertEqual(versions, tuple(range(1, 16)))
 
     def test_failed_v14_migration_rolls_back_objects_marker_and_prior_bytes(self) -> None:
         repository = self._create_at_version(13)
@@ -414,7 +414,7 @@ class SchemaV14Test(unittest.TestCase):
 
                 with self.assertRaisesRegex(
                     sqlite3.DatabaseError,
-                    "decision audit schema does not match V14",
+                    "decision audit schema does not match V15",
                 ):
                     repository.migrate()
 
@@ -487,7 +487,7 @@ class SchemaV14Test(unittest.TestCase):
 
         with self.assertRaisesRegex(
             sqlite3.DatabaseError,
-            "decision audit schema does not match V14",
+            "decision audit schema does not match V15",
         ):
             repository.migrate()
 
@@ -543,7 +543,7 @@ class SchemaV14Test(unittest.TestCase):
 
                 with self.assertRaisesRegex(
                     sqlite3.DatabaseError,
-                    "decision audit schema does not match V14",
+                    "decision audit schema does not match V15",
                 ):
                     repository.migrate()
 
@@ -563,7 +563,7 @@ class SchemaV14Test(unittest.TestCase):
 
         with self.assertRaisesRegex(
             sqlite3.DatabaseError,
-            "decision audit schema does not match V14",
+            "decision audit schema does not match V15",
         ):
             repository.migrate()
 
@@ -589,7 +589,7 @@ class SchemaV14Test(unittest.TestCase):
 
         with self.assertRaisesRegex(
             sqlite3.DatabaseError,
-            "decision audit schema does not match V14",
+            "decision audit schema does not match V15",
         ):
             repository.migrate()
 
@@ -626,7 +626,7 @@ class SchemaV14Test(unittest.TestCase):
 
         repository.migrate()
 
-    def test_v14_has_exact_three_tables_columns_foreign_keys_indexes_and_triggers(self) -> None:
+    def test_current_audit_schema_has_exact_columns_foreign_keys_indexes_and_triggers(self) -> None:
         repository = self._create_at_version(13)
         with repository.connect() as connection:
             tables_before = {
@@ -672,7 +672,12 @@ class SchemaV14Test(unittest.TestCase):
 
         self.assertEqual(
             tables - tables_before,
-            {"request_runs", "source_attempts", "decision_snapshots"},
+            {
+                "request_runs",
+                "source_attempts",
+                "source_work_authorizations",
+                "decision_snapshots",
+            },
         )
         self.assertEqual(
             columns["request_runs"],
@@ -707,6 +712,7 @@ class SchemaV14Test(unittest.TestCase):
                 "registry_version",
                 "registry_checksum",
                 "response_byte_count",
+                "authorization_id",
             ),
         )
         self.assertEqual(
@@ -727,7 +733,15 @@ class SchemaV14Test(unittest.TestCase):
         )
         self.assertEqual(
             foreign_keys["source_attempts"],
-            {("request_run_id", "request_runs", "id", "RESTRICT")},
+            {
+                ("request_run_id", "request_runs", "id", "RESTRICT"),
+                (
+                    "authorization_id",
+                    "source_work_authorizations",
+                    "id",
+                    "RESTRICT",
+                ),
+            },
         )
         self.assertEqual(
             foreign_keys["decision_snapshots"],
@@ -948,7 +962,7 @@ class SchemaV14Test(unittest.TestCase):
         repository.migrate()
         valid_overrides = (
             {},
-            {"outcome": "cache_hit", "attempt_number": 2},
+            {"outcome": "cache_hit"},
             {
                 "outcome": "transient_failure",
                 "data_as_of": None,
@@ -986,10 +1000,6 @@ class SchemaV14Test(unittest.TestCase):
                 "error_code": "cooldown_active",
                 "cooldown_until": COOLDOWN,
                 "response_byte_count": 0,
-            },
-            {
-                "force_actor": "local_owner",
-                "force_reason": "owner_approved_retry",
             },
         )
         for index, overrides in enumerate(valid_overrides):
@@ -1035,6 +1045,8 @@ class SchemaV14Test(unittest.TestCase):
             },
             {"force_actor": "other_owner", "force_reason": "owner_approved_retry"},
             {"force_actor": "local_owner", "force_reason": None},
+            {"force_actor": "local_owner", "force_reason": "owner_approved_retry"},
+            {"attempt_number": 2},
         )
         for index, overrides in enumerate(invalid_overrides, start=20):
             with self.subTest(overrides=overrides), repository.connect() as connection:

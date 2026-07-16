@@ -40,6 +40,7 @@ from kunjin.storage.schema import (
     SCHEMA_V12,
     SCHEMA_V13,
     SCHEMA_V14,
+    SCHEMA_V15,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -77,6 +78,7 @@ _D1_OBJECT_PREFIXES = (
 _DECISION_AUDIT_TABLES = {
     "request_runs",
     "source_attempts",
+    "source_work_authorizations",
     "decision_snapshots",
 }
 _DECISION_AUDIT_OBJECT_NAMESPACES = (
@@ -84,11 +86,13 @@ _DECISION_AUDIT_OBJECT_NAMESPACES = (
     "request_runs_",
     "source_attempt_",
     "source_attempts_",
+    "source_work_authorization_",
+    "source_work_authorizations_",
     "decision_snapshot_",
     "decision_snapshots_",
 )
 _DECISION_AUDIT_OBJECT_ROOTS = frozenset(
-    ("request_run", "source_attempt", "decision_snapshot")
+    ("request_run", "source_attempt", "source_work_authorization", "decision_snapshot")
 )
 _DECISION_AUDIT_ACCESS_ACTIONS = frozenset(
     (sqlite3.SQLITE_READ, sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE)
@@ -162,6 +166,7 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (12, SCHEMA_V12),
         (13, SCHEMA_V13),
         (14, SCHEMA_V14),
+        (15, SCHEMA_V15),
     )
 
 
@@ -280,7 +285,7 @@ def _reject_unexpected_decision_audit_dependencies(
         and str(row["type"]).casefold() in {"virtual", "shadow"}
     }
     if unexpected_virtual_tables:
-        raise sqlite3.DatabaseError("decision audit schema does not match V14")
+        raise sqlite3.DatabaseError("decision audit schema does not match V15")
     main_database = next(
         (
             str(row["file"])
@@ -290,7 +295,7 @@ def _reject_unexpected_decision_audit_dependencies(
         "",
     )
     if not main_database:
-        raise sqlite3.DatabaseError("decision audit schema does not match V14")
+        raise sqlite3.DatabaseError("decision audit schema does not match V15")
     probe = sqlite3.connect(main_database)
     probe.row_factory = sqlite3.Row
 
@@ -344,7 +349,7 @@ def _reject_unexpected_decision_audit_dependencies(
                 _ascii_identifier(str(row["table"])) in _DECISION_AUDIT_TABLES
                 for row in foreign_keys
             ):
-                raise sqlite3.DatabaseError("decision audit schema does not match V14")
+                raise sqlite3.DatabaseError("decision audit schema does not match V15")
 
         probe.set_authorizer(authorize)
         try:
@@ -380,18 +385,18 @@ def _reject_unexpected_decision_audit_dependencies(
         probe.close()
 
     if dependency_sources:
-        raise sqlite3.DatabaseError("decision audit schema does not match V14")
+        raise sqlite3.DatabaseError("decision audit schema does not match V15")
     if any(
         _ascii_identifier(target) not in compiled_trigger_targets
         or normalized_name not in observed_sources
         for normalized_name, target in extra_triggers.items()
     ):
-        raise sqlite3.DatabaseError("decision audit schema does not match V14")
+        raise sqlite3.DatabaseError("decision audit schema does not match V15")
     if any(
         normalized_name not in compiled_views or normalized_name not in observed_sources
         for normalized_name in extra_views
     ):
-        raise sqlite3.DatabaseError("decision audit schema does not match V14")
+        raise sqlite3.DatabaseError("decision audit schema does not match V15")
 
 
 def _ascii_identifier(value: str) -> str:
@@ -810,9 +815,9 @@ def _validate_applied_schema(
 
     if 14 not in applied_versions:
         return
-    expected_v14 = _owned_decision_audit_objects(expected)
-    if _owned_decision_audit_objects(actual) != expected_v14:
-        raise sqlite3.DatabaseError("decision audit schema does not match V14")
+    expected_v15 = _owned_decision_audit_objects(expected)
+    if _owned_decision_audit_objects(actual) != expected_v15:
+        raise sqlite3.DatabaseError("decision audit schema does not match V15")
     _reject_unexpected_decision_audit_dependencies(connection, expected, actual)
 
 

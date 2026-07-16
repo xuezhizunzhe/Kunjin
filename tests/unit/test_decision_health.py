@@ -12,18 +12,21 @@ from kunjin.decision.health import (
     SourceHealthService,
 )
 from kunjin.decision.models import (
+    ActionKind,
     ForceReasonCode,
     FreshnessContext,
     RequestFieldResolution,
     RequestMode,
     RequestTerminalStatus,
+    RiskEffect,
     SourceAttempt,
     SourceAttemptOutcome,
     SourceErrorCode,
     SourceFieldState,
+    StoredSourceAttempt,
 )
 from kunjin.decision.source_registry import SOURCE_REGISTRY_V1_CHECKSUM
-from kunjin.decision.store import DecisionAuditStore
+from kunjin.decision.store import DecisionAuditStore, DecisionAuditStoreError
 from kunjin.storage.repository import Repository
 
 NOW = datetime(2026, 7, 16, 6, 0, tzinfo=timezone.utc)
@@ -45,10 +48,11 @@ class _Harness:
         repository = Repository(tmp_path / "kunjin.db")
         repository.migrate()
         self.store = DecisionAuditStore(repository)
-        self.service = SourceHealthService(self.store)
+        self.service = SourceHealthService(self.store, wall_clock=lambda: NOW)
         self.sequence = 0
+        self.query_sequence = 200
 
-    def record(self, **overrides) -> SourceAttempt:
+    def record(self, **overrides) -> StoredSourceAttempt:
         self.sequence += 1
         mode = overrides.pop("mode", RequestMode.RAPID)
         request_id = overrides.pop("request_id", f"{self.sequence:032x}")
@@ -89,12 +93,85 @@ class _Harness:
             attempt.finished_at,
             (),
         )
-        return attempt
+        return self.store.source_attempt_history(source_id, field_id, SUBJECT)[0]
+
+    def begin(
+        self,
+        *,
+        mode: RequestMode = RequestMode.RAPID,
+        request_id: str | None = None,
+        started_at: datetime = NOW,
+        clock: _Clock | None = None,
+    ) -> tuple[int, RequestBudget]:
+        self.query_sequence += 1
+        if request_id is None:
+            request_id = f"{self.query_sequence:032x}"
+        if clock is None:
+            clock = _Clock(10.0)
+        budget = RequestBudget.create(
+            mode,
+            request_id=request_id,
+            monotonic=clock,
+            wall_clock=lambda: started_at,
+        )
+        return self.store.begin_request(budget), budget
+
+    def transient_parent(
+        self,
+        *,
+        request_id: str,
+        clock: _Clock | None = None,
+        started_at: datetime = NOW - timedelta(seconds=1),
+        finished_at: datetime = NOW,
+    ) -> tuple[int, RequestBudget, StoredSourceAttempt]:
+        request_run_id, budget = self.begin(
+            request_id=request_id,
+            started_at=started_at,
+            clock=clock,
+        )
+        attempt = _attempt(
+            started_at=finished_at - timedelta(seconds=1),
+            finished_at=finished_at,
+            cooldown_until=finished_at + INITIAL_COOLDOWN,
+        )
+        self.store.record_source_attempt(request_run_id, attempt)
+        parent = self.store.source_attempt_history(*PRIMARY, SUBJECT)[0]
+        return request_run_id, budget, parent
+
+    def state(self, identity=PRIMARY, **context_overrides) -> SourceFieldState:
+        request_run_id, budget = self.begin()
+        return self.service.source_field_state(
+            *identity,
+            SUBJECT,
+            _context(budget, **context_overrides),
+            request_run_id=request_run_id,
+            budget=budget,
+        )
+
+    def resolve(
+        self,
+        identity=PRIMARY,
+        *,
+        action: ActionKind = ActionKind.FACT_RESEARCH,
+        risk_effect: RiskEffect = RiskEffect.INFORMATION,
+        **context_overrides,
+    ) -> RequestFieldResolution:
+        request_run_id, budget = self.begin()
+        requirement = self.service.action_requirement(identity[1], action, risk_effect)
+        return self.service.resolve_field(
+            *identity,
+            SUBJECT,
+            _context(budget, **context_overrides),
+            requirement,
+            request_run_id=request_run_id,
+            budget=budget,
+        )
 
 
-def _context(**overrides) -> FreshnessContext:
+def _context(budget: RequestBudget, **overrides) -> FreshnessContext:
     values = {
         "now": NOW,
+        "request_id": budget.request_id,
         "latest_expected_data_as_of": NOW - timedelta(days=1),
     }
     values.update(overrides)
@@ -151,24 +228,18 @@ def test_manual_supplement_is_only_a_request_resolution() -> None:
 def test_source_without_history_is_not_checked(tmp_path) -> None:
     harness = _Harness(tmp_path)
 
-    assert harness.service.source_field_state(*PRIMARY, SUBJECT, _context()) is (
-        SourceFieldState.NOT_CHECKED
-    )
+    assert harness.state() is SourceFieldState.NOT_CHECKED
 
 
 def test_current_and_dated_success_are_projected_from_stored_dates(tmp_path) -> None:
     harness = _Harness(tmp_path)
     harness.record(data_as_of=NOW - timedelta(days=10))
 
-    assert harness.service.source_field_state(*PRIMARY, SUBJECT, _context()) is (
-        SourceFieldState.DEGRADED
-    )
+    assert harness.state() is SourceFieldState.DEGRADED
 
     harness.record(data_as_of=NOW - timedelta(days=1))
 
-    assert harness.service.source_field_state(*PRIMARY, SUBJECT, _context()) is (
-        SourceFieldState.HEALTHY
-    )
+    assert harness.state() is SourceFieldState.HEALTHY
 
 
 def test_cache_hit_is_success_evidence(tmp_path) -> None:
@@ -178,9 +249,7 @@ def test_cache_hit_is_success_evidence(tmp_path) -> None:
         data_as_of=NOW - timedelta(days=1),
     )
 
-    assert harness.service.source_field_state(*PRIMARY, SUBJECT, _context()) is (
-        SourceFieldState.HEALTHY
-    )
+    assert harness.state() is SourceFieldState.HEALTHY
 
 
 def test_same_request_uses_authenticated_run_request_id(tmp_path) -> None:
@@ -194,14 +263,14 @@ def test_same_request_uses_authenticated_run_request_id(tmp_path) -> None:
         finished_at=NOW,
         data_as_of=NOW - timedelta(minutes=1),
     )
+    request_run_id, budget = harness.begin(request_id=claimed_request_id)
 
     state = harness.service.source_field_state(
         *identity,
         SUBJECT,
-        _context(
-            request_id=claimed_request_id,
-            data_request_id=claimed_request_id,
-        ),
+        _context(budget),
+        request_run_id=request_run_id,
+        budget=budget,
     )
 
     assert state is SourceFieldState.DEGRADED
@@ -211,23 +280,41 @@ def test_same_request_can_be_current_from_authenticated_run(tmp_path) -> None:
     harness = _Harness(tmp_path)
     identity = ("yangjibao_portfolio_observation", "personal_position_observation")
     request_id = "e" * 32
-    harness.record(
-        identity=identity,
+    request_run_id, budget = harness.begin(
         request_id=request_id,
+        started_at=NOW - timedelta(minutes=1),
+    )
+    attempt = SourceAttempt(
+        source_id=identity[0],
+        field_id=identity[1],
+        subject_key=SUBJECT,
+        attempt_number=1,
+        outcome=SourceAttemptOutcome.SUCCESS,
+        started_at=NOW - timedelta(seconds=1),
         finished_at=NOW,
         data_as_of=NOW - timedelta(minutes=1),
+        error_code=None,
+        cooldown_until=None,
+        force_actor=None,
+        force_reason=None,
+        registry_version="1",
+        registry_checksum=SOURCE_REGISTRY_V1_CHECKSUM,
+        response_bytes=100,
     )
+    harness.store.record_source_attempt(request_run_id, attempt)
 
     state = harness.service.source_field_state(
         *identity,
         SUBJECT,
-        _context(request_id=request_id, data_request_id="f" * 32),
+        _context(budget),
+        request_run_id=request_run_id,
+        budget=budget,
     )
 
     assert state is SourceFieldState.HEALTHY
 
 
-def test_same_trading_day_is_derived_from_attempt_data_date(tmp_path) -> None:
+def test_same_trading_day_fails_closed_without_authenticated_calendar(tmp_path) -> None:
     harness = _Harness(tmp_path)
     identity = (
         "fund_manager_official_documents",
@@ -239,16 +326,22 @@ def test_same_trading_day_is_derived_from_attempt_data_date(tmp_path) -> None:
         data_as_of=NOW - timedelta(minutes=1),
     )
 
-    state = harness.service.source_field_state(
-        *identity,
-        SUBJECT,
-        _context(
-            trading_day=NOW.date(),
-            data_trading_day=(NOW - timedelta(days=1)).date(),
-        ),
+    state = harness.state(identity, trading_day=NOW.date())
+
+    assert state is SourceFieldState.UNAVAILABLE
+
+
+def test_old_cache_hit_cannot_satisfy_same_request(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    identity = ("yangjibao_portfolio_observation", "personal_position_observation")
+    harness.record(
+        identity=identity,
+        outcome=SourceAttemptOutcome.CACHE_HIT,
+        finished_at=NOW,
+        data_as_of=NOW - timedelta(minutes=1),
     )
 
-    assert state is SourceFieldState.HEALTHY
+    assert harness.state(identity) is SourceFieldState.DEGRADED
 
 
 def test_future_attempts_are_ignored(tmp_path) -> None:
@@ -258,9 +351,14 @@ def test_future_attempts_are_ignored(tmp_path) -> None:
         data_as_of=NOW,
     )
 
-    assert harness.service.source_field_state(*PRIMARY, SUBJECT, _context()) is (
-        SourceFieldState.NOT_CHECKED
-    )
+    assert harness.state() is SourceFieldState.NOT_CHECKED
+
+
+def test_caller_cannot_backdate_health_evaluation(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(data_as_of=NOW - timedelta(days=10))
+
+    assert harness.state(now=NOW - timedelta(days=10)) is SourceFieldState.DEGRADED
 
 
 def test_active_transient_cooldown_precedes_older_success(tmp_path) -> None:
@@ -274,9 +372,7 @@ def test_active_transient_cooldown_precedes_older_success(tmp_path) -> None:
         response_bytes=0,
     )
 
-    assert harness.service.source_field_state(*PRIMARY, SUBJECT, _context()) is (
-        SourceFieldState.COOLDOWN
-    )
+    assert harness.state() is SourceFieldState.COOLDOWN
 
 
 def test_expired_cooldown_without_success_is_unavailable(tmp_path) -> None:
@@ -290,9 +386,7 @@ def test_expired_cooldown_without_success_is_unavailable(tmp_path) -> None:
         response_bytes=0,
     )
 
-    assert harness.service.source_field_state(*PRIMARY, SUBJECT, _context()) is (
-        SourceFieldState.UNAVAILABLE
-    )
+    assert harness.state() is SourceFieldState.UNAVAILABLE
 
 
 @pytest.mark.parametrize(
@@ -316,9 +410,7 @@ def test_permanent_absence_and_audited_unsupported_are_unsupported(
         response_bytes=0,
     )
 
-    assert harness.service.source_field_state(*PRIMARY, SUBJECT, _context()) is (
-        SourceFieldState.UNSUPPORTED
-    )
+    assert harness.state() is SourceFieldState.UNSUPPORTED
 
 
 def test_successful_alternative_makes_field_usable(tmp_path) -> None:
@@ -331,9 +423,7 @@ def test_successful_alternative_makes_field_usable(tmp_path) -> None:
     )
     harness.record(identity=ALTERNATIVE, data_as_of=NOW - timedelta(days=1))
 
-    assert harness.service.resolve_field(*PRIMARY, SUBJECT, _context()) is (
-        RequestFieldResolution.USABLE
-    )
+    assert harness.resolve() is RequestFieldResolution.USABLE
 
 
 def test_dated_alternative_is_partial_without_promoting_it(tmp_path) -> None:
@@ -346,9 +436,7 @@ def test_dated_alternative_is_partial_without_promoting_it(tmp_path) -> None:
     )
     harness.record(identity=ALTERNATIVE, data_as_of=NOW - timedelta(days=10))
 
-    assert harness.service.resolve_field(*PRIMARY, SUBJECT, _context()) is (
-        RequestFieldResolution.PARTIAL
-    )
+    assert harness.resolve() is RequestFieldResolution.PARTIAL
 
 
 def test_lower_tier_healthy_alternative_cannot_satisfy_tier_one_field(tmp_path) -> None:
@@ -362,9 +450,40 @@ def test_lower_tier_healthy_alternative_cannot_satisfy_tier_one_field(tmp_path) 
     )
     harness.record(identity=PRIMARY, data_as_of=NOW - timedelta(days=1))
 
-    assert harness.service.resolve_field(*ALTERNATIVE, SUBJECT, _context()) is (
-        RequestFieldResolution.PARTIAL
+    assert harness.resolve(
+        ALTERNATIVE,
+        action=ActionKind.BUY_OR_ADD,
+        risk_effect=RiskEffect.RISK_INCREASING,
+    ) is RequestFieldResolution.PARTIAL
+
+
+def test_single_tier_two_identity_is_research_usable_but_not_action_usable(
+    tmp_path,
+) -> None:
+    harness = _Harness(tmp_path)
+    official = ("fund_manager_official_documents", "identity_active_status")
+    tier_two = ("eastmoney_f10", "identity_active_status")
+    harness.record(
+        identity=official,
+        outcome=SourceAttemptOutcome.UNSUPPORTED,
+        data_as_of=None,
+        error_code=SourceErrorCode.HTTP_NOT_FOUND,
+        response_bytes=0,
     )
+    harness.record(identity=tier_two, data_as_of=NOW - timedelta(days=1))
+    freshness = {
+        "newer_announcement_check_complete": True,
+        "newer_announcement_found": False,
+        "newer_announcement_checked_at": NOW,
+    }
+
+    assert harness.resolve(official, **freshness) is RequestFieldResolution.USABLE
+    assert harness.resolve(
+        official,
+        action=ActionKind.BUY_OR_ADD,
+        risk_effect=RiskEffect.RISK_INCREASING,
+        **freshness,
+    ) is RequestFieldResolution.PARTIAL
 
 
 def test_manual_supplement_requires_all_alternatives_to_be_exhausted(tmp_path) -> None:
@@ -383,16 +502,12 @@ def test_manual_supplement_requires_all_alternatives_to_be_exhausted(tmp_path) -
         response_bytes=0,
     )
 
-    assert harness.service.resolve_field(*PRIMARY, SUBJECT, _context()) is (
-        RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED
-    )
+    assert harness.resolve() is RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED
 
 
 def test_unchecked_or_cooling_alternative_is_not_misreported_as_exhausted(tmp_path) -> None:
     harness = _Harness(tmp_path)
-    assert harness.service.resolve_field(*PRIMARY, SUBJECT, _context()) is (
-        RequestFieldResolution.PARTIAL
-    )
+    assert harness.resolve() is RequestFieldResolution.PARTIAL
 
     harness.record(
         outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
@@ -401,9 +516,7 @@ def test_unchecked_or_cooling_alternative_is_not_misreported_as_exhausted(tmp_pa
         cooldown_until=NOW + INITIAL_COOLDOWN,
         response_bytes=0,
     )
-    assert harness.service.resolve_field(*PRIMARY, SUBJECT, _context()) is (
-        RequestFieldResolution.PARTIAL
-    )
+    assert harness.resolve() is RequestFieldResolution.PARTIAL
 
 
 def test_initial_cooldown_is_exactly_thirty_minutes() -> None:
@@ -413,210 +526,55 @@ def test_initial_cooldown_is_exactly_thirty_minutes() -> None:
 
 def test_only_first_retryable_transient_attempt_with_budget_can_retry(tmp_path) -> None:
     harness = _Harness(tmp_path)
-    clock = _Clock(10.0)
-    budget = RequestBudget.create(
-        RequestMode.RAPID,
-        request_id="a" * 32,
-        monotonic=clock,
-        wall_clock=lambda: NOW,
+    request_run_id, budget, parent = harness.transient_parent(
+        request_id="a" * 32
     )
 
-    assert harness.service.retry_allowed(
-        _attempt(), budget, minimum_worker_seconds=5.0
+    first = harness.service.retry_allowed(
+        parent,
+        budget,
+        request_run_id=request_run_id,
+        reserved_at=NOW + timedelta(seconds=1),
+        minimum_worker_seconds=5.0,
     )
-    assert not harness.service.retry_allowed(
-        _attempt(), budget, minimum_worker_seconds=5.0
-    )
-    assert not harness.service.retry_allowed(
-        _attempt(attempt_number=2), budget, minimum_worker_seconds=5.0
+    second = harness.service.retry_allowed(
+        parent,
+        budget,
+        request_run_id=request_run_id,
+        reserved_at=NOW + timedelta(seconds=2),
+        minimum_worker_seconds=5.0,
     )
 
-    clock.value = 94.0
-    assert not harness.service.retry_allowed(
-        _attempt(), budget, minimum_worker_seconds=5.0
-    )
+    assert first is not None
+    assert second is None
 
 
 def test_retry_authorization_is_atomic_under_concurrency(tmp_path) -> None:
-    service = _Harness(tmp_path).service
-    budget = _budget(RequestMode.RAPID, "1" * 32)
+    harness = _Harness(tmp_path)
+    request_run_id, budget, parent = harness.transient_parent(request_id="1" * 32)
+    services = (
+        harness.service,
+        SourceHealthService(
+            DecisionAuditStore(harness.store.repository),
+            wall_clock=lambda: NOW,
+        ),
+    )
     barrier = threading.Barrier(3)
-    results: list[bool] = []
+    results: list[object] = []
 
-    def attempt_retry() -> None:
+    def attempt_retry(service: SourceHealthService) -> None:
         barrier.wait()
         results.append(
             service.retry_allowed(
-                _attempt(),
+                parent,
                 budget,
+                request_run_id=request_run_id,
+                reserved_at=NOW + timedelta(seconds=1),
                 minimum_worker_seconds=5.0,
             )
         )
 
-    threads = [threading.Thread(target=attempt_retry) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    barrier.wait()
-    for thread in threads:
-        thread.join(timeout=5)
-
-    assert all(not thread.is_alive() for thread in threads)
-    assert sorted(results) == [False, True]
-
-
-@pytest.mark.parametrize(
-    "attempt",
-    (
-        _attempt(
-            outcome=SourceAttemptOutcome.UNAVAILABLE,
-            error_code=SourceErrorCode.HTTP_4XX,
-            cooldown_until=None,
-        ),
-        _attempt(
-            outcome=SourceAttemptOutcome.UNAVAILABLE,
-            error_code=SourceErrorCode.PAYWALL_OR_AUTH_REQUIRED,
-            cooldown_until=None,
-        ),
-        _attempt(
-            outcome=SourceAttemptOutcome.UNAVAILABLE,
-            error_code=SourceErrorCode.IDENTITY_CONFLICT,
-            cooldown_until=None,
-        ),
-        _attempt(
-            outcome=SourceAttemptOutcome.UNAVAILABLE,
-            error_code=SourceErrorCode.VALIDATION_FAILURE,
-            cooldown_until=None,
-        ),
-        _attempt(
-            outcome=SourceAttemptOutcome.UNAVAILABLE,
-            error_code=SourceErrorCode.PARSE_FAILURE,
-            cooldown_until=None,
-        ),
-    ),
-)
-def test_deterministic_failures_never_retry(tmp_path, attempt: SourceAttempt) -> None:
-    harness = _Harness(tmp_path)
-    budget = RequestBudget.create(
-        RequestMode.DEEP,
-        request_id="b" * 32,
-        monotonic=lambda: 10.0,
-        wall_clock=lambda: NOW,
-    )
-
-    assert not harness.service.retry_allowed(
-        attempt, budget, minimum_worker_seconds=5.0
-    )
-
-
-def test_force_requires_deep_mode_allowlisted_reason_and_first_attempt(tmp_path) -> None:
-    service = _Harness(tmp_path).service
-    reason = ForceReasonCode.OWNER_APPROVED_RETRY
-    rapid_budget = _budget(RequestMode.RAPID, "2" * 32)
-    deep_budget = _budget(RequestMode.DEEP, "3" * 32)
-
-    with pytest.raises(ValueError, match="deep"):
-        service.force_authorization(
-            rapid_budget,
-            *PRIMARY,
-            SUBJECT,
-            NOW + timedelta(seconds=1),
-            reason,
-            attempt_number=1,
-        )
-    with pytest.raises(ValueError, match="force reason"):
-        service.force_authorization(
-            deep_budget,
-            *PRIMARY,
-            SUBJECT,
-            NOW + timedelta(seconds=1),
-            "",
-            attempt_number=1,
-        )
-    with pytest.raises(ValueError, match="first attempt"):
-        service.force_authorization(
-            deep_budget,
-            *PRIMARY,
-            SUBJECT,
-            NOW + timedelta(seconds=1),
-            reason,
-            attempt_number=2,
-        )
-
-    assert service.force_authorization(
-        deep_budget,
-        *PRIMARY,
-        SUBJECT,
-        NOW + timedelta(seconds=1),
-        reason,
-        attempt_number=1,
-    ) == ForceAuthorization(
-        actor="local_owner",
-        reason=reason,
-        request_id=deep_budget.request_id,
-        source_id=PRIMARY[0],
-        field_id=PRIMARY[1],
-        subject_key=SUBJECT,
-        authorized_at=NOW + timedelta(seconds=1),
-        deadline_at=deep_budget.deadline_at,
-    )
-    assert service.force_authorization(
-        deep_budget,
-        *PRIMARY,
-        SUBJECT,
-        NOW + timedelta(seconds=2),
-        reason,
-        attempt_number=1,
-    ) is None
-
-
-def test_force_requires_publishable_budget_and_bounded_wall_time(tmp_path) -> None:
-    service = _Harness(tmp_path).service
-    clock = _Clock(10.0)
-    budget = _budget(RequestMode.DEEP, "4" * 32, clock=clock)
-    reason = ForceReasonCode.VERIFY_SOURCE_RECOVERY
-
-    with pytest.raises(ValueError, match="request lifetime"):
-        service.force_authorization(
-            budget,
-            *PRIMARY,
-            SUBJECT,
-            NOW - timedelta(microseconds=1),
-            reason,
-            attempt_number=1,
-        )
-
-    clock.value = 490.0
-    with pytest.raises(BudgetExpired, match="deadline"):
-        service.force_authorization(
-            budget,
-            *PRIMARY,
-            SUBJECT,
-            NOW + timedelta(seconds=1),
-            reason,
-            attempt_number=1,
-        )
-
-
-def test_force_authorization_is_atomic_under_concurrency(tmp_path) -> None:
-    service = _Harness(tmp_path).service
-    budget = _budget(RequestMode.DEEP, "9" * 32)
-    barrier = threading.Barrier(3)
-    results: list[ForceAuthorization | None] = []
-
-    def authorize_force() -> None:
-        barrier.wait()
-        results.append(
-            service.force_authorization(
-                budget,
-                *PRIMARY,
-                SUBJECT,
-                NOW + timedelta(seconds=1),
-                ForceReasonCode.OWNER_APPROVED_RETRY,
-                attempt_number=1,
-            )
-        )
-
-    threads = [threading.Thread(target=authorize_force) for _ in range(2)]
+    threads = [threading.Thread(target=attempt_retry, args=(service,)) for service in services]
     for thread in threads:
         thread.start()
     barrier.wait()
@@ -628,26 +586,270 @@ def test_force_authorization_is_atomic_under_concurrency(tmp_path) -> None:
     assert sum(result is None for result in results) == 1
 
 
+def test_retry_requires_sufficient_budget(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    clock = _Clock(10.0)
+    request_run_id, budget, parent = harness.transient_parent(
+        request_id="b" * 32,
+        clock=clock,
+    )
+    clock.value = 94.0
+
+    assert harness.service.retry_allowed(
+        parent,
+        budget,
+        request_run_id=request_run_id,
+        reserved_at=NOW + timedelta(seconds=1),
+        minimum_worker_seconds=5.0,
+    ) is None
+
+
+def test_force_requires_deep_mode_allowlisted_reason_and_first_attempt(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    service = harness.service
+    reason = ForceReasonCode.OWNER_APPROVED_RETRY
+    rapid_run_id, rapid_budget = harness.begin(
+        mode=RequestMode.RAPID, request_id="2" * 32
+    )
+    deep_run_id, deep_budget = harness.begin(
+        mode=RequestMode.DEEP, request_id="3" * 32
+    )
+
+    with pytest.raises(ValueError, match="deep"):
+        service.force_authorization(
+            rapid_budget,
+            *PRIMARY,
+            SUBJECT,
+            NOW + timedelta(seconds=1),
+            reason,
+            request_run_id=rapid_run_id,
+            attempt_number=1,
+        )
+    with pytest.raises(ValueError, match="force reason"):
+        service.force_authorization(
+            deep_budget,
+            *PRIMARY,
+            SUBJECT,
+            NOW + timedelta(seconds=1),
+            "",
+            request_run_id=deep_run_id,
+            attempt_number=1,
+        )
+    with pytest.raises(ValueError, match="first attempt"):
+        service.force_authorization(
+            deep_budget,
+            *PRIMARY,
+            SUBJECT,
+            NOW + timedelta(seconds=1),
+            reason,
+            request_run_id=deep_run_id,
+            attempt_number=2,
+        )
+
+    authorization = service.force_authorization(
+        deep_budget,
+        *PRIMARY,
+        SUBJECT,
+        NOW + timedelta(seconds=1),
+        reason,
+        request_run_id=deep_run_id,
+        attempt_number=1,
+    )
+    assert authorization is not None
+    authorization.validate()
+    assert authorization.request_run_id == deep_run_id
+    assert authorization.request_id == deep_budget.request_id
+    assert authorization.reason is reason
+
+    class DerivedForceAuthorization(ForceAuthorization):
+        pass
+
+    with pytest.raises(ValueError, match="subclasses"):
+        DerivedForceAuthorization(authorization.reservation).validate()
+    forced_attempt = SourceAttempt(
+        source_id=PRIMARY[0],
+        field_id=PRIMARY[1],
+        subject_key=SUBJECT,
+        attempt_number=1,
+        outcome=SourceAttemptOutcome.SUCCESS,
+        started_at=NOW + timedelta(seconds=1),
+        finished_at=NOW + timedelta(seconds=2),
+        data_as_of=NOW,
+        error_code=None,
+        cooldown_until=None,
+        force_actor=authorization.actor,
+        force_reason=authorization.reason,
+        registry_version="1",
+        registry_checksum=SOURCE_REGISTRY_V1_CHECKSUM,
+        response_bytes=100,
+    )
+    attempt_id = harness.store.record_source_attempt(
+        deep_run_id,
+        forced_attempt,
+        authorization,
+    )
+    history = harness.store.source_attempt_history(*PRIMARY, SUBJECT)
+    assert history[0].id == attempt_id
+    assert history[0].authorization_id == authorization.authorization_id
+    assert service.force_authorization(
+        deep_budget,
+        *PRIMARY,
+        SUBJECT,
+        NOW + timedelta(seconds=2),
+        reason,
+        request_run_id=deep_run_id,
+        attempt_number=1,
+    ) is None
+
+
+def test_force_requires_publishable_budget_and_bounded_wall_time(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    service = harness.service
+    clock = _Clock(10.0)
+    request_run_id, budget = harness.begin(
+        mode=RequestMode.DEEP,
+        request_id="4" * 32,
+        clock=clock,
+    )
+    reason = ForceReasonCode.VERIFY_SOURCE_RECOVERY
+
+    with pytest.raises(DecisionAuditStoreError, match="request lifetime"):
+        service.force_authorization(
+            budget,
+            *PRIMARY,
+            SUBJECT,
+            NOW - timedelta(microseconds=1),
+            reason,
+            request_run_id=request_run_id,
+            attempt_number=1,
+        )
+
+    clock.value = 490.0
+    with pytest.raises(BudgetExpired, match="deadline"):
+        service.force_authorization(
+            budget,
+            *PRIMARY,
+            SUBJECT,
+            NOW + timedelta(seconds=1),
+            reason,
+            request_run_id=request_run_id,
+            attempt_number=1,
+        )
+
+
+def test_force_authorization_is_atomic_under_concurrency(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    request_run_id, budget = harness.begin(
+        mode=RequestMode.DEEP,
+        request_id="9" * 32,
+    )
+    services = (
+        harness.service,
+        SourceHealthService(
+            DecisionAuditStore(harness.store.repository),
+            wall_clock=lambda: NOW,
+        ),
+    )
+    barrier = threading.Barrier(3)
+    results: list[ForceAuthorization | None] = []
+
+    def authorize_force(service: SourceHealthService) -> None:
+        barrier.wait()
+        results.append(
+            service.force_authorization(
+                budget,
+                *PRIMARY,
+                SUBJECT,
+                NOW + timedelta(seconds=1),
+                ForceReasonCode.OWNER_APPROVED_RETRY,
+                request_run_id=request_run_id,
+                attempt_number=1,
+            )
+        )
+
+    threads = [threading.Thread(target=authorize_force, args=(service,)) for service in services]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sum(result is not None for result in results) == 1
+    assert sum(result is None for result in results) == 1
+
+
+def test_force_authorization_is_single_use_across_service_instances(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    first_service = harness.service
+    second_service = SourceHealthService(
+        DecisionAuditStore(harness.store.repository),
+        wall_clock=lambda: NOW,
+    )
+    request_run_id, budget = harness.begin(
+        mode=RequestMode.DEEP,
+        request_id="0" * 32,
+    )
+    arguments = (
+        budget,
+        *PRIMARY,
+        SUBJECT,
+        NOW + timedelta(seconds=1),
+        ForceReasonCode.OWNER_APPROVED_RETRY,
+    )
+
+    assert first_service.force_authorization(
+        *arguments, request_run_id=request_run_id, attempt_number=1
+    ) is not None
+    assert second_service.force_authorization(
+        *arguments, request_run_id=request_run_id, attempt_number=1
+    ) is None
+
+
+def test_old_attempt_cannot_receive_retry_from_a_new_request(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    old_run_id, old_budget, old_parent = harness.transient_parent(
+        request_id="c" * 32,
+        started_at=NOW - timedelta(days=10, seconds=1),
+        finished_at=NOW - timedelta(days=10),
+    )
+    del old_run_id, old_budget
+    new_run_id, new_budget = harness.begin(request_id="d" * 32)
+
+    assert harness.service.retry_allowed(
+        old_parent,
+        new_budget,
+        request_run_id=new_run_id,
+        reserved_at=NOW + timedelta(seconds=1),
+        minimum_worker_seconds=5.0,
+    ) is None
+
+
 def test_ordinary_request_never_inherits_prior_force(tmp_path) -> None:
-    service = _Harness(tmp_path).service
-    deep_budget = _budget(RequestMode.DEEP, "5" * 32)
+    harness = _Harness(tmp_path)
+    service = harness.service
+    deep_run_id, deep_budget = harness.begin(
+        mode=RequestMode.DEEP, request_id="5" * 32
+    )
     forced = service.force_authorization(
         deep_budget,
         *PRIMARY,
         SUBJECT,
         NOW + timedelta(seconds=1),
         ForceReasonCode.VERIFY_SOURCE_RECOVERY,
+        request_run_id=deep_run_id,
         attempt_number=1,
     )
     assert forced is not None
 
-    rapid_budget = _budget(RequestMode.RAPID, "6" * 32)
+    rapid_run_id, rapid_budget = harness.begin(request_id="6" * 32)
     assert service.force_authorization(
         rapid_budget,
         *PRIMARY,
         SUBJECT,
         NOW + timedelta(seconds=1),
         None,
+        request_run_id=rapid_run_id,
         attempt_number=1,
     ) is None
 
@@ -661,3 +863,22 @@ def test_health_service_requires_exact_audit_store_type(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="exact DecisionAuditStore"):
         SourceHealthService(DerivedStore(repository))
+
+
+def test_default_health_wall_clock_does_not_require_caller_time_prediction(tmp_path) -> None:
+    repository = Repository(tmp_path / "kunjin.db")
+    repository.migrate()
+    store = DecisionAuditStore(repository)
+    service = SourceHealthService(store)
+    budget = RequestBudget.create(RequestMode.RAPID, request_id="e" * 32)
+    request_run_id = store.begin_request(budget)
+
+    state = service.source_field_state(
+        *PRIMARY,
+        SUBJECT,
+        FreshnessContext(now=NOW, request_id="f" * 32),
+        request_run_id=request_run_id,
+        budget=budget,
+    )
+
+    assert state is SourceFieldState.NOT_CHECKED

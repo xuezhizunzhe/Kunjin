@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -2645,5 +2645,225 @@ CREATE TRIGGER decision_snapshot_no_delete
 BEFORE DELETE ON decision_snapshots
 BEGIN
     SELECT RAISE(ABORT, 'decision snapshots are immutable');
+END;
+"""
+
+SCHEMA_V15 = """
+CREATE TABLE source_work_authorizations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    request_run_id INTEGER NOT NULL CHECK(
+        typeof(request_run_id) = 'integer' AND request_run_id > 0
+    ) REFERENCES request_runs(id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK(
+        typeof(kind) = 'text' AND kind IN ('force', 'retry')
+    ),
+    parent_attempt_id INTEGER CHECK(
+        parent_attempt_id IS NULL OR (
+            typeof(parent_attempt_id) = 'integer' AND parent_attempt_id > 0
+        )
+    ) REFERENCES source_attempts(id) ON DELETE RESTRICT,
+    source_id TEXT NOT NULL CHECK(
+        typeof(source_id) = 'text'
+        AND length(source_id) BETWEEN 1 AND 128
+        AND substr(source_id, 1, 1) GLOB '[a-z]'
+        AND source_id NOT GLOB '*[^a-z0-9_]*'
+    ),
+    field_id TEXT NOT NULL CHECK(
+        typeof(field_id) = 'text'
+        AND length(field_id) BETWEEN 1 AND 128
+        AND substr(field_id, 1, 1) GLOB '[a-z]'
+        AND field_id NOT GLOB '*[^a-z0-9_]*'
+    ),
+    subject_key TEXT NOT NULL CHECK(
+        typeof(subject_key) = 'text'
+        AND length(subject_key) = 11
+        AND substr(subject_key, 1, 5) = 'fund:'
+        AND substr(subject_key, 6) NOT GLOB '*[^0-9]*'
+    ),
+    actor TEXT CHECK(
+        actor IS NULL OR (typeof(actor) = 'text' AND actor = 'local_owner')
+    ),
+    reason TEXT CHECK(
+        reason IS NULL OR (
+            typeof(reason) = 'text'
+            AND reason IN (
+                'owner_approved_retry', 'verify_source_recovery',
+                'refresh_after_manual_supplement'
+            )
+        )
+    ),
+    reserved_at TEXT NOT NULL CHECK(
+        typeof(reserved_at) = 'text'
+        AND julianday(reserved_at) IS NOT NULL
+        AND substr(reserved_at, -6) = '+00:00'
+        AND substr(reserved_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', reserved_at) = substr(reserved_at, 1, 19)
+        AND (
+            length(reserved_at) = 25 OR (
+                length(reserved_at) = 32
+                AND substr(reserved_at, 20, 1) = '.'
+                AND substr(reserved_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(reserved_at, 21, 6) != '000000'
+            )
+        )
+    ),
+    deadline_at TEXT NOT NULL CHECK(
+        typeof(deadline_at) = 'text'
+        AND julianday(deadline_at) IS NOT NULL
+        AND substr(deadline_at, -6) = '+00:00'
+        AND substr(deadline_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', deadline_at) = substr(deadline_at, 1, 19)
+        AND (
+            length(deadline_at) = 25 OR (
+                length(deadline_at) = 32
+                AND substr(deadline_at, 20, 1) = '.'
+                AND substr(deadline_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(deadline_at, 21, 6) != '000000'
+            )
+        )
+        AND deadline_at COLLATE BINARY >= reserved_at COLLATE BINARY
+    ),
+    registry_version TEXT NOT NULL CHECK(
+        typeof(registry_version) = 'text'
+        AND length(registry_version) BETWEEN 1 AND 64
+        AND substr(registry_version, 1, 1) GLOB '[a-z0-9]'
+        AND registry_version NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    registry_checksum TEXT NOT NULL CHECK(
+        typeof(registry_checksum) = 'text'
+        AND length(CAST(registry_checksum AS BLOB)) = 64
+        AND registry_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    UNIQUE(request_run_id, kind, source_id, field_id, subject_key),
+    CHECK(
+        (
+            kind = 'force'
+            AND parent_attempt_id IS NULL
+            AND actor = 'local_owner'
+            AND reason IS NOT NULL
+        ) OR (
+            kind = 'retry'
+            AND parent_attempt_id IS NOT NULL
+            AND actor IS NULL
+            AND reason IS NULL
+        )
+    )
+);
+
+ALTER TABLE source_attempts
+ADD COLUMN authorization_id INTEGER
+REFERENCES source_work_authorizations(id) ON DELETE RESTRICT;
+
+CREATE UNIQUE INDEX source_attempts_authorization_consumed
+ON source_attempts(authorization_id)
+WHERE authorization_id IS NOT NULL;
+
+CREATE INDEX source_work_authorizations_request
+ON source_work_authorizations(request_run_id, id);
+
+CREATE TRIGGER source_work_authorization_insert_guard
+BEFORE INSERT ON source_work_authorizations
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM request_runs AS run
+    WHERE run.id = NEW.request_run_id
+      AND run.status = 'running'
+      AND NEW.reserved_at COLLATE BINARY >= run.started_at COLLATE BINARY
+      AND NEW.reserved_at COLLATE BINARY <= run.deadline_at COLLATE BINARY
+      AND NEW.deadline_at = run.deadline_at
+      AND (NEW.kind = 'retry' OR run.mode = 'deep')
+      AND (
+          NEW.kind = 'force'
+          OR EXISTS (
+              SELECT 1
+              FROM source_attempts AS parent
+              WHERE parent.id = NEW.parent_attempt_id
+                AND parent.request_run_id = NEW.request_run_id
+                AND parent.source_id = NEW.source_id
+                AND parent.field_id = NEW.field_id
+                AND parent.subject_key = NEW.subject_key
+                AND parent.attempt_number = 1
+                AND parent.outcome = 'transient_failure'
+                AND parent.error_code IN (
+                    'dns_failure', 'transient_network_failure', 'network_timeout'
+                )
+                AND parent.finished_at COLLATE BINARY <= NEW.reserved_at COLLATE BINARY
+                AND parent.registry_version = NEW.registry_version
+                AND parent.registry_checksum = NEW.registry_checksum
+          )
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'source work authorization binding is invalid');
+END;
+
+CREATE TRIGGER source_work_authorization_no_replace
+BEFORE INSERT ON source_work_authorizations
+WHEN EXISTS (
+    SELECT 1
+    FROM source_work_authorizations
+    WHERE id = NEW.id OR (
+        request_run_id = NEW.request_run_id
+        AND kind = NEW.kind
+        AND source_id = NEW.source_id
+        AND field_id = NEW.field_id
+        AND subject_key = NEW.subject_key
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'source work authorizations are immutable');
+END;
+
+CREATE TRIGGER source_work_authorization_no_update
+BEFORE UPDATE ON source_work_authorizations
+BEGIN
+    SELECT RAISE(ABORT, 'source work authorizations are immutable');
+END;
+
+CREATE TRIGGER source_work_authorization_no_delete
+BEFORE DELETE ON source_work_authorizations
+BEGIN
+    SELECT RAISE(ABORT, 'source work authorizations are immutable');
+END;
+
+CREATE TRIGGER source_attempt_authorization_guard
+BEFORE INSERT ON source_attempts
+WHEN NOT (
+    (
+        NEW.authorization_id IS NULL
+        AND NEW.attempt_number = 1
+        AND NEW.force_actor IS NULL
+        AND NEW.force_reason IS NULL
+    ) OR EXISTS (
+        SELECT 1
+        FROM source_work_authorizations AS authorization
+        JOIN request_runs AS run ON run.id = authorization.request_run_id
+        WHERE authorization.id = NEW.authorization_id
+          AND run.status = 'running'
+          AND authorization.request_run_id = NEW.request_run_id
+          AND authorization.source_id = NEW.source_id
+          AND authorization.field_id = NEW.field_id
+          AND authorization.subject_key = NEW.subject_key
+          AND authorization.registry_version = NEW.registry_version
+          AND authorization.registry_checksum = NEW.registry_checksum
+          AND NEW.started_at COLLATE BINARY >= authorization.reserved_at COLLATE BINARY
+          AND NEW.finished_at COLLATE BINARY <= authorization.deadline_at COLLATE BINARY
+          AND (
+              (
+                  authorization.kind = 'force'
+                  AND NEW.attempt_number = 1
+                  AND NEW.force_actor = authorization.actor
+                  AND NEW.force_reason = authorization.reason
+              ) OR (
+                  authorization.kind = 'retry'
+                  AND NEW.attempt_number = 2
+                  AND NEW.force_actor IS NULL
+                  AND NEW.force_reason IS NULL
+              )
+          )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'source attempt authorization binding is invalid');
 END;
 """

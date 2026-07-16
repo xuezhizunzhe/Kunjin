@@ -3,15 +3,17 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, DecimalException
-from typing import Mapping, Optional, Tuple
+from typing import Mapping, Optional, Tuple, Union
 
-from kunjin.decision.budget import RequestBudget
+from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.models import (
+    V1_SOURCE_FIELD_IDENTITIES,
     ActionKind,
     ActionMaturity,
     ActionRoute,
@@ -20,6 +22,7 @@ from kunjin.decision.models import (
     DecisionRoute,
     EvidenceCompleteness,
     EvidenceFreshness,
+    ForceAuthorization,
     ForceReasonCode,
     RequestMode,
     RequestTerminalStatus,
@@ -27,7 +30,11 @@ from kunjin.decision.models import (
     SourceAttempt,
     SourceAttemptOutcome,
     SourceErrorCode,
+    SourceFieldHistory,
+    SourceFieldRef,
     SourceTier,
+    SourceWorkAuthorization,
+    SourceWorkKind,
     StoredSourceAttempt,
     WorkflowLevel,
     canonical_json_bytes,
@@ -45,6 +52,7 @@ from kunjin.storage.repository import Repository
 _SUBJECT_KEY_PATTERN = re.compile(r"^fund:[0-9]{6}$")
 MAX_CANONICAL_ROUTE_BYTES = MAX_RESPONSE_BYTES
 MAX_CANONICAL_ROUTE_DEPTH = 64
+SOURCE_HISTORY_LIMIT = 64
 
 
 class DecisionAuditStoreError(RuntimeError):
@@ -97,11 +105,22 @@ class DecisionAuditStore:
         self,
         request_run_id: int,
         attempt: SourceAttempt,
+        authorization: Optional[Union[SourceWorkAuthorization, ForceAuthorization]] = None,
     ) -> int:
         _positive_id(request_run_id, "request run id")
         if type(attempt) is not SourceAttempt:
             raise ValueError("attempt must be an exact SourceAttempt")
         attempt.validate()
+        persisted_authorization = None
+        if authorization is not None:
+            if type(authorization) is ForceAuthorization:
+                authorization.validate()
+                persisted_authorization = authorization.reservation
+            elif type(authorization) is SourceWorkAuthorization:
+                authorization.validate()
+                persisted_authorization = authorization
+            else:
+                raise ValueError("authorization must be an exact typed authorization")
         registry = SourceRegistryV1()
         if (
             attempt.registry_version != registry.version
@@ -112,15 +131,10 @@ class DecisionAuditStore:
             with self.repository.connect() as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
                 run = connection.execute(
-                    """
-                    SELECT mode, status, started_at, deadline_at
-                    FROM request_runs WHERE id = ?
-                    """,
+                    "SELECT * FROM request_runs WHERE id = ?",
                     (request_run_id,),
                 ).fetchone()
-                if run is None:
-                    raise DecisionAuditStoreError("request run does not exist")
-                if run["status"] != "running":
+                if run is None or run["status"] != "running":
                     raise DecisionAuditStoreError("request run is not running")
                 if attempt.force_actor is not None and run["mode"] != RequestMode.DEEP.value:
                     raise DecisionAuditStoreError("force attempt requires a deep request")
@@ -154,6 +168,30 @@ class DecisionAuditStore:
                 if attempt.attempt_number != len(existing) + 1:
                     raise DecisionAuditStoreError("source attempt sequence is invalid")
 
+                authenticated_authorization = None
+                if persisted_authorization is not None:
+                    authenticated_authorization = self._load_source_work_authorization(
+                        persisted_authorization.id,
+                        connection=connection,
+                    )
+                    if authenticated_authorization != persisted_authorization:
+                        raise DecisionAuditStoreError("source work authorization binding failed")
+                    if (
+                        authenticated_authorization.kind is SourceWorkKind.FORCE
+                        and type(authorization) is not ForceAuthorization
+                    ):
+                        raise DecisionAuditStoreError("force attempt requires ForceAuthorization")
+                    if (
+                        authenticated_authorization.kind is SourceWorkKind.RETRY
+                        and type(authorization) is not SourceWorkAuthorization
+                    ):
+                        raise DecisionAuditStoreError("retry attempt authorization type is invalid")
+                self._validate_attempt_authorization(
+                    request_run_id,
+                    attempt,
+                    authenticated_authorization,
+                )
+
                 cursor = connection.execute(
                     """
                     INSERT INTO source_attempts(
@@ -161,8 +199,8 @@ class DecisionAuditStore:
                         attempt_number, outcome, started_at, finished_at,
                         data_as_of, error_code, cooldown_until, force_actor,
                         force_reason, registry_version, registry_checksum,
-                        response_byte_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        response_byte_count, authorization_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         request_run_id,
@@ -181,6 +219,9 @@ class DecisionAuditStore:
                         attempt.registry_version,
                         attempt.registry_checksum,
                         attempt.response_bytes,
+                        None
+                        if persisted_authorization is None
+                        else persisted_authorization.id,
                     ),
                 )
                 attempt_id = int(cursor.lastrowid)
@@ -191,6 +232,274 @@ class DecisionAuditStore:
         if attempt_id <= 0:
             raise DecisionAuditStoreError("source attempt insert failed")
         return attempt_id
+
+    def reserve_force(
+        self,
+        request_run_id: int,
+        budget: RequestBudget,
+        source_id: str,
+        field_id: str,
+        subject_key: str,
+        reserved_at: datetime,
+        reason: ForceReasonCode,
+    ) -> Optional[ForceAuthorization]:
+        reservation = self._reserve_source_work(
+            request_run_id,
+            budget,
+            source_id,
+            field_id,
+            subject_key,
+            reserved_at,
+            SourceWorkKind.FORCE,
+            parent=None,
+            actor="local_owner",
+            reason=reason,
+        )
+        if reservation is None:
+            return None
+        authorization = ForceAuthorization(reservation)
+        authorization.validate()
+        return authorization
+
+    def reserve_retry(
+        self,
+        request_run_id: int,
+        budget: RequestBudget,
+        parent: StoredSourceAttempt,
+        reserved_at: datetime,
+        *,
+        minimum_worker_seconds: float,
+    ) -> Optional[SourceWorkAuthorization]:
+        if type(parent) is not StoredSourceAttempt:
+            raise ValueError("retry parent must be an exact StoredSourceAttempt")
+        parent.validate()
+        if (
+            type(minimum_worker_seconds) is not float
+            or not math.isfinite(minimum_worker_seconds)
+            or minimum_worker_seconds <= 0.0
+        ):
+            raise ValueError("minimum worker seconds must be a positive finite exact float")
+        return self._reserve_source_work(
+            request_run_id,
+            budget,
+            parent.attempt.source_id,
+            parent.attempt.field_id,
+            parent.attempt.subject_key,
+            reserved_at,
+            SourceWorkKind.RETRY,
+            parent=parent,
+            actor=None,
+            reason=None,
+            minimum_worker_seconds=minimum_worker_seconds,
+        )
+
+    def _reserve_source_work(
+        self,
+        request_run_id: int,
+        budget: RequestBudget,
+        source_id: str,
+        field_id: str,
+        subject_key: str,
+        reserved_at: datetime,
+        kind: SourceWorkKind,
+        *,
+        parent: Optional[StoredSourceAttempt],
+        actor: Optional[str],
+        reason: Optional[ForceReasonCode],
+        minimum_worker_seconds: Optional[float] = None,
+    ) -> Optional[SourceWorkAuthorization]:
+        _positive_id(request_run_id, "request run id")
+        if type(budget) is not RequestBudget:
+            raise ValueError("budget must be an exact RequestBudget")
+        validate_identifier(source_id, "source id")
+        validate_identifier(field_id, "field id")
+        if type(subject_key) is not str or _SUBJECT_KEY_PATTERN.fullmatch(subject_key) is None:
+            raise ValueError("subject key must be fund: followed by exactly six digits")
+        reserved_at = validate_aware_datetime(
+            reserved_at,
+            "authorization reservation time",
+        ).astimezone(timezone.utc)
+        if type(kind) is not SourceWorkKind:
+            raise ValueError("authorization kind must be an exact SourceWorkKind")
+        registry = SourceRegistryV1()
+        if (source_id, field_id) not in V1_SOURCE_FIELD_IDENTITIES:
+            raise ValueError("authorization source field is not registered")
+        if kind is SourceWorkKind.FORCE:
+            if parent is not None or actor != "local_owner" or type(reason) is not ForceReasonCode:
+                raise ValueError("force reservation requires owner reason and no parent")
+        elif (
+            type(parent) is not StoredSourceAttempt
+            or actor is not None
+            or reason is not None
+        ):
+            raise ValueError("retry reservation requires only an exact parent attempt")
+        try:
+            with self.repository.connect() as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                run = self._authenticate_budget_request(connection, request_run_id, budget)
+                budget.require_publishable()
+                if (
+                    minimum_worker_seconds is not None
+                    and budget.worker_seconds() < minimum_worker_seconds
+                ):
+                    return None
+                if not budget.started_at <= reserved_at <= budget.deadline_at:
+                    raise DecisionAuditStoreError("reservation is outside the request lifetime")
+                if kind is SourceWorkKind.FORCE and run["mode"] != RequestMode.DEEP.value:
+                    raise DecisionAuditStoreError("force reservation requires a deep request")
+                parent_id = None
+                if kind is SourceWorkKind.RETRY:
+                    if parent is None:
+                        raise DecisionAuditStoreError("retry parent is missing")
+                    if (
+                        parent.request_run_id != request_run_id
+                        or parent.request_id != budget.request_id
+                        or parent.attempt.source_id != source_id
+                        or parent.attempt.field_id != field_id
+                        or parent.attempt.subject_key != subject_key
+                        or parent.attempt.attempt_number != 1
+                        or parent.attempt.outcome is not SourceAttemptOutcome.TRANSIENT_FAILURE
+                    ):
+                        raise DecisionAuditStoreError("retry parent binding failed")
+                    parent_row = connection.execute(
+                        """
+                        SELECT source_attempts.*, request_runs.request_id AS request_id
+                        FROM source_attempts
+                        JOIN request_runs ON request_runs.id = source_attempts.request_run_id
+                        WHERE source_attempts.id = ?
+                        """,
+                        (parent.id,),
+                    ).fetchone()
+                    if parent_row is None or _stored_attempt(parent_row) != parent:
+                        raise DecisionAuditStoreError("retry parent authentication failed")
+                    if connection.execute(
+                        """
+                        SELECT 1 FROM source_attempts
+                        WHERE request_run_id = ? AND source_id = ? AND field_id = ?
+                          AND subject_key = ? AND attempt_number = 2
+                        """,
+                        (request_run_id, source_id, field_id, subject_key),
+                    ).fetchone() is not None:
+                        raise DecisionAuditStoreError("retry attempt already exists")
+                    parent_id = parent.id
+                existing = connection.execute(
+                    """
+                    SELECT id FROM source_work_authorizations
+                    WHERE request_run_id = ? AND kind = ? AND source_id = ?
+                      AND field_id = ? AND subject_key = ?
+                    """,
+                    (request_run_id, kind.value, source_id, field_id, subject_key),
+                ).fetchone()
+                if existing is not None:
+                    return None
+                cursor = connection.execute(
+                    """
+                    INSERT INTO source_work_authorizations(
+                        request_run_id, kind, parent_attempt_id, source_id,
+                        field_id, subject_key, actor, reason, reserved_at,
+                        deadline_at, registry_version, registry_checksum
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request_run_id,
+                        kind.value,
+                        parent_id,
+                        source_id,
+                        field_id,
+                        subject_key,
+                        actor,
+                        None if reason is None else reason.value,
+                        _utc_text(reserved_at, "reservation time"),
+                        _utc_text(budget.deadline_at, "authorization deadline"),
+                        registry.version,
+                        registry.checksum(),
+                    ),
+                )
+                return self._load_source_work_authorization(
+                    int(cursor.lastrowid),
+                    connection=connection,
+                )
+        except (DecisionAuditStoreError, BudgetExpired):
+            raise
+        except sqlite3.IntegrityError:
+            raise DecisionAuditStoreError("source work reservation rejected") from None
+        except sqlite3.DatabaseError:
+            raise DecisionAuditStoreError("source work reservation failed") from None
+
+    @staticmethod
+    def _authenticate_budget_request(
+        connection: sqlite3.Connection,
+        request_run_id: int,
+        budget: RequestBudget,
+    ) -> sqlite3.Row:
+        run = connection.execute(
+            "SELECT * FROM request_runs WHERE id = ?",
+            (request_run_id,),
+        ).fetchone()
+        if run is None or run["status"] != "running":
+            raise DecisionAuditStoreError("request run is not running")
+        if (
+            run["request_id"] != budget.request_id
+            or run["mode"] != budget.mode.value
+            or _stored_datetime(run["started_at"], "request start") != budget.started_at
+            or _stored_datetime(run["deadline_at"], "request deadline") != budget.deadline_at
+        ):
+            raise DecisionAuditStoreError("request budget binding failed")
+        return run
+
+    def _load_source_work_authorization(
+        self,
+        authorization_id: int,
+        *,
+        connection: sqlite3.Connection,
+    ) -> SourceWorkAuthorization:
+        _positive_id(authorization_id, "authorization id")
+        row = connection.execute(
+            """
+            SELECT source_work_authorizations.*, request_runs.request_id AS request_id
+            FROM source_work_authorizations
+            JOIN request_runs
+              ON request_runs.id = source_work_authorizations.request_run_id
+            WHERE source_work_authorizations.id = ?
+            """,
+            (authorization_id,),
+        ).fetchone()
+        if row is None:
+            raise DecisionAuditStoreError("source work authorization does not exist")
+        return _stored_source_work_authorization(row)
+
+    @staticmethod
+    def _validate_attempt_authorization(
+        request_run_id: int,
+        attempt: SourceAttempt,
+        authorization: Optional[SourceWorkAuthorization],
+    ) -> None:
+        if authorization is None:
+            if attempt.force_actor is not None or attempt.attempt_number != 1:
+                raise DecisionAuditStoreError("source attempt requires an authorization")
+            return
+        if (
+            authorization.request_run_id != request_run_id
+            or authorization.source_id != attempt.source_id
+            or authorization.field_id != attempt.field_id
+            or authorization.subject_key != attempt.subject_key
+            or attempt.started_at < authorization.reserved_at
+            or attempt.finished_at > authorization.deadline_at
+        ):
+            raise DecisionAuditStoreError("source work authorization binding failed")
+        if authorization.kind is SourceWorkKind.FORCE:
+            if (
+                attempt.attempt_number != 1
+                or attempt.force_actor != authorization.actor
+                or attempt.force_reason is not authorization.reason
+            ):
+                raise DecisionAuditStoreError("force authorization binding failed")
+        elif (
+            attempt.attempt_number != 2
+            or attempt.force_actor is not None
+            or attempt.force_reason is not None
+        ):
+            raise DecisionAuditStoreError("retry authorization binding failed")
 
     def finalize_request(
         self,
@@ -219,6 +528,14 @@ class DecisionAuditStore:
                             AND finished_at COLLATE BINARY > ? COLLATE BINARY
                       )
                       AND NOT EXISTS (
+                          SELECT 1 FROM source_work_authorizations
+                          LEFT JOIN source_attempts
+                            ON source_attempts.authorization_id = source_work_authorizations.id
+                          WHERE source_work_authorizations.request_run_id = ?
+                            AND source_attempts.id IS NULL
+                            AND (? = 'complete' OR ? = '[]')
+                      )
+                      AND NOT EXISTS (
                           SELECT 1 FROM decision_snapshots
                           WHERE request_run_id = ?
                             AND created_at COLLATE BINARY > ? COLLATE BINARY
@@ -231,6 +548,9 @@ class DecisionAuditStore:
                         request_run_id,
                         request_run_id,
                         finished_text,
+                        request_run_id,
+                        status.value,
+                        omitted_json,
                         request_run_id,
                         finished_text,
                     ),
@@ -357,14 +677,91 @@ class DecisionAuditStore:
                     JOIN request_runs ON request_runs.id = source_attempts.request_run_id
                     WHERE source_id = ? AND field_id = ? AND subject_key = ?
                     ORDER BY finished_at DESC, source_attempts.id DESC
+                    LIMIT ?
                     """,
-                    (source_id, field_id, subject_key),
+                    (source_id, field_id, subject_key, SOURCE_HISTORY_LIMIT),
                 ).fetchall()
             return tuple(_stored_attempt(row) for row in rows)
         except DecisionAuditStoreError:
             raise
         except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError):
             raise DecisionAuditStoreError("source attempt authentication failed") from None
+
+    def authenticated_source_attempt_histories(
+        self,
+        request_run_id: int,
+        budget: RequestBudget,
+        references: Tuple[SourceFieldRef, ...],
+        subject_key: str,
+    ) -> Tuple[SourceFieldHistory, ...]:
+        _positive_id(request_run_id, "request run id")
+        if type(budget) is not RequestBudget:
+            raise ValueError("budget must be an exact RequestBudget")
+        if type(references) is not tuple or not references or len(references) > 128:
+            raise ValueError("references must be a non-empty bounded exact tuple")
+        if len(references) != len(set(references)):
+            raise ValueError("references must not contain duplicates")
+        for reference in references:
+            if type(reference) is not SourceFieldRef:
+                raise ValueError("references must contain exact SourceFieldRef records")
+            reference.validate()
+        if type(subject_key) is not str or _SUBJECT_KEY_PATTERN.fullmatch(subject_key) is None:
+            raise ValueError("subject key must be fund: followed by exactly six digits")
+        budget.require_publishable()
+        predicates = " OR ".join(
+            "(source_attempts.source_id = ? AND source_attempts.field_id = ?)"
+            for _ in references
+        )
+        parameters = tuple(
+            item
+            for reference in references
+            for item in (reference.source_id, reference.field_id)
+        )
+        try:
+            with self.repository.connect() as connection, connection:
+                connection.execute("BEGIN")
+                self._authenticate_budget_request(connection, request_run_id, budget)
+                rows = connection.execute(
+                    f"""
+                    WITH ranked AS (
+                        SELECT source_attempts.*,
+                               request_runs.request_id AS request_id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY source_attempts.source_id,
+                                                source_attempts.field_id
+                                   ORDER BY source_attempts.finished_at DESC,
+                                            source_attempts.id DESC
+                               ) AS history_rank
+                        FROM source_attempts
+                        JOIN request_runs
+                          ON request_runs.id = source_attempts.request_run_id
+                        WHERE source_attempts.subject_key = ? AND ({predicates})
+                    )
+                    SELECT * FROM ranked
+                    WHERE history_rank <= ?
+                    ORDER BY source_id, field_id, finished_at DESC, id DESC
+                    """,  # noqa: S608 - placeholders bind every dynamic value
+                    (subject_key, *parameters, SOURCE_HISTORY_LIMIT),
+                ).fetchall()
+                budget.require_publishable()
+                grouped = {reference: [] for reference in references}
+                for row in rows:
+                    record = _stored_attempt(row)
+                    grouped[SourceFieldRef(
+                        record.attempt.source_id,
+                        record.attempt.field_id,
+                    )].append(record)
+                histories = tuple(
+                    SourceFieldHistory(reference, tuple(grouped[reference]))
+                    for reference in references
+                )
+                for history in histories:
+                    history.validate()
+                return histories
+        except (DecisionAuditStoreError, BudgetExpired):
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError):
+            raise DecisionAuditStoreError("source history authentication failed") from None
 
     def _load_decision_snapshot(
         self,
@@ -577,10 +974,37 @@ def _stored_attempt(row: sqlite3.Row) -> StoredSourceAttempt:
         id=_positive_id(row["id"], "attempt id"),
         request_run_id=_positive_id(row["request_run_id"], "request run id"),
         request_id=validate_request_id(row["request_id"]),
+        authorization_id=None
+        if row["authorization_id"] is None
+        else _positive_id(row["authorization_id"], "authorization id"),
         attempt=attempt,
     )
     record.validate()
     return record
+
+
+def _stored_source_work_authorization(row: sqlite3.Row) -> SourceWorkAuthorization:
+    reason = row["reason"]
+    authorization = SourceWorkAuthorization(
+        id=_positive_id(row["id"], "authorization id"),
+        request_run_id=_positive_id(row["request_run_id"], "request run id"),
+        request_id=validate_request_id(row["request_id"]),
+        source_id=_required_text(row["source_id"], "source id"),
+        field_id=_required_text(row["field_id"], "field id"),
+        subject_key=_required_text(row["subject_key"], "subject key"),
+        kind=SourceWorkKind(row["kind"]),
+        parent_attempt_id=None
+        if row["parent_attempt_id"] is None
+        else _positive_id(row["parent_attempt_id"], "parent attempt id"),
+        actor=None if row["actor"] is None else _required_text(row["actor"], "actor"),
+        reason=None if reason is None else ForceReasonCode(reason),
+        reserved_at=_stored_datetime(row["reserved_at"], "reservation time"),
+        deadline_at=_stored_datetime(row["deadline_at"], "authorization deadline"),
+        registry_version=_required_text(row["registry_version"], "registry version"),
+        registry_checksum=_required_checksum(row["registry_checksum"], "registry checksum"),
+    )
+    authorization.validate()
+    return authorization
 
 
 def _decision_route_from_bytes(value: bytes) -> DecisionRoute:

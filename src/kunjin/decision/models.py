@@ -180,6 +180,11 @@ class ForceReasonCode(str, Enum):
     REFRESH_AFTER_MANUAL_SUPPLEMENT = "refresh_after_manual_supplement"
 
 
+class SourceWorkKind(str, Enum):
+    FORCE = "force"
+    RETRY = "retry"
+
+
 class SourceTier(str, Enum):
     TIER_1 = "tier_1"
     TIER_2 = "tier_2"
@@ -1230,6 +1235,7 @@ class StoredSourceAttempt:
     id: int
     request_run_id: int
     request_id: str
+    authorization_id: Optional[int]
     attempt: SourceAttempt
 
     def validate(self) -> None:
@@ -1238,6 +1244,159 @@ class StoredSourceAttempt:
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive exact integer")
         validate_request_id(self.request_id)
+        if self.authorization_id is not None and (
+            type(self.authorization_id) is not int or self.authorization_id <= 0
+        ):
+            raise ValueError("authorization id must be a positive exact integer or None")
         if type(self.attempt) is not SourceAttempt:
             raise ValueError("attempt must be an exact SourceAttempt")
         self.attempt.validate()
+
+
+@dataclass(frozen=True)
+class SourceFieldHistory:
+    reference: SourceFieldRef
+    attempts: Tuple[StoredSourceAttempt, ...]
+
+    def validate(self) -> None:
+        validate_exact_dataclass_state(self, "source field history")
+        if type(self.reference) is not SourceFieldRef:
+            raise ValueError("history reference must be an exact SourceFieldRef")
+        self.reference.validate()
+        if type(self.attempts) is not tuple or len(self.attempts) > MAX_TUPLE_ITEMS:
+            raise ValueError("history attempts must be a bounded exact tuple")
+        for record in self.attempts:
+            if type(record) is not StoredSourceAttempt:
+                raise ValueError("history attempts must contain exact stored attempts")
+            record.validate()
+            if (
+                record.attempt.source_id != self.reference.source_id
+                or record.attempt.field_id != self.reference.field_id
+            ):
+                raise ValueError("history attempt does not match its source field")
+
+
+@dataclass(frozen=True)
+class SourceWorkAuthorization:
+    id: int
+    request_run_id: int
+    request_id: str
+    source_id: str
+    field_id: str
+    subject_key: str
+    kind: SourceWorkKind
+    parent_attempt_id: Optional[int]
+    actor: Optional[str]
+    reason: Optional[ForceReasonCode]
+    reserved_at: datetime
+    deadline_at: datetime
+    registry_version: str
+    registry_checksum: str
+
+    def validate(self) -> None:
+        validate_exact_dataclass_state(self, "source work authorization")
+        for value, name in (
+            (self.id, "authorization id"),
+            (self.request_run_id, "request run id"),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive exact integer")
+        validate_request_id(self.request_id)
+        validate_identifier(self.source_id, "source id")
+        validate_identifier(self.field_id, "field id")
+        if type(self.subject_key) is not str or _SUBJECT_KEY_PATTERN.fullmatch(
+            self.subject_key
+        ) is None:
+            raise ValueError("subject key must be fund: followed by exactly six digits")
+        if type(self.kind) is not SourceWorkKind:
+            raise ValueError("authorization kind must be an exact SourceWorkKind")
+        validate_aware_datetime(self.reserved_at, "authorization reservation time")
+        validate_aware_datetime(self.deadline_at, "authorization deadline")
+        if self.deadline_at < self.reserved_at:
+            raise ValueError("authorization deadline cannot precede its reservation")
+        validate_version(self.registry_version, "registry version")
+        validate_checksum(self.registry_checksum, "registry checksum")
+        if (
+            self.registry_version == "1"
+            and (self.source_id, self.field_id) not in V1_SOURCE_FIELD_IDENTITIES
+        ):
+            raise ValueError("authorization source field is not declared by registry V1")
+        if (
+            self.registry_version == "1"
+            and self.registry_checksum != SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM
+        ):
+            raise ValueError("authorization registry checksum does not match version 1")
+        if self.kind is SourceWorkKind.FORCE:
+            if (
+                self.parent_attempt_id is not None
+                or self.actor != "local_owner"
+                or type(self.reason) is not ForceReasonCode
+            ):
+                raise ValueError("force authorization requires owner reason and no parent")
+        else:
+            if (
+                type(self.parent_attempt_id) is not int
+                or self.parent_attempt_id <= 0
+                or self.actor is not None
+                or self.reason is not None
+            ):
+                raise ValueError("retry authorization requires only a positive parent attempt")
+
+
+@dataclass(frozen=True)
+class ForceAuthorization:
+    reservation: SourceWorkAuthorization
+
+    def validate(self) -> None:
+        validate_exact_dataclass_state(self, "force authorization")
+        if type(self) is not ForceAuthorization:
+            raise ValueError("force authorization subclasses are not accepted")
+        if type(self.reservation) is not SourceWorkAuthorization:
+            raise ValueError("force reservation must be an exact SourceWorkAuthorization")
+        self.reservation.validate()
+        if self.reservation.kind is not SourceWorkKind.FORCE:
+            raise ValueError("force authorization requires a force reservation")
+
+    @property
+    def authorization_id(self) -> int:
+        return self.reservation.id
+
+    @property
+    def request_run_id(self) -> int:
+        return self.reservation.request_run_id
+
+    @property
+    def actor(self) -> str:
+        if self.reservation.actor is None:
+            raise ValueError("force authorization actor is missing")
+        return self.reservation.actor
+
+    @property
+    def reason(self) -> ForceReasonCode:
+        if self.reservation.reason is None:
+            raise ValueError("force authorization reason is missing")
+        return self.reservation.reason
+
+    @property
+    def request_id(self) -> str:
+        return self.reservation.request_id
+
+    @property
+    def source_id(self) -> str:
+        return self.reservation.source_id
+
+    @property
+    def field_id(self) -> str:
+        return self.reservation.field_id
+
+    @property
+    def subject_key(self) -> str:
+        return self.reservation.subject_key
+
+    @property
+    def authorized_at(self) -> datetime:
+        return self.reservation.reserved_at
+
+    @property
+    def deadline_at(self) -> datetime:
+        return self.reservation.deadline_at

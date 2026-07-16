@@ -27,6 +27,7 @@ from kunjin.decision.models import (
     RiskEffect,
     SourceAttempt,
     SourceAttemptOutcome,
+    SourceErrorCode,
     SourceTier,
     WorkflowLevel,
 )
@@ -374,13 +375,37 @@ def test_complete_conclusion_evidence_round_trips_without_field_loss(tmp_path) -
 
 def test_attempts_are_sequential_bounded_and_history_is_newest_first(tmp_path) -> None:
     _, store = _store(tmp_path)
-    request_run_id = store.begin_request(_budget())
+    budget = _budget()
+    request_run_id = store.begin_request(budget)
 
     with pytest.raises(DecisionAuditStoreError, match="attempt sequence"):
         store.record_source_attempt(request_run_id, _attempt(2))
 
-    first_id = store.record_source_attempt(request_run_id, _attempt(1))
-    second_id = store.record_source_attempt(request_run_id, _attempt(2))
+    first = _attempt(
+        1,
+        outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+        data_as_of=None,
+        error_code=SourceErrorCode.NETWORK_TIMEOUT,
+        cooldown_until=NOW + timedelta(minutes=30),
+        response_bytes=0,
+    )
+    first_id = store.record_source_attempt(request_run_id, first)
+    parent = store.source_attempt_history(
+        first.source_id, first.field_id, first.subject_key
+    )[0]
+    authorization = store.reserve_retry(
+        request_run_id,
+        budget,
+        parent,
+        NOW + timedelta(seconds=2),
+        minimum_worker_seconds=5.0,
+    )
+    assert authorization is not None
+    second_id = store.record_source_attempt(
+        request_run_id,
+        _attempt(2),
+        authorization,
+    )
     history = store.source_attempt_history(
         "eastmoney_f10", "identity_active_status", "fund:123456"
     )
@@ -399,16 +424,38 @@ def test_force_attempt_requires_deep_run_and_round_trips_once(tmp_path) -> None:
         force_actor="local_owner",
         force_reason=ForceReasonCode.OWNER_APPROVED_RETRY,
     )
-    rapid_run_id = store.begin_request(_budget(request_id="7" * 32))
+    rapid_budget = _budget(request_id="7" * 32)
+    rapid_run_id = store.begin_request(rapid_budget)
 
     with pytest.raises(DecisionAuditStoreError, match="deep"):
         store.record_source_attempt(rapid_run_id, forced)
+    with pytest.raises(DecisionAuditStoreError, match="deep"):
+        store.reserve_force(
+            rapid_run_id,
+            rapid_budget,
+            forced.source_id,
+            forced.field_id,
+            forced.subject_key,
+            NOW + timedelta(seconds=1),
+            ForceReasonCode.OWNER_APPROVED_RETRY,
+        )
 
     deep_request_id = "8" * 32
-    deep_run_id = store.begin_request(
-        _budget(request_id=deep_request_id, mode=RequestMode.DEEP)
+    deep_budget = _budget(request_id=deep_request_id, mode=RequestMode.DEEP)
+    deep_run_id = store.begin_request(deep_budget)
+    with pytest.raises(DecisionAuditStoreError, match="authorization"):
+        store.record_source_attempt(deep_run_id, forced)
+    authorization = store.reserve_force(
+        deep_run_id,
+        deep_budget,
+        forced.source_id,
+        forced.field_id,
+        forced.subject_key,
+        NOW + timedelta(seconds=1),
+        ForceReasonCode.OWNER_APPROVED_RETRY,
     )
-    attempt_id = store.record_source_attempt(deep_run_id, forced)
+    assert authorization is not None
+    attempt_id = store.record_source_attempt(deep_run_id, forced, authorization)
     history = store.source_attempt_history(
         forced.source_id,
         forced.field_id,
@@ -420,6 +467,55 @@ def test_force_attempt_requires_deep_run_and_round_trips_once(tmp_path) -> None:
     ]
     assert history[0].attempt.force_actor == "local_owner"
     assert history[0].attempt.force_reason is ForceReasonCode.OWNER_APPROVED_RETRY
+    assert history[0].authorization_id == authorization.authorization_id
+
+    wrong_identity = replace(
+        forced,
+        source_id="eastmoney_nav",
+        field_id="formal_nav",
+    )
+    with pytest.raises(DecisionAuditStoreError, match="binding"):
+        store.record_source_attempt(deep_run_id, wrong_identity, authorization)
+
+
+def test_unconsumed_authorization_blocks_complete_and_requires_omitted_work(
+    tmp_path,
+) -> None:
+    _, store = _store(tmp_path)
+    budget = _budget(request_id="9" * 32, mode=RequestMode.DEEP)
+    request_run_id = store.begin_request(budget)
+    authorization = store.reserve_force(
+        request_run_id,
+        budget,
+        "eastmoney_f10",
+        "identity_active_status",
+        "fund:123456",
+        NOW + timedelta(seconds=1),
+        ForceReasonCode.OWNER_APPROVED_RETRY,
+    )
+    assert authorization is not None
+
+    with pytest.raises(DecisionAuditStoreError, match="exactly once"):
+        store.finalize_request(
+            request_run_id,
+            RequestTerminalStatus.COMPLETE,
+            NOW + timedelta(seconds=2),
+            (),
+        )
+    with pytest.raises(DecisionAuditStoreError, match="exactly once"):
+        store.finalize_request(
+            request_run_id,
+            RequestTerminalStatus.PARTIAL,
+            NOW + timedelta(seconds=2),
+            (),
+        )
+
+    store.finalize_request(
+        request_run_id,
+        RequestTerminalStatus.PARTIAL,
+        NOW + timedelta(seconds=2),
+        ("identity_active_status",),
+    )
 
 
 def test_terminal_request_is_immutable_and_rejects_more_children(tmp_path) -> None:
