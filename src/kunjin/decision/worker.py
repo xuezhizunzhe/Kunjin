@@ -324,31 +324,47 @@ def run_public_worker(
         )
     except BaseException as exc:
         primary_error = exc
-    close_error: Optional[BaseException]
+    close_error: Optional[BaseException] = None
+    pending_error: Optional[BaseException] = None
+    cleanup_error: Optional[WorkerExecutionError] = None
+    return_code: Optional[int] = None
     try:
-        close_error = _close_worker_pipes(process)
+        try:
+            close_error = _close_worker_pipes(process)
+        except BaseException as exc:
+            close_error = exc
+        if close_error is not None:
+            budget.cancel("worker_aborted")
+        elif primary_error is not None:
+            reason = (
+                primary_error.reason_code
+                if isinstance(primary_error, WorkerExecutionError)
+                else "worker_aborted"
+            )
+            budget.cancel(reason)
     except BaseException as exc:
-        close_error = exc
-    if close_error is not None:
-        budget.cancel("worker_aborted")
-    elif primary_error is not None:
-        reason = (
-            primary_error.reason_code
-            if isinstance(primary_error, WorkerExecutionError)
-            else "worker_aborted"
-        )
-        budget.cancel(reason)
-    try:
-        return_code = _finalize_process_group(process, pgid)
-    except WorkerExecutionError as cleanup_error:
-        cause = close_error if close_error is not None else primary_error
+        pending_error = exc
+    finally:
+        try:
+            return_code = _finalize_process_group(process, pgid)
+        except WorkerExecutionError as exc:
+            cleanup_error = exc
+    if cleanup_error is not None:
+        cause = pending_error or close_error or primary_error
         if cause is not None:
             raise cleanup_error from cause
-        raise
+        raise cleanup_error
+    if pending_error is not None:
+        raise pending_error
     if close_error is not None:
         if primary_error is not None:
             raise close_error from primary_error
         raise close_error from None
+    if return_code is None:
+        raise _worker_error(
+            "worker_cleanup_failed",
+            "public source worker finalization returned no status",
+        )
     if return_code != 0 and (
         primary_error is None
         or (

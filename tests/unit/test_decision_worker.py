@@ -734,6 +734,94 @@ def test_close_interrupt_still_finalizes_group_before_reraising(
             process.wait(timeout=1)
 
 
+def test_cancel_interrupt_after_close_still_finalizes_and_reaps() -> None:
+    processes: list[subprocess.Popen] = []
+    original_waits = []
+    events = []
+    real_popen = subprocess.Popen
+    real_killpg = os.killpg
+
+    def capture(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        original_wait = process.wait
+        process.wait = MagicMock(wraps=original_wait)
+        processes.append(process)
+        original_waits.append(original_wait)
+        return process
+
+    def record_signal(pgid: int, sent_signal: int):
+        events.append(sent_signal)
+        return real_killpg(pgid, sent_signal)
+
+    budget = _budget(0.1)
+    close_error = SystemExit(51)
+    try:
+        with (
+            patch("kunjin.decision.worker.subprocess.Popen", side_effect=capture),
+            patch("kunjin.decision.worker._default_worker_argv", return_value=_argv("sleep")),
+            patch(
+                "kunjin.decision.worker._close_worker_pipes",
+                return_value=close_error,
+            ),
+            patch.object(RequestBudget, "cancel", side_effect=KeyboardInterrupt),
+            patch("kunjin.decision.worker.os.killpg", side_effect=record_signal),
+            patch(
+                "kunjin.decision.worker._finalize_process_group",
+                wraps=_finalize_process_group,
+            ) as finalize,
+        ):
+            with pytest.raises(KeyboardInterrupt):
+                run_public_worker(_request(), budget)
+        finalize.assert_called_once()
+        assert events == [signal.SIGTERM, signal.SIGKILL]
+        processes[0].wait.assert_called_once()
+        assert processes[0].returncode is not None
+        assert not _process_group_is_alive(processes[0].pid)
+    finally:
+        for process, original_wait in zip(processes, original_waits):
+            _kill_process_group(process.pid)
+            original_wait(timeout=1)
+
+
+def test_cleanup_failure_overrides_cancel_interrupt_after_close() -> None:
+    processes: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def capture(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    cleanup_error = WorkerExecutionError(
+        "worker_cleanup_failed",
+        "public source worker could not be reaped",
+    )
+    budget = _budget(0.1)
+    try:
+        with (
+            patch("kunjin.decision.worker.subprocess.Popen", side_effect=capture),
+            patch("kunjin.decision.worker._default_worker_argv", return_value=_argv("sleep")),
+            patch(
+                "kunjin.decision.worker._close_worker_pipes",
+                return_value=SystemExit(52),
+            ),
+            patch.object(RequestBudget, "cancel", side_effect=KeyboardInterrupt),
+            patch(
+                "kunjin.decision.worker._finalize_process_group",
+                side_effect=cleanup_error,
+            ) as finalize,
+        ):
+            with pytest.raises(WorkerExecutionError) as raised:
+                run_public_worker(_request(), budget)
+        assert raised.value is cleanup_error
+        assert isinstance(raised.value.__cause__, KeyboardInterrupt)
+        finalize.assert_called_once()
+    finally:
+        for process in processes:
+            _kill_process_group(process.pid)
+            process.wait(timeout=1)
+
+
 def test_keyboard_interrupt_cancels_terminates_and_reaps() -> None:
     process = subprocess.Popen(
         _argv("sleep"),
