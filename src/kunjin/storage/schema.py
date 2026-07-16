@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -2205,5 +2205,445 @@ CREATE TRIGGER fund_document_selection_manifest_no_delete
 BEFORE DELETE ON fund_document_selection_manifests
 BEGIN
     SELECT RAISE(ABORT, 'fund document selection manifests are immutable');
+END;
+"""
+
+SCHEMA_V14 = """
+CREATE TABLE request_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    request_id TEXT NOT NULL UNIQUE CHECK(
+        typeof(request_id) = 'text'
+        AND length(CAST(request_id AS BLOB)) = 32
+        AND request_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    mode TEXT NOT NULL CHECK(
+        typeof(mode) = 'text' AND mode IN ('rapid', 'deep')
+    ),
+    status TEXT NOT NULL CHECK(
+        typeof(status) = 'text'
+        AND status IN ('running', 'complete', 'partial', 'failed', 'cancelled', 'expired')
+    ),
+    started_at TEXT NOT NULL CHECK(
+        typeof(started_at) = 'text'
+        AND julianday(started_at) IS NOT NULL
+        AND substr(started_at, -6) = '+00:00'
+        AND substr(started_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', started_at) = substr(started_at, 1, 19)
+        AND (
+            length(started_at) = 25 OR (
+                length(started_at) = 32
+                AND substr(started_at, 20, 1) = '.'
+                AND substr(started_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(started_at, 21, 6) != '000000'
+            )
+        )
+    ),
+    deadline_at TEXT NOT NULL CHECK(
+        typeof(deadline_at) = 'text'
+        AND julianday(deadline_at) IS NOT NULL
+        AND substr(deadline_at, -6) = '+00:00'
+        AND substr(deadline_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', deadline_at) = substr(deadline_at, 1, 19)
+        AND (
+            length(deadline_at) = 25 OR (
+                length(deadline_at) = 32
+                AND substr(deadline_at, 20, 1) = '.'
+                AND substr(deadline_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(deadline_at, 21, 6) != '000000'
+            )
+        )
+        AND julianday(deadline_at) > julianday(started_at)
+    ),
+    finished_at TEXT CHECK(
+        finished_at IS NULL OR (
+            typeof(finished_at) = 'text'
+            AND julianday(finished_at) IS NOT NULL
+            AND substr(finished_at, -6) = '+00:00'
+            AND substr(finished_at, 11, 1) = 'T'
+            AND strftime('%Y-%m-%dT%H:%M:%S', finished_at) = substr(finished_at, 1, 19)
+            AND (
+                length(finished_at) = 25 OR (
+                    length(finished_at) = 32
+                    AND substr(finished_at, 20, 1) = '.'
+                    AND substr(finished_at, 21, 6) NOT GLOB '*[^0-9]*'
+                    AND substr(finished_at, 21, 6) != '000000'
+                )
+            )
+            AND julianday(finished_at) >= julianday(started_at)
+        )
+    ),
+    omitted_work_json TEXT NOT NULL CHECK(
+        typeof(omitted_work_json) = 'text'
+        AND instr(omitted_work_json, char(0)) = 0
+        AND json_valid(omitted_work_json)
+        AND json_type(omitted_work_json) = 'array'
+    ),
+    CHECK(
+        (status = 'running' AND finished_at IS NULL)
+        OR (status != 'running' AND finished_at IS NOT NULL)
+    )
+);
+
+CREATE TABLE source_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    request_run_id INTEGER NOT NULL CHECK(
+        typeof(request_run_id) = 'integer' AND request_run_id > 0
+    ) REFERENCES request_runs(id) ON DELETE RESTRICT,
+    source_id TEXT NOT NULL CHECK(
+        typeof(source_id) = 'text'
+        AND length(source_id) BETWEEN 1 AND 128
+        AND substr(source_id, 1, 1) GLOB '[a-z]'
+        AND source_id NOT GLOB '*[^a-z0-9_]*'
+    ),
+    field_id TEXT NOT NULL CHECK(
+        typeof(field_id) = 'text'
+        AND length(field_id) BETWEEN 1 AND 128
+        AND substr(field_id, 1, 1) GLOB '[a-z]'
+        AND field_id NOT GLOB '*[^a-z0-9_]*'
+    ),
+    subject_key TEXT NOT NULL CHECK(
+        typeof(subject_key) = 'text'
+        AND length(subject_key) = 11
+        AND substr(subject_key, 1, 5) = 'fund:'
+        AND substr(subject_key, 6) NOT GLOB '*[^0-9]*'
+    ),
+    attempt_number INTEGER NOT NULL CHECK(
+        typeof(attempt_number) = 'integer' AND attempt_number IN (1, 2)
+    ),
+    outcome TEXT NOT NULL CHECK(
+        typeof(outcome) = 'text'
+        AND outcome IN (
+            'success', 'transient_failure', 'unavailable', 'unsupported',
+            'cancelled', 'expired', 'cache_hit', 'skipped_cooldown'
+        )
+    ),
+    started_at TEXT NOT NULL CHECK(
+        typeof(started_at) = 'text'
+        AND julianday(started_at) IS NOT NULL
+        AND substr(started_at, -6) = '+00:00'
+        AND substr(started_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', started_at) = substr(started_at, 1, 19)
+        AND (
+            length(started_at) = 25 OR (
+                length(started_at) = 32
+                AND substr(started_at, 20, 1) = '.'
+                AND substr(started_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(started_at, 21, 6) != '000000'
+            )
+        )
+    ),
+    finished_at TEXT NOT NULL CHECK(
+        typeof(finished_at) = 'text'
+        AND julianday(finished_at) IS NOT NULL
+        AND substr(finished_at, -6) = '+00:00'
+        AND substr(finished_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', finished_at) = substr(finished_at, 1, 19)
+        AND (
+            length(finished_at) = 25 OR (
+                length(finished_at) = 32
+                AND substr(finished_at, 20, 1) = '.'
+                AND substr(finished_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(finished_at, 21, 6) != '000000'
+            )
+        )
+        AND julianday(finished_at) >= julianday(started_at)
+    ),
+    data_as_of TEXT CHECK(
+        data_as_of IS NULL OR (
+            typeof(data_as_of) = 'text'
+            AND julianday(data_as_of) IS NOT NULL
+            AND substr(data_as_of, -6) = '+00:00'
+            AND substr(data_as_of, 11, 1) = 'T'
+            AND strftime('%Y-%m-%dT%H:%M:%S', data_as_of) = substr(data_as_of, 1, 19)
+            AND (
+                length(data_as_of) = 25 OR (
+                    length(data_as_of) = 32
+                    AND substr(data_as_of, 20, 1) = '.'
+                    AND substr(data_as_of, 21, 6) NOT GLOB '*[^0-9]*'
+                    AND substr(data_as_of, 21, 6) != '000000'
+                )
+            )
+            AND julianday(data_as_of) <= julianday(finished_at)
+        )
+    ),
+    error_code TEXT CHECK(
+        error_code IS NULL OR (
+            typeof(error_code) = 'text'
+            AND error_code IN (
+                'dns_failure', 'transient_network_failure', 'network_timeout',
+                'source_unavailable', 'http_4xx', 'unsafe_url', 'unsafe_redirect',
+                'oversized_response', 'decode_failure', 'validation_failure',
+                'parse_failure', 'identity_conflict', 'paywall_or_auth_required',
+                'field_unsupported', 'source_contract_unsupported', 'http_not_found',
+                'http_gone', 'request_cancelled', 'request_expired', 'cooldown_active'
+            )
+        )
+    ),
+    cooldown_until TEXT CHECK(
+        cooldown_until IS NULL OR (
+            typeof(cooldown_until) = 'text'
+            AND julianday(cooldown_until) IS NOT NULL
+            AND substr(cooldown_until, -6) = '+00:00'
+            AND substr(cooldown_until, 11, 1) = 'T'
+            AND strftime('%Y-%m-%dT%H:%M:%S', cooldown_until) = substr(cooldown_until, 1, 19)
+            AND (
+                length(cooldown_until) = 25 OR (
+                    length(cooldown_until) = 32
+                    AND substr(cooldown_until, 20, 1) = '.'
+                    AND substr(cooldown_until, 21, 6) NOT GLOB '*[^0-9]*'
+                    AND substr(cooldown_until, 21, 6) != '000000'
+                )
+            )
+        )
+    ),
+    force_actor TEXT CHECK(
+        force_actor IS NULL OR (
+            typeof(force_actor) = 'text' AND force_actor = 'local_owner'
+        )
+    ),
+    force_reason TEXT CHECK(
+        force_reason IS NULL OR (
+            typeof(force_reason) = 'text'
+            AND force_reason IN (
+                'owner_approved_retry', 'verify_source_recovery',
+                'refresh_after_manual_supplement'
+            )
+        )
+    ),
+    registry_version TEXT NOT NULL CHECK(
+        typeof(registry_version) = 'text'
+        AND length(registry_version) BETWEEN 1 AND 64
+        AND substr(registry_version, 1, 1) GLOB '[a-z0-9]'
+        AND registry_version NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    registry_checksum TEXT NOT NULL CHECK(
+        typeof(registry_checksum) = 'text'
+        AND length(CAST(registry_checksum AS BLOB)) = 64
+        AND registry_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    response_byte_count INTEGER NOT NULL CHECK(
+        typeof(response_byte_count) = 'integer' AND response_byte_count >= 0
+    ),
+    UNIQUE(request_run_id, source_id, field_id, subject_key, attempt_number),
+    CHECK(
+        (force_actor IS NULL AND force_reason IS NULL)
+        OR (
+            force_actor = 'local_owner'
+            AND force_reason IS NOT NULL
+            AND outcome NOT IN ('cache_hit', 'skipped_cooldown')
+        )
+    ),
+    CHECK(
+        (
+            outcome IN ('success', 'cache_hit')
+            AND data_as_of IS NOT NULL
+            AND error_code IS NULL
+            AND cooldown_until IS NULL
+        ) OR (
+            outcome = 'transient_failure'
+            AND data_as_of IS NULL
+            AND error_code IN ('dns_failure', 'transient_network_failure', 'network_timeout')
+            AND cooldown_until IS NOT NULL
+            AND julianday(cooldown_until) > julianday(finished_at)
+        ) OR (
+            outcome = 'unavailable'
+            AND data_as_of IS NULL
+            AND error_code IN (
+                'source_unavailable', 'http_4xx', 'unsafe_url', 'unsafe_redirect',
+                'oversized_response', 'decode_failure', 'validation_failure',
+                'parse_failure', 'identity_conflict', 'paywall_or_auth_required'
+            )
+            AND cooldown_until IS NULL
+        ) OR (
+            outcome = 'unsupported'
+            AND data_as_of IS NULL
+            AND error_code IN (
+                'field_unsupported', 'source_contract_unsupported',
+                'http_not_found', 'http_gone'
+            )
+            AND cooldown_until IS NULL
+        ) OR (
+            outcome = 'cancelled'
+            AND data_as_of IS NULL
+            AND error_code = 'request_cancelled'
+            AND cooldown_until IS NULL
+        ) OR (
+            outcome = 'expired'
+            AND data_as_of IS NULL
+            AND error_code = 'request_expired'
+            AND cooldown_until IS NULL
+        ) OR (
+            outcome = 'skipped_cooldown'
+            AND data_as_of IS NULL
+            AND error_code = 'cooldown_active'
+            AND cooldown_until IS NOT NULL
+            AND julianday(cooldown_until) > julianday(finished_at)
+        )
+    )
+);
+
+CREATE INDEX source_attempts_request
+ON source_attempts(request_run_id, id);
+
+CREATE INDEX source_attempts_history
+ON source_attempts(source_id, field_id, subject_key, finished_at DESC, id DESC);
+
+CREATE TABLE decision_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    request_run_id INTEGER NOT NULL UNIQUE CHECK(
+        typeof(request_run_id) = 'integer' AND request_run_id > 0
+    ) REFERENCES request_runs(id) ON DELETE RESTRICT,
+    evidence_policy_version TEXT NOT NULL CHECK(
+        typeof(evidence_policy_version) = 'text'
+        AND length(evidence_policy_version) BETWEEN 1 AND 64
+        AND substr(evidence_policy_version, 1, 1) GLOB '[a-z0-9]'
+        AND evidence_policy_version NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    evidence_policy_json TEXT NOT NULL CHECK(
+        typeof(evidence_policy_json) = 'text'
+        AND instr(evidence_policy_json, char(0)) = 0
+        AND json_valid(evidence_policy_json)
+        AND json_type(evidence_policy_json) = 'object'
+    ),
+    evidence_policy_checksum TEXT NOT NULL CHECK(
+        typeof(evidence_policy_checksum) = 'text'
+        AND length(CAST(evidence_policy_checksum AS BLOB)) = 64
+        AND evidence_policy_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_registry_version TEXT NOT NULL CHECK(
+        typeof(source_registry_version) = 'text'
+        AND length(source_registry_version) BETWEEN 1 AND 64
+        AND substr(source_registry_version, 1, 1) GLOB '[a-z0-9]'
+        AND source_registry_version NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    source_registry_json TEXT NOT NULL CHECK(
+        typeof(source_registry_json) = 'text'
+        AND instr(source_registry_json, char(0)) = 0
+        AND json_valid(source_registry_json)
+        AND json_type(source_registry_json) = 'object'
+    ),
+    source_registry_checksum TEXT NOT NULL CHECK(
+        typeof(source_registry_checksum) = 'text'
+        AND length(CAST(source_registry_checksum AS BLOB)) = 64
+        AND source_registry_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    canonical_route_json TEXT NOT NULL CHECK(
+        typeof(canonical_route_json) = 'text'
+        AND instr(canonical_route_json, char(0)) = 0
+        AND json_valid(canonical_route_json)
+        AND json_type(canonical_route_json) = 'object'
+    ),
+    result_checksum TEXT NOT NULL CHECK(
+        typeof(result_checksum) = 'text'
+        AND length(CAST(result_checksum AS BLOB)) = 64
+        AND result_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL CHECK(
+        typeof(created_at) = 'text'
+        AND julianday(created_at) IS NOT NULL
+        AND substr(created_at, -6) = '+00:00'
+        AND substr(created_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', created_at) = substr(created_at, 1, 19)
+        AND (
+            length(created_at) = 25 OR (
+                length(created_at) = 32
+                AND substr(created_at, 20, 1) = '.'
+                AND substr(created_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(created_at, 21, 6) != '000000'
+            )
+        )
+    )
+);
+
+CREATE TRIGGER request_run_insert_guard
+BEFORE INSERT ON request_runs
+WHEN NEW.status != 'running'
+     OR NEW.finished_at IS NOT NULL
+     OR NEW.omitted_work_json != '[]'
+BEGIN
+    SELECT RAISE(ABORT, 'request runs must begin in running state');
+END;
+
+CREATE TRIGGER request_run_no_replace
+BEFORE INSERT ON request_runs
+WHEN EXISTS (
+    SELECT 1 FROM request_runs
+    WHERE id = NEW.id OR request_id = NEW.request_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'request runs cannot be replaced');
+END;
+
+CREATE TRIGGER request_run_update_guard
+BEFORE UPDATE ON request_runs
+WHEN NOT (
+    OLD.status = 'running'
+    AND NEW.status IN ('complete', 'partial', 'failed', 'cancelled', 'expired')
+    AND NEW.id = OLD.id
+    AND NEW.request_id = OLD.request_id
+    AND NEW.mode = OLD.mode
+    AND NEW.started_at = OLD.started_at
+    AND NEW.deadline_at = OLD.deadline_at
+    AND OLD.finished_at IS NULL
+    AND NEW.finished_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'request run transition is invalid');
+END;
+
+CREATE TRIGGER request_run_no_delete
+BEFORE DELETE ON request_runs
+BEGIN
+    SELECT RAISE(ABORT, 'request runs cannot be deleted');
+END;
+
+CREATE TRIGGER source_attempt_no_replace
+BEFORE INSERT ON source_attempts
+WHEN EXISTS (
+    SELECT 1 FROM source_attempts
+    WHERE id = NEW.id OR (
+        request_run_id = NEW.request_run_id
+        AND source_id = NEW.source_id
+        AND field_id = NEW.field_id
+        AND subject_key = NEW.subject_key
+        AND attempt_number = NEW.attempt_number
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'source attempts are immutable');
+END;
+
+CREATE TRIGGER source_attempt_no_update
+BEFORE UPDATE ON source_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'source attempts are immutable');
+END;
+
+CREATE TRIGGER source_attempt_no_delete
+BEFORE DELETE ON source_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'source attempts are immutable');
+END;
+
+CREATE TRIGGER decision_snapshot_no_replace
+BEFORE INSERT ON decision_snapshots
+WHEN EXISTS (
+    SELECT 1 FROM decision_snapshots
+    WHERE id = NEW.id OR request_run_id = NEW.request_run_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'decision snapshots are immutable');
+END;
+
+CREATE TRIGGER decision_snapshot_no_update
+BEFORE UPDATE ON decision_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'decision snapshots are immutable');
+END;
+
+CREATE TRIGGER decision_snapshot_no_delete
+BEFORE DELETE ON decision_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'decision snapshots are immutable');
 END;
 """

@@ -39,6 +39,7 @@ from kunjin.storage.schema import (
     SCHEMA_V11,
     SCHEMA_V12,
     SCHEMA_V13,
+    SCHEMA_V14,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -141,6 +142,7 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (11, SCHEMA_V11),
         (12, SCHEMA_V12),
         (13, SCHEMA_V13),
+        (14, SCHEMA_V14),
     )
 
 
@@ -608,12 +610,7 @@ def _validate_applied_schema(
 
     if 10 not in applied_versions:
         return
-    expected_before_v10 = _expected_schema_objects(
-        tuple(schema for version, schema in migrations if version < 10)
-    )
-    expected_v10 = {
-        name: value for name, value in expected.items() if name not in expected_before_v10
-    }
+    expected_v10 = _owned_d1_objects(expected)
     if _owned_d1_objects(actual) != expected_v10:
         raise sqlite3.DatabaseError("fund risk schema does not match the current D1 schema")
 

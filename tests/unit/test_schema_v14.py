@@ -1,0 +1,663 @@
+from __future__ import annotations
+
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from kunjin.storage.repository import Repository, _migrate_v12
+from kunjin.storage.schema import (
+    SCHEMA_V1,
+    SCHEMA_V2,
+    SCHEMA_V3,
+    SCHEMA_V4,
+    SCHEMA_V5,
+    SCHEMA_V6,
+    SCHEMA_V7,
+    SCHEMA_V8,
+    SCHEMA_V9,
+    SCHEMA_V10,
+    SCHEMA_V11,
+    SCHEMA_V13,
+    SCHEMA_VERSION,
+)
+
+UTC = "2026-07-16T00:00:00+00:00"
+LATER = "2026-07-16T00:00:01+00:00"
+DEADLINE = "2026-07-16T00:01:30+00:00"
+COOLDOWN = "2026-07-16T00:31:00+00:00"
+REQUEST_ID = "0123456789abcdef0123456789abcdef"
+POLICY_JSON = '{"version":"1"}'
+REGISTRY_JSON = '{"sources":[],"version":"1"}'
+ROUTE_JSON = '{"actions":[],"request_id":"0123456789abcdef0123456789abcdef"}'
+MANIFEST_JSON = '{"evidence_fact_ids":[],"manifest_version":1}'
+
+SCHEMAS_THROUGH_V11 = (
+    SCHEMA_V1,
+    SCHEMA_V2,
+    SCHEMA_V3,
+    SCHEMA_V4,
+    SCHEMA_V5,
+    SCHEMA_V6,
+    SCHEMA_V7,
+    SCHEMA_V8,
+    SCHEMA_V9,
+    SCHEMA_V10,
+    SCHEMA_V11,
+)
+
+
+class SchemaV14Test(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def repository(self, name: str = "kunjin.db") -> Repository:
+        return Repository(Path(self.temporary_directory.name) / name)
+
+    def _create_at_version(self, version: int) -> Repository:
+        repository = self.repository(f"v{version}.db")
+        with repository.connect() as connection:
+            for schema in SCHEMAS_THROUGH_V11[: min(version, 11)]:
+                connection.executescript(schema)
+            if version >= 12:
+                _migrate_v12(connection)
+            if version >= 13:
+                connection.executescript(SCHEMA_V13)
+            connection.executemany(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                [(item, UTC) for item in range(1, version + 1)],
+            )
+            connection.execute(
+                """
+                INSERT INTO fund_classification_policy_versions(
+                    version, canonical_policy_json, policy_checksum,
+                    effective_at, created_at
+                ) VALUES ('1', '{"version":"1"}', ?, ?, ?)
+                """,
+                ("d" * 64, UTC, UTC),
+            )
+            connection.execute(
+                """
+                INSERT INTO fund_risk_classifications(
+                    id, fund_code, policy_version, input_fingerprint,
+                    input_manifest_json, product_family, risk_bucket,
+                    portfolio_role, evidence_status, evidence_tags_json,
+                    reason_codes_json, missing_evidence_json, conflicts_json,
+                    evidence_document_ids_json, evidence_fact_ids_json,
+                    freshness_json, classified_at, valid_until, created_at
+                ) VALUES (
+                    17, '000001', '1', ?, ?, 'broad_index',
+                    'diversified_equity', 'core_eligible', 'verified',
+                    '[]', '[]', '[]', '[]', '[]', '[]', '[]', ?, ?, ?
+                )
+                """,
+                ("e" * 64, MANIFEST_JSON, UTC, DEADLINE, UTC),
+            )
+            if version >= 13:
+                connection.execute(
+                    "INSERT INTO fund_document_refresh_runs(id, fund_code, started_at) "
+                    "VALUES (23, '000001', ?)",
+                    (UTC,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO fund_document_selection_manifests(
+                        refresh_run_id, fund_code, manifest_version,
+                        selection_policy_checksum, canonical_json,
+                        selection_checksum, created_at
+                    ) VALUES (23, '000001', 1, ?, ?, ?, ?)
+                    """,
+                    ("a" * 64, '{"manifest_version":1}', "b" * 64, UTC),
+                )
+            connection.commit()
+        return repository
+
+    def _insert_request(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        request_id: str = REQUEST_ID,
+        mode: str = "rapid",
+    ) -> int:
+        return int(
+            connection.execute(
+                """
+                INSERT INTO request_runs(
+                    request_id, mode, status, started_at, deadline_at,
+                    finished_at, omitted_work_json
+                ) VALUES (?, ?, 'running', ?, ?, NULL, '[]')
+                """,
+                (request_id, mode, UTC, DEADLINE),
+            ).lastrowid
+        )
+
+    def _attempt_values(self, request_run_id: int, **overrides: object) -> dict:
+        values: dict[str, object] = {
+            "request_run_id": request_run_id,
+            "source_id": "eastmoney_f10",
+            "field_id": "identity_active_status",
+            "subject_key": "fund:123456",
+            "attempt_number": 1,
+            "outcome": "success",
+            "started_at": UTC,
+            "finished_at": LATER,
+            "data_as_of": UTC,
+            "error_code": None,
+            "cooldown_until": None,
+            "force_actor": None,
+            "force_reason": None,
+            "registry_version": "1",
+            "registry_checksum": "a" * 64,
+            "response_byte_count": 100,
+        }
+        values.update(overrides)
+        return values
+
+    def _insert_attempt(self, connection: sqlite3.Connection, values: dict) -> int:
+        columns = tuple(values)
+        return int(
+            connection.execute(
+                f"INSERT INTO source_attempts({','.join(columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})",
+                tuple(values[column] for column in columns),
+            ).lastrowid
+        )
+
+    def _insert_snapshot(self, connection: sqlite3.Connection, request_run_id: int) -> int:
+        return int(
+            connection.execute(
+                """
+                INSERT INTO decision_snapshots(
+                    request_run_id, evidence_policy_version,
+                    evidence_policy_json, evidence_policy_checksum,
+                    source_registry_version, source_registry_json,
+                    source_registry_checksum, canonical_route_json,
+                    result_checksum, created_at
+                ) VALUES (?, '1', ?, ?, '1', ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_run_id,
+                    POLICY_JSON,
+                    "b" * 64,
+                    REGISTRY_JSON,
+                    "c" * 64,
+                    ROUTE_JSON,
+                    "d" * 64,
+                    UTC,
+                ),
+            ).lastrowid
+        )
+
+    def test_v10_through_v13_and_fresh_migrate_additively(self) -> None:
+        for version in (10, 11, 12, 13):
+            with self.subTest(version=version):
+                repository = self._create_at_version(version)
+                with repository.connect() as connection:
+                    classification_before = connection.execute(
+                        "SELECT id, CAST(input_manifest_json AS BLOB) AS manifest "
+                        "FROM fund_risk_classifications"
+                    ).fetchone()
+                    selection_before = (
+                        connection.execute(
+                            "SELECT refresh_run_id, CAST(canonical_json AS BLOB) AS manifest "
+                            "FROM fund_document_selection_manifests"
+                        ).fetchone()
+                        if version >= 13
+                        else None
+                    )
+
+                repository.migrate()
+
+                with repository.connect() as connection:
+                    versions = tuple(
+                        row["version"]
+                        for row in connection.execute(
+                            "SELECT version FROM schema_migrations ORDER BY version"
+                        )
+                    )
+                    classification_after = connection.execute(
+                        "SELECT id, CAST(input_manifest_json AS BLOB) AS manifest "
+                        "FROM fund_risk_classifications"
+                    ).fetchone()
+                    selection_after = (
+                        connection.execute(
+                            "SELECT refresh_run_id, CAST(canonical_json AS BLOB) AS manifest "
+                            "FROM fund_document_selection_manifests"
+                        ).fetchone()
+                        if version >= 13
+                        else None
+                    )
+                self.assertEqual(versions, tuple(range(1, 15)))
+                self.assertEqual(tuple(classification_after), tuple(classification_before))
+                if selection_before is not None:
+                    self.assertEqual(tuple(selection_after), tuple(selection_before))
+
+        fresh = self.repository("fresh.db")
+        fresh.migrate()
+        with fresh.connect() as connection:
+            versions = tuple(
+                row["version"]
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                )
+            )
+        self.assertEqual(SCHEMA_VERSION, 14)
+        self.assertEqual(versions, tuple(range(1, 15)))
+
+    def test_failed_v14_migration_rolls_back_objects_marker_and_prior_bytes(self) -> None:
+        repository = self._create_at_version(13)
+        with repository.connect() as connection:
+            classification_before = tuple(
+                connection.execute(
+                    "SELECT id, CAST(input_manifest_json AS BLOB) "
+                    "FROM fund_risk_classifications"
+                ).fetchone()
+            )
+            selection_before = tuple(
+                connection.execute(
+                    "SELECT refresh_run_id, CAST(canonical_json AS BLOB) "
+                    "FROM fund_document_selection_manifests"
+                ).fetchone()
+            )
+
+        broken_v14 = """
+        CREATE TABLE partial_request_runs(id INTEGER PRIMARY KEY);
+        CREATE TABLE incomplete_v14(
+        """
+        with patch("kunjin.storage.repository.SCHEMA_V14", broken_v14):
+            with self.assertRaises(sqlite3.OperationalError):
+                repository.migrate()
+
+        with repository.connect() as connection:
+            versions = tuple(
+                row["version"]
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                )
+            )
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            classification_after = tuple(
+                connection.execute(
+                    "SELECT id, CAST(input_manifest_json AS BLOB) "
+                    "FROM fund_risk_classifications"
+                ).fetchone()
+            )
+            selection_after = tuple(
+                connection.execute(
+                    "SELECT refresh_run_id, CAST(canonical_json AS BLOB) "
+                    "FROM fund_document_selection_manifests"
+                ).fetchone()
+            )
+        self.assertEqual(versions, tuple(range(1, 14)))
+        self.assertNotIn("partial_request_runs", tables)
+        self.assertNotIn("request_runs", tables)
+        self.assertEqual(classification_after, classification_before)
+        self.assertEqual(selection_after, selection_before)
+
+    def test_v14_has_exact_three_tables_columns_foreign_keys_indexes_and_triggers(self) -> None:
+        repository = self._create_at_version(13)
+        with repository.connect() as connection:
+            tables_before = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        repository.migrate()
+        with repository.connect() as connection:
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            columns = {
+                table: tuple(
+                    row["name"]
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                )
+                for table in ("request_runs", "source_attempts", "decision_snapshots")
+            }
+            foreign_keys = {
+                table: {
+                    (row["from"], row["table"], row["to"], row["on_delete"])
+                    for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+                }
+                for table in ("source_attempts", "decision_snapshots")
+            }
+            indexes = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+            }
+            triggers = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+
+        self.assertEqual(
+            tables - tables_before,
+            {"request_runs", "source_attempts", "decision_snapshots"},
+        )
+        self.assertEqual(
+            columns["request_runs"],
+            (
+                "id",
+                "request_id",
+                "mode",
+                "status",
+                "started_at",
+                "deadline_at",
+                "finished_at",
+                "omitted_work_json",
+            ),
+        )
+        self.assertEqual(
+            columns["source_attempts"],
+            (
+                "id",
+                "request_run_id",
+                "source_id",
+                "field_id",
+                "subject_key",
+                "attempt_number",
+                "outcome",
+                "started_at",
+                "finished_at",
+                "data_as_of",
+                "error_code",
+                "cooldown_until",
+                "force_actor",
+                "force_reason",
+                "registry_version",
+                "registry_checksum",
+                "response_byte_count",
+            ),
+        )
+        self.assertEqual(
+            columns["decision_snapshots"],
+            (
+                "id",
+                "request_run_id",
+                "evidence_policy_version",
+                "evidence_policy_json",
+                "evidence_policy_checksum",
+                "source_registry_version",
+                "source_registry_json",
+                "source_registry_checksum",
+                "canonical_route_json",
+                "result_checksum",
+                "created_at",
+            ),
+        )
+        self.assertEqual(
+            foreign_keys["source_attempts"],
+            {("request_run_id", "request_runs", "id", "RESTRICT")},
+        )
+        self.assertEqual(
+            foreign_keys["decision_snapshots"],
+            {("request_run_id", "request_runs", "id", "RESTRICT")},
+        )
+        self.assertTrue(
+            {"source_attempts_request", "source_attempts_history"} <= indexes
+        )
+        self.assertTrue(
+            {
+                "request_run_no_replace",
+                "request_run_insert_guard",
+                "request_run_update_guard",
+                "request_run_no_delete",
+                "source_attempt_no_replace",
+                "source_attempt_no_update",
+                "source_attempt_no_delete",
+                "decision_snapshot_no_replace",
+                "decision_snapshot_no_update",
+                "decision_snapshot_no_delete",
+            }
+            <= triggers
+        )
+
+    def test_request_run_allows_one_finalize_and_rejects_all_other_mutation(self) -> None:
+        repository = self.repository()
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            run_id = self._insert_request(connection)
+            connection.execute(
+                "UPDATE request_runs SET status = 'partial', finished_at = ?, "
+                "omitted_work_json = '[\"market_context\"]' WHERE id = ?",
+                (LATER, run_id),
+            )
+            for statement in (
+                "UPDATE request_runs SET status = 'complete' WHERE id = ?",
+                "UPDATE request_runs SET mode = 'deep' WHERE id = ?",
+                "DELETE FROM request_runs WHERE id = ?",
+                "INSERT OR REPLACE INTO request_runs "
+                "VALUES (?, ?, 'rapid', 'running', ?, ?, NULL, '[]')",
+            ):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    parameters = (
+                        (run_id, REQUEST_ID, UTC, DEADLINE)
+                        if statement.startswith("INSERT")
+                        else (run_id,)
+                    )
+                    connection.execute(statement, parameters)
+
+        invalid_rows = (
+            (REQUEST_ID.upper(), "rapid", "running", UTC, DEADLINE, None, "[]"),
+            (REQUEST_ID, "slow", "running", UTC, DEADLINE, None, "[]"),
+            (REQUEST_ID, "rapid", "complete", UTC, DEADLINE, None, "[]"),
+            (REQUEST_ID, "rapid", "complete", UTC, DEADLINE, LATER, "[]"),
+            (REQUEST_ID, "rapid", "running", UTC, DEADLINE, LATER, "[]"),
+            (REQUEST_ID, "rapid", "running", UTC, DEADLINE, None, '["pending"]'),
+            (REQUEST_ID, "rapid", "running", UTC, DEADLINE, None, "{}"),
+            (REQUEST_ID, "rapid", "running", "not-utc", DEADLINE, None, "[]"),
+        )
+        for index, values in enumerate(invalid_rows):
+            with self.subTest(values=values), repository.connect() as connection:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        """
+                        INSERT INTO request_runs(
+                            request_id, mode, status, started_at, deadline_at,
+                            finished_at, omitted_work_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        values,
+                    )
+
+    def test_source_attempt_matrix_owner_uniqueness_and_immutability(self) -> None:
+        repository = self.repository()
+        repository.migrate()
+        valid_overrides = (
+            {},
+            {"outcome": "cache_hit", "attempt_number": 2},
+            {
+                "outcome": "transient_failure",
+                "data_as_of": None,
+                "error_code": "network_timeout",
+                "cooldown_until": COOLDOWN,
+                "response_byte_count": 0,
+            },
+            {
+                "outcome": "unavailable",
+                "data_as_of": None,
+                "error_code": "source_unavailable",
+                "response_byte_count": 0,
+            },
+            {
+                "outcome": "unsupported",
+                "data_as_of": None,
+                "error_code": "field_unsupported",
+                "response_byte_count": 0,
+            },
+            {
+                "outcome": "cancelled",
+                "data_as_of": None,
+                "error_code": "request_cancelled",
+                "response_byte_count": 0,
+            },
+            {
+                "outcome": "expired",
+                "data_as_of": None,
+                "error_code": "request_expired",
+                "response_byte_count": 0,
+            },
+            {
+                "outcome": "skipped_cooldown",
+                "data_as_of": None,
+                "error_code": "cooldown_active",
+                "cooldown_until": COOLDOWN,
+                "response_byte_count": 0,
+            },
+            {
+                "force_actor": "local_owner",
+                "force_reason": "owner_approved_retry",
+            },
+        )
+        for index, overrides in enumerate(valid_overrides):
+            with self.subTest(overrides=overrides), repository.connect() as connection:
+                run_id = self._insert_request(
+                    connection,
+                    request_id=f"{index + 1:032x}",
+                )
+                attempt_id = self._insert_attempt(
+                    connection, self._attempt_values(run_id, **overrides)
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE source_attempts SET response_byte_count = 0 WHERE id = ?",
+                        (attempt_id,),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute("DELETE FROM source_attempts WHERE id = ?", (attempt_id,))
+                connection.commit()
+
+        invalid_overrides = (
+            {"subject_key": "fund:12345"},
+            {"attempt_number": 3},
+            {"outcome": "failure"},
+            {"finished_at": UTC, "started_at": LATER},
+            {"data_as_of": DEADLINE},
+            {"response_byte_count": -1},
+            {"registry_checksum": "A" * 64},
+            {"outcome": "success", "data_as_of": None},
+            {
+                "outcome": "transient_failure",
+                "data_as_of": None,
+                "error_code": "field_unsupported",
+                "cooldown_until": COOLDOWN,
+            },
+            {
+                "outcome": "skipped_cooldown",
+                "data_as_of": None,
+                "error_code": "cooldown_active",
+                "cooldown_until": COOLDOWN,
+                "force_actor": "local_owner",
+                "force_reason": "verify_source_recovery",
+            },
+            {"force_actor": "other_owner", "force_reason": "owner_approved_retry"},
+            {"force_actor": "local_owner", "force_reason": None},
+        )
+        for index, overrides in enumerate(invalid_overrides, start=20):
+            with self.subTest(overrides=overrides), repository.connect() as connection:
+                run_id = self._insert_request(connection, request_id=f"{index:032x}")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self._insert_attempt(connection, self._attempt_values(run_id, **overrides))
+
+        with repository.connect() as connection, connection:
+            run_id = self._insert_request(connection, request_id="f" * 32)
+            values = self._attempt_values(run_id)
+            attempt_id = self._insert_attempt(connection, values)
+            with self.assertRaises(sqlite3.IntegrityError):
+                self._insert_attempt(connection, values)
+            with self.assertRaises(sqlite3.IntegrityError):
+                columns = tuple(values)
+                connection.execute(
+                    f"INSERT OR REPLACE INTO source_attempts(id,{','.join(columns)}) "
+                    f"VALUES (?,{','.join('?' for _ in columns)})",
+                    (attempt_id, *(values[column] for column in columns)),
+                )
+
+    def test_snapshots_are_bound_complete_json_objects_and_immutable(self) -> None:
+        repository = self.repository()
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            run_id = self._insert_request(connection)
+            snapshot_id = self._insert_snapshot(connection, run_id)
+            with self.assertRaises(sqlite3.IntegrityError):
+                self._insert_snapshot(connection, run_id)
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO decision_snapshots(
+                        id, request_run_id, evidence_policy_version,
+                        evidence_policy_json, evidence_policy_checksum,
+                        source_registry_version, source_registry_json,
+                        source_registry_checksum, canonical_route_json,
+                        result_checksum, created_at
+                    ) VALUES (?, ?, '1', ?, ?, '1', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        run_id,
+                        POLICY_JSON,
+                        "b" * 64,
+                        REGISTRY_JSON,
+                        "c" * 64,
+                        ROUTE_JSON,
+                        "d" * 64,
+                        UTC,
+                    ),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE decision_snapshots SET canonical_route_json = '{}' WHERE id = ?",
+                    (snapshot_id,),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("DELETE FROM decision_snapshots WHERE id = ?", (snapshot_id,))
+
+        invalid_values = (
+            ("[]", "b" * 64, REGISTRY_JSON, "c" * 64, ROUTE_JSON, "d" * 64, UTC),
+            (POLICY_JSON, "B" * 64, REGISTRY_JSON, "c" * 64, ROUTE_JSON, "d" * 64, UTC),
+            (POLICY_JSON, "b" * 64, "{", "c" * 64, ROUTE_JSON, "d" * 64, UTC),
+            (POLICY_JSON, "b" * 64, REGISTRY_JSON, "c" * 64, "[]", "d" * 64, UTC),
+            (POLICY_JSON, "b" * 64, REGISTRY_JSON, "c" * 64, ROUTE_JSON, "D" * 64, UTC),
+            (POLICY_JSON, "b" * 64, REGISTRY_JSON, "c" * 64, ROUTE_JSON, "d" * 64, "bad"),
+        )
+        for index, values in enumerate(invalid_values, start=1):
+            with self.subTest(values=values), repository.connect() as connection:
+                run_id = self._insert_request(connection, request_id=f"{index + 40:032x}")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        """
+                        INSERT INTO decision_snapshots(
+                            request_run_id, evidence_policy_version,
+                            evidence_policy_json, evidence_policy_checksum,
+                            source_registry_version, source_registry_json,
+                            source_registry_checksum, canonical_route_json,
+                            result_checksum, created_at
+                        ) VALUES (?, '1', ?, ?, '1', ?, ?, ?, ?, ?)
+                        """,
+                        (run_id, *values),
+                    )
+
+        with repository.connect() as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self._insert_snapshot(connection, 999999)
+
+
+if __name__ == "__main__":
+    unittest.main()
