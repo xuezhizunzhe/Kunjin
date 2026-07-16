@@ -975,6 +975,13 @@ class ActionRoute:
             raise ValueError("action risk effect does not match the canonical action contract")
         if not set(minimum_gates).issubset(self.required_gates):
             raise ValueError("action route is missing mandatory minimum gates")
+        if self.minimum_state is ActionState.ACTIONABLE:
+            if self.blocking_codes:
+                raise ValueError("actionable state cannot contain blocking codes")
+            if self.action_maturity is not ActionMaturity.MATURE:
+                raise ValueError("actionable state requires mature action interpretation")
+            if not self.research_available:
+                raise ValueError("actionable state requires research to be available")
         if self.exact_amount_available:
             transaction_actions = {
                 ActionKind.BUY_OR_ADD,
@@ -983,12 +990,6 @@ class ActionRoute:
             }
             if self.action not in transaction_actions:
                 raise ValueError("exact amount is allowed only for transaction actions")
-            if not self.research_available:
-                raise ValueError("exact amount requires research to be available")
-            if self.blocking_codes:
-                raise ValueError("blocked action route cannot expose an exact amount")
-            if self.action_maturity is not ActionMaturity.MATURE:
-                raise ValueError("exact amount requires mature action interpretation")
             if self.minimum_state is not ActionState.ACTIONABLE:
                 raise ValueError("exact amount requires actionable state")
 

@@ -848,6 +848,28 @@ def test_action_route_rejects_cross_invariant_bypasses() -> None:
             route.validate()
 
 
+def test_actionable_state_requires_unblocked_mature_research() -> None:
+    buy = replace(
+        _route().actions[0],
+        action_id="buy_or_add",
+        action=ActionKind.BUY_OR_ADD,
+        risk_effect=RiskEffect.RISK_INCREASING,
+        required_gates=("phase_b", "phase_c", "d1", "d2", "d3", "post_trade"),
+        minimum_state=ActionState.ACTIONABLE,
+        action_maturity=ActionMaturity.MATURE,
+        research_available=True,
+        exact_amount_available=False,
+    )
+    invalid = (
+        replace(buy, blocking_codes=("blocked",)),
+        replace(buy, action_maturity=ActionMaturity.EXPERIMENTAL_SHADOW),
+        replace(buy, research_available=False),
+    )
+    for route in invalid:
+        with pytest.raises(ValueError, match="actionable"):
+            route.validate()
+
+
 @pytest.mark.parametrize(
     "subject_key",
     ("account:123456", "fund:12345", "fund:ABCDEF"),
