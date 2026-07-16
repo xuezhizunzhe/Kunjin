@@ -1060,9 +1060,15 @@ def test_worker_module_import_boundary_excludes_private_and_storage_modules() ->
 _DYNAMIC_IMPORT = "__dynamic_import__"
 
 
-def _resolve_import_from(module_name: str, node: ast.ImportFrom) -> set[str]:
+def _resolve_import_from(
+    module_name: str,
+    node: ast.ImportFrom,
+    *,
+    is_package: bool,
+) -> set[str]:
     if node.level:
-        package = module_name.split(".")[:-1]
+        module_parts = module_name.split(".")
+        package = module_parts if is_package else module_parts[:-1]
         parent_count = node.level - 1
         if parent_count > len(package):
             return {_DYNAMIC_IMPORT}
@@ -1079,7 +1085,12 @@ def _resolve_import_from(module_name: str, node: ast.ImportFrom) -> set[str]:
     return names
 
 
-def _ast_import_names(source: str, module_name: str) -> set[str]:
+def _ast_import_names(
+    source: str,
+    module_name: str,
+    *,
+    is_package: bool = False,
+) -> set[str]:
     names = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Name) and node.id in {"__import__", "import_module"}:
@@ -1099,7 +1110,13 @@ def _ast_import_names(source: str, module_name: str) -> set[str]:
             if any(alias.name in {"builtins", "importlib"} for alias in node.names):
                 names.add(_DYNAMIC_IMPORT)
         elif isinstance(node, ast.ImportFrom):
-            names.update(_resolve_import_from(module_name, node))
+            names.update(
+                _resolve_import_from(
+                    module_name,
+                    node,
+                    is_package=is_package,
+                )
+            )
             if node.module in {"builtins", "importlib"}:
                 names.add(_DYNAMIC_IMPORT)
         elif isinstance(node, ast.Call):
@@ -1160,7 +1177,9 @@ def _worker_local_dependency_closure(
         assert module_path is not None
         reachable.add(module_name)
         imported = _ast_import_names(
-            module_path.read_text(encoding="utf-8"), module_name
+            module_path.read_text(encoding="utf-8"),
+            module_name,
+            is_package=module_path.name == "__init__.py",
         )
         all_imports.update(imported)
         for imported_name in imported:
@@ -1185,6 +1204,21 @@ def test_worker_ast_import_detector_catches_boundary_bypasses(source: str) -> No
         imported == "kunjin.storage" or imported.startswith("kunjin.storage.")
         for imported in imports
     )
+
+
+@pytest.mark.parametrize(
+    ("module_name", "source", "expected"),
+    (
+        ("kunjin.funds", "from .. import storage", "kunjin.storage"),
+        ("kunjin.decision", "from . import policy", "kunjin.decision.policy"),
+        ("kunjin.decision", "from .. import storage", "kunjin.storage"),
+    ),
+)
+def test_worker_ast_import_detector_resolves_package_relative_imports(
+    module_name: str, source: str, expected: str
+) -> None:
+    imports = _ast_import_names(source, module_name, is_package=True)
+    assert expected in imports
 
 
 @pytest.mark.parametrize(
