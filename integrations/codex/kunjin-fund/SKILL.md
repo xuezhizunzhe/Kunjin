@@ -90,11 +90,11 @@ block proves the fund itself should be sold.
 ### Reduce Or Exit
 
 Research for `reduce_to_cash` and `full_exit` may continue under blocked Phase B
-because they are risk-reducing paths. A block is not itself a sell signal. Give
-an exact action, amount, or timing only when current position, fee, and
-settlement facts are available and every route-required gate for that conclusion
-is satisfied. Otherwise explain the supported reduction or exit considerations
-and the missing transaction facts without fabricating them.
+because they are risk-reducing paths. A block is not itself a sell signal. Do not
+give an executable exact action or timing unless the route is mature and
+actionable, current position, fee, and settlement facts are confirmed, and every
+route-required gate is satisfied. Otherwise explain the supported considerations
+and missing transaction facts. Apply the exact-output contract below to amounts.
 
 ### Buy, Add, Or Switch
 
@@ -103,12 +103,41 @@ post-trade gates must all be current and satisfied, together with every exact
 `required_gates` item returned by the route. Do not give a mature buy or add
 recommendation, exact amount, or disguised starter-position instruction while
 any gate is missing, blocked, stale, conflicted, or still experimental. Factual
-candidate research may continue independently.
+candidate research may continue independently. Even after future gates pass,
+an exact amount remains subject to the exact-output contract below.
 
 Split `switch_funds` into its reduction leg and purchase leg. The route expands
 them as ordered `switch_reduce` and `switch_buy` actions. Analyze each leg on its
 own evidence: reduction research may continue, but the purchase leg follows the
-full buy/add gate and cannot inherit permission from the reduction leg.
+full buy/add gate and cannot inherit permission from the reduction leg. The
+exact-output contract also governs `buy_or_add` and `switch_buy`.
+
+## Exact Output Authorization
+
+Phase 0 does not implement exact-output authorization, and its current action
+routes expose `exact_amount_available=false`. When
+`exact_amount_available=false`, never return an exact transaction amount in
+chat or Codex-facing JSON; keep any existing amount in an owner-only local view.
+Do not derive or reconstruct it from ratios, observations, or private inputs.
+
+A future exact proposed transaction amount may be returned only when all of
+these conditions hold together:
+
+1. The owner explicitly requests the exact amount for the current action.
+2. The fresh route says `exact_amount_available=true`, the action is mature and
+   actionable, no blocking code remains, and every decision gate passes.
+3. The owner enables a per-request and per-action local exact-output
+   authorization.
+4. Current fees, settlement, availability, and a `transaction_confirmed` local
+   transaction or position confirmation support the action.
+
+The authorization is short-lived, revocable, non-persistent by default, and
+expires after that response. The amount and authorization state never enter
+general logs, audit documents, Git, or a later Codex response without a new
+authorization. The output must not reveal the underlying exact profile values.
+Yangjibao holdings, `position_inferred`, inferred cost, and pending-transaction
+observations cannot authorize an exact action amount by themselves; require
+local confirmation or return `insufficient_data`.
 
 ## Bound Source Work
 

@@ -21,6 +21,32 @@ class OcrMustNotRun:
 
 
 class SmokeTest(unittest.TestCase):
+    def test_kunjin_skill_exact_amount_requires_ephemeral_owner_authorization(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        normalized_skill = " ".join(skill.split())
+
+        for phrase in (
+            "Phase 0 does not implement exact-output authorization",
+            "When `exact_amount_available=false`, never return an exact transaction amount",
+            "chat or Codex-facing JSON",
+            "owner-only local view",
+            "explicitly requests the exact amount",
+            "per-request and per-action local exact-output authorization",
+            "short-lived, revocable, non-persistent by default, and expires after that response",
+            "`transaction_confirmed` local transaction or position confirmation",
+            (
+                "Yangjibao holdings, `position_inferred`, inferred cost, and pending-transaction "
+                "observations cannot authorize"
+            ),
+            "must not reveal the underlying exact profile values",
+            "never enter general logs, audit documents, Git, or a later Codex response",
+            "also governs `buy_or_add` and `switch_buy`",
+        ):
+            self.assertIn(phrase, normalized_skill)
+
     def test_kunjin_skill_routes_subquestions_and_preserves_phase0_boundaries(self) -> None:
         root = Path(__file__).resolve().parents[1]
         skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
