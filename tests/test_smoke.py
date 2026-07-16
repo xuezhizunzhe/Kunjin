@@ -1,6 +1,11 @@
+import json
+import os
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -146,6 +151,435 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("decision route requires JSON mode", cli)
         self.assertNotIn("sync daily completes within 90 seconds", cli)
         self.assertNotIn("fund peers completes within 480 seconds", cli)
+
+    def test_phase0_acceptance_script_has_bounded_amount_free_contract(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script_path = root / "scripts" / "run_phase0_acceptance.sh"
+        script = script_path.read_text(encoding="utf-8")
+
+        self.assertTrue(script_path.stat().st_mode & 0o100)
+        self.assertIn("set -euo pipefail", script)
+        for phrase in (
+            '^[0-9]{6}$',
+            "mktemp -d",
+            "trap cleanup EXIT",
+            "KUNJIN_DATA_DIR",
+            "KUNJIN_STATE_DIR",
+            "PYTHONPYCACHEPREFIX",
+            "--json version",
+            "--json source status",
+            '"fund-profile"',
+            "--mode rapid",
+            "--fund-code",
+            "--json decision route",
+            "--action fact_research",
+            "--action buy_or_add",
+            "sync_exit_code",
+            "sync_elapsed_seconds",
+            "subprocess.Popen",
+            "start_new_session=True",
+            "os.killpg(child.pid, signal.SIGTERM)",
+            "os.killpg(child.pid, signal.SIGKILL)",
+            "child.wait()",
+            "90",
+        ):
+            self.assertIn(phrase, script)
+        for forbidden in (
+            "docker",
+            "yangjibao",
+            "sync portfolio",
+            "profile status",
+            "suitability assess",
+            "allocation ranges",
+            "while ",
+            "until ",
+            "jq ",
+        ):
+            self.assertNotIn(forbidden, script.lower())
+
+    def test_phase0_acceptance_script_runs_offline_with_isolated_runtime(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source_script = root / "scripts" / "run_phase0_acceptance.sh"
+        fake_cli = r'''#!__PYTHON__
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+argv = sys.argv[1:]
+log_path = Path(os.environ["FAKE_KUNJIN_LOG"])
+with log_path.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps({
+        "argv": argv,
+        "data_dir": os.environ.get("KUNJIN_DATA_DIR"),
+        "state_dir": os.environ.get("KUNJIN_STATE_DIR"),
+        "pycache": os.environ.get("PYTHONPYCACHEPREFIX"),
+    }, sort_keys=True) + "\n")
+
+checksum = "a" * 64
+request_id = {
+    "source_before": "1" * 32,
+    "sync": "2" * 32,
+    "source_after": "3" * 32,
+    "route": "4" * 32,
+}
+scenario = os.environ.get("FAKE_KUNJIN_SCENARIO", "complete")
+now = "2026-07-17T00:00:00+00:00"
+
+if scenario in {"stalled", "interrupted"} and argv[:3] == [
+    "--json", "sync", "fund-profile"
+]:
+    Path(os.environ["FAKE_KUNJIN_PID"]).write_text(
+        f"{os.getpid()} {os.getppid()}", encoding="ascii"
+    )
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(4)
+
+def envelope(command, data, errors=None):
+    return {
+        "schema_version": "1",
+        "command": command,
+        "as_of": now,
+        "data": data,
+        "warnings": [],
+        "errors": [] if errors is None else errors,
+    }
+
+def source_data(fund_code, after):
+    failed = scenario == "partial"
+    attempted = after and scenario != "empty"
+    supplementation = {
+        "missing_item": "identity_active_status",
+        "why_required": "Required for product identity facts.",
+        "suggested_location": "Official manager disclosure page.",
+        "accepted_input": ["Dated official public document"],
+        "freshness_requirement": "Current disclosure.",
+        "impact_if_missing": "Purchase interpretation remains blocked.",
+        "supported_without_it": "Other dated public facts remain usable.",
+        "unsupported_without_it": "Current identity conclusion is unavailable.",
+    }
+    result = {
+        "fund_code": fund_code,
+        "mode": "rapid",
+        "policy_checksum": checksum,
+        "policy_version": "1",
+        "registry_checksum": checksum,
+        "registry_version": "1",
+        "request_field_resolutions": [{
+            "action": "fact_research",
+            "field_id": "identity_active_status",
+            "primary_source_id": "manager_profile",
+            "resolution": "manual_supplement_required" if failed else (
+                "usable" if after else "partial"
+            ),
+            "risk_effect": "information",
+        }],
+        "request_id": request_id["source_after" if after else "source_before"],
+        "snapshot_at": now,
+        "source_fields": [{
+            "acceptable_alternatives": [],
+            "consecutive_failures": 1 if attempted and failed else 0,
+            "cooldown_until": None,
+            "field_id": "identity_active_status",
+            "field_scope": "Public fund identity.",
+            "last_failure_at": now if attempted and failed else None,
+            "last_failure_reason": "remote_unavailable" if attempted and failed else None,
+            "last_success_at": now if attempted and not failed else None,
+            "last_success_data_as_of": now if attempted and not failed else None,
+            "source_id": "manager_profile",
+            "source_kind": "official_manager",
+            "source_scope": "Public official disclosure.",
+            "source_tier": "tier_1",
+            "state": "unavailable" if attempted and failed else (
+                "healthy" if attempted else "unavailable"
+            ),
+            "supplementation": supplementation,
+        }],
+    }
+    if scenario == "checksum_mismatch" and after:
+        result["registry_checksum"] = "b" * 64
+    return result
+
+if argv == ["--json", "version"]:
+    payload = envelope("version", {"version": "0.1.0"})
+elif argv == ["--json", "source", "status"]:
+    payload = envelope("source.status", source_data(None, False))
+elif argv[:4] == ["--json", "sync", "fund-profile", "000001"]:
+    if scenario == "empty":
+        sections = {}
+        terminal = "failed"
+    elif scenario == "partial":
+        sections = {
+            "basic_profile": {
+                "section": "basic_profile", "status": "success", "records": 1,
+                "freshness": "fresh", "error_code": None, "as_of": now,
+                "last_success_at": now, "last_attempt_at": now,
+            },
+            "manager_history": {
+                "section": "manager_history", "status": "source_unavailable", "records": 0,
+                "freshness": "missing", "error_code": "remote_unavailable", "as_of": None,
+                "last_success_at": None, "last_attempt_at": now,
+            },
+        }
+        terminal = "partial"
+    else:
+        sections = {
+            "basic_profile": {
+                "section": "basic_profile", "status": "success", "records": 1,
+                "freshness": "fresh", "error_code": None, "as_of": now,
+                "last_success_at": now, "last_attempt_at": now,
+            }
+        }
+        terminal = "complete"
+    payload = envelope("sync.fund-profile", {
+        "fund_code": "000001",
+        "sections": sections,
+        "request": {
+            "request_id": request_id["sync"],
+            "mode": "rapid",
+            "terminal_status": terminal,
+            "deadline_at": "2026-07-17T00:01:30+00:00",
+            "omitted_work": ["manager_history"] if scenario == "partial" else [],
+        },
+        "freshness": {}, "source_documents": [], "warnings": [], "errors": [],
+    })
+    if scenario == "sensitive":
+        payload["data"]["body"] = "token=must-not-be-exported"
+elif argv == ["--json", "source", "status", "--fund-code", "000001"]:
+    payload = envelope("source.status", source_data("000001", True))
+elif argv == [
+    "--json", "decision", "route", "--mode", "rapid",
+    "--action", "fact_research", "--action", "buy_or_add",
+]:
+    payload = envelope("decision.route", {
+        "actions": [
+            {
+                "action": "fact_research", "action_id": "fact_research",
+                "action_maturity": "mature", "blocking_codes": [],
+                "exact_amount_available": False, "minimum_state": "research_only",
+                "required_gates": [], "research_available": True,
+                "risk_effect": "information",
+            },
+            {
+                "action": "buy_or_add", "action_id": "buy_or_add",
+                "action_maturity": "experimental_shadow",
+                "blocking_codes": ["d2_not_implemented", "d3_not_implemented"],
+                "exact_amount_available": False, "minimum_state": "research_only",
+                "required_gates": ["phase_b", "phase_c", "d1", "d2", "d3", "post_trade"],
+                "research_available": True, "risk_effect": "risk_increasing",
+            },
+        ],
+        "conclusion_evidence": [], "created_at": now, "missing_fields": ["d2", "d3"],
+        "mode": "rapid", "opposing_evidence": [], "policy_checksum": checksum,
+        "policy_version": "1", "registry_checksum": checksum, "registry_version": "1",
+        "request_id": request_id["route"], "result_checksum": checksum,
+        "workflow_level": "rapid_evidence",
+    })
+else:
+    raise SystemExit("unexpected fake CLI invocation: " + repr(argv))
+
+print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+'''.replace("__PYTHON__", sys.executable)
+
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            repository_root = temporary_root / "repository"
+            scripts_directory = repository_root / "scripts"
+            venv_bin = repository_root / ".venv" / "bin"
+            scripts_directory.mkdir(parents=True)
+            venv_bin.mkdir(parents=True)
+            shutil.copy2(source_script, scripts_directory / source_script.name)
+            fake_cli_path = venv_bin / "kunjin"
+            fake_cli_path.write_text(fake_cli, encoding="utf-8")
+            fake_cli_path.chmod(0o700)
+            (venv_bin / "python").symlink_to(sys.executable)
+            log_path = temporary_root / "calls.jsonl"
+
+            for scenario in ("complete", "partial"):
+                with self.subTest(scenario=scenario):
+                    output_dir = temporary_root / f"output-{scenario}"
+                    result = subprocess.run(
+                        [
+                            str(scripts_directory / source_script.name),
+                            "000001",
+                            str(output_dir),
+                        ],
+                        env={
+                            "PATH": "/usr/bin:/bin",
+                            "FAKE_KUNJIN_LOG": str(log_path),
+                            "FAKE_KUNJIN_SCENARIO": scenario,
+                        },
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr.decode())
+                    self.assertEqual(output_dir.stat().st_mode & 0o777, 0o700)
+                    self.assertEqual(
+                        {item.name for item in output_dir.iterdir()},
+                        {
+                            "decision-route.json",
+                            "source-status-after.json",
+                            "source-status-before.json",
+                            "summary.json",
+                            "sync-fund-profile.json",
+                            "version.json",
+                        },
+                    )
+                    for item in output_dir.iterdir():
+                        self.assertEqual(item.stat().st_mode & 0o777, 0o600)
+                        json.loads(item.read_text(encoding="utf-8"))
+                    summary = json.loads(
+                        (output_dir / "summary.json").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(summary["status"], "passed")
+                    self.assertEqual(summary["mode"], "rapid")
+                    self.assertLessEqual(summary["sync_elapsed_seconds"], 90)
+                    self.assertGreaterEqual(summary["source_attempt_count"], 1)
+                    self.assertGreaterEqual(summary["fact_record_count"], 1)
+                    self.assertEqual(summary["partial"], scenario == "partial")
+
+            for scenario in ("empty", "sensitive", "checksum_mismatch"):
+                with self.subTest(rejected_scenario=scenario):
+                    rejected_output = temporary_root / f"output-{scenario}"
+                    failed = subprocess.run(
+                        [
+                            str(scripts_directory / source_script.name),
+                            "000001",
+                            str(rejected_output),
+                        ],
+                        env={
+                            "PATH": "/usr/bin:/bin",
+                            "FAKE_KUNJIN_LOG": str(log_path),
+                            "FAKE_KUNJIN_SCENARIO": scenario,
+                        },
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertFalse(rejected_output.exists())
+
+            calls = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            expected = [
+                ["--json", "version"],
+                ["--json", "source", "status"],
+                ["--json", "sync", "fund-profile", "000001", "--mode", "rapid"],
+                ["--json", "source", "status", "--fund-code", "000001"],
+                [
+                    "--json", "decision", "route", "--mode", "rapid",
+                    "--action", "fact_research", "--action", "buy_or_add",
+                ],
+            ]
+            for offset in range(0, len(calls), len(expected)):
+                batch = calls[offset : offset + len(expected)]
+                self.assertEqual([item["argv"] for item in batch], expected)
+                runtime_roots = {
+                    str(Path(item[key]).parent)
+                    for item in batch
+                    for key in ("data_dir", "state_dir", "pycache")
+                }
+                self.assertEqual(len(runtime_roots), 1)
+                self.assertNotEqual(next(iter(runtime_roots)), str(repository_root))
+
+            stalled_output = temporary_root / "output-stalled"
+            stalled_pid = temporary_root / "stalled.pid"
+            started = time.monotonic()
+            stalled = subprocess.run(
+                [
+                    str(scripts_directory / source_script.name),
+                    "000001",
+                    str(stalled_output),
+                ],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "FAKE_KUNJIN_LOG": str(log_path),
+                    "FAKE_KUNJIN_PID": str(stalled_pid),
+                    "FAKE_KUNJIN_SCENARIO": "stalled",
+                    "KUNJIN_PHASE0_SYNC_TIMEOUT_SECONDS": "1",
+                },
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=6,
+            )
+            self.assertNotEqual(stalled.returncode, 0)
+            self.assertLess(time.monotonic() - started, 1.1)
+            self.assertFalse(stalled_output.exists())
+            stalled_process = int(
+                stalled_pid.read_text(encoding="ascii").split()[0]
+            )
+            with self.assertRaises(ProcessLookupError):
+                os.kill(stalled_process, 0)
+
+            interrupted_output = temporary_root / "output-interrupted"
+            interrupted_pid = temporary_root / "interrupted.pid"
+            interrupted = subprocess.Popen(
+                [
+                    str(scripts_directory / source_script.name),
+                    "000001",
+                    str(interrupted_output),
+                ],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "FAKE_KUNJIN_LOG": str(log_path),
+                    "FAKE_KUNJIN_PID": str(interrupted_pid),
+                    "FAKE_KUNJIN_SCENARIO": "interrupted",
+                    "KUNJIN_PHASE0_SYNC_TIMEOUT_SECONDS": "5",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            wait_deadline = time.monotonic() + 2
+            while not interrupted_pid.exists() and time.monotonic() < wait_deadline:
+                time.sleep(0.01)
+            self.assertTrue(interrupted_pid.exists())
+            cli_process, watchdog_process = (
+                int(value)
+                for value in interrupted_pid.read_text(encoding="ascii").split()
+            )
+            os.kill(watchdog_process, signal.SIGTERM)
+            interrupted.communicate(timeout=2)
+            self.assertNotEqual(interrupted.returncode, 0)
+            self.assertFalse(interrupted_output.exists())
+            cli_still_alive = True
+            try:
+                os.kill(cli_process, 0)
+            except ProcessLookupError:
+                cli_still_alive = False
+            if cli_still_alive:
+                os.kill(cli_process, signal.SIGKILL)
+            self.assertFalse(cli_still_alive)
+
+    def test_phase0_acceptance_rejects_unsafe_arguments_without_cli_work(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = root / "scripts" / "run_phase0_acceptance.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            linked_output = temporary_root / "linked-output"
+            linked_output.symlink_to(temporary_root / "target", target_is_directory=True)
+            cases = (
+                ([], 64),
+                (["12345", str(temporary_root / "missing")], 65),
+                (["abcdef", str(temporary_root / "missing")], 65),
+                (["000001", "relative-output"], 65),
+                (["000001", str(linked_output)], 66),
+            )
+            for args, expected_exit in cases:
+                with self.subTest(args=args):
+                    result = subprocess.run(
+                        [str(script), *args],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, expected_exit)
 
     def _run_build_script_with_iidfile_bytes(
         self,

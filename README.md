@@ -14,6 +14,27 @@ investment theses, weekly reports, and a weekday post-close synchronization job.
 KunJin does not log in to or operate Alipay, modify Yangjibao data, place fund
 orders, or produce automatic trading instructions.
 
+## Phase 0 Live Acceptance
+
+Phase 0 proves bounded routing, source health, and graceful partial results.
+It does not prove news intelligence, D2/D3, mature hold/sell timing, or an exact
+buy amount. Full one-fund usefulness acceptance belongs to Phase 1.
+
+After local unit verification, run the amount-free public acceptance with an
+approved public fund code and a new absolute output directory:
+
+```bash
+scripts/run_phase0_acceptance.sh 000000 /private/tmp/kunjin-phase0-results
+```
+
+Replace `000000` at execution time with the approved six-digit public code. No
+personal holding is hard-coded. The script uses a fresh private data/state
+runtime, performs one rapid public profile synchronization, checks the pre/post
+source state and fact/buy routes, and writes only validated amount-free JSON and
+a summary. It does not read the personal profile or database, synchronize
+Yangjibao, use Docker, poll a failed source, or authorize a mature purchase or
+exact amount. The output directory must not already exist.
+
 ## Requirements
 
 - macOS
