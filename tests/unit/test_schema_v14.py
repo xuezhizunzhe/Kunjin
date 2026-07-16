@@ -512,6 +512,85 @@ class SchemaV14Test(unittest.TestCase):
                 ):
                     repository.migrate()
 
+    def test_failed_trigger_probe_observations_do_not_count_as_success(self) -> None:
+        repository = self.repository("broken-trigger-probe.db")
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            connection.execute(
+                """
+                CREATE TRIGGER broken_insert_probe
+                AFTER INSERT ON sync_runs
+                BEGIN
+                    SELECT * FROM missing_dependency;
+                END
+                """
+            )
+
+        with self.assertRaisesRegex(
+            sqlite3.DatabaseError,
+            "decision audit schema does not match V14",
+        ):
+            repository.migrate()
+
+    def test_v13_preseeded_audit_trigger_rolls_back_v14_upgrade(self) -> None:
+        repository = self._create_at_version(13)
+        with repository.connect() as connection, connection:
+            connection.execute(
+                """
+                CREATE TRIGGER preseeded_audit_writer
+                AFTER INSERT ON sync_runs
+                BEGIN
+                    INSERT INTO 'request_runs'(
+                        request_id, mode, status, started_at, deadline_at,
+                        finished_at, omitted_work_json
+                    ) VALUES (
+                        'ffffffffffffffffffffffffffffffff', 'rapid', 'running',
+                        '2026-07-16T00:00:00+00:00',
+                        '2026-07-16T00:01:30+00:00', NULL, '[]'
+                    );
+                END
+                """
+            )
+
+        with self.assertRaisesRegex(
+            sqlite3.DatabaseError,
+            "decision audit schema does not match V14",
+        ):
+            repository.migrate()
+
+        with repository.connect() as connection:
+            versions = tuple(
+                row["version"]
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                )
+            )
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        self.assertEqual(versions, tuple(range(1, 14)))
+        self.assertNotIn("request_runs", tables)
+
+    def test_update_of_implicit_rowid_alias_triggers_are_probeable(self) -> None:
+        repository = self.repository("rowid-triggers.db")
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            for index, alias in enumerate(("rowid", "_rowid_", "oid")):
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER benign_rowid_trigger_{index}
+                    AFTER UPDATE OF {alias} ON sync_runs
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+
+        repository.migrate()
+
     def test_v14_has_exact_three_tables_columns_foreign_keys_indexes_and_triggers(self) -> None:
         repository = self._create_at_version(13)
         with repository.connect() as connection:

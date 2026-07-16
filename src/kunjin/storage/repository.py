@@ -246,16 +246,20 @@ def _trigger_probe_statements(
         for row in connection.execute(f"PRAGMA table_xinfo({quoted_target})").fetchall()
         if int(row["hidden"]) in {0, 1}
     )
-    statements = [
-        f"EXPLAIN INSERT INTO {quoted_target} DEFAULT VALUES",
-        f"EXPLAIN DELETE FROM {quoted_target} WHERE 0",
-    ]
+    statements = [f"EXPLAIN INSERT INTO {quoted_target} DEFAULT VALUES"]
     if columns:
         assignments = ", ".join(
             f"{_quote_sqlite_identifier(column)} = {_quote_sqlite_identifier(column)}"
             for column in columns
         )
         statements.append(f"EXPLAIN UPDATE {quoted_target} SET {assignments} WHERE 0")
+    for alias in ("rowid", "_rowid_", "oid"):
+        quoted_alias = _quote_sqlite_identifier(alias)
+        statements.append(
+            f"EXPLAIN UPDATE {quoted_target} "
+            f"SET {quoted_alias} = {quoted_alias} WHERE 0"
+        )
+    statements.append(f"EXPLAIN DELETE FROM {quoted_target} WHERE 0")
     return tuple(statements)
 
 
@@ -294,6 +298,8 @@ def _reject_unexpected_decision_audit_dependencies(
     monitored_sources = set(extra_triggers) | set(extra_views)
     observed_sources = set()
     dependency_sources = set()
+    statement_observed_sources = set()
+    statement_dependency_sources = set()
 
     def authorize(
         action: int,
@@ -305,13 +311,13 @@ def _reject_unexpected_decision_audit_dependencies(
         del arg2, database_name
         normalized_source = None if source is None else _ascii_identifier(source)
         if normalized_source in monitored_sources:
-            observed_sources.add(normalized_source)
+            statement_observed_sources.add(normalized_source)
             if (
                 action in _DECISION_AUDIT_ACCESS_ACTIONS
                 and arg1 is not None
                 and _ascii_identifier(arg1) in _DECISION_AUDIT_TABLES
             ):
-                dependency_sources.add(normalized_source)
+                statement_dependency_sources.add(normalized_source)
         return sqlite3.SQLITE_OK
 
     compiled_trigger_targets = set()
@@ -335,20 +341,28 @@ def _reject_unexpected_decision_audit_dependencies(
             for target in sorted(set(extra_triggers.values()), key=_ascii_identifier):
                 target_compiled = False
                 for statement in _trigger_probe_statements(probe, target):
+                    statement_observed_sources.clear()
+                    statement_dependency_sources.clear()
                     try:
                         probe.execute(statement).close()
                     except sqlite3.Error:
                         continue
+                    observed_sources.update(statement_observed_sources)
+                    dependency_sources.update(statement_dependency_sources)
                     target_compiled = True
                 if target_compiled:
                     compiled_trigger_targets.add(_ascii_identifier(target))
 
             for normalized_name, name in sorted(extra_views.items()):
                 statement = f"EXPLAIN SELECT * FROM {_quote_sqlite_identifier(name)}"
+                statement_observed_sources.clear()
+                statement_dependency_sources.clear()
                 try:
                     probe.execute(statement).close()
                 except sqlite3.Error:
                     continue
+                observed_sources.update(statement_observed_sources)
+                dependency_sources.update(statement_dependency_sources)
                 compiled_views.add(normalized_name)
         finally:
             probe.set_authorizer(None)
