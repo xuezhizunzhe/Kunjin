@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Tuple
 
@@ -158,9 +158,7 @@ class D2EvidencePolicy:
                 self.broad_index_candidate_asset_coverage.to_canonical_dict()
             ),
             "cash_excluded_from_denominators": self.cash_excluded_from_denominators,
-            "candidate_identity_required_fields": list(
-                self.candidate_identity_required_fields
-            ),
+            "candidate_identity_required_fields": list(self.candidate_identity_required_fields),
             "classification_coverage": self.classification_coverage.to_canonical_dict(),
             "derivatives_leverage_shorts_residual_reported_separately": (
                 self.derivatives_leverage_shorts_residual_reported_separately
@@ -172,9 +170,7 @@ class D2EvidencePolicy:
                 self.below_minimum_lookthrough_requires_worst_case_within_cap
             ),
             "failure_blocks_exact_amount": self.failure_blocks_exact_amount,
-            "failure_blocks_mature_risk_increase": (
-                self.failure_blocks_mature_risk_increase
-            ),
+            "failure_blocks_mature_risk_increase": (self.failure_blocks_mature_risk_increase),
             "insufficient_active_coverage_blocks_reassuring_conclusion": (
                 self.insufficient_active_coverage_blocks_reassuring_conclusion
             ),
@@ -231,7 +227,17 @@ class PostTradePolicy:
         if self.valuation_date_tolerance_days != 0:
             raise ValueError("EvidencePolicy V1 requires same-date valuations")
         expected_constraints = (
+            "current_profile",
+            "phase_b",
+            "phase_c",
+            "current_portfolio",
+            "personal_position",
+            "d2",
             "d3",
+            "approved_versioned_target_point",
+            "approved_versioned_target_bands",
+            "target_distinct_from_feasible_ceiling",
+            "transaction_availability",
             "emergency_reserve",
             "monthly_cash_flow",
             "goal_horizon",
@@ -282,19 +288,13 @@ class PostTradePolicy:
             "aggregate_matching_exposure_across_all_fund_labels": (
                 self.aggregate_matching_exposure_across_all_fund_labels
             ),
-            "amount_uses_minimum_remaining_capacity": (
-                self.amount_uses_minimum_remaining_capacity
-            ),
+            "amount_uses_minimum_remaining_capacity": (self.amount_uses_minimum_remaining_capacity),
             "block_exact_amount_on_failure": self.block_exact_amount_on_failure,
             "cap_scope": self.cap_scope,
             "denominator_scope": self.denominator_scope,
             "includes_pending_transactions": self.includes_pending_transactions,
-            "requires_material_holding_completeness": (
-                self.requires_material_holding_completeness
-            ),
-            "requires_unlinked_account_affirmation": (
-                self.requires_unlinked_account_affirmation
-            ),
+            "requires_material_holding_completeness": (self.requires_material_holding_completeness),
+            "requires_unlinked_account_affirmation": (self.requires_unlinked_account_affirmation),
             "required_constraints": list(self.required_constraints),
             "split_transactions_cannot_bypass_cap": self.split_transactions_cannot_bypass_cap,
             "stale_or_misaligned_valuation_blocks_exact_amount": (
@@ -321,174 +321,189 @@ class PostTradePolicy:
         }
 
 
-_REQUIREMENTS = (
-    EvidenceRequirement(
-        "phase_b_c",
-        "authenticated current result bound to current profile and policy",
-        "24 hours; invalidate on any bound input change",
-        "block buy, add, switch-buy, and exact amount; preserve facts and reduce analysis",
-    ),
-    EvidenceRequirement(
-        "personal_position",
-        "successful same-request portfolio sync plus confirmed pending transactions",
-        "same request",
-        "block exact buy, reduce, and exit amounts; allow labeled last-observation ratios",
-    ),
-    EvidenceRequirement(
-        "identity_active_status",
-        "one tier_1 source or two independent matching structured tier_2 records",
-        "7 days; invalidate immediately on newer status announcement",
-        "identity or status conflict blocks every product-specific action",
-    ),
-    EvidenceRequirement(
-        "current_manager_team",
-        "one tier_1 source or two independent structured tier_2 records",
-        "7 days; invalidate immediately on manager announcement",
-        "one tier_2 source supports rapid research only; conflict blocks manager comparison",
-    ),
-    EvidenceRequirement(
-        "fees_share_class_relationship",
-        "tier_1 schedule or verified current channel plus one matching structured source",
-        "effective period with completed newer-announcement check",
-        "block exact fee, share-class choice, and exact amount; preserve labeled overview",
-    ),
-    EvidenceRequirement(
-        "transaction_availability_limits_cutoff",
-        "same-day official or channel record, or validated private channel screenshot",
-        "2 hours for current or today; same trading day otherwise",
-        "block executable buy or redeem conclusion and exact amount",
-    ),
-    EvidenceRequirement(
-        "formal_nav",
-        "latest expected formal NAV under the applicable publication calendar",
-        "latest expected comparable NAV day and normal publication window",
-        "stale data supports dated history only and no current timing conclusion",
-    ),
-    EvidenceRequirement(
-        "adjusted_return_correlation",
-        "validated cumulative-NAV or total-return series with aligned dates and sample",
-        "common end date is the latest expected comparable NAV day",
-        "ambiguity is insufficient_data; never substitute NAV-level correlation",
-    ),
-    EvidenceRequirement(
-        "holdings_industries",
-        "latest statutory period with report date, publication date, and disclosure scope",
-        "current until a newer report is due under the disclosure calendar",
-        "preserve unknown exposure and block reassuring diversification claims",
-    ),
-    EvidenceRequirement(
-        "fund_manager_product_announcement",
-        "validated official item",
-        "resolved query window plus completed correction and retraction check",
-        "missing feed lowers coverage; unresolved official conflict blocks affected action",
-    ),
-    EvidenceRequirement(
-        "news_media_context",
-        "official original source or genuinely independent lineage; media remains attributed",
-        "resolved query window; current cache at most 2 hours",
-        "never independently authorizes action; conflict lowers confidence or abstains",
-    ),
-    EvidenceRequirement(
-        "target_point_bands",
-        "current versioned owner-approved policy distinct from feasible ceilings",
-        "invalidate on profile, goal, or policy change",
-        "block exact buy, reduce, and rebalance amount",
-    ),
-)
+def _build_requirements() -> Tuple[EvidenceRequirement, ...]:
+    return (
+        EvidenceRequirement(
+            "phase_b_c",
+            "authenticated current result bound to current profile and policy",
+            "24 hours; invalidate on any bound input change",
+            "block buy, add, switch-buy, and exact amount; preserve facts and reduce analysis",
+        ),
+        EvidenceRequirement(
+            "personal_position",
+            "successful same-request portfolio sync plus confirmed pending transactions",
+            "same request",
+            "block exact buy, reduce, and exit amounts; allow labeled last-observation ratios",
+        ),
+        EvidenceRequirement(
+            "identity_active_status",
+            "one tier_1 source or two independent matching structured tier_2 records",
+            "7 days; invalidate immediately on newer status announcement",
+            "identity or status conflict blocks every product-specific action",
+        ),
+        EvidenceRequirement(
+            "current_manager_team",
+            "one tier_1 source or two independent structured tier_2 records",
+            "7 days; invalidate immediately on manager announcement",
+            "one tier_2 source supports rapid research only; conflict blocks manager comparison",
+        ),
+        EvidenceRequirement(
+            "fees_share_class_relationship",
+            "tier_1 schedule or verified current channel plus one matching structured source",
+            "effective period with completed newer-announcement check",
+            "block exact fee, share-class choice, and exact amount; preserve labeled overview",
+        ),
+        EvidenceRequirement(
+            "transaction_availability_limits_cutoff",
+            "same-day official or channel record, or validated private channel screenshot",
+            "2 hours for current or today; same trading day otherwise",
+            "block executable buy or redeem conclusion and exact amount",
+        ),
+        EvidenceRequirement(
+            "formal_nav",
+            "latest expected formal NAV under the applicable publication calendar",
+            "latest expected comparable NAV day and normal publication window",
+            "stale data supports dated history only and no current timing conclusion",
+        ),
+        EvidenceRequirement(
+            "adjusted_return_correlation",
+            "validated cumulative-NAV or total-return series with aligned dates and sample",
+            "common end date is the latest expected comparable NAV day",
+            "ambiguity is insufficient_data; never substitute NAV-level correlation",
+        ),
+        EvidenceRequirement(
+            "holdings_industries",
+            "latest statutory period with report date, publication date, and disclosure scope",
+            "current until a newer report is due under the disclosure calendar",
+            "preserve unknown exposure and block reassuring diversification claims",
+        ),
+        EvidenceRequirement(
+            "fund_manager_product_announcement",
+            "validated official item",
+            "resolved query window plus completed correction and retraction check",
+            "missing feed lowers coverage; unresolved official conflict blocks affected action",
+        ),
+        EvidenceRequirement(
+            "news_media_context",
+            "official original source or genuinely independent lineage; media remains attributed",
+            "resolved query window; current cache at most 2 hours",
+            "never independently authorizes action; conflict lowers confidence or abstains",
+        ),
+        EvidenceRequirement(
+            "target_point_bands",
+            "current versioned owner-approved policy distinct from feasible ceilings",
+            "invalidate on profile, goal, or policy change",
+            "block exact buy, reduce, and rebalance amount",
+        ),
+    )
 
-_D2_POLICY = D2EvidencePolicy(
-    classification_coverage=CoverageGate(
-        "classification_coverage",
-        "classified current non-cash fund market value",
-        "total current non-cash fund market value",
-        Decimal("90"),
-    ),
-    sector_candidate_asset_coverage=CoverageGate(
-        "candidate_asset_coverage_sector",
-        "sum of verified disclosed or constituent asset weights",
-        "100 percent of candidate net assets",
-        Decimal("80"),
-    ),
-    broad_index_candidate_asset_coverage=CoverageGate(
-        "candidate_asset_coverage_broad_index",
-        "sum of verified disclosed or constituent asset weights",
-        "100 percent of candidate net assets",
-        Decimal("90"),
-    ),
-    transaction_after_lookthrough_coverage=CoverageGate(
-        "transaction_after_lookthrough_coverage",
-        "sum of transaction-after fund market value times verified internal coverage",
-        "total transaction-after non-cash fund market value",
-        Decimal("70"),
-    ),
-    cash_excluded_from_denominators=True,
-    derivatives_leverage_shorts_residual_reported_separately=True,
-    unresolved_exposure_cannot_increase_coverage=True,
-    fund_of_funds_lookthrough_requires_verified_inputs=True,
-    test_every_applicable_limit=True,
-    allocate_all_unknown_to_each_limit=True,
-    unknown_exposure_consumes_capacity=True,
-    insufficient_active_coverage_blocks_reassuring_conclusion=True,
-    candidate_identity_required_fields=(
-        "asset_class",
-        "portfolio_role",
-        "manager_team",
-        "exact_index_theme",
-    ),
-    below_minimum_lookthrough_requires_worst_case_within_cap=True,
-    failure_blocks_mature_risk_increase=True,
-    failure_blocks_exact_amount=True,
-    threshold_change_requires_independent_review=True,
-    threshold_change_requires_owner_approval=True,
-)
 
-_POST_TRADE_POLICY = PostTradePolicy(
-    cap_scope="all_linked_accounts_current_and_pending",
-    denominator_scope="complete_kunjin_managed_portfolio",
-    requires_unlinked_account_affirmation=True,
-    requires_material_holding_completeness=True,
-    includes_pending_transactions=True,
-    valuation_date_tolerance_days=0,
-    stale_or_misaligned_valuation_blocks_exact_amount=True,
-    block_exact_amount_on_failure=True,
-    aggregate_matching_exposure_across_all_fund_labels=True,
-    split_transactions_cannot_bypass_cap=True,
-    unknown_exposure_consumes_capacity=True,
-    target_requires_explicit_derivation=True,
-    tactical_sector_cap_requires_derivation=True,
-    tactical_sector_cap_requires_stress_loss_assumption=True,
-    tactical_sector_cap_requires_independent_review=True,
-    tactical_sector_cap_requires_owner_approval=True,
-    tactical_sector_cap_requires_version_and_effective_date=True,
-    required_constraints=(
-        "d3",
-        "emergency_reserve",
-        "monthly_cash_flow",
-        "goal_horizon",
-        "asset_class",
-        "individual_fund",
-        "theme",
-        "manager",
-        "industry",
-        "security",
-        "known_exposure",
-        "unknown_exposure",
-        "pending_transactions",
-        "fees",
-        "minimum_purchase",
-        "minimum_remainder",
-        "channel_limits",
-    ),
-    amount_uses_minimum_remaining_capacity=True,
-)
+def _build_d2_policy() -> D2EvidencePolicy:
+    return D2EvidencePolicy(
+        classification_coverage=CoverageGate(
+            "classification_coverage",
+            "classified current non-cash fund market value",
+            "total current non-cash fund market value",
+            Decimal("90"),
+        ),
+        sector_candidate_asset_coverage=CoverageGate(
+            "candidate_asset_coverage_sector",
+            "sum of verified disclosed or constituent asset weights",
+            "100 percent of candidate net assets",
+            Decimal("80"),
+        ),
+        broad_index_candidate_asset_coverage=CoverageGate(
+            "candidate_asset_coverage_broad_index",
+            "sum of verified disclosed or constituent asset weights",
+            "100 percent of candidate net assets",
+            Decimal("90"),
+        ),
+        transaction_after_lookthrough_coverage=CoverageGate(
+            "transaction_after_lookthrough_coverage",
+            "sum of transaction-after fund market value times verified internal coverage",
+            "total transaction-after non-cash fund market value",
+            Decimal("70"),
+        ),
+        cash_excluded_from_denominators=True,
+        derivatives_leverage_shorts_residual_reported_separately=True,
+        unresolved_exposure_cannot_increase_coverage=True,
+        fund_of_funds_lookthrough_requires_verified_inputs=True,
+        test_every_applicable_limit=True,
+        allocate_all_unknown_to_each_limit=True,
+        unknown_exposure_consumes_capacity=True,
+        insufficient_active_coverage_blocks_reassuring_conclusion=True,
+        candidate_identity_required_fields=(
+            "asset_class",
+            "portfolio_role",
+            "manager_team",
+            "exact_index_theme",
+        ),
+        below_minimum_lookthrough_requires_worst_case_within_cap=True,
+        failure_blocks_mature_risk_increase=True,
+        failure_blocks_exact_amount=True,
+        threshold_change_requires_independent_review=True,
+        threshold_change_requires_owner_approval=True,
+    )
+
+
+def _build_post_trade_policy() -> PostTradePolicy:
+    return PostTradePolicy(
+        cap_scope="all_linked_accounts_current_and_pending",
+        denominator_scope="complete_kunjin_managed_portfolio",
+        requires_unlinked_account_affirmation=True,
+        requires_material_holding_completeness=True,
+        includes_pending_transactions=True,
+        valuation_date_tolerance_days=0,
+        stale_or_misaligned_valuation_blocks_exact_amount=True,
+        block_exact_amount_on_failure=True,
+        aggregate_matching_exposure_across_all_fund_labels=True,
+        split_transactions_cannot_bypass_cap=True,
+        unknown_exposure_consumes_capacity=True,
+        target_requires_explicit_derivation=True,
+        tactical_sector_cap_requires_derivation=True,
+        tactical_sector_cap_requires_stress_loss_assumption=True,
+        tactical_sector_cap_requires_independent_review=True,
+        tactical_sector_cap_requires_owner_approval=True,
+        tactical_sector_cap_requires_version_and_effective_date=True,
+        required_constraints=(
+            "current_profile",
+            "phase_b",
+            "phase_c",
+            "current_portfolio",
+            "personal_position",
+            "d2",
+            "d3",
+            "approved_versioned_target_point",
+            "approved_versioned_target_bands",
+            "target_distinct_from_feasible_ceiling",
+            "transaction_availability",
+            "emergency_reserve",
+            "monthly_cash_flow",
+            "goal_horizon",
+            "asset_class",
+            "individual_fund",
+            "theme",
+            "manager",
+            "industry",
+            "security",
+            "known_exposure",
+            "unknown_exposure",
+            "pending_transactions",
+            "fees",
+            "minimum_purchase",
+            "minimum_remainder",
+            "channel_limits",
+        ),
+        amount_uses_minimum_remaining_capacity=True,
+    )
 
 
 @dataclass(frozen=True)
 class EvidencePolicyV1:
     version: str = "1"
-    requirements: Tuple[EvidenceRequirement, ...] = _REQUIREMENTS
-    d2: D2EvidencePolicy = _D2_POLICY
-    post_trade: PostTradePolicy = _POST_TRADE_POLICY
+    requirements: Tuple[EvidenceRequirement, ...] = field(default_factory=_build_requirements)
+    d2: D2EvidencePolicy = field(default_factory=_build_d2_policy)
+    post_trade: PostTradePolicy = field(default_factory=_build_post_trade_policy)
 
     def validate(self) -> None:
         validate_exact_dataclass_state(self, "evidence policy V1")
@@ -496,7 +511,8 @@ class EvidencePolicyV1:
             raise ValueError("evidence policy V1 subclasses are not accepted")
         if type(self.version) is not str or self.version != "1":
             raise ValueError("evidence policy V1 version must be '1'")
-        if type(self.requirements) is not tuple or self.requirements != _REQUIREMENTS:
+        expected_requirements = _build_requirements()
+        if type(self.requirements) is not tuple or self.requirements != expected_requirements:
             raise ValueError("evidence policy V1 requirements must be canonical")
         field_ids = []
         for requirement in self.requirements:
@@ -506,10 +522,13 @@ class EvidencePolicyV1:
             field_ids.append(requirement.field_id)
         if len(field_ids) != len(set(field_ids)):
             raise ValueError("evidence policy field ids must be unique")
-        if type(self.d2) is not D2EvidencePolicy or self.d2 != _D2_POLICY:
+        if type(self.d2) is not D2EvidencePolicy or self.d2 != _build_d2_policy():
             raise ValueError("evidence policy V1 D2 rules must be canonical")
         self.d2.validate()
-        if type(self.post_trade) is not PostTradePolicy or self.post_trade != _POST_TRADE_POLICY:
+        if (
+            type(self.post_trade) is not PostTradePolicy
+            or self.post_trade != _build_post_trade_policy()
+        ):
             raise ValueError("evidence policy V1 post-trade rules must be canonical")
         self.post_trade.validate()
 

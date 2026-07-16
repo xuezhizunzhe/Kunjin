@@ -213,8 +213,8 @@ def test_phase0_enums_are_exact() -> None:
 def test_policy_and_registry_have_pinned_canonical_bytes() -> None:
     policy = EvidencePolicyV1()
     registry = SourceRegistryV1()
-    assert policy.checksum() == EVIDENCE_POLICY_V1_CHECKSUM
-    assert registry.checksum() == SOURCE_REGISTRY_V1_CHECKSUM
+    assert policy.checksum() == "6be880169a65dbaecfd75ba21250afea247320df033e37694feb4168505dd3fe"
+    assert registry.checksum() == "1893c53c2f8211d429f5a3b87ac579c7800e6a47b58470a952f7ad91c070db7e"
     for item in (policy, registry):
         canonical = item.canonical_json()
         assert (
@@ -267,6 +267,20 @@ def test_source_registry_references_are_finite_resolvable_and_complete() -> None
     )
 
 
+def test_runtime_source_identity_and_tier_are_bound_to_canonical_v1() -> None:
+    with pytest.raises(ValueError, match="source and field"):
+        replace(_source_attempt(), field_id="fabricated_field").validate()
+    with pytest.raises(ValueError, match="source tier"):
+        _complete_current_tier1(source_ids=("eastmoney_f10",)).validate()
+    with pytest.raises(ValueError, match="source id"):
+        _complete_current_tier1(source_ids=("fabricated_source",)).validate()
+    tier2 = _complete_current_tier1(
+        source_tier=SourceTier.TIER_2,
+        source_ids=("eastmoney_f10",),
+    )
+    tier2.validate()
+
+
 def test_dynamic_freshness_rules_fail_closed_without_exact_context() -> None:
     registry = SourceRegistryV1()
     cases = (
@@ -283,6 +297,7 @@ def test_dynamic_freshness_rules_fail_closed_without_exact_context() -> None:
     empty = FreshnessContext(now=UTC_NOW)
     for source_id, field_id in cases:
         field = _field(registry, source_id, field_id)
+        assert field.freshness.maximum_age_seconds is not None
         assert not field.is_current(UTC_NOW - timedelta(minutes=1), empty)
 
 
@@ -314,7 +329,12 @@ def test_each_dynamic_freshness_rule_accepts_only_matching_context() -> None:
     holdings = _field(registry, "eastmoney_f10", "holdings_industries")
     assert holdings.is_current(
         data_as_of,
-        FreshnessContext(now=UTC_NOW, next_disclosure_due_at=UTC_NOW + timedelta(days=1)),
+        FreshnessContext(
+            now=UTC_NOW,
+            next_disclosure_due_at=UTC_NOW + timedelta(days=1),
+            expected_report_period_end=date(2026, 6, 30),
+            data_report_period_end=date(2026, 6, 30),
+        ),
     )
     market = _field(registry, "eastmoney_market", "market_context")
     assert market.is_current(
@@ -341,6 +361,7 @@ def test_each_dynamic_freshness_rule_accepts_only_matching_context() -> None:
         replace(
             query_context,
             correction_retraction_check_complete=True,
+            correction_retraction_found=False,
             correction_retraction_checked_at=UTC_NOW,
         ),
     )
@@ -444,6 +465,7 @@ def test_dated_fallback_cannot_bypass_integrity_checks() -> None:
         replace(
             query,
             correction_retraction_check_complete=True,
+            correction_retraction_found=False,
             correction_retraction_checked_at=UTC_NOW,
         ),
     )
@@ -452,6 +474,7 @@ def test_dated_fallback_cannot_bypass_integrity_checks() -> None:
         replace(
             query,
             correction_retraction_check_complete=True,
+            correction_retraction_found=False,
             correction_retraction_checked_at=UTC_NOW - timedelta(hours=3),
         ),
     )
@@ -460,9 +483,47 @@ def test_dated_fallback_cannot_bypass_integrity_checks() -> None:
         replace(
             query,
             correction_retraction_check_complete=True,
+            correction_retraction_found=False,
             correction_retraction_checked_at=UTC_NOW + timedelta(seconds=1),
         ),
     )
+
+
+def test_disclosure_freshness_rejects_ancient_or_mismatched_reports() -> None:
+    holdings = _field(SourceRegistryV1(), "eastmoney_f10", "holdings_industries")
+    context = FreshnessContext(
+        now=UTC_NOW,
+        next_disclosure_due_at=UTC_NOW + timedelta(days=1),
+        expected_report_period_end=date(2026, 6, 30),
+        data_report_period_end=date(2026, 6, 30),
+    )
+    assert not holdings.is_current(UTC_NOW - timedelta(days=1_500), context)
+    assert not holdings.is_current(
+        UTC_NOW - timedelta(days=1),
+        replace(context, data_report_period_end=date(2026, 3, 31)),
+    )
+    assert not holdings.is_current(
+        UTC_NOW - timedelta(days=1),
+        replace(context, data_report_period_end=date(2026, 9, 30)),
+    )
+
+
+def test_unresolved_correction_blocks_current_and_fallback() -> None:
+    announcement = _field(
+        SourceRegistryV1(),
+        "fund_manager_official_documents",
+        "fund_manager_product_announcement",
+    )
+    context = FreshnessContext(
+        now=UTC_NOW,
+        query_window_start=UTC_NOW - timedelta(days=30),
+        query_window_end=UTC_NOW,
+        correction_retraction_check_complete=True,
+        correction_retraction_found=True,
+        correction_retraction_checked_at=UTC_NOW,
+    )
+    assert not announcement.is_current(UTC_NOW - timedelta(days=1), context)
+    assert not announcement.is_usable(UTC_NOW - timedelta(days=10), context)
 
 
 def test_effective_period_requires_explicit_open_or_closed_mode() -> None:
@@ -514,7 +575,17 @@ def test_policy_encodes_structured_d2_and_post_trade_fail_closed_rules() -> None
     assert policy.post_trade.block_exact_amount_on_failure
     assert policy.post_trade.amount_uses_minimum_remaining_capacity
     assert policy.post_trade.required_constraints == (
+        "current_profile",
+        "phase_b",
+        "phase_c",
+        "current_portfolio",
+        "personal_position",
+        "d2",
         "d3",
+        "approved_versioned_target_point",
+        "approved_versioned_target_bands",
+        "target_distinct_from_feasible_ceiling",
+        "transaction_availability",
         "emergency_reserve",
         "monthly_cash_flow",
         "goal_horizon",
@@ -554,6 +625,24 @@ def test_policy_and_registry_tampering_fail_closed() -> None:
         replace(registry, sources=(tampered_source, *registry.sources[1:])).validate()
 
 
+def test_nested_tampering_cannot_contaminate_future_v1_instances() -> None:
+    policy = EvidencePolicyV1()
+    object.__setattr__(policy.requirements[0], "field_id", "tampered_requirement")
+    with pytest.raises(ValueError):
+        policy.validate()
+    fresh_policy = EvidencePolicyV1()
+    fresh_policy.validate()
+    assert fresh_policy.checksum() == EVIDENCE_POLICY_V1_CHECKSUM
+
+    registry = SourceRegistryV1()
+    object.__setattr__(registry.sources[0].fields[0], "field_id", "tampered_field")
+    with pytest.raises(ValueError):
+        registry.validate()
+    fresh_registry = SourceRegistryV1()
+    fresh_registry.validate()
+    assert fresh_registry.checksum() == SOURCE_REGISTRY_V1_CHECKSUM
+
+
 @pytest.mark.parametrize(
     "request_id",
     ("ABCDEF0123456789ABCDEF0123456789", "short", "g" * 32),
@@ -563,6 +652,77 @@ def test_request_id_is_exact_lowercase_uuid_hex(request_id: str) -> None:
     object.__setattr__(route, "request_id", request_id)
     with pytest.raises(ValueError, match="request id"):
         route.validate()
+
+
+@pytest.mark.parametrize(
+    "action,risk_effect,required_gates",
+    (
+        (ActionKind.FACT_RESEARCH, RiskEffect.INFORMATION, ()),
+        (
+            ActionKind.CONTINUE_HOLDING,
+            RiskEffect.RISK_MAINTAINING,
+            ("phase_b_context", "phase_e_policy"),
+        ),
+        (
+            ActionKind.REDUCE_TO_CASH,
+            RiskEffect.RISK_REDUCING,
+            ("position", "fees", "settlement", "minimum_remainder"),
+        ),
+        (
+            ActionKind.FULL_EXIT,
+            RiskEffect.RISK_REDUCING,
+            ("exit_reason", "position", "fees", "settlement", "use_of_proceeds"),
+        ),
+        (
+            ActionKind.BUY_OR_ADD,
+            RiskEffect.RISK_INCREASING,
+            ("phase_b", "phase_c", "d1", "d2", "d3", "post_trade"),
+        ),
+    ),
+)
+def test_action_route_accepts_exact_risk_and_minimum_gates(
+    action: ActionKind,
+    risk_effect: RiskEffect,
+    required_gates: tuple,
+) -> None:
+    route = replace(
+        _route().actions[0],
+        action_id=action.value,
+        action=action,
+        risk_effect=risk_effect,
+        required_gates=required_gates,
+    )
+    route.validate()
+
+
+def test_action_route_rejects_cross_invariant_bypasses() -> None:
+    fact = _route().actions[0]
+    invalid_routes = (
+        replace(fact, risk_effect=RiskEffect.RISK_INCREASING),
+        replace(fact, exact_amount_available=True),
+        replace(
+            fact,
+            action=ActionKind.BUY_OR_ADD,
+            risk_effect=RiskEffect.INFORMATION,
+            action_maturity=ActionMaturity.MATURE,
+            required_gates=(),
+        ),
+        replace(
+            fact,
+            action=ActionKind.REDUCE_TO_CASH,
+            risk_effect=RiskEffect.RISK_REDUCING,
+            required_gates=("position",),
+        ),
+        replace(
+            fact,
+            action=ActionKind.SWITCH_FUNDS,
+            risk_effect=RiskEffect.RISK_INCREASING,
+        ),
+        replace(fact, blocking_codes=("blocked",), exact_amount_available=True),
+    )
+    for route in invalid_routes:
+        with pytest.raises(ValueError):
+            route.validate()
 
 
 @pytest.mark.parametrize(
@@ -655,6 +815,24 @@ def test_conclusion_evidence_rejects_untyped_quality_values(
 
 
 @pytest.mark.parametrize(
+    "publisher",
+    (
+        "access_token=secret",
+        "private_value=100",
+        "nonce=abc",
+        "api_key=abc",
+    ),
+)
+def test_public_runtime_text_rejects_secret_or_private_markers(publisher: str) -> None:
+    evidence = replace(
+        _complete_current_tier1(),
+        publishers=(publisher,),
+    )
+    with pytest.raises(ValueError, match="private marker"):
+        evidence.validate()
+
+
+@pytest.mark.parametrize(
     "overrides",
     (
         {"publishers": ()},
@@ -742,6 +920,12 @@ def test_decimal_canonicalization_ignores_ambient_context() -> None:
     assert low_policy_bytes == high_policy_bytes
     assert low_policy_checksum == high_policy_checksum
     assert low_evidence_bytes == high_evidence_bytes
+
+
+@pytest.mark.parametrize("value", (Decimal("1e1000000"), Decimal("1e-1000000")))
+def test_decimal_canonicalization_rejects_huge_output_before_allocation(value: Decimal) -> None:
+    with pytest.raises(ValueError, match="too long"):
+        canonical_json_bytes(value)
 
 
 @pytest.mark.parametrize(
@@ -851,6 +1035,40 @@ def test_source_attempt_outcome_matrix_rejects_invalid_shapes(
 ) -> None:
     with pytest.raises(ValueError):
         attempt.validate()
+
+
+def test_source_attempt_rejects_semantic_error_and_force_bypasses() -> None:
+    invalid = (
+        _source_attempt(
+            outcome=SourceAttemptOutcome.UNSUPPORTED,
+            data_as_of=None,
+            error_code="network_timeout",
+            response_bytes=0,
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.UNAVAILABLE,
+            data_as_of=None,
+            error_code="network_timeout",
+            response_bytes=0,
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.CACHE_HIT,
+            force_actor="local_owner",
+            force_reason=ForceReasonCode.VERIFY_SOURCE_RECOVERY,
+        ),
+        _source_attempt(
+            outcome=SourceAttemptOutcome.SKIPPED_COOLDOWN,
+            data_as_of=None,
+            error_code="cooldown_active",
+            cooldown_until=UTC_NOW + timedelta(minutes=1),
+            force_actor="local_owner",
+            force_reason=ForceReasonCode.VERIFY_SOURCE_RECOVERY,
+            response_bytes=0,
+        ),
+    )
+    for attempt in invalid:
+        with pytest.raises(ValueError):
+            attempt.validate()
 
 
 def test_v1_and_nested_records_reject_injected_state() -> None:

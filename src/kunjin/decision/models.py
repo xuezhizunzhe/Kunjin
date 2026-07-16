@@ -13,10 +13,10 @@ from typing import Any, Optional, Tuple
 MAX_PUBLIC_TEXT_CHARS = 4_096
 MAX_TUPLE_ITEMS = 128
 EVIDENCE_POLICY_V1_GOLDEN_CHECKSUM = (
-    "ee39f6184bf92d5ac1c94a5a15a52e227f94f53a5ca2829872183314288fd57c"
+    "6be880169a65dbaecfd75ba21250afea247320df033e37694feb4168505dd3fe"
 )
 SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM = (
-    "6afb3f967a682defa8c56570281e923a4c83cbb8d72350a00120aaf470a6bcb3"
+    "1893c53c2f8211d429f5a3b87ac579c7800e6a47b58470a952f7ad91c070db7e"
 )
 
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -24,6 +24,28 @@ _REQUEST_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _SUBJECT_KEY_PATTERN = re.compile(r"^fund:[0-9]{6}$")
 _CHECKSUM_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _VERSION_PATTERN = re.compile(r"^[1-9][0-9]{0,8}$")
+_PRIVATE_MARKERS = (
+    "access_token",
+    "authorization: bearer",
+    "authorization=bearer",
+    "bearer ",
+    "cookie=",
+    "password",
+    "secret",
+    "api_key",
+    "credential",
+    "ciphertext",
+    "nonce",
+    "private_value",
+    "monthly_net_income",
+    "account_balance",
+    "account_number",
+    "order_id",
+    "transaction_id",
+    "transaction_identifier",
+    "phone_number",
+    "email_address",
+)
 
 
 class RequestMode(str, Enum):
@@ -127,6 +149,55 @@ class FreshnessKind(str, Enum):
     SAME_REQUEST = "same_request"
 
 
+V1_SOURCE_TIERS = (
+    ("eastmoney_f10", SourceTier.TIER_2),
+    ("eastmoney_nav", SourceTier.TIER_2),
+    ("eastmoney_market", SourceTier.TIER_2),
+    ("fund_manager_official_documents", SourceTier.TIER_1),
+    ("yangjibao_portfolio_observation", SourceTier.PRIVATE_OBSERVATION),
+)
+V1_SOURCE_FIELD_IDENTITIES = frozenset(
+    (
+        ("eastmoney_f10", "identity_active_status"),
+        ("eastmoney_f10", "current_manager_team"),
+        ("eastmoney_f10", "fees_share_class_relationship"),
+        ("eastmoney_f10", "holdings_industries"),
+        ("eastmoney_f10", "fund_manager_product_announcement"),
+        ("eastmoney_nav", "formal_nav"),
+        ("eastmoney_nav", "adjusted_return_series"),
+        ("eastmoney_market", "market_context"),
+        ("fund_manager_official_documents", "identity_active_status"),
+        ("fund_manager_official_documents", "current_manager_team"),
+        ("fund_manager_official_documents", "fees_share_class_relationship"),
+        ("fund_manager_official_documents", "holdings_industries"),
+        ("fund_manager_official_documents", "fund_manager_product_announcement"),
+        (
+            "fund_manager_official_documents",
+            "transaction_availability_limits_cutoff",
+        ),
+        ("fund_manager_official_documents", "formal_nav"),
+        ("fund_manager_official_documents", "adjusted_return_series"),
+        ("yangjibao_portfolio_observation", "personal_position_observation"),
+        ("yangjibao_portfolio_observation", "transaction_channel_observation"),
+    )
+)
+
+
+def resolve_v1_source_tier(source_ids: Tuple[str, ...]) -> SourceTier:
+    tier_by_source = dict(V1_SOURCE_TIERS)
+    try:
+        tiers = {tier_by_source[source_id] for source_id in source_ids}
+    except KeyError as exc:
+        raise ValueError("source id is not declared by SourceRegistry V1") from exc
+    if SourceTier.TIER_1 in tiers:
+        return SourceTier.TIER_1
+    if SourceTier.TIER_2 in tiers:
+        return SourceTier.TIER_2
+    if SourceTier.PRIVATE_OBSERVATION in tiers:
+        return SourceTier.PRIVATE_OBSERVATION
+    raise ValueError("source ids cannot resolve an aggregate source tier")
+
+
 def validate_exact_dataclass_state(value: object, name: str) -> None:
     state = vars(value)
     expected = {field.name for field in dataclass_fields(type(value))}
@@ -149,12 +220,16 @@ def validate_public_text(
         for character in value
     ):
         raise ValueError(f"{name} contains unsupported characters")
+    if any(marker in value.casefold() for marker in _PRIVATE_MARKERS):
+        raise ValueError(f"{name} contains a secret or private marker")
     return value
 
 
 def validate_identifier(value: object, name: str) -> str:
     if type(value) is not str or _IDENTIFIER_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{name} must be a lowercase public identifier")
+    if any(marker in value.casefold() for marker in _PRIVATE_MARKERS):
+        raise ValueError(f"{name} contains a secret or private marker")
     return value
 
 
@@ -231,6 +306,15 @@ def canonical_decimal(value: Decimal) -> str:
     if type(exponent) is not int:
         raise ValueError("finite Decimal exponent must be an integer")
     if exponent >= 0:
+        maximum_rendered_length = len(digits) + exponent
+    else:
+        point = len(digits) + exponent
+        maximum_rendered_length = (
+            2 + (-point) + len(digits) if point <= 0 else len(digits) + 1
+        )
+    if maximum_rendered_length + decimal_tuple.sign > 1_024:
+        raise ValueError("canonical decimal representation is too long")
+    if exponent >= 0:
         rendered = digits + ("0" * exponent)
     else:
         point = len(digits) + exponent
@@ -242,8 +326,6 @@ def canonical_decimal(value: Decimal) -> str:
     rendered = rendered.lstrip("0") or "0"
     if rendered.startswith("."):
         rendered = "0" + rendered
-    if len(rendered) > 1_024:
-        raise ValueError("canonical decimal representation is too long")
     return ("-" if decimal_tuple.sign else "") + rendered
 
 
@@ -310,9 +392,12 @@ class FreshnessContext:
     query_window_start: Optional[datetime] = None
     query_window_end: Optional[datetime] = None
     correction_retraction_check_complete: Optional[bool] = None
+    correction_retraction_found: Optional[bool] = None
     correction_retraction_checked_at: Optional[datetime] = None
     trading_day: Optional[date] = None
     data_trading_day: Optional[date] = None
+    expected_report_period_end: Optional[date] = None
+    data_report_period_end: Optional[date] = None
 
     def validate(self) -> None:
         validate_exact_dataclass_state(self, "freshness context")
@@ -340,6 +425,7 @@ class FreshnessContext:
                 self.correction_retraction_check_complete,
                 "correction retraction check complete",
             ),
+            (self.correction_retraction_found, "correction retraction found"),
         ):
             if value is not None and type(value) is not bool:
                 raise ValueError(f"{name} must be an exact boolean or None")
@@ -367,6 +453,8 @@ class FreshnessContext:
         for value, name in (
             (self.trading_day, "trading day"),
             (self.data_trading_day, "data trading day"),
+            (self.expected_report_period_end, "expected report period end"),
+            (self.data_report_period_end, "data report period end"),
         ):
             if value is not None and type(value) is not date:
                 raise ValueError(f"{name} must be an exact date or None")
@@ -392,8 +480,8 @@ class FreshnessRule:
         ):
             if value is not None and (type(value) is not int or value <= 0):
                 raise ValueError(f"{name} must be a positive exact integer or None")
-        if self.kind is FreshnessKind.FIXED_AGE and self.maximum_age_seconds is None:
-            raise ValueError("fixed-age freshness requires a maximum age")
+        if self.maximum_age_seconds is None:
+            raise ValueError("every freshness rule requires a conservative maximum age")
         if (
             self.dated_history_fallback_seconds is not None
             and self.maximum_age_seconds is not None
@@ -441,6 +529,7 @@ class FreshnessRule:
             return False
         if self.requires_correction_retraction_check and not (
             context.correction_retraction_check_complete is True
+            and context.correction_retraction_found is False
             and check_is_recent(context.correction_retraction_checked_at)
         ):
             return False
@@ -473,7 +562,16 @@ class FreshnessRule:
             return context.effective_period_open_ended is True
         if self.kind is FreshnessKind.DISCLOSURE_CALENDAR:
             due_at = context.next_disclosure_due_at
-            return due_at is not None and context.now <= due_at
+            expected_period = context.expected_report_period_end
+            data_period = context.data_report_period_end
+            return (
+                due_at is not None
+                and expected_period is not None
+                and data_period is not None
+                and data_period >= expected_period
+                and data_period <= data_as_of.date()
+                and context.now <= due_at
+            )
         if self.kind is FreshnessKind.QUERY_WINDOW:
             start = context.query_window_start
             end = context.query_window_end
@@ -666,6 +764,12 @@ class ConclusionEvidence:
             raise ValueError("source tier must be an exact SourceTier")
         validate_public_text_tuple(self.publishers, "publishers")
         validate_identifier_tuple(self.source_ids, "source ids")
+        if self.source_ids:
+            resolved_tier = resolve_v1_source_tier(self.source_ids)
+            if self.source_tier is not resolved_tier:
+                raise ValueError("claimed source tier does not match SourceRegistry V1")
+        elif self.source_tier is not SourceTier.USER_PROVIDED:
+            raise ValueError("known source tier requires a declared SourceRegistry V1 source id")
         if (
             type(self.publication_times) is not tuple
             or len(self.publication_times) > MAX_TUPLE_ITEMS
@@ -775,6 +879,36 @@ class ActionRoute:
         validate_identifier(self.minimum_state, "minimum state")
         if type(self.action_maturity) is not ActionMaturity:
             raise ValueError("action maturity must be an exact ActionMaturity")
+        contracts = {
+            ActionKind.FACT_RESEARCH: (RiskEffect.INFORMATION, ()),
+            ActionKind.CONTINUE_HOLDING: (
+                RiskEffect.RISK_MAINTAINING,
+                ("phase_b_context", "phase_e_policy"),
+            ),
+            ActionKind.REDUCE_TO_CASH: (
+                RiskEffect.RISK_REDUCING,
+                ("position", "fees", "settlement", "minimum_remainder"),
+            ),
+            ActionKind.FULL_EXIT: (
+                RiskEffect.RISK_REDUCING,
+                ("exit_reason", "position", "fees", "settlement", "use_of_proceeds"),
+            ),
+            ActionKind.BUY_OR_ADD: (
+                RiskEffect.RISK_INCREASING,
+                ("phase_b", "phase_c", "d1", "d2", "d3", "post_trade"),
+            ),
+        }
+        if self.action is ActionKind.SWITCH_FUNDS:
+            raise ValueError("switch_funds is an input action and must be emitted as two legs")
+        expected_risk, minimum_gates = contracts[self.action]
+        if self.risk_effect is not expected_risk:
+            raise ValueError("action risk effect does not match the canonical action contract")
+        if not set(minimum_gates).issubset(self.required_gates):
+            raise ValueError("action route is missing mandatory minimum gates")
+        if self.blocking_codes and self.exact_amount_available:
+            raise ValueError("blocked action route cannot expose an exact amount")
+        if self.action is ActionKind.FACT_RESEARCH and self.exact_amount_available:
+            raise ValueError("fact research never exposes an exact amount")
 
     def to_canonical_dict(self) -> dict:
         self.validate()
@@ -923,6 +1057,11 @@ class SourceAttempt:
             raise ValueError("cooldown cannot precede finished at")
         if self.error_code is not None:
             validate_identifier(self.error_code, "error code")
+            if (
+                self.error_code == "network_timeout"
+                and self.outcome is not SourceAttemptOutcome.TRANSIENT_FAILURE
+            ):
+                raise ValueError("network_timeout is valid only for transient failure")
         if (self.force_actor is None) != (self.force_reason is None):
             raise ValueError("force actor and force reason must be present together")
         if self.force_actor is not None:
@@ -930,8 +1069,18 @@ class SourceAttempt:
                 raise ValueError("force actor must be local_owner")
             if type(self.force_reason) is not ForceReasonCode:
                 raise ValueError("force reason must be an exact ForceReasonCode")
+            if self.outcome in {
+                SourceAttemptOutcome.CACHE_HIT,
+                SourceAttemptOutcome.SKIPPED_COOLDOWN,
+            }:
+                raise ValueError("force metadata cannot attach to cache or cooldown skips")
         validate_version(self.registry_version, "registry version")
         validate_checksum(self.registry_checksum, "registry checksum")
+        if (
+            self.registry_version == "1"
+            and (self.source_id, self.field_id) not in V1_SOURCE_FIELD_IDENTITIES
+        ):
+            raise ValueError("source and field are not declared by SourceRegistry V1")
         if (
             self.registry_version == "1"
             and self.registry_checksum != SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM
@@ -968,6 +1117,11 @@ class SourceAttempt:
                 or self.cooldown_until is not None
             ):
                 raise ValueError("unavailable or unsupported attempt requires only an error")
+            if self.outcome is SourceAttemptOutcome.UNSUPPORTED and self.error_code not in {
+                "field_unsupported",
+                "source_contract_unsupported",
+            }:
+                raise ValueError("unsupported outcome requires a semantic unsupported error")
         elif self.outcome is SourceAttemptOutcome.CANCELLED:
             if (
                 self.data_as_of is not None
