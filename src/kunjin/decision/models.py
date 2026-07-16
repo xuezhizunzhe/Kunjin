@@ -1034,6 +1034,13 @@ class DecisionRoute:
             raise ValueError("mode must be an exact RequestMode")
         if type(self.workflow_level) is not WorkflowLevel:
             raise ValueError("workflow level must be an exact WorkflowLevel")
+        expected_workflow_level = (
+            WorkflowLevel.RAPID_EVIDENCE
+            if self.mode is RequestMode.RAPID
+            else WorkflowLevel.DECISION_EVIDENCE
+        )
+        if self.workflow_level is not expected_workflow_level:
+            raise ValueError("workflow level does not match request mode")
         if (
             type(self.actions) is not tuple
             or not self.actions

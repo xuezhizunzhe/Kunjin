@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, Optional, Tuple
 
@@ -12,11 +14,11 @@ from kunjin.decision.models import (
     RequestMode,
     RiskEffect,
     WorkflowLevel,
-    validate_identifier,
     validate_request_id,
 )
 from kunjin.decision.policy import EvidencePolicyV1
 from kunjin.decision.source_registry import SourceRegistryV1
+from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
 
 _ActionRule = Tuple[RiskEffect, Tuple[str, ...]]
 
@@ -44,6 +46,21 @@ ACTION_RULES: Mapping[ActionKind, _ActionRule] = MappingProxyType(
 
 _CURRENT_PHASE_B_STATUSES = frozenset(
     ("blocked", "constrained", "ready_for_allocation")
+)
+_FRESH_PHASE_B_KEYS = frozenset(
+    (
+        "state",
+        "freshness",
+        "assessment_id",
+        "profile_version_id",
+        "policy_version",
+        "status",
+        "hard_blocks",
+        "constraints",
+        "assessed_at",
+        "valid_until",
+        "capability",
+    )
 )
 
 
@@ -230,30 +247,66 @@ def _phase_b_context(value: object) -> _PhaseBContext:
         return _PhaseBContext(None)
     state = value.get("state")
     freshness = value.get("freshness")
-    status = value.get("status")
-    if state != "fresh" or freshness != "fresh" or status not in _CURRENT_PHASE_B_STATUSES:
+    if state != "fresh" or freshness != "fresh":
+        return _PhaseBContext(None)
+    if set(value) != _FRESH_PHASE_B_KEYS:
         return _PhaseBContext(None)
     try:
-        hard_blocks = _safe_codes(value.get("hard_blocks", ()), "hard blocks")
-        constraints = _safe_codes(value.get("constraints", ()), "constraints")
-    except ValueError:
+        assessment_id = value["assessment_id"]
+        profile_version_id = value["profile_version_id"]
+        if (
+            type(assessment_id) is not int
+            or assessment_id <= 0
+            or type(profile_version_id) is not int
+            or profile_version_id <= 0
+            or value["policy_version"] != "1"
+            or value["capability"] != "research_only"
+        ):
+            raise ValueError("Phase B metadata identity is invalid")
+        status = AssessmentStatus(value["status"])
+        hard_blocks = _safe_enum_codes(
+            value["hard_blocks"], BlockReason, "hard blocks"
+        )
+        constraints = _safe_enum_codes(
+            value["constraints"], ConstraintReason, "constraints"
+        )
+        assessed_at = _aware_iso_datetime(value["assessed_at"], "assessed at")
+        valid_until = _aware_iso_datetime(value["valid_until"], "valid until")
+        if assessed_at >= valid_until:
+            raise ValueError("Phase B metadata timing is invalid")
+    except (KeyError, TypeError, ValueError):
         return _PhaseBContext(None)
-    if status == "blocked" and not hard_blocks:
+    if status is AssessmentStatus.BLOCKED and not hard_blocks:
         return _PhaseBContext(None)
-    if status != "blocked" and hard_blocks:
+    if status is not AssessmentStatus.BLOCKED and hard_blocks:
         return _PhaseBContext(None)
-    return _PhaseBContext(status, hard_blocks, constraints)
+    if status is AssessmentStatus.CONSTRAINED and not constraints:
+        return _PhaseBContext(None)
+    if status is AssessmentStatus.READY_FOR_ALLOCATION and constraints:
+        return _PhaseBContext(None)
+    return _PhaseBContext(status.value, hard_blocks, constraints)
 
 
-def _safe_codes(value: object, name: str) -> Tuple[str, ...]:
-    if type(value) not in (list, tuple) or len(value) > 128:
-        raise ValueError(f"{name} must be a bounded list or tuple")
-    result = tuple(value)
-    for item in result:
-        validate_identifier(item, name)
+def _safe_enum_codes(
+    value: object,
+    enum_type: type[Enum],
+    name: str,
+) -> Tuple[str, ...]:
+    if type(value) is not list or len(value) > 128:
+        raise ValueError(f"{name} must be a bounded exact list")
+    result = tuple(enum_type(item).value for item in value)
     if len(result) != len(set(result)):
         raise ValueError(f"{name} must not contain duplicates")
     return result
+
+
+def _aware_iso_datetime(value: object, name: str) -> datetime:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact ISO datetime")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return parsed
 
 
 def _extend_unique(target: list, values: Tuple[str, ...]) -> None:

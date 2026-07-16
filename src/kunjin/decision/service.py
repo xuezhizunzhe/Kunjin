@@ -82,6 +82,9 @@ class DecisionRoutingService:
                 suitability_status=suitability_status,
             )
             created_at = self._current_time()
+            finished_at = self._current_time_not_before(created_at)
+            if finished_at > budget.deadline_at:
+                raise BudgetExpired("request audit deadline reached")
             snapshot = self._store.save_decision_snapshot(
                 request_run_id,
                 route,
@@ -89,17 +92,7 @@ class DecisionRoutingService:
                 self._registry,
                 created_at,
                 budget=budget,
-            )
-            budget.require_publishable()
-            finished_at = self._current_time_not_before(created_at)
-            if finished_at > budget.deadline_at:
-                raise BudgetExpired("request audit deadline reached")
-            self._store.finalize_request(
-                request_run_id,
-                RequestTerminalStatus.COMPLETE,
-                finished_at,
-                (),
-                budget=budget,
+                complete_request_at=finished_at,
             )
             return snapshot
         except BudgetExpired:

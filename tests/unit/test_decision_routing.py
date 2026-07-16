@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -19,7 +20,7 @@ from kunjin.decision.policy import EvidencePolicyV1
 from kunjin.decision.routing import ACTION_RULES, ActionRouter
 from kunjin.decision.service import DecisionRoutingService
 from kunjin.decision.source_registry import SourceRegistryV1
-from kunjin.decision.store import DecisionAuditStore
+from kunjin.decision.store import DecisionAuditStore, DecisionAuditStoreError
 from kunjin.storage.repository import Repository
 
 NOW = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
@@ -115,7 +116,7 @@ def test_action_rules_are_immutable_and_cover_only_canonical_outputs() -> None:
 @pytest.mark.parametrize(
     "suitability_status",
     (
-        _status(status="blocked", hard_blocks=("reserve_shortfall",)),
+        _status(status="blocked", hard_blocks=("emergency_reserve_shortfall",)),
         _status(state="missing"),
         _status(state="stale", status="blocked", hard_blocks=("profile_stale",)),
     ),
@@ -138,7 +139,7 @@ def test_fresh_blocked_holding_is_deterministic_mature_no_add() -> None:
         (ActionKind.CONTINUE_HOLDING,),
         _status(
             status="blocked",
-            hard_blocks=("reserve_shortfall", "high_cost_debt"),
+            hard_blocks=("emergency_reserve_shortfall", "high_interest_debt"),
         ),
     )
     action = route.actions[0]
@@ -149,8 +150,8 @@ def test_fresh_blocked_holding_is_deterministic_mature_no_add() -> None:
     assert action.exact_amount_available is False
     assert action.blocking_codes == (
         "phase_b_blocked",
-        "reserve_shortfall",
-        "high_cost_debt",
+        "emergency_reserve_shortfall",
+        "high_interest_debt",
         "phase_e_policy_missing",
     )
     assert "financial_safety_conflicts_with_continued_exposure" in (
@@ -175,11 +176,20 @@ def test_noncurrent_phase_b_never_produces_unqualified_hold(state: str) -> None:
     assert "reserve_shortfall" not in action.blocking_codes
 
 
-@pytest.mark.parametrize("status", ("constrained", "ready_for_allocation"))
-def test_nonblocked_phase_b_cannot_mature_hold_before_phase_e(status: str) -> None:
+@pytest.mark.parametrize(
+    ("status", "constraints"),
+    (
+        ("constrained", ("monthly_ceiling_constrained",)),
+        ("ready_for_allocation", ()),
+    ),
+)
+def test_nonblocked_phase_b_cannot_mature_hold_before_phase_e(
+    status: str,
+    constraints: tuple[str, ...],
+) -> None:
     route = _route(
         (ActionKind.CONTINUE_HOLDING,),
-        _status(status=status, constraints=("equity_cap_binding",)),
+        _status(status=status, constraints=constraints),
     )
     action = route.actions[0]
 
@@ -188,7 +198,7 @@ def test_nonblocked_phase_b_cannot_mature_hold_before_phase_e(status: str) -> No
     assert action.blocking_codes == ("phase_e_policy_missing",)
     assert route.opposing_evidence == (
         "continued_exposure_is_not_risk_free",
-        "equity_cap_binding",
+        *constraints,
     )
 
 
@@ -223,8 +233,20 @@ def test_reduce_and_exit_research_continue_under_block_but_amounts_do_not() -> N
 @pytest.mark.parametrize(
     ("suitability_status", "phase_b_code"),
     (
-        (_status(status="blocked", hard_blocks=("reserve_shortfall",)), "phase_b_blocked"),
-        (_status(status="constrained"), None),
+        (
+            _status(
+                status="blocked",
+                hard_blocks=("emergency_reserve_shortfall",),
+            ),
+            "phase_b_blocked",
+        ),
+        (
+            _status(
+                status="constrained",
+                constraints=("monthly_ceiling_constrained",),
+            ),
+            None,
+        ),
         (_status(status="ready_for_allocation"), None),
         (_status(state="missing"), "financial_safety_not_current"),
         (_status(state="stale"), "financial_safety_not_current"),
@@ -252,7 +274,7 @@ def test_buy_or_add_is_blocked_for_every_phase_b_state(
 def test_switch_is_deterministically_split_into_reduce_and_buy_legs() -> None:
     route = _route(
         (ActionKind.FACT_RESEARCH, ActionKind.SWITCH_FUNDS),
-        _status(status="blocked", hard_blocks=("reserve_shortfall",)),
+        _status(status="blocked", hard_blocks=("emergency_reserve_shortfall",)),
     )
 
     assert tuple(action.action_id for action in route.actions) == (
@@ -396,6 +418,50 @@ def test_malformed_fresh_phase_b_metadata_fails_closed() -> None:
     )
 
 
+def test_forged_phase_b_identifiers_never_enter_route_or_audit_codes() -> None:
+    forged = _status(
+        status="ready_for_allocation",
+        constraints=("token_abcdef123456", "salary_999999"),
+    )
+
+    route = _route((ActionKind.CONTINUE_HOLDING,), forged)
+    encoded = route.canonical_json().decode("ascii")
+
+    assert route.actions[0].blocking_codes == (
+        "financial_safety_not_current",
+        "phase_e_policy_missing",
+    )
+    assert "token_abcdef123456" not in encoded
+    assert "salary_999999" not in encoded
+
+
+def test_forged_phase_b_identifiers_are_not_persisted_by_service(tmp_path) -> None:
+    repository = Repository(tmp_path / "kunjin.db")
+    repository.migrate()
+    forged = _status(
+        status="ready_for_allocation",
+        constraints=("token_abcdef123456", "salary_999999"),
+    )
+    service = DecisionRoutingService(
+        StubSuitabilityService(forged),
+        DecisionAuditStore(repository),
+        now=lambda: NOW,
+    )
+
+    snapshot = service.route(_budget(), (ActionKind.CONTINUE_HOLDING,))
+
+    assert snapshot.route.actions[0].blocking_codes == (
+        "financial_safety_not_current",
+        "phase_e_policy_missing",
+    )
+    with repository.connect() as connection:
+        stored = connection.execute(
+            "SELECT canonical_route_json FROM decision_snapshots"
+        ).fetchone()[0]
+    assert "token_abcdef123456" not in stored
+    assert "salary_999999" not in stored
+
+
 def test_service_clock_failure_is_sanitized_and_request_is_finalized(tmp_path) -> None:
     repository = Repository(tmp_path / "kunjin.db")
     repository.migrate()
@@ -459,6 +525,36 @@ def test_snapshot_budget_expiry_rolls_back_before_commit(tmp_path) -> None:
         ).fetchone()[0] == 0
 
 
+def test_expiry_between_snapshot_and_terminal_state_leaves_no_readable_snapshot(
+    tmp_path,
+) -> None:
+    repository = Repository(tmp_path / "kunjin.db")
+    repository.migrate()
+    store = DecisionAuditStore(repository)
+    ticks = iter((10.0, 10.0, 10.0, 10.0, 10.0, 100.0))
+    budget = _budget(monotonic=lambda: next(ticks))
+    service = DecisionRoutingService(
+        StubSuitabilityService(_status()),
+        store,
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(BudgetExpired):
+        service.route(budget, (ActionKind.FACT_RESEARCH,))
+
+    with repository.connect() as connection:
+        run = connection.execute(
+            "SELECT status FROM request_runs"
+        ).fetchone()
+        snapshot_count = connection.execute(
+            "SELECT count(*) FROM decision_snapshots"
+        ).fetchone()[0]
+    assert run["status"] == "expired"
+    assert snapshot_count == 0
+    with pytest.raises(DecisionAuditStoreError, match="does not exist"):
+        store._load_decision_snapshot(1)
+
+
 def test_success_finalization_budget_expiry_rolls_back_terminal_state(tmp_path) -> None:
     repository = Repository(tmp_path / "kunjin.db")
     repository.migrate()
@@ -479,3 +575,36 @@ def test_success_finalization_budget_expiry_rolls_back_terminal_state(tmp_path) 
         assert connection.execute(
             "SELECT status FROM request_runs WHERE id = ?", (request_run_id,)
         ).fetchone()[0] == "running"
+
+
+def test_decision_route_rejects_workflow_level_that_disagrees_with_mode() -> None:
+    route = _route((ActionKind.FACT_RESEARCH,), None)
+
+    with pytest.raises(ValueError, match="workflow level"):
+        replace(route, workflow_level=WorkflowLevel.DECISION_EVIDENCE).validate()
+
+
+def test_store_rejects_workflow_level_that_disagrees_with_request_mode(
+    tmp_path,
+) -> None:
+    repository = Repository(tmp_path / "kunjin.db")
+    repository.migrate()
+    store = DecisionAuditStore(repository)
+    request_run_id = store.begin_request(_budget())
+    bad_route = replace(
+        _route((ActionKind.FACT_RESEARCH,), None),
+        workflow_level=WorkflowLevel.DECISION_EVIDENCE,
+    )
+
+    with pytest.raises(ValueError, match="workflow level"):
+        store.save_decision_snapshot(
+            request_run_id,
+            bad_route,
+            EvidencePolicyV1(),
+            SourceRegistryV1(),
+            NOW,
+        )
+    with repository.connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM decision_snapshots"
+        ).fetchone()[0] == 0

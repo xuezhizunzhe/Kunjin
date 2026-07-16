@@ -569,54 +569,14 @@ class DecisionAuditStore:
                 connection.execute("BEGIN IMMEDIATE")
                 if budget is not None:
                     self._authenticate_budget_request(connection, request_run_id, budget)
-                pending_fields = {
-                    str(row["field_id"])
-                    for row in connection.execute(
-                        """
-                        SELECT source_work_authorizations.field_id
-                        FROM source_work_authorizations
-                        LEFT JOIN source_attempts
-                          ON source_attempts.authorization_id = source_work_authorizations.id
-                        WHERE source_work_authorizations.request_run_id = ?
-                          AND source_attempts.id IS NULL
-                        """,
-                        (request_run_id,),
-                    ).fetchall()
-                }
-                if pending_fields and (
-                    status is RequestTerminalStatus.COMPLETE
-                    or not pending_fields.issubset(set(omitted_work))
-                ):
-                    raise DecisionAuditStoreError("request was not finalized exactly once")
-                cursor = connection.execute(
-                    """
-                    UPDATE request_runs
-                    SET status = ?, finished_at = ?, omitted_work_json = ?
-                    WHERE id = ? AND status = 'running'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM source_attempts
-                          WHERE request_run_id = ?
-                            AND finished_at COLLATE BINARY > ? COLLATE BINARY
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM decision_snapshots
-                          WHERE request_run_id = ?
-                            AND created_at COLLATE BINARY > ? COLLATE BINARY
-                      )
-                    """,
-                    (
-                        status.value,
-                        finished_text,
-                        omitted_json,
-                        request_run_id,
-                        request_run_id,
-                        finished_text,
-                        request_run_id,
-                        finished_text,
-                    ),
+                self._finalize_request_in_transaction(
+                    connection,
+                    request_run_id,
+                    status,
+                    finished_text,
+                    omitted_work,
+                    omitted_json,
                 )
-                if cursor.rowcount != 1:
-                    raise DecisionAuditStoreError("request was not finalized exactly once")
                 if budget is not None:
                     budget.require_publishable()
                 connection.commit()
@@ -634,6 +594,7 @@ class DecisionAuditStore:
         created_at: datetime,
         *,
         budget: Optional[RequestBudget] = None,
+        complete_request_at: Optional[datetime] = None,
     ) -> StoredDecisionSnapshot:
         _positive_id(request_run_id, "request run id")
         if type(route) is not DecisionRoute:
@@ -644,6 +605,8 @@ class DecisionAuditStore:
             raise ValueError("registry must be an exact SourceRegistryV1")
         if budget is not None and type(budget) is not RequestBudget:
             raise ValueError("budget must be an exact RequestBudget or None")
+        if complete_request_at is not None and budget is None:
+            raise ValueError("atomic request completion requires an exact RequestBudget")
         if budget is not None:
             budget.require_publishable()
         policy.validate()
@@ -662,6 +625,11 @@ class DecisionAuditStore:
             raise DecisionAuditStoreError("snapshot registry binding failed")
         route.validate()
         created_text = _utc_text(created_at, "snapshot creation")
+        complete_text = (
+            None
+            if complete_request_at is None
+            else _utc_text(complete_request_at, "request finish")
+        )
         policy_json_bytes = policy.canonical_json()
         registry_json_bytes = registry.canonical_json()
         route_json_bytes = route.canonical_json()
@@ -688,6 +656,7 @@ class DecisionAuditStore:
                     raise DecisionAuditStoreError("request run is not running")
                 if budget is not None:
                     self._authenticate_budget_request(connection, request_run_id, budget)
+                    budget.require_publishable()
                 request_start = _stored_datetime(run["started_at"], "request start")
                 request_deadline = _stored_datetime(run["deadline_at"], "request deadline")
                 snapshot_created = _stored_datetime(created_text, "snapshot creation")
@@ -720,6 +689,20 @@ class DecisionAuditStore:
                         created_text,
                     ),
                 )
+                if complete_text is not None:
+                    completed_at = _stored_datetime(complete_text, "request finish")
+                    if not snapshot_created <= completed_at <= request_deadline:
+                        raise DecisionAuditStoreError(
+                            "request completion is outside its publishable lifetime"
+                        )
+                    self._finalize_request_in_transaction(
+                        connection,
+                        request_run_id,
+                        RequestTerminalStatus.COMPLETE,
+                        complete_text,
+                        (),
+                        "[]",
+                    )
                 snapshot = self._load_decision_snapshot(
                     request_run_id,
                     connection=connection,
@@ -732,6 +715,64 @@ class DecisionAuditStore:
             raise
         except sqlite3.DatabaseError:
             raise DecisionAuditStoreError("decision snapshot insert failed") from None
+
+    @staticmethod
+    def _finalize_request_in_transaction(
+        connection: sqlite3.Connection,
+        request_run_id: int,
+        status: RequestTerminalStatus,
+        finished_text: str,
+        omitted_work: Tuple[str, ...],
+        omitted_json: str,
+    ) -> None:
+        pending_fields = {
+            str(row["field_id"])
+            for row in connection.execute(
+                """
+                SELECT source_work_authorizations.field_id
+                FROM source_work_authorizations
+                LEFT JOIN source_attempts
+                  ON source_attempts.authorization_id = source_work_authorizations.id
+                WHERE source_work_authorizations.request_run_id = ?
+                  AND source_attempts.id IS NULL
+                """,
+                (request_run_id,),
+            ).fetchall()
+        }
+        if pending_fields and (
+            status is RequestTerminalStatus.COMPLETE
+            or not pending_fields.issubset(set(omitted_work))
+        ):
+            raise DecisionAuditStoreError("request was not finalized exactly once")
+        cursor = connection.execute(
+            """
+            UPDATE request_runs
+            SET status = ?, finished_at = ?, omitted_work_json = ?
+            WHERE id = ? AND status = 'running'
+              AND NOT EXISTS (
+                  SELECT 1 FROM source_attempts
+                  WHERE request_run_id = ?
+                    AND finished_at COLLATE BINARY > ? COLLATE BINARY
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM decision_snapshots
+                  WHERE request_run_id = ?
+                    AND created_at COLLATE BINARY > ? COLLATE BINARY
+              )
+            """,
+            (
+                status.value,
+                finished_text,
+                omitted_json,
+                request_run_id,
+                request_run_id,
+                finished_text,
+                request_run_id,
+                finished_text,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise DecisionAuditStoreError("request was not finalized exactly once")
 
     def source_attempt_history(
         self,
@@ -996,9 +1037,9 @@ def _stored_snapshot(
     route_json = _authenticated_route_json_bytes(
         row["canonical_route_json"], result_checksum
     )
-    route = _decision_route_from_bytes(route_json)
     request_id = validate_request_id(row["request_id"])
     request_mode = RequestMode(row["request_mode"])
+    route = _decision_route_from_bytes(route_json, request_id, request_mode)
     if route.request_id != request_id or route.mode is not request_mode:
         raise DecisionAuditStoreError("snapshot request binding failed")
     if route.policy_version != policy.version or route.policy_checksum != policy_checksum:
@@ -1082,7 +1123,11 @@ def _stored_source_work_authorization(row: sqlite3.Row) -> SourceWorkAuthorizati
     return authorization
 
 
-def _decision_route_from_bytes(value: bytes) -> DecisionRoute:
+def _decision_route_from_bytes(
+    value: bytes,
+    expected_request_id: str,
+    expected_mode: RequestMode,
+) -> DecisionRoute:
     try:
         payload = json.loads(
             value.decode("ascii"),
@@ -1107,6 +1152,11 @@ def _decision_route_from_bytes(value: bytes) -> DecisionRoute:
         },
         "decision route",
     )
+    if (
+        payload["request_id"] != expected_request_id
+        or payload["mode"] != expected_mode.value
+    ):
+        raise DecisionAuditStoreError("snapshot request binding failed")
     actions = _required_list(payload["actions"], "actions")
     evidence = _required_list(payload["conclusion_evidence"], "conclusion evidence")
     route = DecisionRoute(

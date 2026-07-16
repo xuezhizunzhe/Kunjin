@@ -1096,6 +1096,7 @@ def test_snapshot_read_rechecks_request_binding_even_with_matching_checksum(tmp_
     ("field", "value", "error"),
     (
         ("mode", "deep", "request binding"),
+        ("workflow_level", "decision_evidence", "authentication"),
         ("policy_version", "2", "policy binding"),
         ("registry_version", "2", "registry binding"),
     ),
