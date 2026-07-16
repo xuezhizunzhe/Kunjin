@@ -2773,6 +2773,18 @@ WHEN NOT EXISTS (
       AND NEW.deadline_at = run.deadline_at
       AND (NEW.kind = 'retry' OR run.mode = 'deep')
       AND (
+          NEW.kind = 'retry'
+          OR NOT EXISTS (
+              SELECT 1
+              FROM source_attempts AS ordinary
+              WHERE ordinary.request_run_id = NEW.request_run_id
+                AND ordinary.source_id = NEW.source_id
+                AND ordinary.field_id = NEW.field_id
+                AND ordinary.subject_key = NEW.subject_key
+                AND ordinary.attempt_number = 1
+          )
+      )
+      AND (
           NEW.kind = 'force'
           OR EXISTS (
               SELECT 1
@@ -2834,6 +2846,18 @@ WHEN NOT (
         AND NEW.attempt_number = 1
         AND NEW.force_actor IS NULL
         AND NEW.force_reason IS NULL
+        AND NOT EXISTS (
+            SELECT 1
+            FROM source_work_authorizations AS pending_force
+            LEFT JOIN source_attempts AS consumed
+              ON consumed.authorization_id = pending_force.id
+            WHERE pending_force.request_run_id = NEW.request_run_id
+              AND pending_force.kind = 'force'
+              AND pending_force.source_id = NEW.source_id
+              AND pending_force.field_id = NEW.field_id
+              AND pending_force.subject_key = NEW.subject_key
+              AND consumed.id IS NULL
+        )
     ) OR EXISTS (
         SELECT 1
         FROM source_work_authorizations AS authorization

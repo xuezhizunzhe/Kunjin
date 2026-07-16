@@ -478,6 +478,48 @@ class SchemaV15Test(unittest.TestCase):
                         **overrides,
                     )
 
+    def test_pending_force_authorization_blocks_direct_ordinary_attempt_one(self) -> None:
+        repository = self.repository()
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            run_id = self._insert_run(connection, request_id="7" * 32)
+            self._insert_authorization(
+                connection,
+                self._authorization_values(run_id),
+            )
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                self._insert_parent_attempt(
+                    connection,
+                    run_id,
+                    outcome="success",
+                    data_as_of=UTC,
+                    error_code=None,
+                    cooldown_until=None,
+                    response_byte_count=100,
+                )
+
+    def test_direct_force_authorization_is_blocked_after_ordinary_attempt_one(self) -> None:
+        repository = self.repository()
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            run_id = self._insert_run(connection, request_id="8" * 32)
+            self._insert_parent_attempt(
+                connection,
+                run_id,
+                outcome="success",
+                data_as_of=UTC,
+                error_code=None,
+                cooldown_until=None,
+                response_byte_count=100,
+            )
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                self._insert_authorization(
+                    connection,
+                    self._authorization_values(run_id),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

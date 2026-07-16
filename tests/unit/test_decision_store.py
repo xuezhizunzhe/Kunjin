@@ -509,6 +509,13 @@ def test_unconsumed_authorization_blocks_complete_and_requires_omitted_work(
             NOW + timedelta(seconds=2),
             (),
         )
+    with pytest.raises(DecisionAuditStoreError, match="exactly once"):
+        store.finalize_request(
+            request_run_id,
+            RequestTerminalStatus.PARTIAL,
+            NOW + timedelta(seconds=2),
+            ("formal_nav",),
+        )
 
     store.finalize_request(
         request_run_id,
@@ -516,6 +523,118 @@ def test_unconsumed_authorization_blocks_complete_and_requires_omitted_work(
         NOW + timedelta(seconds=2),
         ("identity_active_status",),
     )
+
+
+def test_every_unconsumed_authorization_field_requires_omitted_coverage(tmp_path) -> None:
+    _, store = _store(tmp_path)
+    budget = _budget(request_id="a" * 32, mode=RequestMode.DEEP)
+    request_run_id = store.begin_request(budget)
+    for field_id in ("identity_active_status", "current_manager_team"):
+        assert store.reserve_force(
+            request_run_id,
+            budget,
+            "eastmoney_f10",
+            field_id,
+            "fund:123456",
+            NOW + timedelta(seconds=1),
+            ForceReasonCode.OWNER_APPROVED_RETRY,
+        ) is not None
+
+    with pytest.raises(DecisionAuditStoreError, match="exactly once"):
+        store.finalize_request(
+            request_run_id,
+            RequestTerminalStatus.PARTIAL,
+            NOW + timedelta(seconds=2),
+            ("identity_active_status",),
+        )
+
+    store.finalize_request(
+        request_run_id,
+        RequestTerminalStatus.PARTIAL,
+        NOW + timedelta(seconds=2),
+        ("identity_active_status", "current_manager_team"),
+    )
+
+
+def test_force_reservation_and_ordinary_attempt_one_are_mutually_exclusive(tmp_path) -> None:
+    _, store = _store(tmp_path)
+    budget = _budget(request_id="b" * 32, mode=RequestMode.DEEP)
+    request_run_id = store.begin_request(budget)
+    ordinary = _attempt()
+    store.record_source_attempt(request_run_id, ordinary)
+
+    assert store.reserve_force(
+        request_run_id,
+        budget,
+        ordinary.source_id,
+        ordinary.field_id,
+        ordinary.subject_key,
+        NOW + timedelta(seconds=3),
+        ForceReasonCode.OWNER_APPROVED_RETRY,
+    ) is None
+
+    second_budget = _budget(request_id="c" * 32, mode=RequestMode.DEEP)
+    second_run_id = store.begin_request(second_budget)
+    authorization = store.reserve_force(
+        second_run_id,
+        second_budget,
+        ordinary.source_id,
+        ordinary.field_id,
+        ordinary.subject_key,
+        NOW + timedelta(seconds=1),
+        ForceReasonCode.OWNER_APPROVED_RETRY,
+    )
+    assert authorization is not None
+    with pytest.raises(DecisionAuditStoreError, match="authorization"):
+        store.record_source_attempt(second_run_id, ordinary)
+
+
+def test_force_reservation_and_ordinary_attempt_are_atomic_across_stores(tmp_path) -> None:
+    repository, first_store = _store(tmp_path)
+    second_store = DecisionAuditStore(repository)
+    budget = _budget(request_id="d" * 32, mode=RequestMode.DEEP)
+    request_run_id = first_store.begin_request(budget)
+    ordinary = _attempt()
+    barrier = threading.Barrier(3)
+    results: dict[str, object] = {}
+
+    def record_ordinary() -> int:
+        barrier.wait()
+        return first_store.record_source_attempt(request_run_id, ordinary)
+
+    def reserve_force():
+        barrier.wait()
+        return second_store.reserve_force(
+            request_run_id,
+            budget,
+            ordinary.source_id,
+            ordinary.field_id,
+            ordinary.subject_key,
+            NOW + timedelta(seconds=1),
+            ForceReasonCode.OWNER_APPROVED_RETRY,
+        )
+
+    threads = (
+        threading.Thread(
+            target=_capture_thread_result,
+            args=(results, "ordinary", record_ordinary),
+        ),
+        threading.Thread(
+            target=_capture_thread_result,
+            args=(results, "force", reserve_force),
+        ),
+    )
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        _join_thread(thread)
+
+    if type(results["ordinary"]) is int:
+        assert results["force"] is None
+    else:
+        assert isinstance(results["ordinary"], DecisionAuditStoreError)
+        assert results["force"] is not None
 
 
 def test_terminal_request_is_immutable_and_rejects_more_children(tmp_path) -> None:

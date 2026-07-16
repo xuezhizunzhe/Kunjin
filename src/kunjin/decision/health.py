@@ -48,6 +48,21 @@ _ACTION_RISK = {
     ActionKind.BUY_OR_ADD: RiskEffect.RISK_INCREASING,
     ActionKind.SWITCH_FUNDS: RiskEffect.RISK_INCREASING,
 }
+_REGISTRY_POLICY_REQUIREMENT_V1 = {
+    "adjusted_return_series": "adjusted_return_correlation",
+    "current_manager_team": "current_manager_team",
+    "fees_share_class_relationship": "fees_share_class_relationship",
+    "formal_nav": "formal_nav",
+    "fund_manager_product_announcement": "fund_manager_product_announcement",
+    "holdings_industries": "holdings_industries",
+    "identity_active_status": "identity_active_status",
+    "market_context": "news_media_context",
+    "personal_position_observation": "personal_position",
+    "transaction_availability_limits_cutoff": (
+        "transaction_availability_limits_cutoff"
+    ),
+    "transaction_channel_observation": "transaction_availability_limits_cutoff",
+}
 
 
 def _utc_now() -> datetime:
@@ -56,6 +71,7 @@ def _utc_now() -> datetime:
 
 @dataclass(frozen=True)
 class ActionEvidenceRequirement:
+    field_id: str
     action: ActionKind
     risk_effect: RiskEffect
     policy_requirement: EvidenceRequirement
@@ -64,6 +80,7 @@ class ActionEvidenceRequirement:
         validate_exact_dataclass_state(self, "action evidence requirement")
         if type(self) is not ActionEvidenceRequirement:
             raise ValueError("action evidence requirement subclasses are not accepted")
+        validate_identifier(self.field_id, "field id")
         if type(self.action) is not ActionKind:
             raise ValueError("action must be an exact ActionKind")
         if type(self.risk_effect) is not RiskEffect:
@@ -102,6 +119,7 @@ class SourceHealthService:
         self.registry = registry
         self.policy = policy
         self.wall_clock = wall_clock
+        self._validate_requirement_bindings()
 
     def action_requirement(
         self,
@@ -110,14 +128,17 @@ class SourceHealthService:
         risk_effect: RiskEffect,
     ) -> ActionEvidenceRequirement:
         validate_identifier(field_id, "field id")
+        requirement_id = _REGISTRY_POLICY_REQUIREMENT_V1.get(field_id)
+        if requirement_id is None:
+            raise ValueError("field has no executable EvidencePolicy V1 requirement")
         matches = tuple(
             requirement
             for requirement in self.policy.requirements
-            if requirement.field_id == field_id
+            if requirement.field_id == requirement_id
         )
         if len(matches) != 1:
             raise ValueError("field has no executable EvidencePolicy V1 requirement")
-        requirement = ActionEvidenceRequirement(action, risk_effect, matches[0])
+        requirement = ActionEvidenceRequirement(field_id, action, risk_effect, matches[0])
         requirement.validate()
         return requirement
 
@@ -158,7 +179,10 @@ class SourceHealthService:
         requirement.validate()
         if requirement.policy_requirement not in self.policy.requirements:
             raise ValueError("requirement is not bound to the active evidence policy")
-        if requirement.policy_requirement.field_id != field_id:
+        if requirement.field_id != field_id or (
+            requirement.policy_requirement.field_id
+            != _REGISTRY_POLICY_REQUIREMENT_V1.get(field_id)
+        ):
             raise ValueError("requirement does not match the requested field")
         primary_ref = SourceFieldRef(source_id, field_id)
         primary = self._field_policy(source_id, field_id)
@@ -205,7 +229,6 @@ class SourceHealthService:
         budget: RequestBudget,
         *,
         request_run_id: int,
-        reserved_at: datetime,
         minimum_worker_seconds: float,
     ) -> Optional[SourceWorkAuthorization]:
         if type(parent) is not StoredSourceAttempt:
@@ -232,6 +255,7 @@ class SourceHealthService:
             return None
         if not enough_budget:
             return None
+        reserved_at = self._trusted_authorization_time(budget)
         return self.audit_store.reserve_retry(
             request_run_id,
             budget,
@@ -251,7 +275,6 @@ class SourceHealthService:
         source_id: str,
         field_id: str,
         subject_key: str,
-        authorized_at: datetime,
         force_reason: Optional[ForceReasonCode],
         *,
         request_run_id: int,
@@ -265,10 +288,6 @@ class SourceHealthService:
             or _SUBJECT_KEY_PATTERN.fullmatch(subject_key) is None
         ):
             raise ValueError("subject key must be fund: followed by exactly six digits")
-        authorized_at = validate_aware_datetime(
-            authorized_at,
-            "force authorization time",
-        ).astimezone(timezone.utc)
         if type(attempt_number) is not int or attempt_number not in {1, 2}:
             raise ValueError("attempt number must be exactly 1 or 2")
         if force_reason is None:
@@ -279,6 +298,7 @@ class SourceHealthService:
             raise ValueError("force requires deep mode")
         if attempt_number != 1:
             raise ValueError("force is allowed only on the first attempt")
+        authorized_at = self._trusted_authorization_time(budget)
         authorization = self.audit_store.reserve_force(
             request_run_id,
             budget,
@@ -292,6 +312,36 @@ class SourceHealthService:
             return None
         authorization.validate()
         return authorization
+
+    def _validate_requirement_bindings(self) -> None:
+        registry_fields = {
+            field.field_id
+            for source in self.registry.sources
+            for field in source.fields
+        }
+        if registry_fields != set(_REGISTRY_POLICY_REQUIREMENT_V1):
+            raise ValueError("registry fields differ from EvidencePolicy V1 bindings")
+        policy_fields = tuple(requirement.field_id for requirement in self.policy.requirements)
+        if len(policy_fields) != len(set(policy_fields)) or not set(
+            _REGISTRY_POLICY_REQUIREMENT_V1.values()
+        ).issubset(policy_fields):
+            raise ValueError("EvidencePolicy V1 binding target is missing or ambiguous")
+
+    def _trusted_authorization_time(
+        self,
+        budget: RequestBudget,
+    ) -> datetime:
+        budget.require_publishable()
+        try:
+            trusted_at = validate_aware_datetime(
+                self.wall_clock(),
+                "health wall clock",
+            ).astimezone(timezone.utc)
+        except Exception:
+            raise ValueError("health wall clock failed") from None
+        if not budget.started_at <= trusted_at <= budget.deadline_at:
+            raise ValueError("health wall clock is outside the request lifetime")
+        return trusted_at
 
     def _trusted_context(
         self,

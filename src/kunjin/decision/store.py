@@ -191,6 +191,31 @@ class DecisionAuditStore:
                     attempt,
                     authenticated_authorization,
                 )
+                if authorization is None and attempt.attempt_number == 1:
+                    pending_force = connection.execute(
+                        """
+                        SELECT 1
+                        FROM source_work_authorizations
+                        LEFT JOIN source_attempts consumed
+                          ON consumed.authorization_id = source_work_authorizations.id
+                        WHERE source_work_authorizations.request_run_id = ?
+                          AND source_work_authorizations.kind = 'force'
+                          AND source_work_authorizations.source_id = ?
+                          AND source_work_authorizations.field_id = ?
+                          AND source_work_authorizations.subject_key = ?
+                          AND consumed.id IS NULL
+                        """,
+                        (
+                            request_run_id,
+                            attempt.source_id,
+                            attempt.field_id,
+                            attempt.subject_key,
+                        ),
+                    ).fetchone()
+                    if pending_force is not None:
+                        raise DecisionAuditStoreError(
+                            "ordinary attempt is blocked by a force authorization"
+                        )
 
                 cursor = connection.execute(
                     """
@@ -347,6 +372,15 @@ class DecisionAuditStore:
                     raise DecisionAuditStoreError("reservation is outside the request lifetime")
                 if kind is SourceWorkKind.FORCE and run["mode"] != RequestMode.DEEP.value:
                     raise DecisionAuditStoreError("force reservation requires a deep request")
+                if kind is SourceWorkKind.FORCE and connection.execute(
+                    """
+                    SELECT 1 FROM source_attempts
+                    WHERE request_run_id = ? AND source_id = ? AND field_id = ?
+                      AND subject_key = ? AND attempt_number = 1
+                    """,
+                    (request_run_id, source_id, field_id, subject_key),
+                ).fetchone() is not None:
+                    return None
                 parent_id = None
                 if kind is SourceWorkKind.RETRY:
                     if parent is None:
@@ -517,6 +551,25 @@ class DecisionAuditStore:
         try:
             with self.repository.connect() as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
+                pending_fields = {
+                    str(row["field_id"])
+                    for row in connection.execute(
+                        """
+                        SELECT source_work_authorizations.field_id
+                        FROM source_work_authorizations
+                        LEFT JOIN source_attempts
+                          ON source_attempts.authorization_id = source_work_authorizations.id
+                        WHERE source_work_authorizations.request_run_id = ?
+                          AND source_attempts.id IS NULL
+                        """,
+                        (request_run_id,),
+                    ).fetchall()
+                }
+                if pending_fields and (
+                    status is RequestTerminalStatus.COMPLETE
+                    or not pending_fields.issubset(set(omitted_work))
+                ):
+                    raise DecisionAuditStoreError("request was not finalized exactly once")
                 cursor = connection.execute(
                     """
                     UPDATE request_runs
@@ -526,14 +579,6 @@ class DecisionAuditStore:
                           SELECT 1 FROM source_attempts
                           WHERE request_run_id = ?
                             AND finished_at COLLATE BINARY > ? COLLATE BINARY
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM source_work_authorizations
-                          LEFT JOIN source_attempts
-                            ON source_attempts.authorization_id = source_work_authorizations.id
-                          WHERE source_work_authorizations.request_run_id = ?
-                            AND source_attempts.id IS NULL
-                            AND (? = 'complete' OR ? = '[]')
                       )
                       AND NOT EXISTS (
                           SELECT 1 FROM decision_snapshots
@@ -548,9 +593,6 @@ class DecisionAuditStore:
                         request_run_id,
                         request_run_id,
                         finished_text,
-                        request_run_id,
-                        status.value,
-                        omitted_json,
                         request_run_id,
                         finished_text,
                     ),
