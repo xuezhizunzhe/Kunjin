@@ -117,6 +117,7 @@ class ProjectedSourceField:
 class SourceStatusSnapshot:
     projections: tuple[ProjectedSourceField, ...]
     resolutions: tuple[RequestFieldResolution, ...]
+    evaluated_at: datetime
 
     def validate(self) -> None:
         validate_exact_dataclass_state(self, "source status snapshot")
@@ -139,6 +140,7 @@ class SourceStatusSnapshot:
                 raise ValueError(
                     "source status resolutions must contain exact resolution values"
                 )
+        validate_aware_datetime(self.evaluated_at, "source status evaluation time")
 
 
 class SourceHealthService:
@@ -332,7 +334,11 @@ class SourceHealthService:
                 for reference in (primary_ref, *primary.acceptable_alternatives)
             )
             resolutions.append(self._resolution_from_projected(projected, requirement))
-        snapshot = SourceStatusSnapshot(projections, tuple(resolutions))
+        snapshot = SourceStatusSnapshot(
+            projections,
+            tuple(resolutions),
+            trusted_context.now,
+        )
         snapshot.validate()
         return snapshot
 

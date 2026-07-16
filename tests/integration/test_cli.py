@@ -677,6 +677,11 @@ class CliIntegrationTest(unittest.TestCase):
             f"managed_path={self.context.paths.database}",
             "failed at /private/tmp/output.log",
             "runtime traceback: line 7",
+            "monthly%20net%20income=918273645001",
+            "monthly%2520net%2520income=918273645001",
+            "918273645001",
+            "owner value 918273645001",
+            "income 918273645001",
         ):
             with self.subTest(private_publisher=private_publisher):
                 changed = json.loads(json.dumps(conclusion))
@@ -688,6 +693,29 @@ class CliIntegrationTest(unittest.TestCase):
         changed["lineage_ids"] = ["target_amount"]
         with self.assertRaises(ValueError):
             _conclusion_evidence_from_public(changed)
+        changed["lineage_ids"] = ["target_amount_918273645001"]
+        with self.assertRaises(ValueError):
+            _conclusion_evidence_from_public(changed)
+        for private_lineage in (
+            "income_value_918273645001",
+            "private_918273645001",
+        ):
+            changed["lineage_ids"] = [private_lineage]
+            with self.assertRaises(ValueError):
+                _conclusion_evidence_from_public(changed)
+
+        for legitimate_publisher in (
+            "7 Fund Management",
+            "Amount Asset Management",
+        ):
+            with self.subTest(legitimate_publisher=legitimate_publisher):
+                changed = json.loads(json.dumps(conclusion))
+                changed["publishers"] = [legitimate_publisher]
+                _conclusion_evidence_from_public(changed)
+        changed = json.loads(json.dumps(conclusion))
+        changed["independent_lineage_count"] = 1
+        changed["lineage_ids"] = ["market_context_v2"]
+        _conclusion_evidence_from_public(changed)
 
     def test_phase0_decision_route_supports_deep_and_switch_legs(self) -> None:
         payload, exit_code, _ = run(
@@ -809,6 +837,7 @@ class CliIntegrationTest(unittest.TestCase):
                 "registry_version",
                 "request_field_resolutions",
                 "request_id",
+                "snapshot_at",
                 "source_fields",
             },
         )
@@ -854,6 +883,30 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         valid = payload["data"]
         _validate_source_status_data(valid)
+
+        snapshot_at = datetime.fromisoformat(valid["snapshot_at"])
+        boundary = json.loads(json.dumps(valid))
+        row = boundary["source_fields"][0]
+        row["state"] = "cooldown"
+        row["last_failure_at"] = (snapshot_at - timedelta(seconds=1)).isoformat()
+        row["last_failure_reason"] = "network_timeout"
+        row["consecutive_failures"] = 1
+        row["cooldown_until"] = (snapshot_at + timedelta(seconds=1)).isoformat()
+        with patch(
+            "kunjin.cli._request_finish_now",
+            return_value=snapshot_at + timedelta(seconds=2),
+        ):
+            _validate_source_status_data(boundary)
+        expired = json.loads(json.dumps(boundary))
+        expired["source_fields"][0]["cooldown_until"] = valid["snapshot_at"]
+        with self.assertRaises(ValueError):
+            _validate_source_status_data(expired)
+        noncanonical = json.loads(json.dumps(valid))
+        noncanonical["snapshot_at"] = noncanonical["snapshot_at"].replace(
+            "+00:00", "Z"
+        )
+        with self.assertRaises(ValueError):
+            _validate_source_status_data(noncanonical)
 
         mutations = (
             ("consecutive_failures", True),

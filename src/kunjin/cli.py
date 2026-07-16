@@ -5,6 +5,8 @@ import json
 import os
 import re
 import sys
+import unicodedata
+import urllib.parse
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -1625,6 +1627,7 @@ _SOURCE_STATUS_DATA_KEYS = frozenset(
         "registry_version",
         "request_field_resolutions",
         "request_id",
+        "snapshot_at",
         "source_fields",
     }
 )
@@ -1681,6 +1684,7 @@ _ROUTE_FIELDS = frozenset(
         "use_of_proceeds",
     }
 )
+_ROUTE_GATE_CODES = _ROUTE_FIELDS | frozenset({"phase_b_context"})
 _ROUTE_BLOCKING_CODES = frozenset(
     {
         "phase_b_blocked",
@@ -1744,6 +1748,20 @@ _PHASE0_PRIVATE_TEXT_MARKERS = (
     "transaction identifier",
     "worker pid",
 )
+_PHASE0_TEXT_DECODE_PASSES = 3
+_PHASE0_NUMERIC_PAYLOAD = re.compile(
+    r"^[+\-]?\s*(?:[¥￥$€£]\s*)?\d[\d,]*(?:\.\d+)?"
+    r"(?:\s*(?:cny|rmb|usd|eur|元|万元))?$",
+    re.IGNORECASE,
+)
+_PHASE0_AMOUNT_ASSIGNMENT = re.compile(
+    r"(?:^|[^a-z0-9])(?:amount|balance|debt|goal|income|reserve|target)"
+    r"\s*[:=]\s*[¥￥$€£]?\s*\d",
+    re.IGNORECASE,
+)
+_PHASE0_LARGE_NUMBER_TOKEN = re.compile(
+    r"(?<![\d,])(?:\d{8,}|\d{1,3}(?:,\d{3}){2,})(?![\d,])"
+)
 
 
 def _utc_iso(value: datetime) -> str:
@@ -1782,10 +1800,18 @@ def _identifier_list(
     name: str,
     *,
     allow_empty: bool = True,
+    allowed_identifiers: Optional[frozenset[str]] = None,
 ) -> Tuple[str, ...]:
     if type(value) is not list or len(value) > 128 or (not allow_empty and not value):
         raise ValueError(f"{name} must be a bounded exact list")
-    result = tuple(_public_identifier(item, name) for item in value)
+    result = tuple(
+        _public_identifier(
+            item,
+            name,
+            allowed_identifiers=allowed_identifiers,
+        )
+        for item in value
+    )
     if len(result) != len(set(result)):
         raise ValueError(f"{name} must not contain duplicates")
     return result
@@ -1800,25 +1826,65 @@ def _public_text_list(value: object, name: str) -> Tuple[str, ...]:
     return result
 
 
-def _public_identifier(value: object, name: str) -> str:
+def _public_identifier(
+    value: object,
+    name: str,
+    *,
+    allowed_identifiers: Optional[frozenset[str]] = None,
+) -> str:
     result = validate_identifier(value, name)
+    if allowed_identifiers is not None and result in allowed_identifiers:
+        return result
     if result in _PHASE0_FORBIDDEN_IDENTIFIERS:
         raise ValueError(f"{name} is a private identifier")
+    normalized = " ".join(result.casefold().split("_"))
+    padded = f" {normalized} "
+    if any(f" {marker} " in padded for marker in _PHASE0_PRIVATE_TEXT_MARKERS):
+        raise ValueError(f"{name} contains a private identifier")
+    if _PHASE0_LARGE_NUMBER_TOKEN.search(result) is not None:
+        raise ValueError(f"{name} contains a private numeric token")
     return result
 
 
 def _phase0_public_text(value: object, name: str) -> str:
     result = validate_public_text(value, name)
+    normalized_text = _normalize_phase0_public_text(result, name)
+    validate_public_text(normalized_text, name)
     normalized = " ".join(
-        part for part in re.split(r"[\W_]+", result.casefold()) if part
+        part for part in re.split(r"[\W_]+", normalized_text.casefold()) if part
     )
     if any(marker in normalized for marker in _PHASE0_PRIVATE_TEXT_MARKERS):
         raise ValueError(f"{name} contains a private value")
+    if _PHASE0_NUMERIC_PAYLOAD.fullmatch(normalized_text.strip()) is not None or (
+        _PHASE0_AMOUNT_ASSIGNMENT.search(normalized_text) is not None
+        or _PHASE0_LARGE_NUMBER_TOKEN.search(normalized_text) is not None
+    ):
+        raise ValueError(f"{name} contains an amount-like private value")
     try:
-        validate_public_risk_string(result)
+        validate_public_risk_string(normalized_text)
     except ValueError:
         raise ValueError(f"{name} contains local implementation details")
     return result
+
+
+def _normalize_phase0_public_text(value: str, name: str) -> str:
+    current = unicodedata.normalize("NFKC", value)
+    for _ in range(_PHASE0_TEXT_DECODE_PASSES):
+        try:
+            decoded = urllib.parse.unquote(current, errors="strict")
+        except UnicodeDecodeError:
+            raise ValueError(f"{name} contains invalid encoded text") from None
+        normalized = unicodedata.normalize("NFKC", decoded)
+        if normalized == current:
+            return normalized
+        current = normalized
+    try:
+        remaining = urllib.parse.unquote(current, errors="strict")
+    except UnicodeDecodeError:
+        raise ValueError(f"{name} contains invalid encoded text") from None
+    if unicodedata.normalize("NFKC", remaining) != current:
+        raise ValueError(f"{name} exceeds the decoding boundary")
+    return current
 
 
 def _decision_route_response(
@@ -1874,9 +1940,15 @@ def _validate_decision_route_data(data: object) -> None:
         actions=actions,
         conclusion_evidence=conclusion_evidence,
         opposing_evidence=_identifier_list(
-            data["opposing_evidence"], "opposing evidence"
+            data["opposing_evidence"],
+            "opposing evidence",
+            allowed_identifiers=_ROUTE_OPPOSING_CODES,
         ),
-        missing_fields=_identifier_list(data["missing_fields"], "missing fields"),
+        missing_fields=_identifier_list(
+            data["missing_fields"],
+            "missing fields",
+            allowed_identifiers=_ROUTE_FIELDS,
+        ),
         policy_version=validate_version(data["policy_version"], "policy version"),
         policy_checksum=data["policy_checksum"],
         registry_version=validate_version(
@@ -1904,8 +1976,16 @@ def _action_route_from_public(value: object) -> ActionRoute:
     if type(value) is not dict or set(value) != _ACTION_ROUTE_DATA_KEYS:
         raise ValueError("decision action output keys are invalid")
     action = ActionKind(value["action"])
-    required_gates = _identifier_list(value["required_gates"], "required gates")
-    blocking_codes = _identifier_list(value["blocking_codes"], "blocking codes")
+    required_gates = _identifier_list(
+        value["required_gates"],
+        "required gates",
+        allowed_identifiers=_ROUTE_GATE_CODES,
+    )
+    blocking_codes = _identifier_list(
+        value["blocking_codes"],
+        "blocking codes",
+        allowed_identifiers=_ROUTE_BLOCKING_CODES,
+    )
     if required_gates != _ACTION_REQUIRED_GATES[action]:
         raise ValueError("decision action required gates are invalid")
     if not set(blocking_codes).issubset(_ROUTE_BLOCKING_CODES):
@@ -2157,6 +2237,9 @@ def _source_status_response(
             "registry_version": service.registry.version,
             "request_field_resolutions": request_field_resolutions,
             "request_id": budget.request_id,
+            "snapshot_at": _utc_iso(
+                budget.started_at if snapshot is None else snapshot.evaluated_at
+            ),
             "source_fields": source_fields,
         }
         _validate_source_status_data(data)
@@ -2235,6 +2318,9 @@ def _validate_source_status_data(data: object) -> None:
         data["request_id"]
     ):
         raise ValueError("source status request id is invalid")
+    snapshot_at = _parse_utc_iso(data["snapshot_at"], "source status snapshot")
+    if snapshot_at is None:
+        raise ValueError("source status snapshot is required")
     policy = EvidencePolicyV1()
     registry = SourceRegistryV1()
     if (
@@ -2313,6 +2399,11 @@ def _validate_source_status_data(data: object) -> None:
             and last_success_data_as_of > last_success_at
         ):
             raise ValueError("source data date cannot follow its successful retrieval")
+        if any(
+            timestamp is not None and timestamp > snapshot_at
+            for timestamp in (last_failure_at, last_success_at)
+        ):
+            raise ValueError("source attempt time cannot follow its snapshot")
         if (state is SourceFieldState.COOLDOWN) != (cooldown_until is not None):
             raise ValueError("source cooldown state and expiry must be paired")
         if state is SourceFieldState.NOT_CHECKED and any(
@@ -2338,7 +2429,7 @@ def _validate_source_status_data(data: object) -> None:
             failure_reason not in TRANSIENT_SOURCE_ERRORS
             or item["consecutive_failures"] <= 0
             or cooldown_until is None
-            or cooldown_until <= _request_finish_now()
+            or cooldown_until <= snapshot_at
         ):
             raise ValueError("cooldown state requires an active transient failure")
         if state is SourceFieldState.UNSUPPORTED and (
