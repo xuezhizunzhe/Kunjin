@@ -1,4 +1,4 @@
 interface:
   display_name: "KunJin Fund Research"
-  short_description: "Research personal funds with gated evidence"
-  default_prompt: "Use $kunjin-fund for amount-free fund research and classification evidence; keep every result research_only and run suitability, allocation, and current D1 gates before any directional or position-size discussion."
+  short_description: "Route personal funds with classification evidence"
+  default_prompt: "Use $kunjin-fund to route each fund subquestion by action, return evidence-backed research_only or conditional guidance, and never trade automatically."

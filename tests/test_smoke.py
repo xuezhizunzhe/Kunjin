@@ -21,6 +21,76 @@ class OcrMustNotRun:
 
 
 class SmokeTest(unittest.TestCase):
+    def test_kunjin_skill_routes_subquestions_and_preserves_phase0_boundaries(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        agent = (root / "integrations/codex/kunjin-fund/agents/openai.yaml").read_text(
+            encoding="utf-8"
+        )
+        normalized_skill = " ".join(skill.split())
+
+        self.assertLess(len(skill.splitlines()), 500)
+        for action in (
+            "fact_research",
+            "continue_holding",
+            "reduce_to_cash",
+            "full_exit",
+            "buy_or_add",
+            "switch_funds",
+        ):
+            self.assertIn(f"--action {action}", skill)
+
+        for phrase in (
+            "Decompose every request into independently answerable subquestions",
+            "Run one JSON `decision route` before researching each routed request",
+            "Facts are not blocked by Phase B or Phase C",
+            "fresh current route",
+            "minimum_state=no_add",
+            "phase_b_blocked",
+            "Research for `reduce_to_cash` and `full_exit` may continue",
+            "position, fee, and settlement facts",
+            "Split `switch_funds` into its reduction leg and purchase leg",
+            "Phase B, Phase C, D1, D2, D3, and post-trade",
+            "Do not give a mature buy or add recommendation",
+            "Rapid is the default and has a 90-second terminal budget",
+            "Deep is explicit and has a 480-second terminal budget",
+            "source status",
+            "cooldown",
+            "partial result",
+            "manual supplementation",
+            "Never develop a new source adapter during the user's request",
+            "Never continue work in the background after returning",
+            (
+                "Do not claim the 90/480-second budgets for legacy `sync fund`, "
+                "`sync market`, `sync portfolio`, `sync fund-documents`, `sync daily`, "
+                "or `fund peers`"
+            ),
+            "D1 remains `research_only`",
+            "Docker is optional",
+            "Never execute a trade",
+        ):
+            self.assertIn(phrase, normalized_skill)
+
+        self.assertNotIn(
+            "For every buy, hold, add, reduce, sell, rebalance, position-size, or other "
+            "directional request, follow this gate in order",
+            normalized_skill,
+        )
+        self.assertNotIn(
+            "If `blocked`, stop and explain the exact Phase B hard-block",
+            normalized_skill,
+        )
+        for phrase in (
+            "$kunjin-fund",
+            "route each fund subquestion by action",
+            "evidence-backed research_only or conditional guidance",
+            "never trade automatically",
+        ):
+            self.assertIn(phrase, agent)
+        self.assertNotIn("before any directional or position-size discussion", agent)
+
     def test_phase0_commands_are_top_level_json_contracts(self) -> None:
         root = Path(__file__).resolve().parents[1]
         cli = (root / "src/kunjin/cli.py").read_text(encoding="utf-8")
@@ -291,6 +361,7 @@ class SmokeTest(unittest.TestCase):
         agent = (root / "integrations/codex/kunjin-fund/agents/openai.yaml").read_text(
             encoding="utf-8"
         )
+        normalized_skill = " ".join(skill.split())
 
         for command in (
             "--json suitability assess",
@@ -332,15 +403,15 @@ class SmokeTest(unittest.TestCase):
             "insufficient_data",
             "research_only",
         ):
-            self.assertIn(phrase, skill)
+            self.assertIn(phrase, normalized_skill)
         self.assertIn(
             "exact block, binding-constraint, and profile-conflict codes",
-            skill,
+            normalized_skill,
         )
 
         self.assertIn("$kunjin-fund", agent)
-        self.assertIn("suitability", agent)
-        self.assertIn("allocation", agent)
+        self.assertIn("route each fund subquestion by action", agent)
+        self.assertIn("conditional guidance", agent)
         self.assertIn("research_only", agent)
 
     def test_phase_d1_readme_and_skill_contracts_are_packaged(self) -> None:
@@ -350,6 +421,7 @@ class SmokeTest(unittest.TestCase):
         agent = (root / "integrations/codex/kunjin-fund/agents/openai.yaml").read_text(
             encoding="utf-8"
         )
+        normalized_skill = " ".join(skill.split())
 
         commands = (
             "--json sync fund-documents",
@@ -402,7 +474,10 @@ class SmokeTest(unittest.TestCase):
         ):
             self.assertIn(phrase, readme)
 
-        self.assertIn("fact-only D1 research does not require Phase B or Phase C", skill)
+        self.assertIn(
+            "fact-only D1 research does not require Phase B or Phase C",
+            normalized_skill,
+        )
         self.assertLess(
             skill.index("--json suitability assess"),
             skill.index("--json allocation ranges"),
@@ -425,11 +500,11 @@ class SmokeTest(unittest.TestCase):
                 "or document content"
             ),
             "unsupported is not missing evidence",
-            "Stop on every non-`verified` D1 result",
+            "Non-`verified` D1 evidence may still support dated, attributed facts",
             "D2 portfolio correlation and overlap controls",
             "D3 product-selection and pre-purchase checks",
         ):
-            self.assertIn(phrase, skill)
+            self.assertIn(phrase, normalized_skill)
 
         self.assertIn("$kunjin-fund", agent)
         self.assertIn("classification evidence", agent)
