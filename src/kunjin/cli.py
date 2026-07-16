@@ -34,6 +34,14 @@ from kunjin.allocation.service import (
 from kunjin.allocation.store import AllocationAssessmentStore, AllocationPolicyStore
 from kunjin.analytics.portfolio import analyze_portfolio
 from kunjin.analytics.research import analyze_fund_history, analyze_sectors
+from kunjin.decision.budget import RequestBudget
+from kunjin.decision.health import SourceHealthService
+from kunjin.decision.models import (
+    ForceReasonCode,
+    RequestMode,
+    RequestTerminalStatus,
+)
+from kunjin.decision.store import DecisionAuditStore
 from kunjin.funds.peers.analytics import PEER_CALCULATION_VERSION
 from kunjin.funds.peers.research import (
     build_explicit_compare_report,
@@ -64,7 +72,9 @@ from kunjin.funds.risk.store import FundRiskStore
 from kunjin.funds.service import (
     HOLDING_SECTIONS,
     PROFILE_SECTIONS,
+    SECTION_SPECS,
     FundDisclosureService,
+    SourceRequestContext,
 )
 from kunjin.funds.sources import FundTextClient
 from kunjin.funds.store import FundDisclosureStore
@@ -221,9 +231,21 @@ class InvalidReportPeriodError(ValueError):
     code = "invalid_report_period"
 
 
+class BoundedDisclosureSyncError(ValueError):
+    code = "fund_disclosure_sync_failed"
+
+    def __init__(self, request_metadata: Dict[str, Any]) -> None:
+        self.request_metadata = request_metadata
+        super().__init__("bounded fund disclosure synchronization failed")
+
+
 class KunjinArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise CliUsageError(message)
+
+
+def _request_finish_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -423,6 +445,17 @@ def build_parser() -> argparse.ArgumentParser:
     sync_fund_profile.add_argument("fund_code")
     sync_fund_holdings = sync_subparsers.add_parser("fund-holdings")
     sync_fund_holdings.add_argument("fund_code")
+    for bounded_sync in (sync_fund_profile, sync_fund_holdings):
+        bounded_sync.add_argument(
+            "--mode",
+            choices=[item.value for item in RequestMode],
+            default=RequestMode.RAPID.value,
+        )
+        bounded_sync.add_argument("--force", action="store_true")
+        bounded_sync.add_argument(
+            "--force-reason",
+            choices=[item.value for item in ForceReasonCode],
+        )
     sync_fund_peers = sync_subparsers.add_parser("fund-peers")
     sync_fund_peers.add_argument("fund_code")
     sync_fund_peers.add_argument("--candidate", action="append", default=[])
@@ -661,15 +694,134 @@ def _report_metadata(
     }
 
 
-def _sync_disclosure(context: ApplicationContext, fund_code: str, profile: bool) -> Dict[str, Any]:
+def _sync_disclosure(
+    context: ApplicationContext,
+    fund_code: str,
+    profile: bool,
+    *,
+    mode: RequestMode,
+    force_reason: Optional[ForceReasonCode],
+) -> Dict[str, Any]:
     _validate_fund_code(fund_code)
     if context.fund_disclosure_service is None:
         raise ValueError("fund disclosure service is unavailable")
-    result = (
-        context.fund_disclosure_service.sync_profile(fund_code)
-        if profile
-        else context.fund_disclosure_service.sync_holdings(fund_code)
+    budget = RequestBudget.create(mode)
+    audit_store = DecisionAuditStore(context.repository)
+    request_run_id = audit_store.begin_request(budget)
+    health_service = SourceHealthService(audit_store)
+    request_context = SourceRequestContext(
+        request_run_id,
+        budget,
+        audit_store,
+        health_service,
+        force_reason,
     )
+    requested_sections = PROFILE_SECTIONS if profile else HOLDING_SECTIONS
+    terminal_status = RequestTerminalStatus.FAILED
+    omitted_work: Tuple[str, ...] = ()
+    result = None
+
+    def request_metadata() -> Dict[str, Any]:
+        return {
+            "request_id": budget.request_id,
+            "mode": budget.mode.value,
+            "terminal_status": terminal_status.value,
+            "deadline_at": budget.deadline_at.isoformat(),
+            "omitted_work": list(omitted_work),
+        }
+
+    def finalize(primary: Optional[BaseException] = None) -> None:
+        nonlocal terminal_status
+        finished_at = _request_finish_now()
+        if finished_at < budget.started_at:
+            terminal_status = RequestTerminalStatus.FAILED
+            finished_at = budget.started_at
+        elif finished_at >= budget.deadline_at:
+            budget.cancel("request_deadline_reached")
+            terminal_status = RequestTerminalStatus.EXPIRED
+        try:
+            audit_store.finalize_request(
+                request_run_id,
+                terminal_status,
+                finished_at,
+                omitted_work,
+            )
+        except BaseException as finalization_error:
+            if primary is not None:
+                raise primary.with_traceback(primary.__traceback__) from finalization_error
+            raise BoundedDisclosureSyncError(request_metadata()) from finalization_error
+
+    try:
+        result = (
+            context.fund_disclosure_service.sync_profile(
+                fund_code,
+                request_context=request_context,
+            )
+            if profile
+            else context.fund_disclosure_service.sync_holdings(
+                fund_code,
+                request_context=request_context,
+            )
+        )
+        omitted_work = result.omitted_work
+        usable = tuple(
+            item
+            for item in result.sections.values()
+            if item.error_code is None and item.status in {"success", "not_disclosed"}
+        )
+        if budget.cancelled:
+            terminal_status = (
+                RequestTerminalStatus.EXPIRED
+                if budget.cancel_reason
+                in {"request_expired", "worker_timeout", "request_deadline_reached"}
+                else RequestTerminalStatus.CANCELLED
+            )
+        elif not usable:
+            terminal_status = RequestTerminalStatus.FAILED
+        elif omitted_work or len(usable) != len(result.sections):
+            terminal_status = RequestTerminalStatus.PARTIAL
+        else:
+            terminal_status = RequestTerminalStatus.COMPLETE
+    except (KeyboardInterrupt, SystemExit) as error:
+        budget.cancel("request_cancelled")
+        terminal_status = RequestTerminalStatus.CANCELLED
+        omitted_work = tuple(
+            dict.fromkeys(
+                (
+                    *requested_sections,
+                    *(
+                        SECTION_SPECS[item].audit_field_id
+                        for item in requested_sections
+                    ),
+                )
+            )
+        )
+        finalize(error)
+        raise
+    except Exception as error:
+        terminal_status = (
+            RequestTerminalStatus.EXPIRED
+            if budget.cancelled
+            and budget.cancel_reason
+            in {"request_expired", "worker_timeout", "request_deadline_reached"}
+            else RequestTerminalStatus.FAILED
+        )
+        omitted_work = tuple(
+            dict.fromkeys(
+                (
+                    *requested_sections,
+                    *(
+                        SECTION_SPECS[item].audit_field_id
+                        for item in requested_sections
+                    ),
+                )
+            )
+        )
+        finalize(error)
+        raise BoundedDisclosureSyncError(request_metadata()) from error
+    finalize()
+    if result is None:
+        raise BoundedDisclosureSyncError(request_metadata())
     report = _disclosure_report(context, fund_code)
     failed_sections = [
         {
@@ -683,6 +835,7 @@ def _sync_disclosure(context: ApplicationContext, fund_code: str, profile: bool)
     data = {
         "fund_code": fund_code,
         "sections": serialize(result.sections),
+        "request": request_metadata(),
         **_report_metadata(report, failed_sections),
     }
     successful = any(
@@ -1601,7 +1754,24 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         "fund-holdings",
     }:
         profile = args.sync_command == "fund-profile"
-        result = _sync_disclosure(context, args.fund_code, profile)
+        mode = RequestMode(args.mode)
+        if args.force:
+            if mode is not RequestMode.DEEP:
+                raise CliUsageError("force requires deep mode")
+            if args.force_reason is None:
+                raise CliUsageError("force requires an allowlisted non-empty reason")
+            force_reason = ForceReasonCode(args.force_reason)
+        else:
+            if args.force_reason is not None:
+                raise CliUsageError("force reason requires --force")
+            force_reason = None
+        result = _sync_disclosure(
+            context,
+            args.fund_code,
+            profile,
+            mode=mode,
+            force_reason=force_reason,
+        )
         command = f"sync.{args.sync_command}"
         errors = []
         if not result["successful"]:
@@ -2033,8 +2203,14 @@ def run(
             message = _RISK_PUBLIC_ERROR_MESSAGES[code]
             if exc.reason is not None:
                 message = f"{message}: {exc.reason}"
+        error_data = (
+            {"request": exc.request_metadata}
+            if isinstance(exc, BoundedDisclosureSyncError)
+            else None
+        )
         payload = envelope(
             (_command_name(args) if args is not None else _command_name_from_argv(raw_argv)),
+            error_data,
             errors=[{"code": str(code), "message": message}],
         )
         exit_code = 1

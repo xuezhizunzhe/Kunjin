@@ -8,6 +8,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Type
 
+from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.funds.models import (
     AssetType,
     DisclosureBundle,
@@ -109,7 +110,10 @@ class FundDisclosureStore:
         records: Iterable[Any],
         state: str,
         warning: Optional[str] = None,
+        *,
+        budget: Optional[RequestBudget] = None,
     ) -> int:
+        self._require_budget(budget)
         section_name = _section_value(section)
         if state not in {"success", "not_disclosed"}:
             raise ValueError("publication state must be success or not_disclosed")
@@ -142,7 +146,9 @@ class FundDisclosureStore:
                 raise ValueError("publication records must not already be stored")
 
         attempted_at = source.retrieved_at.isoformat()
-        with self.repository.connect() as connection, connection:
+        with self.repository.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_budget(budget)
             connection.execute(
                 """
                 INSERT OR IGNORE INTO fund_source_documents(
@@ -176,6 +182,7 @@ class FundDisclosureStore:
                     connection,
                     replace(record, source_document_id=source_document_id),
                 )
+                self._require_budget(budget)
             connection.execute(
                 """
                 INSERT INTO fund_section_syncs(
@@ -201,6 +208,8 @@ class FundDisclosureStore:
                     warning,
                 ),
             )
+            self._require_budget(budget)
+            connection.commit()
         return source_document_id
 
     def mark_section_failure(
@@ -210,7 +219,10 @@ class FundDisclosureStore:
         error_code: str,
         error_message: str,
         attempted_at: datetime,
+        *,
+        budget: Optional[RequestBudget] = None,
     ) -> None:
+        self._require_budget(budget)
         section_name = _section_value(section)
         if len(fund_code) != 6 or not fund_code.isdigit():
             raise ValueError(f"invalid fund code: {fund_code}")
@@ -218,7 +230,9 @@ class FundDisclosureStore:
             raise ValueError("attempted_at must be timezone-aware")
         if not error_code or not error_message:
             raise ValueError("failure code and message are required")
-        with self.repository.connect() as connection, connection:
+        with self.repository.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_budget(budget)
             connection.execute(
                 """
                 INSERT INTO fund_section_syncs(
@@ -233,6 +247,18 @@ class FundDisclosureStore:
                 """,
                 (fund_code, section_name, attempted_at.isoformat(), error_code, error_message),
             )
+            self._require_budget(budget)
+            connection.commit()
+
+    @staticmethod
+    def _require_budget(budget: Optional[RequestBudget]) -> None:
+        if budget is None:
+            return
+        if type(budget) is not RequestBudget:
+            raise ValueError("budget must be an exact RequestBudget or None")
+        if budget.worker_seconds() <= 0.0:
+            raise BudgetExpired("request work budget is exhausted")
+        budget.require_publishable()
 
     def section_status(self, fund_code: str) -> Dict[str, Dict[str, Optional[str]]]:
         with self.repository.connect() as connection:

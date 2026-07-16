@@ -5,7 +5,7 @@ import re
 import tempfile
 import unittest
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +23,7 @@ from kunjin.allocation.service import (
 )
 from kunjin.allocation.store import AllocationAssessmentStore, AllocationPolicyStore
 from kunjin.cli import ApplicationContext, build_context, run
+from kunjin.decision.models import ForceReasonCode
 from kunjin.funds.models import DisclosureBundle, DocumentKind
 from kunjin.funds.peers.models import (
     MembershipKind,
@@ -186,15 +187,17 @@ class FakeDisclosureService:
         self.snapshots = snapshots or {}
         self.calls = []
 
-    def sync_profile(self, fund_code):
+    def sync_profile(self, fund_code, *, request_context=None):
         self.calls.append(("profile", fund_code))
-        if isinstance(self.profile_result, Exception):
+        self.request_context = request_context
+        if isinstance(self.profile_result, BaseException):
             raise self.profile_result
         return self.profile_result
 
-    def sync_holdings(self, fund_code):
+    def sync_holdings(self, fund_code, *, request_context=None):
         self.calls.append(("holdings", fund_code))
-        if isinstance(self.holdings_result, Exception):
+        self.request_context = request_context
+        if isinstance(self.holdings_result, BaseException):
             raise self.holdings_result
         return self.holdings_result
 
@@ -2434,11 +2437,200 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(partial["errors"], [])
         self.assertTrue(partial["data"]["errors"])
+        self.assertEqual(
+            set(partial["data"]["request"]),
+            {
+                "request_id",
+                "mode",
+                "terminal_status",
+                "deadline_at",
+                "omitted_work",
+            },
+        )
+        self.assertRegex(partial["data"]["request"]["request_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(partial["data"]["request"]["mode"], "rapid")
+        self.assertEqual(partial["data"]["request"]["terminal_status"], "partial")
+        self.assertEqual(
+            datetime.fromisoformat(partial["data"]["request"]["deadline_at"])
+            - service.request_context.budget.started_at,
+            timedelta(seconds=90),
+        )
 
         failed, exit_code, _ = run(["--json", "sync", "fund-holdings", "519755"], self.context)
         self.assertEqual(exit_code, 1)
         self.assertEqual(failed["errors"][0]["code"], "fund_disclosure_sync_failed")
         self.assertEqual(len(failed["data"]["errors"]), 2)
+        self.assertEqual(failed["data"]["request"]["terminal_status"], "failed")
+
+    def test_disclosure_sync_deep_force_is_allowlisted_and_bound_to_context(self) -> None:
+        self.context.fund_disclosure_store = FakeDisclosureStore(empty_disclosure_bundle())
+        service = FakeDisclosureService(profile=disclosure_sync_result())
+        self.context.fund_disclosure_service = service
+
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "sync",
+                "fund-profile",
+                "519755",
+                "--mode",
+                "deep",
+                "--force",
+                "--force-reason",
+                "verify_source_recovery",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["request"]["mode"], "deep")
+        self.assertEqual(service.request_context.budget.total_seconds, 480.0)
+        self.assertEqual(
+            datetime.fromisoformat(payload["data"]["request"]["deadline_at"])
+            - service.request_context.budget.started_at,
+            timedelta(seconds=480),
+        )
+        self.assertIs(
+            service.request_context.force_reason,
+            ForceReasonCode.VERIFY_SOURCE_RECOVERY,
+        )
+
+    def test_disclosure_sync_rejects_invalid_force_combinations_before_fetch(self) -> None:
+        service = FakeDisclosureService(profile=disclosure_sync_result())
+        self.context.fund_disclosure_service = service
+        for argv in (
+            [
+                "--json",
+                "sync",
+                "fund-profile",
+                "519755",
+                "--force",
+                "--force-reason",
+                "verify_source_recovery",
+            ],
+            [
+                "--json",
+                "sync",
+                "fund-profile",
+                "519755",
+                "--mode",
+                "deep",
+                "--force",
+            ],
+            [
+                "--json",
+                "sync",
+                "fund-profile",
+                "519755",
+                "--mode",
+                "deep",
+                "--force-reason",
+                "verify_source_recovery",
+            ],
+        ):
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+        self.assertEqual(service.calls, [])
+
+    def test_disclosure_sync_interrupt_finalizes_cancelled_request(self) -> None:
+        service = FakeDisclosureService(profile=KeyboardInterrupt())
+        self.context.fund_disclosure_service = service
+
+        with self.assertRaises(KeyboardInterrupt):
+            run(["--json", "sync", "fund-profile", "519755"], self.context)
+
+        with self.context.repository.connect() as connection:
+            row = connection.execute(
+                "SELECT status, omitted_work_json FROM request_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row["status"], "cancelled")
+        self.assertIn("basic_profile", json.loads(row["omitted_work_json"]))
+
+    def test_disclosure_sync_exception_keeps_public_request_metadata(self) -> None:
+        secret = f"private failure at {self.context.paths.database} token=never-print"
+        service = FakeDisclosureService(profile=ValueError(secret))
+        self.context.fund_disclosure_service = service
+
+        payload, exit_code, _ = run(
+            ["--json", "sync", "fund-profile", "519755"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            set(payload["data"]["request"]),
+            {
+                "request_id",
+                "mode",
+                "terminal_status",
+                "deadline_at",
+                "omitted_work",
+            },
+        )
+        self.assertEqual(payload["data"]["request"]["terminal_status"], "failed")
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn(str(self.context.paths.database), rendered)
+        self.assertNotIn("never-print", rendered)
+
+    def test_disclosure_sync_expiry_returns_terminal_metadata_and_finalizes(self) -> None:
+        class ExpiringDisclosureService(FakeDisclosureService):
+            def sync_profile(inner_self, fund_code, *, request_context=None):
+                inner_self.calls.append(("profile", fund_code))
+                inner_self.request_context = request_context
+                request_context.budget.cancel("worker_timeout")
+                return inner_self.profile_result
+
+        service = ExpiringDisclosureService(profile=disclosure_sync_result())
+        self.context.fund_disclosure_service = service
+        self.context.fund_disclosure_store = FakeDisclosureStore(empty_disclosure_bundle())
+
+        payload, exit_code, _ = run(
+            ["--json", "sync", "fund-profile", "519755"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["request"]["terminal_status"], "expired")
+        with self.context.repository.connect() as connection:
+            row = connection.execute(
+                "SELECT status, finished_at, deadline_at "
+                "FROM request_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row["status"], "expired")
+        self.assertLessEqual(
+            datetime.fromisoformat(row["finished_at"]),
+            datetime.fromisoformat(row["deadline_at"]),
+        )
+
+    def test_disclosure_sync_late_finish_is_expired_without_backdating_audit(self) -> None:
+        self.context.fund_disclosure_store = FakeDisclosureStore(empty_disclosure_bundle())
+        service = FakeDisclosureService(profile=disclosure_sync_result())
+        self.context.fund_disclosure_service = service
+
+        def late_finish() -> datetime:
+            return service.request_context.budget.deadline_at + timedelta(seconds=1)
+
+        with patch("kunjin.cli._request_finish_now", side_effect=late_finish):
+            payload, exit_code, _ = run(
+                ["--json", "sync", "fund-profile", "519755"],
+                self.context,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["request"]["terminal_status"], "expired")
+        with self.context.repository.connect() as connection:
+            row = connection.execute(
+                "SELECT status, finished_at, deadline_at "
+                "FROM request_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row["status"], "expired")
+        self.assertGreater(
+            datetime.fromisoformat(row["finished_at"]),
+            datetime.fromisoformat(row["deadline_at"]),
+        )
 
     def test_disclosure_commands_reject_invalid_fund_code(self) -> None:
         for argv in (

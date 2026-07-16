@@ -159,6 +159,16 @@ def main() -> int:
         sys.stdout.buffer.write(_response(request, text="\n".join(sorted(os.environ))))
     elif mode == "success":
         sys.stdout.buffer.write(_response(request))
+    elif mode == "success_file":
+        with open(sys.argv[2], encoding="utf-8") as handle:
+            text = handle.read()
+        sys.stdout.buffer.write(
+            _response(
+                request,
+                text=text,
+                retrieved_at=datetime.fromisoformat(sys.argv[3]),
+            )
+        )
     else:
         return 9
     sys.stdout.buffer.flush()

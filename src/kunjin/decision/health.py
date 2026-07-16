@@ -152,6 +152,26 @@ class SourceHealthService:
         request_run_id: int,
         budget: RequestBudget,
     ) -> SourceFieldState:
+        state, _history = self.source_field_state_and_history(
+            source_id,
+            field_id,
+            subject_key,
+            context,
+            request_run_id=request_run_id,
+            budget=budget,
+        )
+        return state
+
+    def source_field_state_and_history(
+        self,
+        source_id: str,
+        field_id: str,
+        subject_key: str,
+        context: FreshnessContext,
+        *,
+        request_run_id: int,
+        budget: RequestBudget,
+    ) -> tuple[SourceFieldState, SourceFieldHistory]:
         reference = SourceFieldRef(source_id, field_id)
         policy = self._field_policy(source_id, field_id)
         trusted_context = self._trusted_context(context, budget)
@@ -161,7 +181,16 @@ class SourceHealthService:
             (reference,),
             subject_key,
         )
-        return self._project_state(histories[0], policy, trusted_context)
+        filtered = SourceFieldHistory(
+            reference,
+            tuple(
+                record
+                for record in histories[0].attempts
+                if record.attempt.finished_at <= trusted_context.now
+            ),
+        )
+        filtered.validate()
+        return self._project_state(filtered, policy, trusted_context), filtered
 
     def resolve_field(
         self,

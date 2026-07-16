@@ -3,14 +3,37 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from kunjin.decision.budget import BudgetExpired, RequestBudget
+from kunjin.decision.health import SourceHealthService
+from kunjin.decision.models import (
+    ForceAuthorization,
+    ForceReasonCode,
+    FreshnessContext,
+    SourceAttempt,
+    SourceAttemptOutcome,
+    SourceErrorCode,
+    SourceFieldHistory,
+    SourceFieldState,
+    SourceWorkAuthorization,
+    StoredSourceAttempt,
+)
+from kunjin.decision.source_registry import SourceRegistryV1
+from kunjin.decision.store import DecisionAuditStore
+from kunjin.decision.worker import WorkerExecutionError, run_public_worker
+from kunjin.decision.worker_protocol import SCHEMA_VERSION, WorkerRequest, WorkerResponse
 from kunjin.funds import parsers
 from kunjin.funds.html import FundParseError
 from kunjin.funds.models import DisclosureBundle, DocumentKind
 from kunjin.funds.parsers import ParsedSection
-from kunjin.funds.sources import FundTextClient, build_disclosure_url, build_f10_url
+from kunjin.funds.sources import (
+    FundTextClient,
+    TextResponse,
+    build_disclosure_url,
+    build_f10_url,
+)
 from kunjin.funds.store import FundDisclosureStore
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -22,6 +45,33 @@ FRESHNESS_VALUES = frozenset({"fresh", "stale", "missing", "unknown"})
 class SectionSpec:
     document_kind: DocumentKind
     parser_name: str
+    worker_field_id: str
+    audit_field_id: str
+
+
+@dataclass(frozen=True)
+class SourceRequestContext:
+    request_run_id: int
+    budget: RequestBudget
+    audit_store: DecisionAuditStore
+    health_service: SourceHealthService
+    force_reason: Optional[ForceReasonCode] = None
+
+    def __post_init__(self) -> None:
+        if type(self) is not SourceRequestContext:
+            raise ValueError("request context subclasses are not accepted")
+        if type(self.request_run_id) is not int or self.request_run_id <= 0:
+            raise ValueError("request run id must be a positive exact integer")
+        if type(self.budget) is not RequestBudget:
+            raise ValueError("budget must be an exact RequestBudget")
+        if type(self.audit_store) is not DecisionAuditStore:
+            raise ValueError("audit store must be an exact DecisionAuditStore")
+        if type(self.health_service) is not SourceHealthService:
+            raise ValueError("health service must be an exact SourceHealthService")
+        if self.health_service.audit_store is not self.audit_store:
+            raise ValueError("health service and request context must share the audit store")
+        if self.force_reason is not None and type(self.force_reason) is not ForceReasonCode:
+            raise ValueError("force reason must be an exact ForceReasonCode")
 
 
 @dataclass(frozen=True)
@@ -41,22 +91,52 @@ class FundDisclosureSyncResult:
     fund_code: str
     sections: Dict[str, SectionSyncResult]
     conflicts: Tuple[str, ...]
+    omitted_work: Tuple[str, ...] = ()
 
 
 SECTION_SPECS = {
-    "basic_profile": SectionSpec(DocumentKind.BASIC_PROFILE, "parse_basic_profile"),
-    "manager_history": SectionSpec(
-        DocumentKind.MANAGER_HISTORY, "parse_manager_history"
+    "basic_profile": SectionSpec(
+        DocumentKind.BASIC_PROFILE,
+        "parse_basic_profile",
+        "basic_profile",
+        "identity_active_status",
     ),
-    "fee_schedule": SectionSpec(DocumentKind.FEE_SCHEDULE, "parse_fee_schedule"),
-    "size_history": SectionSpec(DocumentKind.SIZE_HISTORY, "parse_size_history"),
+    "manager_history": SectionSpec(
+        DocumentKind.MANAGER_HISTORY,
+        "parse_manager_history",
+        "manager_history",
+        "current_manager_team",
+    ),
+    "fee_schedule": SectionSpec(
+        DocumentKind.FEE_SCHEDULE,
+        "parse_fee_schedule",
+        "fee_schedule",
+        "fees_share_class_relationship",
+    ),
+    "size_history": SectionSpec(
+        DocumentKind.SIZE_HISTORY,
+        "parse_size_history",
+        "size_history",
+        "identity_active_status",
+    ),
     "quarterly_holdings": SectionSpec(
-        DocumentKind.QUARTERLY_HOLDINGS, "parse_quarterly_holdings"
+        DocumentKind.QUARTERLY_HOLDINGS,
+        "parse_quarterly_holdings",
+        "quarterly_holdings",
+        "holdings_industries",
     ),
     "industry_exposure": SectionSpec(
-        DocumentKind.INDUSTRY_EXPOSURE, "parse_industry_exposure"
+        DocumentKind.INDUSTRY_EXPOSURE,
+        "parse_industry_exposure",
+        "industry_exposure",
+        "holdings_industries",
     ),
-    "announcements": SectionSpec(DocumentKind.ANNOUNCEMENT, "parse_announcements"),
+    "announcements": SectionSpec(
+        DocumentKind.ANNOUNCEMENT,
+        "parse_announcements",
+        "announcement",
+        "fund_manager_product_announcement",
+    ),
 }
 
 PROFILE_SECTIONS = (
@@ -120,22 +200,54 @@ class FundDisclosureService:
         client: FundTextClient,
         store: FundDisclosureStore,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        worker_runner: Callable[[WorkerRequest, RequestBudget], WorkerResponse] = (
+            run_public_worker
+        ),
     ) -> None:
         self.client = client
         self.store = store
         self.now = now
+        self.worker_runner = worker_runner
 
-    def sync_profile(self, fund_code: str) -> FundDisclosureSyncResult:
-        return self._sync(fund_code, PROFILE_SECTIONS)
+    def sync_profile(
+        self,
+        fund_code: str,
+        *,
+        request_context: Optional[SourceRequestContext] = None,
+    ) -> FundDisclosureSyncResult:
+        return self._sync(fund_code, PROFILE_SECTIONS, request_context=request_context)
 
-    def sync_classification(self, fund_code: str) -> FundDisclosureSyncResult:
-        return self._sync(fund_code, CLASSIFICATION_SECTIONS)
+    def sync_classification(
+        self,
+        fund_code: str,
+        *,
+        request_context: Optional[SourceRequestContext] = None,
+    ) -> FundDisclosureSyncResult:
+        return self._sync(
+            fund_code,
+            CLASSIFICATION_SECTIONS,
+            request_context=request_context,
+        )
 
-    def sync_holdings(self, fund_code: str) -> FundDisclosureSyncResult:
-        return self._sync(fund_code, HOLDING_SECTIONS)
+    def sync_holdings(
+        self,
+        fund_code: str,
+        *,
+        request_context: Optional[SourceRequestContext] = None,
+    ) -> FundDisclosureSyncResult:
+        return self._sync(fund_code, HOLDING_SECTIONS, request_context=request_context)
 
-    def sync_all(self, fund_code: str) -> FundDisclosureSyncResult:
-        return self._sync(fund_code, PROFILE_SECTIONS + HOLDING_SECTIONS)
+    def sync_all(
+        self,
+        fund_code: str,
+        *,
+        request_context: Optional[SourceRequestContext] = None,
+    ) -> FundDisclosureSyncResult:
+        return self._sync(
+            fund_code,
+            PROFILE_SECTIONS + HOLDING_SECTIONS,
+            request_context=request_context,
+        )
 
     def section_snapshot(self, fund_code: str, section: str) -> SectionSyncResult:
         spec = self._spec(section)
@@ -144,11 +256,19 @@ class FundDisclosureService:
         return self._result(section, spec, bundle, as_of)
 
     def _sync(
-        self, fund_code: str, section_names: Tuple[str, ...]
+        self,
+        fund_code: str,
+        section_names: Tuple[str, ...],
+        *,
+        request_context: Optional[SourceRequestContext],
     ) -> FundDisclosureSyncResult:
         # Validate before entering the isolated loop; an invalid identifier is a
         # request error, not a remote section failure.
         build_f10_url(DocumentKind.BASIC_PROFILE, fund_code)
+        if request_context is not None:
+            if type(request_context) is not SourceRequestContext:
+                raise ValueError("request context must be an exact SourceRequestContext")
+            return self._sync_bounded(fund_code, section_names, request_context)
         conflicts = []
         for section_name in section_names:
             spec = self._spec(section_name)
@@ -191,17 +311,582 @@ class FundDisclosureService:
             conflicts=tuple(dict.fromkeys(conflicts)),
         )
 
-    def _fetch_and_parse(
-        self, fund_code: str, spec: SectionSpec
-    ) -> ParsedSection:
+    def _sync_bounded(
+        self,
+        fund_code: str,
+        section_names: Tuple[str, ...],
+        context: SourceRequestContext,
+    ) -> FundDisclosureSyncResult:
+        groups: Dict[str, List[str]] = {}
+        for section_name in section_names:
+            spec = self._spec(section_name)
+            groups.setdefault(spec.audit_field_id, []).append(section_name)
+        conflicts: List[str] = []
+        omitted: List[str] = []
+        subject_key = f"fund:{fund_code}"
+        try:
+            for audit_field_id, grouped_sections in groups.items():
+                if context.budget.cancelled or context.budget.worker_seconds() <= 0.0:
+                    if not context.budget.cancelled:
+                        context.budget.cancel("request_deadline_reached")
+                    omitted.extend(grouped_sections)
+                    omitted.append(audit_field_id)
+                    continue
+                self._sync_bounded_group(
+                    fund_code,
+                    audit_field_id,
+                    tuple(grouped_sections),
+                    subject_key,
+                    context,
+                    conflicts,
+                    omitted,
+                )
+        except (KeyboardInterrupt, SystemExit):
+            context.budget.cancel("request_cancelled")
+            omitted.extend(
+                section for section in section_names if section not in omitted
+            )
+            raise
+
+        as_of = self._aware_now()
+        bundle = self.store.load_bundle(fund_code)
+        return FundDisclosureSyncResult(
+            fund_code=fund_code,
+            sections={
+                section_name: self._result(
+                    section_name, self._spec(section_name), bundle, as_of
+                )
+                for section_name in section_names
+            },
+            conflicts=tuple(dict.fromkeys(conflicts)),
+            omitted_work=tuple(dict.fromkeys(omitted)),
+        )
+
+    def _sync_bounded_group(
+        self,
+        fund_code: str,
+        audit_field_id: str,
+        section_names: Tuple[str, ...],
+        subject_key: str,
+        context: SourceRequestContext,
+        conflicts: List[str],
+        omitted: List[str],
+    ) -> None:
+        authorization = None
+        if context.force_reason is not None:
+            authorization = context.health_service.force_authorization(
+                context.budget,
+                "eastmoney_f10",
+                audit_field_id,
+                subject_key,
+                context.force_reason,
+                request_run_id=context.request_run_id,
+                attempt_number=1,
+            )
+            if authorization is None:
+                omitted.extend(section_names)
+                omitted.append(audit_field_id)
+                return
+        else:
+            freshness_context = self._health_context(
+                fund_code,
+                audit_field_id,
+                context,
+            )
+            state, trusted_history = (
+                context.health_service.source_field_state_and_history(
+                "eastmoney_f10",
+                audit_field_id,
+                subject_key,
+                freshness_context,
+                request_run_id=context.request_run_id,
+                budget=context.budget,
+            )
+            )
+            cached_data_as_of = next(
+                (
+                    record.attempt.data_as_of
+                    for record in trusted_history.attempts
+                    if record.attempt.outcome
+                    in {SourceAttemptOutcome.SUCCESS, SourceAttemptOutcome.CACHE_HIT}
+                    and record.attempt.data_as_of is not None
+                ),
+                None,
+            )
+            if (
+                state is SourceFieldState.HEALTHY
+                and cached_data_as_of is not None
+                and self._group_cache_is_current(fund_code, section_names)
+            ):
+                now = self._audit_now(context)
+                self._record_attempt(
+                    audit_field_id,
+                    subject_key,
+                    1,
+                    SourceAttemptOutcome.CACHE_HIT,
+                    now,
+                    now,
+                    cached_data_as_of,
+                    None,
+                    None,
+                    0,
+                    context,
+                    None,
+                )
+                return
+            if state is SourceFieldState.COOLDOWN:
+                self._record_cooldown_skip(
+                    audit_field_id,
+                    subject_key,
+                    context,
+                    trusted_history,
+                )
+                omitted.extend(section_names)
+                omitted.append(audit_field_id)
+                return
+
+        first = self._execute_bounded_attempt(
+            fund_code,
+            audit_field_id,
+            section_names,
+            subject_key,
+            1,
+            context,
+            authorization,
+            conflicts,
+            omitted,
+        )
+        if first[0] is SourceAttemptOutcome.SUCCESS:
+            return
+        if first[0] is not SourceAttemptOutcome.TRANSIENT_FAILURE:
+            omitted.extend(first[3])
+            omitted.append(audit_field_id)
+            return
+        parent = first[4]
+        retry = context.health_service.retry_allowed(
+            parent,
+            context.budget,
+            request_run_id=context.request_run_id,
+            minimum_worker_seconds=0.25,
+        )
+        if retry is None:
+            omitted.extend(first[3])
+            omitted.append(audit_field_id)
+            return
+        failed_sections = first[3]
+        second = self._execute_bounded_attempt(
+            fund_code,
+            audit_field_id,
+            failed_sections,
+            subject_key,
+            2,
+            context,
+            retry,
+            conflicts,
+            omitted,
+        )
+        if second[0] is not SourceAttemptOutcome.SUCCESS:
+            omitted.extend(second[3])
+            omitted.append(audit_field_id)
+
+    def _execute_bounded_attempt(
+        self,
+        fund_code: str,
+        audit_field_id: str,
+        section_names: Tuple[str, ...],
+        subject_key: str,
+        attempt_number: int,
+        context: SourceRequestContext,
+        authorization: object,
+        conflicts: List[str],
+        omitted: List[str],
+    ) -> Tuple[
+        SourceAttemptOutcome,
+        Optional[SourceErrorCode],
+        int,
+        Tuple[str, ...],
+        StoredSourceAttempt,
+    ]:
+        started_at = self._audit_now(context)
+        response_bytes = 0
+        data_dates: List[datetime] = []
+        failures: List[Tuple[str, SourceAttemptOutcome, SourceErrorCode]] = []
+        for index, section_name in enumerate(section_names):
+            spec = self._spec(section_name)
+            try:
+                context.budget.require_publishable()
+                response = self.worker_runner(
+                    self._worker_request(fund_code, spec, context.budget),
+                    context.budget,
+                )
+                if not response.ok:
+                    error_code = SourceErrorCode(response.reason_code)
+                    outcome = self._failure_outcome(error_code)
+                    failures.append((section_name, outcome, error_code))
+                    self._mark_failure(
+                        fund_code,
+                        spec,
+                        error_code.value,
+                        context,
+                    )
+                    continue
+                payload = response.payload
+                if payload is None:
+                    raise ValueError("worker success payload is missing")
+                response_bytes += len(payload.text.encode("utf-8"))
+                parsed = self._parse_response(
+                    fund_code,
+                    spec,
+                    TextResponse(
+                        requested_url=payload.requested_url,
+                        final_url=payload.final_url,
+                        text=payload.text,
+                        retrieved_at=payload.retrieved_at,
+                        checksum=payload.checksum,
+                        content_type=payload.content_type,
+                    ),
+                )
+                context.budget.require_publishable()
+                self.store.publish_section(
+                    fund_code,
+                    spec.document_kind,
+                    parsed.source,
+                    parsed.records,
+                    parsed.state,
+                    warning="; ".join(parsed.warnings) or None,
+                    budget=context.budget,
+                )
+                conflicts.extend(
+                    f"{section_name}:{conflict}" for conflict in parsed.conflicts
+                )
+                data_dates.append(payload.retrieved_at)
+            except BudgetExpired:
+                context.budget.cancel("request_deadline_reached")
+                failures.append(
+                    (
+                        section_name,
+                        SourceAttemptOutcome.EXPIRED,
+                        SourceErrorCode.REQUEST_EXPIRED,
+                    )
+                )
+                omitted.extend(section_names[index:])
+                break
+            except WorkerExecutionError:
+                if context.budget.cancelled:
+                    outcome = SourceAttemptOutcome.EXPIRED
+                    code = SourceErrorCode.REQUEST_EXPIRED
+                    omitted.extend(section_names[index:])
+                else:
+                    outcome = SourceAttemptOutcome.UNAVAILABLE
+                    code = SourceErrorCode.SOURCE_UNAVAILABLE
+                failures.append((section_name, outcome, code))
+                if not context.budget.cancelled:
+                    self._mark_failure(fund_code, spec, code.value, context)
+                else:
+                    break
+            except FundParseError as error:
+                code = (
+                    SourceErrorCode.IDENTITY_CONFLICT
+                    if error.code == "identity_conflict"
+                    else SourceErrorCode.PARSE_FAILURE
+                )
+                failures.append((section_name, SourceAttemptOutcome.UNAVAILABLE, code))
+                self._mark_failure(fund_code, spec, error.code, context)
+                if code is SourceErrorCode.IDENTITY_CONFLICT:
+                    conflicts.append(f"{section_name}:identity_conflict")
+            except (KeyboardInterrupt, SystemExit):
+                failures.append(
+                    (
+                        section_name,
+                        SourceAttemptOutcome.CANCELLED,
+                        SourceErrorCode.REQUEST_CANCELLED,
+                    )
+                )
+                omitted.extend(section_names[index:])
+                context.budget.cancel("request_cancelled")
+                self._record_attempt(
+                    audit_field_id,
+                    subject_key,
+                    attempt_number,
+                    SourceAttemptOutcome.CANCELLED,
+                    started_at,
+                    self._audit_now_or_deadline(context),
+                    None,
+                    SourceErrorCode.REQUEST_CANCELLED,
+                    None,
+                    response_bytes,
+                    context,
+                    authorization,
+                )
+                raise
+            except (TypeError, ValueError):
+                failures.append(
+                    (
+                        section_name,
+                        SourceAttemptOutcome.UNAVAILABLE,
+                        SourceErrorCode.VALIDATION_FAILURE,
+                    )
+                )
+                self._mark_failure(
+                    fund_code,
+                    spec,
+                    SourceErrorCode.VALIDATION_FAILURE.value,
+                    context,
+                )
+
+        outcome, error_code = self._group_outcome(failures)
+        finished_at = self._audit_now_or_deadline(context)
+        data_as_of = min(data_dates) if outcome is SourceAttemptOutcome.SUCCESS else None
+        cooldown_until = (
+            context.health_service.cooldown_until(finished_at)
+            if outcome is SourceAttemptOutcome.TRANSIENT_FAILURE
+            else None
+        )
+        stored_attempt = self._record_attempt(
+            audit_field_id,
+            subject_key,
+            attempt_number,
+            outcome,
+            started_at,
+            finished_at,
+            data_as_of,
+            error_code,
+            cooldown_until,
+            response_bytes,
+            context,
+            authorization,
+        )
+        return (
+            outcome,
+            error_code,
+            response_bytes,
+            tuple(item[0] for item in failures),
+            stored_attempt,
+        )
+
+    @staticmethod
+    def _group_outcome(
+        failures: List[Tuple[str, SourceAttemptOutcome, SourceErrorCode]],
+    ) -> Tuple[SourceAttemptOutcome, Optional[SourceErrorCode]]:
+        if not failures:
+            return SourceAttemptOutcome.SUCCESS, None
+        if any(item[1] is SourceAttemptOutcome.CANCELLED for item in failures):
+            return SourceAttemptOutcome.CANCELLED, SourceErrorCode.REQUEST_CANCELLED
+        if any(item[1] is SourceAttemptOutcome.EXPIRED for item in failures):
+            return SourceAttemptOutcome.EXPIRED, SourceErrorCode.REQUEST_EXPIRED
+        if all(item[1] is SourceAttemptOutcome.TRANSIENT_FAILURE for item in failures):
+            return SourceAttemptOutcome.TRANSIENT_FAILURE, failures[0][2]
+        if all(item[1] is SourceAttemptOutcome.UNSUPPORTED for item in failures):
+            return SourceAttemptOutcome.UNSUPPORTED, failures[0][2]
+        non_transient = next(
+            (item[2] for item in failures if item[1] is SourceAttemptOutcome.UNAVAILABLE),
+            SourceErrorCode.SOURCE_UNAVAILABLE,
+        )
+        return SourceAttemptOutcome.UNAVAILABLE, non_transient
+
+    @staticmethod
+    def _failure_outcome(error_code: SourceErrorCode) -> SourceAttemptOutcome:
+        if error_code in {
+            SourceErrorCode.DNS_FAILURE,
+            SourceErrorCode.TRANSIENT_NETWORK_FAILURE,
+            SourceErrorCode.NETWORK_TIMEOUT,
+        }:
+            return SourceAttemptOutcome.TRANSIENT_FAILURE
+        if error_code in {
+            SourceErrorCode.FIELD_UNSUPPORTED,
+            SourceErrorCode.SOURCE_CONTRACT_UNSUPPORTED,
+            SourceErrorCode.HTTP_NOT_FOUND,
+            SourceErrorCode.HTTP_GONE,
+        }:
+            return SourceAttemptOutcome.UNSUPPORTED
+        return SourceAttemptOutcome.UNAVAILABLE
+
+    def _record_attempt(
+        self,
+        audit_field_id: str,
+        subject_key: str,
+        attempt_number: int,
+        outcome: SourceAttemptOutcome,
+        started_at: datetime,
+        finished_at: datetime,
+        data_as_of: Optional[datetime],
+        error_code: Optional[SourceErrorCode],
+        cooldown_until: Optional[datetime],
+        response_bytes: int,
+        context: SourceRequestContext,
+        authorization: object,
+    ) -> StoredSourceAttempt:
+        registry = SourceRegistryV1()
+        force_actor = None
+        force_reason = None
+        if context.force_reason is not None and attempt_number == 1:
+            force_actor = "local_owner"
+            force_reason = context.force_reason
+        attempt = SourceAttempt(
+            source_id="eastmoney_f10",
+            field_id=audit_field_id,
+            subject_key=subject_key,
+            attempt_number=attempt_number,
+            outcome=outcome,
+            started_at=started_at,
+            finished_at=finished_at,
+            data_as_of=data_as_of,
+            error_code=error_code,
+            cooldown_until=cooldown_until,
+            force_actor=force_actor,
+            force_reason=force_reason,
+            registry_version=registry.version,
+            registry_checksum=registry.checksum(),
+            response_bytes=response_bytes,
+        )
+        attempt.validate()
+        attempt_id = context.audit_store.record_source_attempt(
+            context.request_run_id,
+            attempt,
+            authorization,
+        )
+        authorization_id = None
+        if type(authorization) is ForceAuthorization:
+            authorization_id = authorization.reservation.id
+        elif type(authorization) is SourceWorkAuthorization:
+            authorization_id = authorization.id
+        elif authorization is not None:
+            raise ValueError("authorization must use an exact supported type")
+        stored = StoredSourceAttempt(
+            id=attempt_id,
+            request_run_id=context.request_run_id,
+            request_id=context.budget.request_id,
+            authorization_id=authorization_id,
+            attempt=attempt,
+        )
+        stored.validate()
+        return stored
+
+    def _record_cooldown_skip(
+        self,
+        audit_field_id: str,
+        subject_key: str,
+        context: SourceRequestContext,
+        history: SourceFieldHistory,
+    ) -> None:
+        cooldown_until = next(
+            (
+                item.attempt.cooldown_until
+                for item in history.attempts
+                if item.attempt.cooldown_until is not None
+                and item.attempt.cooldown_until > context.budget.started_at
+            ),
+            None,
+        )
+        if cooldown_until is None:
+            raise ValueError("cooldown state has no authenticated deadline")
+        now = self._audit_now(context)
+        self._record_attempt(
+            audit_field_id,
+            subject_key,
+            1,
+            SourceAttemptOutcome.SKIPPED_COOLDOWN,
+            now,
+            now,
+            None,
+            SourceErrorCode.COOLDOWN_ACTIVE,
+            cooldown_until,
+            0,
+            context,
+            None,
+        )
+
+    def _health_context(
+        self,
+        fund_code: str,
+        audit_field_id: str,
+        context: SourceRequestContext,
+    ) -> FreshnessContext:
+        now = context.budget.started_at
+        values = {"now": now}
+        if audit_field_id == "holdings_industries":
+            bundle = self.store.load_bundle(fund_code)
+            periods = tuple(
+                record.report_period
+                for record in (*bundle.holdings, *bundle.industry_exposure)
+            )
+            expected = expected_report_period(now.astimezone(SHANGHAI).date())
+            values.update(
+                {
+                    "next_disclosure_due_at": self._next_disclosure_due(now),
+                    "expected_report_period_end": expected,
+                    "data_report_period_end": max(periods) if periods else None,
+                }
+            )
+        freshness = FreshnessContext(**values)
+        freshness.validate()
+        return freshness
+
+    def _group_cache_is_current(
+        self,
+        fund_code: str,
+        section_names: Tuple[str, ...],
+    ) -> bool:
+        return all(
+            snapshot.freshness == "fresh"
+            and snapshot.error_code is None
+            and snapshot.status in {"success", "not_disclosed"}
+            for snapshot in (
+                self.section_snapshot(fund_code, section_name)
+                for section_name in section_names
+            )
+        )
+
+    @staticmethod
+    def _next_disclosure_due(now: datetime) -> datetime:
+        local = now.astimezone(SHANGHAI)
+        current = local.date()
+        if current >= date(current.year, 11, 7):
+            due = date(current.year + 1, 4, 7)
+        elif current >= date(current.year, 8, 7):
+            due = date(current.year, 11, 7)
+        elif current >= date(current.year, 5, 7):
+            due = date(current.year, 8, 7)
+        elif current >= date(current.year, 4, 7):
+            due = date(current.year, 5, 7)
+        else:
+            due = date(current.year, 4, 7)
+        return datetime.combine(due, datetime.min.time(), tzinfo=SHANGHAI).astimezone(
+            timezone.utc
+        )
+
+    @staticmethod
+    def _worker_request(
+        fund_code: str,
+        spec: SectionSpec,
+        budget: RequestBudget,
+    ) -> WorkerRequest:
         year = (
-            self._aware_now().astimezone(SHANGHAI).year
+            budget.started_at.astimezone(SHANGHAI).year
             if spec.document_kind is DocumentKind.INDUSTRY_EXPOSURE
             else None
         )
-        response = self.client.fetch(
-            build_disclosure_url(spec.document_kind, fund_code, year=year), REFERER
+        request = WorkerRequest(
+            schema_version=SCHEMA_VERSION,
+            request_id=budget.request_id,
+            source_id="eastmoney_f10",
+            field_id=spec.worker_field_id,
+            subject_key=f"fund:{fund_code}",
+            operation="fund_text_fetch",
+            arguments={
+                "url": build_disclosure_url(spec.document_kind, fund_code, year=year),
+                "referer": REFERER,
+            },
         )
+        request.validate()
+        return request
+
+    def _parse_response(
+        self,
+        fund_code: str,
+        spec: SectionSpec,
+        response: TextResponse,
+    ) -> ParsedSection:
         parser = getattr(parsers, spec.parser_name)
         if spec.document_kind is DocumentKind.ANNOUNCEMENT:
             identity = self.store.load_bundle(fund_code).identity
@@ -214,6 +899,53 @@ class FundDisclosureService:
         }:
             return self._attach_publication_dates(parsed, fund_code)
         return parsed
+
+    def _mark_failure(
+        self,
+        fund_code: str,
+        spec: SectionSpec,
+        code: str,
+        context: SourceRequestContext,
+    ) -> None:
+        context.budget.require_publishable()
+        self.store.mark_section_failure(
+            fund_code,
+            spec.document_kind,
+            code,
+            code,
+            self._aware_now(),
+            budget=context.budget,
+        )
+
+    @staticmethod
+    def _audit_now(context: SourceRequestContext) -> datetime:
+        value = context.health_service.wall_clock()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("health wall clock must be timezone-aware")
+        value = value.astimezone(timezone.utc)
+        if not context.budget.started_at <= value <= context.budget.deadline_at:
+            raise BudgetExpired("audit clock is outside request lifetime")
+        return value
+
+    @staticmethod
+    def _audit_now_or_deadline(context: SourceRequestContext) -> datetime:
+        try:
+            return FundDisclosureService._audit_now(context)
+        except BudgetExpired:
+            return context.budget.deadline_at
+
+    def _fetch_and_parse(
+        self, fund_code: str, spec: SectionSpec
+    ) -> ParsedSection:
+        year = (
+            self._aware_now().astimezone(SHANGHAI).year
+            if spec.document_kind is DocumentKind.INDUSTRY_EXPOSURE
+            else None
+        )
+        response = self.client.fetch(
+            build_disclosure_url(spec.document_kind, fund_code, year=year), REFERER
+        )
+        return self._parse_response(fund_code, spec, response)
 
     def _attach_publication_dates(
         self, parsed: ParsedSection, fund_code: str
