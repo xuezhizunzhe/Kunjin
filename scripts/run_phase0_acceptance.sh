@@ -101,6 +101,7 @@ import os
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -288,6 +289,104 @@ RISK_EFFECTS = {"information", "risk_increasing"}
 WORKFLOW_LEVELS = {"rapid_evidence"}
 MAX_RAW_BYTES = 4 * 1024 * 1024
 RENAME_EXCL = 0x00000004
+PROC_PIDPATHINFO_MAXSIZE = 4096
+PROC_PIDT_BSDINFOWITHUNIQID = 18
+PROC_UID_ONLY = 4
+
+
+class ProcBSDInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+class ProcUniqueIdentifierInfo(ctypes.Structure):
+    _fields_ = [
+        ("p_uuid", ctypes.c_ubyte * 16),
+        ("p_uniqueid", ctypes.c_uint64),
+        ("p_puniqueid", ctypes.c_uint64),
+        ("p_idversion", ctypes.c_int32),
+        ("p_orig_ppidversion", ctypes.c_int32),
+        ("p_reserve2", ctypes.c_uint64),
+        ("p_reserve3", ctypes.c_uint64),
+    ]
+
+
+class ProcBSDInfoWithUniqueID(ctypes.Structure):
+    _fields_ = [
+        ("bsd", ProcBSDInfo),
+        ("unique", ProcUniqueIdentifierInfo),
+    ]
+
+
+class ProcessIdentity:
+    def __init__(self, metadata, executable_path):
+        self.pid = metadata[0]
+        self.process_group = metadata[1]
+        self.uid = metadata[2]
+        self.start_seconds = metadata[3]
+        self.start_microseconds = metadata[4]
+        self.executable_uuid = metadata[5]
+        self.unique_id = metadata[6]
+        self.parent_unique_id = metadata[7]
+        self.id_version = metadata[8]
+        self.executable_path = executable_path
+
+    def stable_key(self):
+        return (
+            self.unique_id,
+            self.parent_unique_id,
+            self.uid,
+            self.start_seconds,
+            self.start_microseconds,
+        )
+
+
+libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+proc_listchildpids = libproc.proc_listchildpids
+proc_listchildpids.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+proc_listchildpids.restype = ctypes.c_int
+proc_pidpath = libproc.proc_pidpath
+proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+proc_pidpath.restype = ctypes.c_int
+proc_pidinfo = libproc.proc_pidinfo
+proc_pidinfo.argtypes = [
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_uint64,
+    ctypes.c_void_p,
+    ctypes.c_int,
+]
+proc_pidinfo.restype = ctypes.c_int
+proc_listpids = libproc.proc_listpids
+proc_listpids.argtypes = [
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+    ctypes.c_int,
+]
+proc_listpids.restype = ctypes.c_int
 
 
 class AcceptanceFailure(Exception):
@@ -383,9 +482,39 @@ def request_id(value, label):
     return value
 
 
-def group_exists(process_group):
+def child_pids(parent_pid):
+    buffer = (ctypes.c_int * 4096)()
+    ctypes.set_errno(0)
+    count = proc_listchildpids(parent_pid, buffer, ctypes.sizeof(buffer))
+    if count < 0 and ctypes.get_errno() == errno.ESRCH:
+        return []
+    if count < 0:
+        raise AcceptanceFailure("process child enumeration failed")
+    if count >= len(buffer):
+        raise AcceptanceFailure("process child enumeration was truncated")
+    if count == 0:
+        return []
+    return [pid for pid in buffer[:count] if pid > 0]
+
+
+def same_uid_pids(uid):
+    estimated = proc_listpids(PROC_UID_ONLY, uid, None, 0)
+    if estimated <= 0:
+        raise AcceptanceFailure("system process enumeration failed")
+    capacity = max(1024, estimated + 256)
+    buffer = (ctypes.c_int * capacity)()
+    ctypes.set_errno(0)
+    count = proc_listpids(PROC_UID_ONLY, uid, buffer, ctypes.sizeof(buffer))
+    if count <= 0:
+        raise AcceptanceFailure("system process enumeration failed")
+    if count >= capacity:
+        raise AcceptanceFailure("system process enumeration was truncated")
+    return [pid for pid in buffer[:count] if pid > 0]
+
+
+def process_is_present(pid):
     try:
-        os.killpg(process_group, 0)
+        os.kill(pid, 0)
         return True
     except ProcessLookupError:
         return False
@@ -393,36 +522,187 @@ def group_exists(process_group):
         return True
 
 
-def terminate_process_group(child, deadline):
-    original_handlers = {
-        handled: signal.getsignal(handled)
-        for handled in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
-    }
-    for handled in original_handlers:
-        signal.signal(handled, signal.SIG_IGN)
-    try:
+def process_metadata(pid):
+    info = ProcBSDInfoWithUniqueID()
+    ctypes.set_errno(0)
+    result = proc_pidinfo(
+        pid,
+        PROC_PIDT_BSDINFOWITHUNIQID,
+        0,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if result == 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.ESRCH or not process_is_present(pid):
+            return None
+    if result != ctypes.sizeof(info) or info.bsd.pbi_pid != pid:
+        raise AcceptanceFailure("process identity query failed")
+    return (
+        pid,
+        info.bsd.pbi_pgid,
+        info.bsd.pbi_uid,
+        info.bsd.pbi_start_tvsec,
+        info.bsd.pbi_start_tvusec,
+        bytes(info.unique.p_uuid),
+        info.unique.p_uniqueid,
+        info.unique.p_puniqueid,
+        info.unique.p_idversion,
+    )
+
+
+def process_identity(pid):
+    for _ in range(3):
+        metadata = process_metadata(pid)
+        if metadata is None:
+            return None
+        path_buffer = ctypes.create_string_buffer(PROC_PIDPATHINFO_MAXSIZE)
+        ctypes.set_errno(0)
+        length = proc_pidpath(pid, path_buffer, len(path_buffer))
+        if length <= 0 and not process_is_present(pid):
+            return None
+        if length <= 0 or length >= len(path_buffer):
+            raise AcceptanceFailure("process executable identity query failed")
+        confirmed = process_metadata(pid)
+        if confirmed is None:
+            return None
+        stable_metadata = (metadata[6], metadata[7], metadata[2:5])
+        stable_confirmation = (confirmed[6], confirmed[7], confirmed[2:5])
+        if stable_metadata != stable_confirmation:
+            return None
+        if confirmed[5:] != metadata[5:]:
+            continue
+        identity = ProcessIdentity(metadata, bytes(path_buffer.raw[:length]))
+        identity.process_group = confirmed[1]
+        return identity
+    raise AcceptanceFailure("process identity did not stabilize after exec")
+
+
+def remember_descendant(identity, observed):
+    previous = observed.get(identity.unique_id)
+    if previous is not None and previous.stable_key() != identity.stable_key():
+        raise AcceptanceFailure("observed descendant identity changed")
+    observed[identity.unique_id] = identity
+
+
+def observe_descendants(root_identity, observed, *, full_scan=False):
+    pending = [root_identity, *observed.values()]
+    visited = set()
+    while pending:
+        parent = pending.pop()
+        if parent.unique_id in visited:
+            continue
+        visited.add(parent.unique_id)
+        for pid in child_pids(parent.pid):
+            identity = process_identity(pid)
+            if identity is None or identity.parent_unique_id != parent.unique_id:
+                continue
+            remember_descendant(identity, observed)
+            pending.append(identity)
+    if not full_scan:
+        return
+    metadata_by_parent = {}
+    for pid in same_uid_pids(root_identity.uid):
+        metadata = process_metadata(pid)
+        if metadata is not None:
+            metadata_by_parent.setdefault(metadata[7], []).append(metadata)
+    pending_unique_ids = [root_identity.unique_id, *observed]
+    visited = set()
+    while pending_unique_ids:
+        parent_unique_id = pending_unique_ids.pop()
+        if parent_unique_id in visited:
+            continue
+        visited.add(parent_unique_id)
+        for metadata in metadata_by_parent.get(parent_unique_id, []):
+            identity = process_identity(metadata[0])
+            if identity is None or identity.parent_unique_id != parent_unique_id:
+                continue
+            remember_descendant(identity, observed)
+            pending_unique_ids.append(identity.unique_id)
+
+
+def observed_process_exists(pid, expected_identity):
+    current = process_identity(pid)
+    return current is not None and (
+        current.stable_key() == expected_identity.stable_key()
+    )
+
+
+def signal_observed_descendants(observed, signal_number):
+    own_process_group = os.getpgrp()
+    signaled_groups = set()
+    for expected in observed.values():
+        current = process_identity(expected.pid)
+        if current is None or current.stable_key() != expected.stable_key():
+            continue
         try:
-            os.killpg(child.pid, signal.SIGTERM)
+            if (
+                current.process_group == current.pid
+                and current.process_group != own_process_group
+                and current.process_group not in signaled_groups
+            ):
+                os.killpg(current.process_group, signal_number)
+                signaled_groups.add(current.process_group)
+            else:
+                os.kill(current.pid, signal_number)
         except ProcessLookupError:
             pass
-        for _ in range(10):
-            if not group_exists(child.pid) or time.monotonic() >= deadline:
-                break
-            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
-        if group_exists(child.pid):
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        if child.poll() is None:
-            child.wait()
-        for _ in range(20):
-            if not group_exists(child.pid) or time.monotonic() >= deadline:
-                break
-            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
-    finally:
-        for handled, previous in original_handlers.items():
-            signal.signal(handled, previous)
+
+
+def terminate_observed_descendants(observed, deadline):
+    signal_observed_descendants(observed, signal.SIGTERM)
+    for _ in range(10):
+        if not any(
+            observed_process_exists(pid, identity)
+            for pid, identity in (
+                (identity.pid, identity) for identity in observed.values()
+            )
+        ) or time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+    signal_observed_descendants(observed, signal.SIGKILL)
+    for _ in range(20):
+        if not any(
+            observed_process_exists(pid, identity)
+            for pid, identity in (
+                (identity.pid, identity) for identity in observed.values()
+            )
+        ) or time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+
+
+def signal_root_process(root_identity, signal_number):
+    current = process_identity(root_identity.pid)
+    if current is None or current.stable_key() != root_identity.stable_key():
+        return
+    try:
+        os.kill(current.pid, signal_number)
+    except ProcessLookupError:
+        pass
+
+
+def terminate_process_tree(child, root_identity, observed, deadline):
+    signal_root_process(root_identity, signal.SIGTERM)
+    signal_observed_descendants(observed, signal.SIGTERM)
+    for _ in range(10):
+        if child.poll() is not None or time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+    signal_root_process(root_identity, signal.SIGKILL)
+    signal_observed_descendants(observed, signal.SIGKILL)
+    if child.poll() is None:
+        try:
+            child.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            raise AcceptanceFailure("CLI process cleanup exceeded its deadline") from None
+    for _ in range(20):
+        if not any(
+            observed_process_exists(identity.pid, identity)
+            for identity in observed.values()
+        ) or time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
 
 
 command_elapsed_seconds = {}
@@ -436,6 +716,8 @@ def run_command(name, arguments):
     remaining = command_deadline - command_started
     cleanup_reserve = min(0.2, max(0.05, remaining / 4))
     child = None
+    root_identity = None
+    observed_descendants = {}
     try:
         with raw_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
             os.chmod(raw_path, 0o600)
@@ -447,14 +729,49 @@ def run_command(name, arguments):
                 stderr=stderr,
                 start_new_session=True,
             )
-            try:
-                exit_code = child.wait(timeout=max(0, remaining - cleanup_reserve))
-            except subprocess.TimeoutExpired:
-                terminate_process_group(child, min(command_deadline, time.monotonic() + cleanup_reserve))
+            root_identity = process_identity(child.pid)
+            if root_identity is None:
+                raise AcceptanceFailure(name + " process identity is unavailable")
+            wait_deadline = command_started + max(0, remaining - cleanup_reserve)
+            while True:
+                observe_descendants(root_identity, observed_descendants)
+                exit_code = child.poll()
+                if exit_code is not None:
+                    observe_descendants(
+                        root_identity,
+                        observed_descendants,
+                        full_scan=True,
+                    )
+                    break
+                if time.monotonic() >= wait_deadline:
+                    exit_code = None
+                    break
+                time.sleep(min(0.005, max(0, wait_deadline - time.monotonic())))
+            if exit_code is None:
+                observe_descendants(
+                    root_identity,
+                    observed_descendants,
+                    full_scan=True,
+                )
+                terminate_process_tree(
+                    child,
+                    root_identity,
+                    observed_descendants,
+                    min(command_deadline, time.monotonic() + cleanup_reserve),
+                )
                 raise AcceptanceFailure(name + " reached the global acceptance deadline")
-        if group_exists(child.pid):
-            terminate_process_group(child, min(command_deadline, time.monotonic() + cleanup_reserve))
-            raise AcceptanceFailure(name + " left a residual process group")
+        if any(
+            observed_process_exists(pid, identity)
+            for pid, identity in (
+                (identity.pid, identity)
+                for identity in observed_descendants.values()
+            )
+        ):
+            terminate_observed_descendants(
+                observed_descendants,
+                min(command_deadline, time.monotonic() + cleanup_reserve),
+            )
+            raise AcceptanceFailure(name + " left a detached descendant")
         if exit_code != 0:
             raise AcceptanceFailure(name + " returned a non-zero process exit")
         size = raw_path.stat().st_size
@@ -464,11 +781,25 @@ def run_command(name, arguments):
         require_time(command_deadline, name)
         return raw_path
     except BaseException:
-        if child is not None and group_exists(child.pid):
-            terminate_process_group(
-                child,
-                min(command_deadline, time.monotonic() + cleanup_reserve),
-            )
+        if root_identity is not None:
+            try:
+                observe_descendants(
+                    root_identity,
+                    observed_descendants,
+                    full_scan=True,
+                )
+            except AcceptanceFailure:
+                pass
+        if child is not None and root_identity is not None:
+            try:
+                terminate_process_tree(
+                    child,
+                    root_identity,
+                    observed_descendants,
+                    min(command_deadline, time.monotonic() + cleanup_reserve),
+                )
+            except AcceptanceFailure:
+                pass
         raise
 
 
@@ -948,6 +1279,105 @@ def exclusive_rename(parent_fd, staging_name, target_name):
         raise AcceptanceFailure("exclusive atomic output publication failed")
 
 
+def same_file_identity(left, right):
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def drain_pending_alarm():
+    while signal.SIGALRM in signal.sigpending():
+        signal.sigwait({signal.SIGALRM})
+
+
+def run_rename_test_hook(position):
+    hook = os.environ.get("KUNJIN_PHASE0_TEST_RENAME_HOOK")
+    if hook == "pending_before_rename" and position == "before_rename":
+        os.kill(os.getpid(), signal.SIGALRM)
+    elif hook == "pending_after_rename" and position == "after_rename":
+        os.kill(os.getpid(), signal.SIGALRM)
+    elif hook == "expire_after_rename" and position == "after_rename":
+        time.sleep(max(0, hard_deadline - time.monotonic()) + 0.01)
+    elif hook == "expire_after_fsync" and position == "after_fsync":
+        time.sleep(max(0, hard_deadline - time.monotonic()) + 0.01)
+
+
+def commit_staging():
+    global published, staging_fd, staging_name
+
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    staging_identity = os.fstat(staging_fd)
+    renamed = False
+    try:
+        run_rename_test_hook("before_rename")
+        exclusive_rename(parent_fd, staging_name, output_basename)
+        renamed = True
+        staging_name = output_basename
+        run_rename_test_hook("after_rename")
+
+        target_identity = os.stat(
+            output_basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(target_identity.st_mode) or not same_file_identity(
+            staging_identity, target_identity
+        ):
+            raise AcceptanceFailure("published output identity changed")
+        if time.monotonic() >= hard_deadline:
+            raise AcceptanceDeadline()
+        os.fsync(parent_fd)
+        run_rename_test_hook("after_fsync")
+        if time.monotonic() >= hard_deadline:
+            raise AcceptanceDeadline()
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        drain_pending_alarm()
+        os.close(staging_fd)
+        staging_fd = None
+        staging_name = None
+        published = True
+    except BaseException:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        drain_pending_alarm()
+        if renamed and not published:
+            target_identity = os.stat(
+                output_basename,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not same_file_identity(staging_identity, target_identity):
+                raise AcceptanceFailure(
+                    "expired output could not be safely withdrawn"
+                ) from None
+            rollback_name = ".kunjin-phase0-rollback-" + secrets.token_hex(16)
+            exclusive_rename(parent_fd, output_basename, rollback_name)
+            rollback_identity = os.stat(
+                rollback_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not same_file_identity(staging_identity, rollback_identity):
+                raise AcceptanceFailure("withdrawn output identity changed") from None
+            staging_name = rollback_name
+            remove_staging(parent_fd, staging_fd, staging_name)
+            staging_fd = None
+            staging_name = None
+            try:
+                os.stat(output_basename, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AcceptanceFailure("expired output remains published") from None
+            try:
+                os.stat(rollback_name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AcceptanceFailure("expired output rollback remains") from None
+            os.fsync(parent_fd)
+        raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
 staging_name = None
 staging_fd = None
 parent_fd = None
@@ -1114,14 +1544,7 @@ try:
         raise AcceptanceFailure("staging directory contents are invalid")
     os.fsync(staging_fd)
     require_time(publish_deadline, "atomic publication")
-    exclusive_rename(parent_fd, staging_name, output_basename)
-    published = True
-    if time.monotonic() > hard_deadline:
-        raise AcceptanceDeadline()
-    signal.setitimer(signal.ITIMER_REAL, 0)
-    os.close(staging_fd)
-    staging_fd = None
-    staging_name = None
+    commit_staging()
 except BaseException:
     if parent_fd is not None and not published:
         remove_staging(parent_fd, staging_fd, staging_name)

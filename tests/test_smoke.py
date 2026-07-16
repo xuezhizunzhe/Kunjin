@@ -175,13 +175,19 @@ class SmokeTest(unittest.TestCase):
             "subprocess.Popen",
             "start_new_session=True",
             "signal.setitimer",
+            "signal.pthread_sigmask",
+            "signal.sigpending",
+            "signal.sigwait",
             "renameatx_np",
             "RENAME_EXCL",
+            "PROC_PIDT_BSDINFOWITHUNIQID",
+            "p_uniqueid",
+            "p_puniqueid",
+            "stable_key",
             "os.O_NOFOLLOW",
             "dir_fd=parent_fd",
-            "os.killpg(child.pid, signal.SIGTERM)",
-            "os.killpg(child.pid, signal.SIGKILL)",
-            "child.wait()",
+            "os.kill(current.pid, signal_number)",
+            "child.wait(",
             "90",
         ):
             self.assertIn(phrase, script)
@@ -192,10 +198,10 @@ class SmokeTest(unittest.TestCase):
             "profile status",
             "suitability assess",
             "allocation ranges",
-            "while ",
             "jq ",
             "/bin/cp",
             '"${OUTPUT_DIR}"/*.json',
+            "os.killpg(child.pid",
         ):
             self.assertNotIn(forbidden, script.lower())
 
@@ -234,7 +240,11 @@ now = "2026-07-17T00:00:00+00:00"
 if scenario == "global_slow":
     time.sleep(0.24)
 
-if scenario == "residual_process" and argv == ["--json", "version"]:
+if scenario in {
+    "residual_process", "detached_worker", "detached_worker_immediate"
+} and argv == [
+    "--json", "version"
+]:
     residual = subprocess.Popen(
         [
             sys.executable,
@@ -248,10 +258,13 @@ if scenario == "residual_process" and argv == ["--json", "version"]:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=scenario.startswith("detached_worker"),
     )
     Path(os.environ["FAKE_KUNJIN_PID"]).write_text(
         str(residual.pid), encoding="ascii"
     )
+    if scenario == "detached_worker":
+        time.sleep(0.1)
 
 if scenario in {"stalled", "interrupted"} and argv[:3] == [
     "--json", "sync", "fund-profile"
@@ -802,7 +815,96 @@ print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
                 os.kill(residual_process, signal.SIGKILL)
             self.assertNotEqual(residual.returncode, 0)
             self.assertFalse(residual_output.exists())
-            self.assertFalse(residual_still_alive)
+            self.assertFalse(residual_still_alive, residual.stderr.decode())
+
+            for scenario in ("detached_worker", "detached_worker_immediate"):
+                with self.subTest(detached_scenario=scenario):
+                    detached_output = temporary_root / f"output-{scenario}"
+                    detached_pid = temporary_root / f"{scenario}.pid"
+                    detached = subprocess.run(
+                        [
+                            str(scripts_directory / source_script.name),
+                            "000001",
+                            str(detached_output),
+                        ],
+                        env={
+                            "PATH": "/usr/bin:/bin",
+                            "FAKE_KUNJIN_LOG": str(log_path),
+                            "FAKE_KUNJIN_PID": str(detached_pid),
+                            "FAKE_KUNJIN_SCENARIO": scenario,
+                        },
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                        timeout=6,
+                    )
+                    detached_process = int(detached_pid.read_text(encoding="ascii"))
+                    detached_still_alive = True
+                    try:
+                        os.kill(detached_process, 0)
+                    except ProcessLookupError:
+                        detached_still_alive = False
+                    if detached_still_alive:
+                        os.kill(detached_process, signal.SIGKILL)
+                    self.assertNotEqual(detached.returncode, 0)
+                    self.assertFalse(detached_output.exists())
+                    self.assertFalse(
+                        detached_still_alive, detached.stderr.decode()
+                    )
+
+            for hook in ("pending_before_rename", "pending_after_rename"):
+                with self.subTest(rename_signal_hook=hook):
+                    hook_output = temporary_root / f"output-{hook}"
+                    hooked = subprocess.run(
+                        [
+                            str(scripts_directory / source_script.name),
+                            "000001",
+                            str(hook_output),
+                        ],
+                        env={
+                            "PATH": "/usr/bin:/bin",
+                            "FAKE_KUNJIN_LOG": str(log_path),
+                            "FAKE_KUNJIN_SCENARIO": "complete",
+                            "KUNJIN_PHASE0_TEST_RENAME_HOOK": hook,
+                        },
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(hooked.returncode, 0, hooked.stderr.decode())
+                    self.assertTrue(hook_output.is_dir())
+
+            for hook in ("expire_after_rename", "expire_after_fsync"):
+                with self.subTest(expired_publish_hook=hook):
+                    expired_publish = temporary_root / f"output-{hook}"
+                    expired = subprocess.run(
+                        [
+                            str(scripts_directory / source_script.name),
+                            "000001",
+                            str(expired_publish),
+                        ],
+                        env={
+                            "PATH": "/usr/bin:/bin",
+                            "FAKE_KUNJIN_LOG": str(log_path),
+                            "FAKE_KUNJIN_SCENARIO": "complete",
+                            "KUNJIN_PHASE0_ACCEPTANCE_TIMEOUT_SECONDS": "1",
+                            "KUNJIN_PHASE0_TEST_RENAME_HOOK": hook,
+                        },
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                        timeout=3,
+                    )
+                    self.assertNotEqual(expired.returncode, 0)
+                    self.assertFalse(expired_publish.exists())
+                    self.assertEqual(
+                        [
+                            item
+                            for item in temporary_root.iterdir()
+                            if item.name.startswith(".kunjin-phase0-")
+                        ],
+                        [],
+                    )
 
             slow_output = temporary_root / "output-global-slow"
             slow_started = time.monotonic()
