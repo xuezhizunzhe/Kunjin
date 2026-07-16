@@ -271,6 +271,16 @@ def _reject_unexpected_decision_audit_dependencies(
     extras = {name: value for name, value in actual.items() if name not in expected}
     if not extras:
         return
+    normalized_extra_names = {_ascii_identifier(name) for name in extras}
+    unexpected_virtual_tables = {
+        _ascii_identifier(str(row["name"]))
+        for row in connection.execute("PRAGMA table_list").fetchall()
+        if str(row["schema"]) == "main"
+        and _ascii_identifier(str(row["name"])) in normalized_extra_names
+        and str(row["type"]).casefold() in {"virtual", "shadow"}
+    }
+    if unexpected_virtual_tables:
+        raise sqlite3.DatabaseError("decision audit schema does not match V14")
     main_database = next(
         (
             str(row["file"])

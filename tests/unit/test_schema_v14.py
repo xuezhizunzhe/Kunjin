@@ -456,6 +456,41 @@ class SchemaV14Test(unittest.TestCase):
 
         repository.migrate()
 
+    def test_unexpected_fts_external_content_table_is_rejected(self) -> None:
+        repository = self.repository("fts-external-content.db")
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            try:
+                connection.execute(
+                    """
+                    CREATE VIRTUAL TABLE hidden_audit_fts USING fts5(
+                        request_id,
+                        content='request_runs',
+                        content_rowid='id'
+                    )
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if "no such module: fts5" in str(exc).casefold():
+                    self.skipTest("SQLite build does not expose FTS5")
+                raise
+            connection.execute(
+                """
+                CREATE TRIGGER hidden_audit_fts_sync
+                AFTER INSERT ON sync_runs
+                BEGIN
+                    INSERT INTO hidden_audit_fts(rowid, request_id)
+                    VALUES (NEW.id, NEW.source);
+                END
+                """
+            )
+
+        with self.assertRaisesRegex(
+            sqlite3.DatabaseError,
+            "decision audit schema does not match V14",
+        ):
+            repository.migrate()
+
     def test_string_literals_and_comments_do_not_bind_audit_tables(self) -> None:
         repository = self.repository("literal-and-comment-identifiers.db")
         repository.migrate()
