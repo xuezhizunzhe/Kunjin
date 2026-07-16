@@ -74,6 +74,16 @@ _D1_OBJECT_PREFIXES = (
     "fund_classification_policy",
     "fund_risk_classification",
 )
+_DECISION_AUDIT_TABLES = {
+    "request_runs",
+    "source_attempts",
+    "decision_snapshots",
+}
+_DECISION_AUDIT_OBJECT_PREFIXES = (
+    "request_run",
+    "source_attempt",
+    "decision_snapshot",
+)
 _LEGACY_V8_POLICY_TABLE = "__kunjin_legacy_v8_policy_versions"
 _LEGACY_V8_ASSESSMENT_TABLE = "__kunjin_legacy_v8_assessments"
 _WAL_RETRY_TIMEOUT_SECONDS = 5.0
@@ -197,6 +207,21 @@ def _owned_d1_objects(
         if _ascii_identifier(value[1]) in _D1_TABLES
         or _ascii_identifier(name).startswith(_D1_OBJECT_PREFIXES)
         or any(table in _ascii_identifier(value[2]) for table in _D1_TABLES)
+    }
+
+
+def _owned_decision_audit_objects(
+    objects: Dict[str, Tuple[str, str, str]],
+) -> Dict[str, Tuple[str, str, str]]:
+    return {
+        name: value
+        for name, value in objects.items()
+        if _ascii_identifier(value[1]) in _DECISION_AUDIT_TABLES
+        or _ascii_identifier(name).startswith(_DECISION_AUDIT_OBJECT_PREFIXES)
+        or any(
+            table in _ascii_identifier(value[2])
+            for table in _DECISION_AUDIT_TABLES
+        )
     }
 
 
@@ -613,6 +638,12 @@ def _validate_applied_schema(
     expected_v10 = _owned_d1_objects(expected)
     if _owned_d1_objects(actual) != expected_v10:
         raise sqlite3.DatabaseError("fund risk schema does not match the current D1 schema")
+
+    if 14 not in applied_versions:
+        return
+    expected_v14 = _owned_decision_audit_objects(expected)
+    if _owned_decision_audit_objects(actual) != expected_v14:
+        raise sqlite3.DatabaseError("decision audit schema does not match V14")
 
 
 _FUND_MANDATE_FACT_NO_UPDATE = """

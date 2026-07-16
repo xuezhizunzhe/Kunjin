@@ -2252,7 +2252,7 @@ CREATE TABLE request_runs (
                 AND substr(deadline_at, 21, 6) != '000000'
             )
         )
-        AND julianday(deadline_at) > julianday(started_at)
+        AND deadline_at COLLATE BINARY > started_at COLLATE BINARY
     ),
     finished_at TEXT CHECK(
         finished_at IS NULL OR (
@@ -2269,7 +2269,7 @@ CREATE TABLE request_runs (
                     AND substr(finished_at, 21, 6) != '000000'
                 )
             )
-            AND julianday(finished_at) >= julianday(started_at)
+            AND finished_at COLLATE BINARY >= started_at COLLATE BINARY
         )
     ),
     omitted_work_json TEXT NOT NULL CHECK(
@@ -2346,7 +2346,7 @@ CREATE TABLE source_attempts (
                 AND substr(finished_at, 21, 6) != '000000'
             )
         )
-        AND julianday(finished_at) >= julianday(started_at)
+        AND finished_at COLLATE BINARY >= started_at COLLATE BINARY
     ),
     data_as_of TEXT CHECK(
         data_as_of IS NULL OR (
@@ -2363,7 +2363,7 @@ CREATE TABLE source_attempts (
                     AND substr(data_as_of, 21, 6) != '000000'
                 )
             )
-            AND julianday(data_as_of) <= julianday(finished_at)
+            AND data_as_of COLLATE BINARY <= finished_at COLLATE BINARY
         )
     ),
     error_code TEXT CHECK(
@@ -2444,7 +2444,7 @@ CREATE TABLE source_attempts (
             AND data_as_of IS NULL
             AND error_code IN ('dns_failure', 'transient_network_failure', 'network_timeout')
             AND cooldown_until IS NOT NULL
-            AND julianday(cooldown_until) > julianday(finished_at)
+            AND cooldown_until COLLATE BINARY > finished_at COLLATE BINARY
         ) OR (
             outcome = 'unavailable'
             AND data_as_of IS NULL
@@ -2477,7 +2477,7 @@ CREATE TABLE source_attempts (
             AND data_as_of IS NULL
             AND error_code = 'cooldown_active'
             AND cooldown_until IS NOT NULL
-            AND julianday(cooldown_until) > julianday(finished_at)
+            AND cooldown_until COLLATE BINARY > finished_at COLLATE BINARY
         )
     )
 );

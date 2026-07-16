@@ -27,6 +27,9 @@ UTC = "2026-07-16T00:00:00+00:00"
 LATER = "2026-07-16T00:00:01+00:00"
 DEADLINE = "2026-07-16T00:01:30+00:00"
 COOLDOWN = "2026-07-16T00:31:00+00:00"
+MICRO_1 = "2026-07-16T00:00:00.000001+00:00"
+MICRO_2 = "2026-07-16T00:00:00.000002+00:00"
+MICRO_3 = "2026-07-16T00:00:00.000003+00:00"
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
 POLICY_JSON = '{"version":"1"}'
 REGISTRY_JSON = '{"sources":[],"version":"1"}'
@@ -122,6 +125,8 @@ class SchemaV14Test(unittest.TestCase):
         *,
         request_id: str = REQUEST_ID,
         mode: str = "rapid",
+        started_at: str = UTC,
+        deadline_at: str = DEADLINE,
     ) -> int:
         return int(
             connection.execute(
@@ -131,7 +136,7 @@ class SchemaV14Test(unittest.TestCase):
                     finished_at, omitted_work_json
                 ) VALUES (?, ?, 'running', ?, ?, NULL, '[]')
                 """,
-                (request_id, mode, UTC, DEADLINE),
+                (request_id, mode, started_at, deadline_at),
             ).lastrowid
         )
 
@@ -302,6 +307,45 @@ class SchemaV14Test(unittest.TestCase):
         self.assertNotIn("request_runs", tables)
         self.assertEqual(classification_after, classification_before)
         self.assertEqual(selection_after, selection_before)
+
+    def test_extra_decision_audit_objects_are_rejected_even_with_indirect_binding(self) -> None:
+        hostile_scripts = (
+            """
+            CREATE TRIGGER injected_request_ignore
+            BEFORE INSERT ON request_runs
+            BEGIN
+                SELECT RAISE(IGNORE);
+            END;
+            """,
+            "CREATE INDEX injected_attempt_index ON source_attempts(outcome);",
+            "CREATE TABLE decision_snapshots_shadow(id INTEGER PRIMARY KEY);",
+            """
+            CREATE TRIGGER unrelated_audit_reader
+            AFTER INSERT ON sync_runs
+            BEGIN
+                SELECT count(*) FROM decision_snapshots;
+            END;
+            """,
+            """
+            CREATE TRIGGER mixed_case_audit_reader
+            AFTER INSERT ON sync_runs
+            BEGIN
+                SELECT count(*) FROM ReQuEsT_RuNs;
+            END;
+            """,
+        )
+        for index, hostile_script in enumerate(hostile_scripts):
+            with self.subTest(index=index):
+                repository = self.repository(f"hostile-{index}.db")
+                repository.migrate()
+                with repository.connect() as connection, connection:
+                    connection.executescript(hostile_script)
+
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "decision audit schema does not match V14",
+                ):
+                    repository.migrate()
 
     def test_v14_has_exact_three_tables_columns_foreign_keys_indexes_and_triggers(self) -> None:
         repository = self._create_at_version(13)
@@ -476,6 +520,149 @@ class SchemaV14Test(unittest.TestCase):
                         """,
                         values,
                     )
+
+    def test_request_times_preserve_exact_microsecond_order(self) -> None:
+        repository = self.repository()
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            self._insert_request(
+                connection,
+                request_id="1" * 32,
+                started_at=MICRO_1,
+                deadline_at=MICRO_2,
+            )
+            for request_id, started_at, deadline_at in (
+                ("2" * 32, MICRO_2, MICRO_1),
+                ("3" * 32, MICRO_1, MICRO_1),
+            ):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self._insert_request(
+                        connection,
+                        request_id=request_id,
+                        started_at=started_at,
+                        deadline_at=deadline_at,
+                    )
+
+            inverse_finish = self._insert_request(
+                connection,
+                request_id="4" * 32,
+                started_at=MICRO_2,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE request_runs SET status = 'failed', finished_at = ? WHERE id = ?",
+                    (MICRO_1, inverse_finish),
+                )
+
+            equal_finish = self._insert_request(
+                connection,
+                request_id="5" * 32,
+                started_at=MICRO_1,
+            )
+            connection.execute(
+                "UPDATE request_runs SET status = 'complete', finished_at = ? WHERE id = ?",
+                (MICRO_1, equal_finish),
+            )
+
+    def test_attempt_finish_and_data_times_preserve_exact_microsecond_order(self) -> None:
+        repository = self.repository()
+        repository.migrate()
+        with repository.connect() as connection, connection:
+            inverse_finish_run = self._insert_request(connection, request_id="6" * 32)
+            with self.assertRaises(sqlite3.IntegrityError):
+                self._insert_attempt(
+                    connection,
+                    self._attempt_values(
+                        inverse_finish_run,
+                        started_at=MICRO_2,
+                        finished_at=MICRO_1,
+                        data_as_of=MICRO_1,
+                    ),
+                )
+
+            equal_finish_run = self._insert_request(connection, request_id="7" * 32)
+            self._insert_attempt(
+                connection,
+                self._attempt_values(
+                    equal_finish_run,
+                    started_at=MICRO_1,
+                    finished_at=MICRO_1,
+                    data_as_of=MICRO_1,
+                ),
+            )
+
+            future_data_run = self._insert_request(connection, request_id="8" * 32)
+            with self.assertRaises(sqlite3.IntegrityError):
+                self._insert_attempt(
+                    connection,
+                    self._attempt_values(
+                        future_data_run,
+                        started_at=MICRO_1,
+                        finished_at=MICRO_2,
+                        data_as_of=MICRO_3,
+                    ),
+                )
+
+            equal_data_run = self._insert_request(connection, request_id="9" * 32)
+            self._insert_attempt(
+                connection,
+                self._attempt_values(
+                    equal_data_run,
+                    started_at=MICRO_1,
+                    finished_at=MICRO_2,
+                    data_as_of=MICRO_2,
+                ),
+            )
+
+    def test_attempt_cooldown_preserves_exact_microsecond_order(self) -> None:
+        repository = self.repository()
+        repository.migrate()
+        cases = (
+            ("transient_failure", "network_timeout", ("a", "b", "c")),
+            ("skipped_cooldown", "cooldown_active", ("d", "e", "f")),
+        )
+        for outcome, error_code, request_prefixes in cases:
+            with self.subTest(outcome=outcome), repository.connect() as connection, connection:
+                forward_run = self._insert_request(
+                    connection,
+                    request_id=request_prefixes[0] * 32,
+                )
+                self._insert_attempt(
+                    connection,
+                    self._attempt_values(
+                        forward_run,
+                        outcome=outcome,
+                        started_at=MICRO_1,
+                        finished_at=MICRO_2,
+                        data_as_of=None,
+                        error_code=error_code,
+                        cooldown_until=MICRO_3,
+                        response_byte_count=0,
+                    ),
+                )
+
+                for request_prefix, cooldown_until in zip(
+                    request_prefixes[1:],
+                    (MICRO_2, MICRO_1),
+                ):
+                    run_id = self._insert_request(
+                        connection,
+                        request_id=request_prefix * 32,
+                    )
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        self._insert_attempt(
+                            connection,
+                            self._attempt_values(
+                                run_id,
+                                outcome=outcome,
+                                started_at=MICRO_1,
+                                finished_at=MICRO_2,
+                                data_as_of=None,
+                                error_code=error_code,
+                                cooldown_until=cooldown_until,
+                                response_byte_count=0,
+                            ),
+                        )
 
     def test_source_attempt_matrix_owner_uniqueness_and_immutability(self) -> None:
         repository = self.repository()
