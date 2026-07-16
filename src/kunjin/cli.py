@@ -74,6 +74,7 @@ from kunjin.funds.service import (
     PROFILE_SECTIONS,
     SECTION_SPECS,
     FundDisclosureService,
+    FundDisclosureSyncInterrupted,
     SourceRequestContext,
 )
 from kunjin.funds.sources import FundTextClient
@@ -730,7 +731,7 @@ def _sync_disclosure(
             "omitted_work": list(omitted_work),
         }
 
-    def finalize(primary: Optional[BaseException] = None) -> None:
+    def finalize() -> None:
         nonlocal terminal_status
         finished_at = _request_finish_now()
         if finished_at < budget.started_at:
@@ -747,8 +748,6 @@ def _sync_disclosure(
                 omitted_work,
             )
         except BaseException as finalization_error:
-            if primary is not None:
-                raise primary.with_traceback(primary.__traceback__) from finalization_error
             raise BoundedDisclosureSyncError(request_metadata()) from finalization_error
 
     try:
@@ -782,21 +781,27 @@ def _sync_disclosure(
             terminal_status = RequestTerminalStatus.PARTIAL
         else:
             terminal_status = RequestTerminalStatus.COMPLETE
-    except (KeyboardInterrupt, SystemExit) as error:
+    except (KeyboardInterrupt, SystemExit) as control_flow_error:
         budget.cancel("request_cancelled")
         terminal_status = RequestTerminalStatus.CANCELLED
-        omitted_work = tuple(
-            dict.fromkeys(
-                (
-                    *requested_sections,
-                    *(
-                        SECTION_SPECS[item].audit_field_id
-                        for item in requested_sections
-                    ),
+        if isinstance(control_flow_error, FundDisclosureSyncInterrupted):
+            omitted_work = control_flow_error.omitted_work
+        else:
+            omitted_work = tuple(
+                dict.fromkeys(
+                    (
+                        *requested_sections,
+                        *(
+                            SECTION_SPECS[item].audit_field_id
+                            for item in requested_sections
+                        ),
+                    )
                 )
             )
-        )
-        finalize(error)
+        try:
+            finalize()
+        except BoundedDisclosureSyncError:
+            pass
         raise
     except Exception as error:
         terminal_status = (
@@ -817,7 +822,10 @@ def _sync_disclosure(
                 )
             )
         )
-        finalize(error)
+        try:
+            finalize()
+        except BoundedDisclosureSyncError as finalization_error:
+            raise BoundedDisclosureSyncError(request_metadata()) from finalization_error
         raise BoundedDisclosureSyncError(request_metadata()) from error
     finalize()
     if result is None:

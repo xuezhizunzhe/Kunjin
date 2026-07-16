@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+from contextlib import nullcontext
 from dataclasses import asdict, is_dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
@@ -112,6 +114,7 @@ class FundDisclosureStore:
         warning: Optional[str] = None,
         *,
         budget: Optional[RequestBudget] = None,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> int:
         self._require_budget(budget)
         section_name = _section_value(section)
@@ -146,10 +149,15 @@ class FundDisclosureStore:
                 raise ValueError("publication records must not already be stored")
 
         attempted_at = source.retrieved_at.isoformat()
-        with self.repository.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        owns_connection = connection is None
+        if not owns_connection and type(connection) is not sqlite3.Connection:
+            raise ValueError("connection must be an exact sqlite3.Connection or None")
+        manager = self.repository.connect() if owns_connection else nullcontext(connection)
+        with manager as active_connection:
+            if owns_connection:
+                active_connection.execute("BEGIN IMMEDIATE")
             self._require_budget(budget)
-            connection.execute(
+            active_connection.execute(
                 """
                 INSERT OR IGNORE INTO fund_source_documents(
                     fund_code, document_kind, title, url, source_name, source_tier,
@@ -169,7 +177,7 @@ class FundDisclosureStore:
                     source.checksum,
                 ),
             )
-            row = connection.execute(
+            row = active_connection.execute(
                 """
                 SELECT id FROM fund_source_documents
                 WHERE fund_code = ? AND document_kind = ? AND url = ? AND checksum = ?
@@ -179,11 +187,11 @@ class FundDisclosureStore:
             source_document_id = int(row["id"])
             for record in validated_records:
                 self._insert_record(
-                    connection,
+                    active_connection,
                     replace(record, source_document_id=source_document_id),
                 )
                 self._require_budget(budget)
-            connection.execute(
+            active_connection.execute(
                 """
                 INSERT INTO fund_section_syncs(
                     fund_code, section, state, current_source_document_id,
@@ -209,7 +217,8 @@ class FundDisclosureStore:
                 ),
             )
             self._require_budget(budget)
-            connection.commit()
+            if owns_connection:
+                active_connection.commit()
         return source_document_id
 
     def mark_section_failure(
@@ -221,6 +230,7 @@ class FundDisclosureStore:
         attempted_at: datetime,
         *,
         budget: Optional[RequestBudget] = None,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> None:
         self._require_budget(budget)
         section_name = _section_value(section)
@@ -230,10 +240,15 @@ class FundDisclosureStore:
             raise ValueError("attempted_at must be timezone-aware")
         if not error_code or not error_message:
             raise ValueError("failure code and message are required")
-        with self.repository.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        owns_connection = connection is None
+        if not owns_connection and type(connection) is not sqlite3.Connection:
+            raise ValueError("connection must be an exact sqlite3.Connection or None")
+        manager = self.repository.connect() if owns_connection else nullcontext(connection)
+        with manager as active_connection:
+            if owns_connection:
+                active_connection.execute("BEGIN IMMEDIATE")
             self._require_budget(budget)
-            connection.execute(
+            active_connection.execute(
                 """
                 INSERT INTO fund_section_syncs(
                     fund_code, section, state, current_source_document_id,
@@ -248,7 +263,8 @@ class FundDisclosureStore:
                 (fund_code, section_name, attempted_at.isoformat(), error_code, error_message),
             )
             self._require_budget(budget)
-            connection.commit()
+            if owns_connection:
+                active_connection.commit()
 
     @staticmethod
     def _require_budget(budget: Optional[RequestBudget]) -> None:

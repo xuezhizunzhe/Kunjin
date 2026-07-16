@@ -22,12 +22,13 @@ from kunjin.decision.models import (
     SourceErrorCode,
 )
 from kunjin.decision.source_registry import SourceRegistryV1
-from kunjin.decision.store import DecisionAuditStore
+from kunjin.decision.store import DecisionAuditStore, DecisionAuditStoreError
 from kunjin.decision.worker_protocol import WorkerResponse, WorkerTextPayload
 from kunjin.funds.models import DocumentKind
 from kunjin.funds.service import (
     SECTION_SPECS,
     FundDisclosureService,
+    FundDisclosureSyncInterrupted,
     SourceRequestContext,
     announcement_report_period,
     expected_report_period,
@@ -590,6 +591,28 @@ class FundDisclosureServiceTest(unittest.TestCase):
         )
         self.assertIs(history[0].attempt.outcome, SourceAttemptOutcome.EXPIRED)
 
+    def test_bounded_business_publication_rolls_back_when_attempt_audit_fails(self) -> None:
+        context = self._bounded_context("43" * 16)
+
+        with patch.object(
+            context.audit_store,
+            "record_source_attempt",
+            side_effect=DecisionAuditStoreError("synthetic audit failure"),
+        ):
+            with self.assertRaises(DecisionAuditStoreError):
+                self.service.sync_classification(
+                    "519755", request_context=context
+                )
+
+        self.assertIsNone(self.store.load_bundle("519755").identity)
+        self.assertEqual(self.store.section_status("519755"), {})
+        self.assertEqual(
+            context.audit_store.source_attempt_history(
+                "eastmoney_f10", "identity_active_status", "fund:519755"
+            ),
+            (),
+        )
+
     def test_bounded_failure_mark_rolls_back_when_budget_expires_before_commit(self) -> None:
         ticks = [100.0]
         context = self._bounded_context("42" * 16, ticks=ticks)
@@ -639,6 +662,78 @@ class FundDisclosureServiceTest(unittest.TestCase):
                 item.attempt.outcome is SourceAttemptOutcome.TRANSIENT_FAILURE
                 for item in history
             )
+        )
+
+    def test_bounded_mixed_permanent_failure_preserves_transient_cooldown(self) -> None:
+        self.worker.failures["basic_profile"] = [
+            SourceErrorCode.DNS_FAILURE,
+            SourceErrorCode.NETWORK_TIMEOUT,
+        ]
+        self.worker.failures["size_history"] = [SourceErrorCode.HTTP_4XX]
+        context = self._bounded_context("91" * 16)
+
+        result = self.service.sync_profile("519755", request_context=context)
+
+        self.assertIn("basic_profile", result.omitted_work)
+        self.assertIn("size_history", result.omitted_work)
+        self.assertEqual(
+            [call.field_id for call in self.worker.calls].count("basic_profile"),
+            2,
+        )
+        self.assertEqual(
+            [call.field_id for call in self.worker.calls].count("size_history"),
+            1,
+        )
+        history = context.audit_store.source_attempt_history(
+            "eastmoney_f10", "identity_active_status", "fund:519755"
+        )
+        self.assertEqual(
+            [item.attempt.outcome for item in history if item.request_id == "91" * 16],
+            [
+                SourceAttemptOutcome.TRANSIENT_FAILURE,
+                SourceAttemptOutcome.TRANSIENT_FAILURE,
+            ],
+        )
+        calls_before = len(self.worker.calls)
+        self._finalize(context, result)
+
+        cooldown_context = self._bounded_context("92" * 16)
+        cooldown = self.service.sync_classification(
+            "519755", request_context=cooldown_context
+        )
+
+        self.assertEqual(len(self.worker.calls), calls_before)
+        self.assertIn("basic_profile", cooldown.omitted_work)
+
+    def test_bounded_mixed_retry_recovers_only_transient_section(self) -> None:
+        self.worker.failures["basic_profile"] = [SourceErrorCode.DNS_FAILURE]
+        self.worker.failures["size_history"] = [SourceErrorCode.HTTP_4XX]
+        context = self._bounded_context("93" * 16)
+
+        result = self.service.sync_profile("519755", request_context=context)
+
+        self.assertEqual(result.sections["basic_profile"].status, "success")
+        self.assertEqual(result.sections["size_history"].error_code, "http_4xx")
+        self.assertNotIn("basic_profile", result.omitted_work)
+        self.assertIn("size_history", result.omitted_work)
+        self.assertEqual(
+            [call.field_id for call in self.worker.calls].count("basic_profile"),
+            2,
+        )
+        self.assertEqual(
+            [call.field_id for call in self.worker.calls].count("size_history"),
+            1,
+        )
+        history = tuple(
+            item
+            for item in context.audit_store.source_attempt_history(
+                "eastmoney_f10", "identity_active_status", "fund:519755"
+            )
+            if item.request_id == "93" * 16
+        )
+        self.assertEqual(
+            [item.attempt.outcome for item in history],
+            [SourceAttemptOutcome.UNAVAILABLE, SourceAttemptOutcome.TRANSIENT_FAILURE],
         )
 
     def test_bounded_parse_and_identity_failures_are_not_retried(self) -> None:
@@ -770,6 +865,29 @@ class FundDisclosureServiceTest(unittest.TestCase):
             self.audit_now,
             ("basic_profile",),
         )
+
+    def test_bounded_interrupt_omits_only_uncommitted_sections(self) -> None:
+        context = self._bounded_context("81" * 16)
+        worker = self.worker
+
+        def interrupt_after_identity(request, budget):
+            if request.field_id == "manager_history":
+                raise KeyboardInterrupt
+            return worker(request, budget)
+
+        self.service.worker_runner = interrupt_after_identity
+        with self.assertRaises(FundDisclosureSyncInterrupted) as raised:
+            self.service.sync_profile("519755", request_context=context)
+
+        omitted = raised.exception.omitted_work
+        self.assertNotIn("basic_profile", omitted)
+        self.assertNotIn("size_history", omitted)
+        self.assertIn("manager_history", omitted)
+        self.assertIn("fee_schedule", omitted)
+        self.assertIn("announcements", omitted)
+        bundle = self.store.load_bundle("519755")
+        self.assertIsNotNone(bundle.identity)
+        self.assertTrue(bundle.sizes)
 
     def test_bounded_healthy_holdings_cache_records_cache_hit_without_workers(self) -> None:
         self.service.sync_profile("519755")

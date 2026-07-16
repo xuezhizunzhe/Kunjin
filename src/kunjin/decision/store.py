@@ -6,6 +6,7 @@ import json
 import math
 import re
 import sqlite3
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, DecimalException
@@ -106,6 +107,8 @@ class DecisionAuditStore:
         request_run_id: int,
         attempt: SourceAttempt,
         authorization: Optional[Union[SourceWorkAuthorization, ForceAuthorization]] = None,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> int:
         _positive_id(request_run_id, "request run id")
         if type(attempt) is not SourceAttempt:
@@ -127,10 +130,15 @@ class DecisionAuditStore:
             or attempt.registry_checksum != registry.checksum()
         ):
             raise DecisionAuditStoreError("source attempt registry binding failed")
+        owns_connection = connection is None
+        if not owns_connection and type(connection) is not sqlite3.Connection:
+            raise ValueError("connection must be an exact sqlite3.Connection or None")
+        manager = self.repository.connect() if owns_connection else nullcontext(connection)
         try:
-            with self.repository.connect() as connection, connection:
-                connection.execute("BEGIN IMMEDIATE")
-                run = connection.execute(
+            with manager as active_connection:
+                if owns_connection:
+                    active_connection.execute("BEGIN IMMEDIATE")
+                run = active_connection.execute(
                     "SELECT * FROM request_runs WHERE id = ?",
                     (request_run_id,),
                 ).fetchone()
@@ -146,7 +154,7 @@ class DecisionAuditStore:
                 ):
                     raise DecisionAuditStoreError("attempt is outside its request lifetime")
 
-                rows = connection.execute(
+                rows = active_connection.execute(
                     """
                     SELECT attempt_number
                     FROM source_attempts
@@ -172,7 +180,7 @@ class DecisionAuditStore:
                 if persisted_authorization is not None:
                     authenticated_authorization = self._load_source_work_authorization(
                         persisted_authorization.id,
-                        connection=connection,
+                        connection=active_connection,
                     )
                     if authenticated_authorization != persisted_authorization:
                         raise DecisionAuditStoreError("source work authorization binding failed")
@@ -192,7 +200,7 @@ class DecisionAuditStore:
                     authenticated_authorization,
                 )
                 if authorization is None and attempt.attempt_number == 1:
-                    pending_force = connection.execute(
+                    pending_force = active_connection.execute(
                         """
                         SELECT 1
                         FROM source_work_authorizations
@@ -217,7 +225,7 @@ class DecisionAuditStore:
                             "ordinary attempt is blocked by a force authorization"
                         )
 
-                cursor = connection.execute(
+                cursor = active_connection.execute(
                     """
                     INSERT INTO source_attempts(
                         request_run_id, source_id, field_id, subject_key,
@@ -250,6 +258,8 @@ class DecisionAuditStore:
                     ),
                 )
                 attempt_id = int(cursor.lastrowid)
+                if owns_connection:
+                    active_connection.commit()
         except DecisionAuditStoreError:
             raise
         except sqlite3.DatabaseError:

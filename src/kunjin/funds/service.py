@@ -94,6 +94,24 @@ class FundDisclosureSyncResult:
     omitted_work: Tuple[str, ...] = ()
 
 
+class FundDisclosureSyncInterrupted(KeyboardInterrupt):
+    def __init__(self, omitted_work: Tuple[str, ...]) -> None:
+        self.omitted_work = omitted_work
+        super().__init__("bounded fund disclosure synchronization was interrupted")
+
+
+@dataclass(frozen=True)
+class _PendingSectionMutation:
+    section_name: str
+    spec: SectionSpec
+    parsed: Optional[ParsedSection] = None
+    failure_code: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if (self.parsed is None) == (self.failure_code is None):
+            raise ValueError("section mutation requires exactly one result")
+
+
 SECTION_SPECS = {
     "basic_profile": SectionSpec(
         DocumentKind.BASIC_PROFILE,
@@ -323,6 +341,7 @@ class FundDisclosureService:
             groups.setdefault(spec.audit_field_id, []).append(section_name)
         conflicts: List[str] = []
         omitted: List[str] = []
+        completed: List[str] = []
         subject_key = f"fund:{fund_code}"
         try:
             for audit_field_id, grouped_sections in groups.items():
@@ -341,11 +360,24 @@ class FundDisclosureService:
                     conflicts,
                     omitted,
                 )
-        except (KeyboardInterrupt, SystemExit):
+                completed.extend(
+                    section
+                    for section in grouped_sections
+                    if section not in omitted
+                )
+        except KeyboardInterrupt as error:
             context.budget.cancel("request_cancelled")
-            omitted.extend(
-                section for section in section_names if section not in omitted
+            incomplete = tuple(
+                section for section in section_names if section not in completed
             )
+            omitted.extend(incomplete)
+            omitted.extend(self._spec(section).audit_field_id for section in incomplete)
+            raise FundDisclosureSyncInterrupted(
+                tuple(dict.fromkeys(omitted))
+            ) from error
+        except SystemExit:
+            context.budget.cancel("request_cancelled")
+            omitted.extend(section for section in section_names if section not in omitted)
             raise
 
         as_of = self._aware_now()
@@ -473,17 +505,17 @@ class FundDisclosureService:
             omitted.extend(first[3])
             omitted.append(audit_field_id)
             return
-        failed_sections = first[3]
         second = self._execute_bounded_attempt(
             fund_code,
             audit_field_id,
-            failed_sections,
+            tuple(item[0] for item in first[5]),
             subject_key,
             2,
             context,
             retry,
             conflicts,
             omitted,
+            carried_failures=first[6],
         )
         if second[0] is not SourceAttemptOutcome.SUCCESS:
             omitted.extend(second[3])
@@ -500,17 +532,27 @@ class FundDisclosureService:
         authorization: object,
         conflicts: List[str],
         omitted: List[str],
+        *,
+        carried_failures: Tuple[
+            Tuple[str, SourceAttemptOutcome, SourceErrorCode], ...
+        ] = (),
     ) -> Tuple[
         SourceAttemptOutcome,
         Optional[SourceErrorCode],
         int,
         Tuple[str, ...],
         StoredSourceAttempt,
+        Tuple[Tuple[str, SourceAttemptOutcome, SourceErrorCode], ...],
+        Tuple[Tuple[str, SourceAttemptOutcome, SourceErrorCode], ...],
     ]:
         started_at = self._audit_now(context)
         response_bytes = 0
         data_dates: List[datetime] = []
-        failures: List[Tuple[str, SourceAttemptOutcome, SourceErrorCode]] = []
+        failures: List[Tuple[str, SourceAttemptOutcome, SourceErrorCode]] = list(
+            carried_failures
+        )
+        mutations: List[_PendingSectionMutation] = []
+        pending_conflicts: List[str] = []
         for index, section_name in enumerate(section_names):
             spec = self._spec(section_name)
             try:
@@ -523,11 +565,12 @@ class FundDisclosureService:
                     error_code = SourceErrorCode(response.reason_code)
                     outcome = self._failure_outcome(error_code)
                     failures.append((section_name, outcome, error_code))
-                    self._mark_failure(
-                        fund_code,
-                        spec,
-                        error_code.value,
-                        context,
+                    mutations.append(
+                        _PendingSectionMutation(
+                            section_name,
+                            spec,
+                            failure_code=error_code.value,
+                        )
                     )
                     continue
                 payload = response.payload
@@ -547,16 +590,8 @@ class FundDisclosureService:
                     ),
                 )
                 context.budget.require_publishable()
-                self.store.publish_section(
-                    fund_code,
-                    spec.document_kind,
-                    parsed.source,
-                    parsed.records,
-                    parsed.state,
-                    warning="; ".join(parsed.warnings) or None,
-                    budget=context.budget,
-                )
-                conflicts.extend(
+                mutations.append(_PendingSectionMutation(section_name, spec, parsed=parsed))
+                pending_conflicts.extend(
                     f"{section_name}:{conflict}" for conflict in parsed.conflicts
                 )
                 data_dates.append(payload.retrieved_at)
@@ -581,7 +616,13 @@ class FundDisclosureService:
                     code = SourceErrorCode.SOURCE_UNAVAILABLE
                 failures.append((section_name, outcome, code))
                 if not context.budget.cancelled:
-                    self._mark_failure(fund_code, spec, code.value, context)
+                    mutations.append(
+                        _PendingSectionMutation(
+                            section_name,
+                            spec,
+                            failure_code=code.value,
+                        )
+                    )
                 else:
                     break
             except FundParseError as error:
@@ -591,9 +632,15 @@ class FundDisclosureService:
                     else SourceErrorCode.PARSE_FAILURE
                 )
                 failures.append((section_name, SourceAttemptOutcome.UNAVAILABLE, code))
-                self._mark_failure(fund_code, spec, error.code, context)
+                mutations.append(
+                    _PendingSectionMutation(
+                        section_name,
+                        spec,
+                        failure_code=error.code,
+                    )
+                )
                 if code is SourceErrorCode.IDENTITY_CONFLICT:
-                    conflicts.append(f"{section_name}:identity_conflict")
+                    pending_conflicts.append(f"{section_name}:identity_conflict")
             except (KeyboardInterrupt, SystemExit):
                 failures.append(
                     (
@@ -617,6 +664,7 @@ class FundDisclosureService:
                     response_bytes,
                     context,
                     authorization,
+                    (),
                 )
                 raise
             except (TypeError, ValueError):
@@ -627,11 +675,12 @@ class FundDisclosureService:
                         SourceErrorCode.VALIDATION_FAILURE,
                     )
                 )
-                self._mark_failure(
-                    fund_code,
-                    spec,
-                    SourceErrorCode.VALIDATION_FAILURE.value,
-                    context,
+                mutations.append(
+                    _PendingSectionMutation(
+                        section_name,
+                        spec,
+                        failure_code=SourceErrorCode.VALIDATION_FAILURE.value,
+                    )
                 )
 
         outcome, error_code = self._group_outcome(failures)
@@ -642,26 +691,66 @@ class FundDisclosureService:
             if outcome is SourceAttemptOutcome.TRANSIENT_FAILURE
             else None
         )
-        stored_attempt = self._record_attempt(
-            audit_field_id,
-            subject_key,
-            attempt_number,
-            outcome,
-            started_at,
-            finished_at,
-            data_as_of,
-            error_code,
-            cooldown_until,
-            response_bytes,
-            context,
-            authorization,
-        )
+        try:
+            stored_attempt = self._record_attempt(
+                audit_field_id,
+                subject_key,
+                attempt_number,
+                outcome,
+                started_at,
+                finished_at,
+                data_as_of,
+                error_code,
+                cooldown_until,
+                response_bytes,
+                context,
+                authorization,
+                tuple(mutations),
+            )
+        except BudgetExpired:
+            context.budget.cancel("request_deadline_reached")
+            outcome = SourceAttemptOutcome.EXPIRED
+            error_code = SourceErrorCode.REQUEST_EXPIRED
+            finished_at = self._audit_now_or_deadline(context)
+            stored_attempt = self._record_attempt(
+                audit_field_id,
+                subject_key,
+                attempt_number,
+                outcome,
+                started_at,
+                finished_at,
+                None,
+                error_code,
+                None,
+                response_bytes,
+                context,
+                authorization,
+                (),
+            )
+            failures.extend(
+                (section_name, outcome, error_code)
+                for section_name in section_names
+                if section_name not in {item[0] for item in failures}
+            )
+            omitted.extend(section_names)
+        else:
+            conflicts.extend(pending_conflicts)
         return (
             outcome,
             error_code,
             response_bytes,
             tuple(item[0] for item in failures),
             stored_attempt,
+            tuple(
+                item
+                for item in failures
+                if item[1] is SourceAttemptOutcome.TRANSIENT_FAILURE
+            ),
+            tuple(
+                item
+                for item in failures
+                if item[1] is not SourceAttemptOutcome.TRANSIENT_FAILURE
+            ),
         )
 
     @staticmethod
@@ -674,8 +763,16 @@ class FundDisclosureService:
             return SourceAttemptOutcome.CANCELLED, SourceErrorCode.REQUEST_CANCELLED
         if any(item[1] is SourceAttemptOutcome.EXPIRED for item in failures):
             return SourceAttemptOutcome.EXPIRED, SourceErrorCode.REQUEST_EXPIRED
-        if all(item[1] is SourceAttemptOutcome.TRANSIENT_FAILURE for item in failures):
-            return SourceAttemptOutcome.TRANSIENT_FAILURE, failures[0][2]
+        transient = next(
+            (
+                item[2]
+                for item in failures
+                if item[1] is SourceAttemptOutcome.TRANSIENT_FAILURE
+            ),
+            None,
+        )
+        if transient is not None:
+            return SourceAttemptOutcome.TRANSIENT_FAILURE, transient
         if all(item[1] is SourceAttemptOutcome.UNSUPPORTED for item in failures):
             return SourceAttemptOutcome.UNSUPPORTED, failures[0][2]
         non_transient = next(
@@ -715,6 +812,7 @@ class FundDisclosureService:
         response_bytes: int,
         context: SourceRequestContext,
         authorization: object,
+        mutations: Tuple[_PendingSectionMutation, ...] = (),
     ) -> StoredSourceAttempt:
         registry = SourceRegistryV1()
         force_actor = None
@@ -740,11 +838,54 @@ class FundDisclosureService:
             response_bytes=response_bytes,
         )
         attempt.validate()
-        attempt_id = context.audit_store.record_source_attempt(
-            context.request_run_id,
-            attempt,
-            authorization,
-        )
+        if mutations:
+            if (
+                self.store.repository.database.resolve()
+                != context.audit_store.repository.database.resolve()
+            ):
+                raise ValueError("business and audit stores must share one database")
+            with context.audit_store.repository.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for mutation in mutations:
+                    if mutation.parsed is not None:
+                        parsed = mutation.parsed
+                        self.store.publish_section(
+                            parsed.source.fund_code,
+                            mutation.spec.document_kind,
+                            parsed.source,
+                            parsed.records,
+                            parsed.state,
+                            warning="; ".join(parsed.warnings) or None,
+                            budget=context.budget,
+                            connection=connection,
+                        )
+                    else:
+                        failure_code = mutation.failure_code
+                        if failure_code is None:
+                            raise ValueError("failure mutation is missing its code")
+                        self.store.mark_section_failure(
+                            attempt.subject_key.removeprefix("fund:"),
+                            mutation.spec.document_kind,
+                            failure_code,
+                            failure_code,
+                            self._aware_now(),
+                            budget=context.budget,
+                            connection=connection,
+                        )
+                attempt_id = context.audit_store.record_source_attempt(
+                    context.request_run_id,
+                    attempt,
+                    authorization,
+                    connection=connection,
+                )
+                self.store._require_budget(context.budget)
+                connection.commit()
+        else:
+            attempt_id = context.audit_store.record_source_attempt(
+                context.request_run_id,
+                attempt,
+                authorization,
+            )
         authorization_id = None
         if type(authorization) is ForceAuthorization:
             authorization_id = authorization.reservation.id
@@ -899,23 +1040,6 @@ class FundDisclosureService:
         }:
             return self._attach_publication_dates(parsed, fund_code)
         return parsed
-
-    def _mark_failure(
-        self,
-        fund_code: str,
-        spec: SectionSpec,
-        code: str,
-        context: SourceRequestContext,
-    ) -> None:
-        context.budget.require_publishable()
-        self.store.mark_section_failure(
-            fund_code,
-            spec.document_kind,
-            code,
-            code,
-            self._aware_now(),
-            budget=context.budget,
-        )
 
     @staticmethod
     def _audit_now(context: SourceRequestContext) -> datetime:

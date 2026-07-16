@@ -24,6 +24,7 @@ from kunjin.allocation.service import (
 from kunjin.allocation.store import AllocationAssessmentStore, AllocationPolicyStore
 from kunjin.cli import ApplicationContext, build_context, run
 from kunjin.decision.models import ForceReasonCode
+from kunjin.decision.store import DecisionAuditStoreError
 from kunjin.funds.models import DisclosureBundle, DocumentKind
 from kunjin.funds.peers.models import (
     MembershipKind,
@@ -48,7 +49,11 @@ from kunjin.funds.risk.service import (
     RiskServiceError,
 )
 from kunjin.funds.risk.store import FundRiskStore
-from kunjin.funds.service import FundDisclosureSyncResult, SectionSyncResult
+from kunjin.funds.service import (
+    FundDisclosureSyncInterrupted,
+    FundDisclosureSyncResult,
+    SectionSyncResult,
+)
 from kunjin.funds.store import FundDisclosureStore
 from kunjin.ledger.alipay import AlipayPaymentParser
 from kunjin.ledger.models import OcrBlock
@@ -2548,6 +2553,33 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(row["status"], "cancelled")
         self.assertIn("basic_profile", json.loads(row["omitted_work_json"]))
 
+    def test_disclosure_sync_interrupt_preserves_completed_section_metadata(self) -> None:
+        service = FakeDisclosureService(
+            profile=FundDisclosureSyncInterrupted(
+                (
+                    "manager_history",
+                    "current_manager_team",
+                    "fee_schedule",
+                    "fees_share_class_relationship",
+                    "announcements",
+                    "fund_manager_product_announcement",
+                )
+            )
+        )
+        self.context.fund_disclosure_service = service
+
+        with self.assertRaises(KeyboardInterrupt):
+            run(["--json", "sync", "fund-profile", "519755"], self.context)
+
+        with self.context.repository.connect() as connection:
+            row = connection.execute(
+                "SELECT omitted_work_json FROM request_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        omitted = json.loads(row["omitted_work_json"])
+        self.assertNotIn("basic_profile", omitted)
+        self.assertNotIn("size_history", omitted)
+        self.assertIn("manager_history", omitted)
+
     def test_disclosure_sync_exception_keeps_public_request_metadata(self) -> None:
         secret = f"private failure at {self.context.paths.database} token=never-print"
         service = FakeDisclosureService(profile=ValueError(secret))
@@ -2574,6 +2606,41 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertNotIn(secret, rendered)
         self.assertNotIn(str(self.context.paths.database), rendered)
         self.assertNotIn("never-print", rendered)
+
+    def test_disclosure_sync_primary_and_finalize_failures_stay_safe(self) -> None:
+        service = FakeDisclosureService(
+            profile=RuntimeError("PRIMARY_PRIVATE_DETAIL token=primary-secret")
+        )
+        self.context.fund_disclosure_service = service
+
+        with patch(
+            "kunjin.cli.DecisionAuditStore.finalize_request",
+            side_effect=DecisionAuditStoreError(
+                "FINALIZE_PRIVATE_DETAIL token=final-secret"
+            ),
+        ):
+            payload, exit_code, _ = run(
+                ["--json", "sync", "fund-profile", "519755"],
+                self.context,
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            payload["errors"][0],
+            {
+                "code": "fund_disclosure_sync_failed",
+                "message": "bounded fund disclosure synchronization failed",
+            },
+        )
+        self.assertEqual(payload["data"]["request"]["terminal_status"], "failed")
+        rendered = json.dumps(payload, ensure_ascii=False)
+        for private in (
+            "PRIMARY_PRIVATE_DETAIL",
+            "primary-secret",
+            "FINALIZE_PRIVATE_DETAIL",
+            "final-secret",
+        ):
+            self.assertNotIn(private, rendered)
 
     def test_disclosure_sync_expiry_returns_terminal_metadata_and_finalizes(self) -> None:
         class ExpiringDisclosureService(FakeDisclosureService):
