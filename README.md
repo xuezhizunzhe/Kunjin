@@ -31,7 +31,9 @@ Replace `000000` at execution time with the approved six-digit public code. No
 personal holding is hard-coded. The script uses a fresh private data/state
 runtime, performs one rapid public profile synchronization, checks the pre/post
 source state and fact/buy routes, and writes only validated amount-free JSON and
-a summary. It does not read the personal profile or database, synchronize
+a summary. One global 90-second deadline covers all five CLI commands, strict
+schema projection, private staging, and atomic publication; a command that
+leaves a child process behind fails closed. It does not read the personal profile or database, synchronize
 Yangjibao, use Docker, poll a failed source, or authorize a mature purchase or
 exact amount. The output directory must not already exist.
 

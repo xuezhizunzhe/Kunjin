@@ -36,8 +36,8 @@ if [[ ! -d "${OUTPUT_PARENT_LEXICAL}" ]]; then
     exit 66
 fi
 readonly OUTPUT_PARENT="$(cd -P "${OUTPUT_PARENT_LEXICAL}" && pwd -P)"
-readonly OUTPUT_DIR="${OUTPUT_PARENT}/${OUTPUT_BASENAME}"
-if [[ -e "${OUTPUT_DIR}" || -L "${OUTPUT_DIR}" ]]; then
+if [[ -e "${OUTPUT_PARENT}/${OUTPUT_BASENAME}" \
+   || -L "${OUTPUT_PARENT}/${OUTPUT_BASENAME}" ]]; then
     printf 'physical OUTPUT_DIR must not already exist or be a symbolic link\n' >&2
     exit 66
 fi
@@ -54,7 +54,6 @@ if [[ -L "${SCRIPT_SOURCE}" ]]; then
     printf 'acceptance script symlink invocation is rejected\n' >&2
     exit 66
 fi
-readonly SCRIPT_BASENAME="${SCRIPT_SOURCE##*/}"
 readonly SCRIPT_DIRECTORY="$(cd -P "${SCRIPT_SOURCE%/*}" && pwd -P)"
 readonly ROOT_DIR="$(cd -P "${SCRIPT_DIRECTORY}/.." && pwd -P)"
 readonly CLI="${ROOT_DIR}/.venv/bin/kunjin"
@@ -63,10 +62,12 @@ if [[ ! -x "${CLI}" || ! -x "${PYTHON}" ]]; then
     printf 'repository virtual environment is unavailable\n' >&2
     exit 69
 fi
-readonly SYNC_TIMEOUT_SECONDS="${KUNJIN_PHASE0_SYNC_TIMEOUT_SECONDS:-90}"
-if [[ ! "${SYNC_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ \
-   || "${SYNC_TIMEOUT_SECONDS}" -gt 90 ]]; then
-    printf 'Phase 0 sync timeout must be an integer from 1 through 90 seconds\n' >&2
+
+# The override can only shorten the production 90-second global acceptance budget.
+readonly ACCEPTANCE_TIMEOUT_SECONDS="${KUNJIN_PHASE0_ACCEPTANCE_TIMEOUT_SECONDS:-90}"
+if [[ ! "${ACCEPTANCE_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ \
+   || "${ACCEPTANCE_TIMEOUT_SECONDS}" -gt 90 ]]; then
+    printf 'Phase 0 acceptance timeout must be an integer from 1 through 90 seconds\n' >&2
     exit 65
 fi
 
@@ -84,449 +85,1061 @@ export PYTHONPYCACHEPREFIX="${RUNTIME_DIR}/pycache"
 /bin/mkdir -p "${KUNJIN_DATA_DIR}" "${KUNJIN_STATE_DIR}" "${PYTHONPYCACHEPREFIX}"
 /bin/chmod 700 "${KUNJIN_DATA_DIR}" "${KUNJIN_STATE_DIR}" "${PYTHONPYCACHEPREFIX}"
 
-readonly VERSION_JSON="${RUNTIME_DIR}/version.json"
-readonly SOURCE_BEFORE_JSON="${RUNTIME_DIR}/source-status-before.json"
-readonly SYNC_JSON="${RUNTIME_DIR}/sync-fund-profile.json"
-readonly SOURCE_AFTER_JSON="${RUNTIME_DIR}/source-status-after.json"
-readonly ROUTE_JSON="${RUNTIME_DIR}/decision-route.json"
-readonly SUMMARY_JSON="${RUNTIME_DIR}/summary.json"
-readonly SYNC_WATCHDOG_METADATA="${RUNTIME_DIR}/sync-watchdog.metadata"
-readonly SYNC_WATCHDOG_STDERR="${RUNTIME_DIR}/sync-watchdog.stderr"
-
-run_required_json() {
-    local output_path="$1"
-    shift
-    if ! "${CLI}" "$@" > "${output_path}" 2> "${output_path}.stderr"; then
-        printf 'required amount-free KunJin command failed\n' >&2
-        return 1
-    fi
-    /bin/chmod 600 "${output_path}" "${output_path}.stderr"
-}
-
-run_required_json "${VERSION_JSON}" --json version
-run_required_json "${SOURCE_BEFORE_JSON}" --json source status
-
-if ! "${PYTHON}" - \
-    "${SYNC_TIMEOUT_SECONDS}" \
+set +e
+"${PYTHON}" - \
+    "${ACCEPTANCE_TIMEOUT_SECONDS}" \
     "${CLI}" \
     "${CODE}" \
-    "${SYNC_JSON}" \
-    "${SYNC_JSON}.stderr" \
-    "${SYNC_WATCHDOG_METADATA}" \
-    2> "${SYNC_WATCHDOG_STDERR}" <<'PY'
+    "${RUNTIME_DIR}" \
+    "${OUTPUT_PARENT}" \
+    "${OUTPUT_BASENAME}" \
+    2> "${RUNTIME_DIR}/driver.stderr" <<'PY'
+import ctypes
+import errno
+import json
 import os
+import re
+import secrets
 import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
-
-
-timeout_text, cli, code, stdout_path, stderr_path, metadata_path = sys.argv[1:]
-timeout_seconds = int(timeout_text)
-started = time.monotonic()
-hard_deadline = started + timeout_seconds
-soft_deadline = hard_deadline - min(0.5, timeout_seconds / 2)
-cleanup_deadline = hard_deadline - min(0.25, timeout_seconds / 4)
-timed_out = False
-process = None
-
-
-class WatchdogInterrupted(BaseException):
-    pass
-
-
-def interrupt_watchdog(_signal_number, _frame):
-    raise WatchdogInterrupted()
-
-
-for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
-    signal.signal(handled_signal, interrupt_watchdog)
-
-
-def terminate_process_group(child, deadline):
-    for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
-        signal.signal(handled_signal, signal.SIG_IGN)
-    try:
-        os.killpg(child.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        child.wait(timeout=max(0, min(0.2, deadline - time.monotonic())))
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(child.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    child.wait()
-
-
-try:
-    with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
-        process = subprocess.Popen(
-            [
-                cli,
-                "--json",
-                "sync",
-                "fund-profile",
-                code,
-                "--mode",
-                "rapid",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
-        )
-        try:
-            exit_code = process.wait(
-                timeout=max(0, soft_deadline - time.monotonic())
-            )
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            terminate_process_group(process, cleanup_deadline)
-            exit_code = 124
-except BaseException:
-    if process is not None:
-        terminate_process_group(
-            process,
-            min(cleanup_deadline, time.monotonic() + 0.2),
-        )
-    raise
-finally:
-    if process is not None and process.poll() is None:
-        terminate_process_group(
-            process,
-            min(cleanup_deadline, time.monotonic() + 0.2),
-        )
-elapsed_milliseconds = int((time.monotonic() - started) * 1000)
-Path(metadata_path).write_text(
-    f"{exit_code}\t{elapsed_milliseconds}\t{int(timed_out)}\n",
-    encoding="ascii",
-)
-PY
-then
-    printf 'Phase 0 sync watchdog failed\n' >&2
-    exit 70
-fi
-/bin/chmod 600 \
-    "${SYNC_JSON}" \
-    "${SYNC_JSON}.stderr" \
-    "${SYNC_WATCHDOG_METADATA}" \
-    "${SYNC_WATCHDOG_STDERR}"
-IFS=$'\t' read -r SYNC_EXIT_CODE SYNC_ELAPSED_MILLISECONDS SYNC_TIMED_OUT \
-    < "${SYNC_WATCHDOG_METADATA}"
-readonly SYNC_EXIT_CODE SYNC_ELAPSED_MILLISECONDS SYNC_TIMED_OUT
-if [[ ! "${SYNC_EXIT_CODE}" =~ ^-?[0-9]+$ \
-   || ! "${SYNC_ELAPSED_MILLISECONDS}" =~ ^[0-9]+$ \
-   || ! "${SYNC_TIMED_OUT}" =~ ^[01]$ ]]; then
-    printf 'Phase 0 sync watchdog metadata is invalid\n' >&2
-    exit 70
-fi
-if [[ "${SYNC_TIMED_OUT}" -eq 1 ]]; then
-    printf 'Phase 0 rapid sync reached its terminal wall-clock deadline\n' >&2
-    exit 124
-fi
-
-run_required_json \
-    "${SOURCE_AFTER_JSON}" --json source status --fund-code "${CODE}"
-run_required_json \
-    "${ROUTE_JSON}" --json decision route --mode rapid \
-    --action fact_research --action buy_or_add
-
-"${PYTHON}" - \
-    "${CODE}" \
-    "${SYNC_EXIT_CODE}" \
-    "${SYNC_ELAPSED_MILLISECONDS}" \
-    "${VERSION_JSON}" \
-    "${SOURCE_BEFORE_JSON}" \
-    "${SYNC_JSON}" \
-    "${SOURCE_AFTER_JSON}" \
-    "${ROUTE_JSON}" \
-    "${SUMMARY_JSON}" <<'PY'
-import json
-import re
-import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
 (
+    timeout_text,
+    cli,
     code,
-    sync_exit_text,
-    sync_elapsed_milliseconds_text,
-    version_path,
-    source_before_path,
-    sync_path,
-    source_after_path,
-    route_path,
-    summary_path,
+    runtime_path,
+    output_parent_path,
+    output_basename,
 ) = sys.argv[1:]
+timeout_seconds = int(timeout_text)
+runtime = Path(runtime_path)
+
+started = time.monotonic()
+hard_deadline = started + timeout_seconds
+publish_deadline = hard_deadline - min(0.25, timeout_seconds / 4)
+command_deadline = publish_deadline - min(0.25, timeout_seconds / 4)
 
 REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
 CHECKSUM = re.compile(r"^[0-9a-f]{64}$")
-FORBIDDEN_KEYS = {
-    "access_token",
-    "authorization_token",
-    "body",
-    "debt",
-    "emergency_reserve",
-    "income",
-    "managed_path",
-    "monthly_net_income",
-    "private_key",
-    "raw_body",
-    "request_body",
-    "token",
+IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
+VERSION = re.compile(r"^[0-9][0-9A-Za-z.+_-]{0,63}$")
+FUND_CODE = re.compile(r"^[0-9]{6}$")
+ENVELOPE_KEYS = {
+    "schema_version",
+    "command",
+    "as_of",
+    "data",
+    "warnings",
+    "errors",
 }
-FORBIDDEN_TEXT = (
-    re.compile(r"(?:^|[\s=])/(?:Users|private|tmp|var)/"),
-    re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]+"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"(?i)(?:token|private[_ -]?key)\s*[:=]"),
-)
-ENVELOPE_KEYS = {"schema_version", "command", "as_of", "data", "warnings", "errors"}
+SOURCE_DATA_KEYS = {
+    "fund_code",
+    "mode",
+    "policy_checksum",
+    "policy_version",
+    "registry_checksum",
+    "registry_version",
+    "request_field_resolutions",
+    "request_id",
+    "snapshot_at",
+    "source_fields",
+}
+SOURCE_FIELD_KEYS = {
+    "acceptable_alternatives",
+    "consecutive_failures",
+    "cooldown_until",
+    "field_id",
+    "field_scope",
+    "last_failure_at",
+    "last_failure_reason",
+    "last_success_at",
+    "last_success_data_as_of",
+    "source_id",
+    "source_kind",
+    "source_scope",
+    "source_tier",
+    "state",
+    "supplementation",
+}
+SUPPLEMENTATION_KEYS = {
+    "accepted_input",
+    "freshness_requirement",
+    "impact_if_missing",
+    "missing_item",
+    "suggested_location",
+    "supported_without_it",
+    "unsupported_without_it",
+    "why_required",
+}
+RESOLUTION_KEYS = {
+    "action",
+    "field_id",
+    "primary_source_id",
+    "resolution",
+    "risk_effect",
+}
+SYNC_DATA_KEYS = {
+    "conflicts",
+    "errors",
+    "freshness",
+    "fund_code",
+    "request",
+    "sections",
+    "sources",
+    "warnings",
+}
+SECTION_KEYS = {
+    "as_of",
+    "error_code",
+    "freshness",
+    "last_attempt_at",
+    "last_success_at",
+    "records",
+    "section",
+    "status",
+}
+REQUEST_KEYS = {
+    "deadline_at",
+    "mode",
+    "omitted_work",
+    "request_id",
+    "terminal_status",
+}
+SOURCE_DOCUMENT_KEYS = {
+    "document_kind",
+    "id",
+    "published_at",
+    "publisher",
+    "retrieved_at",
+    "source_name",
+    "source_tier",
+    "title",
+    "url",
+}
+FRESHNESS_KEYS = {"as_of", "sections"}
+FRESHNESS_SECTION_KEYS = {
+    "age_days",
+    "last_attempted_at",
+    "last_success_at",
+    "state",
+}
+SYNC_ERROR_KEYS = {"code", "message", "section"}
+ROUTE_DATA_KEYS = {
+    "actions",
+    "conclusion_evidence",
+    "created_at",
+    "missing_fields",
+    "mode",
+    "opposing_evidence",
+    "policy_checksum",
+    "policy_version",
+    "registry_checksum",
+    "registry_version",
+    "request_id",
+    "result_checksum",
+    "workflow_level",
+}
+ACTION_KEYS = {
+    "action",
+    "action_id",
+    "action_maturity",
+    "blocking_codes",
+    "exact_amount_available",
+    "minimum_state",
+    "required_gates",
+    "research_available",
+    "risk_effect",
+}
+CONCLUSION_KEYS = {
+    "completeness",
+    "conflicts",
+    "coverage_percent",
+    "freshness",
+    "independent_lineage_count",
+    "inferred",
+    "lineage_ids",
+    "market_as_of",
+    "missing_critical_fields",
+    "publication_times",
+    "publishers",
+    "report_as_of",
+    "retrieved_at",
+    "source_ids",
+    "source_tier",
+}
+SOURCE_STATES = {
+    "not_checked",
+    "healthy",
+    "degraded",
+    "cooldown",
+    "unavailable",
+    "unsupported",
+}
+RESOLUTIONS = {"usable", "partial", "manual_supplement_required"}
+SOURCE_TIERS = {"tier_1", "tier_2", "private_observation", "user_provided"}
+ACTION_MATURITIES = {"mature", "experimental_shadow"}
+ACTION_STATES = {"research_only", "no_add", "experimental_shadow", "actionable"}
+RISK_EFFECTS = {"information", "risk_increasing"}
+WORKFLOW_LEVELS = {"rapid_evidence"}
+MAX_RAW_BYTES = 4 * 1024 * 1024
+RENAME_EXCL = 0x00000004
 
 
-def fail(message):
-    raise SystemExit("phase0 acceptance failed: " + message)
+class AcceptanceFailure(Exception):
+    pass
 
 
-def read_envelope(path, expected_command):
+class AcceptanceDeadline(BaseException):
+    pass
+
+
+class AcceptanceInterrupted(BaseException):
+    pass
+
+
+def on_deadline(_signal_number, _frame):
+    raise AcceptanceDeadline()
+
+
+def on_interrupt(_signal_number, _frame):
+    raise AcceptanceInterrupted()
+
+
+signal.signal(signal.SIGALRM, on_deadline)
+for interrupt_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(interrupt_signal, on_interrupt)
+signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+
+
+def require_time(deadline, label):
+    if time.monotonic() >= deadline:
+        raise AcceptanceFailure(label + " exceeded the global acceptance budget")
+
+
+def exact_dict(value, keys, label):
+    if type(value) is not dict or set(value) != keys:
+        raise AcceptanceFailure(label + " keys are invalid")
+    return value
+
+
+def exact_list(value, label):
+    if type(value) is not list:
+        raise AcceptanceFailure(label + " must be a list")
+    return value
+
+
+def identifier(value, label):
+    if type(value) is not str or IDENTIFIER.fullmatch(value) is None:
+        raise AcceptanceFailure(label + " is invalid")
+    return value
+
+
+def identifier_list(value, label):
+    values = exact_list(value, label)
+    projected = [identifier(item, label + " item") for item in values]
+    if len(projected) != len(set(projected)):
+        raise AcceptanceFailure(label + " contains duplicates")
+    return projected
+
+
+def public_text(value, label, *, optional=False):
+    if optional and value is None:
+        return None
+    if type(value) is not str or not value or len(value) > 4096:
+        raise AcceptanceFailure(label + " is invalid")
+    if any(ord(character) < 32 and character not in "\t" for character in value):
+        raise AcceptanceFailure(label + " contains control characters")
+    return value
+
+
+def utc_text(value, label, *, optional=False):
+    if optional and value is None:
+        return None
+    if type(value) is not str or not value.endswith("+00:00"):
+        raise AcceptanceFailure(label + " is not canonical UTC")
     try:
-        raw = Path(path).read_text(encoding="utf-8")
-        payload = json.loads(raw)
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        fail(expected_command + " did not return one valid UTF-8 JSON document")
-    if type(payload) is not dict or set(payload) != ENVELOPE_KEYS:
-        fail(expected_command + " envelope keys are invalid")
-    if payload["schema_version"] != "1" or payload["command"] != expected_command:
-        fail(expected_command + " schema or command is invalid")
-    if type(payload["data"]) is not dict:
-        fail(expected_command + " data must be a non-empty-capable object")
-    if type(payload["warnings"]) is not list or type(payload["errors"]) is not list:
-        fail(expected_command + " warnings or errors are invalid")
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise AcceptanceFailure(label + " is invalid") from None
+    if parsed.utcoffset() != timedelta(0):
+        raise AcceptanceFailure(label + " is not UTC")
+    return value
+
+
+def checksum(value, label):
+    if type(value) is not str or CHECKSUM.fullmatch(value) is None:
+        raise AcceptanceFailure(label + " is invalid")
+    return value
+
+
+def request_id(value, label):
+    if type(value) is not str or REQUEST_ID.fullmatch(value) is None:
+        raise AcceptanceFailure(label + " is invalid")
+    return value
+
+
+def group_exists(process_group):
     try:
-        parsed_as_of = datetime.fromisoformat(payload["as_of"])
-    except (TypeError, ValueError):
-        fail(expected_command + " as_of is invalid")
-    if parsed_as_of.utcoffset() is None:
-        fail(expected_command + " as_of must be timezone-aware")
-    return payload
+        os.killpg(process_group, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
-def validate_public_tree(value, key=None):
-    if key is not None:
-        normalized_key = key.lower()
-        if normalized_key in FORBIDDEN_KEYS:
-            fail("private or raw field is present")
-        if normalized_key == "checksum" or normalized_key.endswith("_checksum"):
-            if type(value) is not str or CHECKSUM.fullmatch(value) is None:
-                fail("public checksum is invalid")
-    if type(value) is dict:
-        for child_key, child_value in value.items():
-            if type(child_key) is not str:
-                fail("JSON object key is not text")
-            validate_public_tree(child_value, child_key)
-    elif type(value) is list:
-        for child in value:
-            validate_public_tree(child)
-    elif type(value) is str:
-        if any(pattern.search(value) for pattern in FORBIDDEN_TEXT):
-            fail("path, credential, body, or private-key material is present")
-
-
-version = read_envelope(version_path, "version")
-source_before = read_envelope(source_before_path, "source.status")
-sync = read_envelope(sync_path, "sync.fund-profile")
-source_after = read_envelope(source_after_path, "source.status")
-route = read_envelope(route_path, "decision.route")
-for payload in (version, source_before, sync, source_after, route):
-    validate_public_tree(payload)
-
-if version["errors"] or type(version["data"].get("version")) is not str:
-    fail("version is unavailable")
-if source_before["errors"] or source_before["data"].get("fund_code") is not None:
-    fail("pre-run source status must be amount-free and unscoped")
-if source_after["errors"] or source_after["data"].get("fund_code") != code:
-    fail("post-run source status is unavailable for the requested public code")
-if route["errors"]:
-    fail("decision route is unavailable")
-if sync["data"].get("fund_code") != code:
-    fail("sync result does not match the requested public code")
-
-request_ids = {
-    "source_before": source_before["data"].get("request_id"),
-    "sync": sync["data"].get("request", {}).get("request_id"),
-    "source_after": source_after["data"].get("request_id"),
-    "route": route["data"].get("request_id"),
-}
-if any(type(value) is not str or REQUEST_ID.fullmatch(value) is None for value in request_ids.values()):
-    fail("one or more request identifiers are invalid")
-if len(set(request_ids.values())) != len(request_ids):
-    fail("request identifiers must be distinct")
-
-required_checksums = (
-    source_before["data"].get("policy_checksum"),
-    source_before["data"].get("registry_checksum"),
-    source_after["data"].get("policy_checksum"),
-    source_after["data"].get("registry_checksum"),
-    route["data"].get("policy_checksum"),
-    route["data"].get("registry_checksum"),
-    route["data"].get("result_checksum"),
-)
-if any(type(value) is not str or CHECKSUM.fullmatch(value) is None for value in required_checksums):
-    fail("required public checksums are missing or invalid")
-policy_identities = {
-    (payload["data"].get("policy_version"), payload["data"].get("policy_checksum"))
-    for payload in (source_before, source_after, route)
-}
-registry_identities = {
-    (payload["data"].get("registry_version"), payload["data"].get("registry_checksum"))
-    for payload in (source_before, source_after, route)
-}
-if len(policy_identities) != 1 or len(registry_identities) != 1:
-    fail("policy or registry identity changed during acceptance")
-if any(type(value) is not str or not value for identity in (*policy_identities, *registry_identities) for value in identity):
-    fail("policy or registry version identity is invalid")
-if source_before["data"].get("mode") != "rapid" or source_after["data"].get("mode") != "rapid":
-    fail("source status must use rapid mode")
-if sync["data"].get("request", {}).get("mode") != "rapid":
-    fail("fund profile sync did not use rapid mode")
-if route["data"].get("mode") != "rapid":
-    fail("decision route did not use rapid mode")
-
-try:
-    sync_exit_code = int(sync_exit_text)
-    sync_elapsed_milliseconds = int(sync_elapsed_milliseconds_text)
-except ValueError:
-    fail("sync exit or elapsed metadata is invalid")
-if sync_exit_code != 0 or sync["errors"]:
-    fail("sync did not return a successful public partial-or-complete envelope")
-sync_elapsed_seconds = sync_elapsed_milliseconds / 1000
-if sync_elapsed_milliseconds < 0 or sync_elapsed_milliseconds > 90000:
-    fail("rapid fund profile sync exceeded 90 seconds")
-
-post_fields = source_after["data"].get("source_fields")
-if type(post_fields) is not list or not post_fields:
-    fail("post-run source fields are empty")
-source_attempt_count = sum(
-    1
-    for item in post_fields
-    if type(item) is dict
-    and (item.get("last_success_at") is not None or item.get("last_failure_at") is not None)
-)
-if source_attempt_count < 1:
-    fail("no bounded source attempt was recorded")
-
-sections = sync["data"].get("sections")
-if type(sections) is not dict or not sections:
-    fail("sync returned an empty fact envelope")
-fact_record_count = sum(
-    item.get("records", 0)
-    for item in sections.values()
-    if type(item) is dict
-    and item.get("status") in {"success", "not_disclosed"}
-    and type(item.get("records")) is int
-    and item.get("records", 0) > 0
-)
-if fact_record_count < 1:
-    fail("sync returned no obtained public facts")
-
-terminal_status = sync["data"].get("request", {}).get("terminal_status")
-if terminal_status not in {"complete", "partial"}:
-    fail("sync did not reach a usable terminal status")
-resolutions = source_after["data"].get("request_field_resolutions")
-if type(resolutions) is not list or not resolutions:
-    fail("post-run field resolutions are empty")
-missing_resolutions = [
-    item for item in resolutions
-    if type(item) is dict and item.get("resolution") != "usable"
-]
-partial = terminal_status == "partial" or bool(missing_resolutions)
-if partial:
-    if not missing_resolutions:
-        fail("partial sync does not identify the missing field impact")
-    source_by_identity = {
-        (item.get("source_id"), item.get("field_id")): item
-        for item in post_fields
-        if type(item) is dict
+def terminate_process_group(child, deadline):
+    original_handlers = {
+        handled: signal.getsignal(handled)
+        for handled in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
     }
-    for resolution in missing_resolutions:
-        identity = (resolution.get("primary_source_id"), resolution.get("field_id"))
-        supplementation = source_by_identity.get(identity, {}).get("supplementation")
-        if type(supplementation) is not dict:
-            fail("partial result lacks a concrete supplementation record")
-        if not supplementation.get("impact_if_missing"):
-            fail("partial result lacks missing-field action impact")
-        if not supplementation.get("suggested_location") or not supplementation.get("accepted_input"):
-            fail("partial result lacks a concrete supplementation path")
+    for handled in original_handlers:
+        signal.signal(handled, signal.SIG_IGN)
+    try:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        for _ in range(10):
+            if not group_exists(child.pid) or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        if group_exists(child.pid):
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if child.poll() is None:
+            child.wait()
+        for _ in range(20):
+            if not group_exists(child.pid) or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+    finally:
+        for handled, previous in original_handlers.items():
+            signal.signal(handled, previous)
 
-actions = route["data"].get("actions")
-if type(actions) is not list:
-    fail("decision route actions are invalid")
-actions_by_name = {
-    item.get("action"): item for item in actions if type(item) is dict
-}
-facts_action = actions_by_name.get("fact_research")
-buy_action = actions_by_name.get("buy_or_add")
-if type(facts_action) is not dict or facts_action.get("research_available") is not True:
-    fail("independent fact research is unavailable")
-if type(buy_action) is not dict:
-    fail("buy_or_add route is missing")
-if (
-    buy_action.get("exact_amount_available") is not False
-    or buy_action.get("minimum_state") == "actionable"
-    or buy_action.get("action_maturity") == "mature"
-    or not buy_action.get("blocking_codes")
-):
-    fail("Phase 0 must block a mature or exact purchase direction")
 
-summary = {
-    "schema_version": "1",
-    "acceptance": "phase0_amount_free_live",
-    "status": "passed",
-    "fund_code": code,
-    "mode": "rapid",
-    "fresh_isolated_runtime": True,
-    "sync_exit_code": sync_exit_code,
-    "sync_elapsed_seconds": sync_elapsed_seconds,
-    "source_attempt_count": source_attempt_count,
-    "fact_record_count": fact_record_count,
-    "partial": partial,
-    "request_ids": request_ids,
-    "checksums": {
-        "policy_version": route["data"]["policy_version"],
-        "policy_checksum": route["data"]["policy_checksum"],
-        "registry_version": route["data"]["registry_version"],
-        "registry_checksum": route["data"]["registry_checksum"],
-        "route_result_checksum": route["data"]["result_checksum"],
-    },
-}
-validate_public_tree(summary)
-Path(summary_path).write_text(
-    json.dumps(summary, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n",
-    encoding="utf-8",
-)
+command_elapsed_seconds = {}
+
+
+def run_command(name, arguments):
+    require_time(command_deadline, name)
+    raw_path = runtime / (name + ".raw.json")
+    stderr_path = runtime / (name + ".stderr")
+    command_started = time.monotonic()
+    remaining = command_deadline - command_started
+    cleanup_reserve = min(0.2, max(0.05, remaining / 4))
+    child = None
+    try:
+        with raw_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
+            os.chmod(raw_path, 0o600)
+            os.chmod(stderr_path, 0o600)
+            child = subprocess.Popen(
+                [cli, *arguments],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+            )
+            try:
+                exit_code = child.wait(timeout=max(0, remaining - cleanup_reserve))
+            except subprocess.TimeoutExpired:
+                terminate_process_group(child, min(command_deadline, time.monotonic() + cleanup_reserve))
+                raise AcceptanceFailure(name + " reached the global acceptance deadline")
+        if group_exists(child.pid):
+            terminate_process_group(child, min(command_deadline, time.monotonic() + cleanup_reserve))
+            raise AcceptanceFailure(name + " left a residual process group")
+        if exit_code != 0:
+            raise AcceptanceFailure(name + " returned a non-zero process exit")
+        size = raw_path.stat().st_size
+        if size <= 0 or size > MAX_RAW_BYTES:
+            raise AcceptanceFailure(name + " JSON size is invalid")
+        command_elapsed_seconds[name] = round(time.monotonic() - command_started, 3)
+        require_time(command_deadline, name)
+        return raw_path
+    except BaseException:
+        if child is not None and group_exists(child.pid):
+            terminate_process_group(
+                child,
+                min(command_deadline, time.monotonic() + cleanup_reserve),
+            )
+        raise
+
+
+def load_envelope(path, expected_command):
+    require_time(publish_deadline, expected_command + " validation")
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise AcceptanceFailure(expected_command + " is not one UTF-8 JSON document") from None
+    exact_dict(payload, ENVELOPE_KEYS, expected_command + " envelope")
+    if payload["schema_version"] != "1" or payload["command"] != expected_command:
+        raise AcceptanceFailure(expected_command + " envelope identity is invalid")
+    as_of = utc_text(payload["as_of"], expected_command + " as_of")
+    exact_list(payload["warnings"], expected_command + " warnings")
+    for warning in payload["warnings"]:
+        public_text(warning, expected_command + " warning")
+    if payload["errors"] != []:
+        raise AcceptanceFailure(expected_command + " returned command errors")
+    if type(payload["data"]) is not dict:
+        raise AcceptanceFailure(expected_command + " data is invalid")
+    return payload, as_of
+
+
+def projected_envelope(command, as_of, data):
+    return {
+        "schema_version": "1",
+        "command": command,
+        "as_of": as_of,
+        "data": data,
+        "warnings": [],
+        "errors": [],
+    }
+
+
+def project_version(path):
+    payload, as_of = load_envelope(path, "version")
+    data = exact_dict(payload["data"], {"version"}, "version data")
+    if type(data["version"]) is not str or VERSION.fullmatch(data["version"]) is None:
+        raise AcceptanceFailure("version value is invalid")
+    return projected_envelope("version", as_of, {"version": data["version"]})
+
+
+def project_supplementation(value, label):
+    item = exact_dict(value, SUPPLEMENTATION_KEYS, label)
+    accepted_input = exact_list(item["accepted_input"], label + " accepted input")
+    projected_inputs = [
+        public_text(entry, label + " accepted input entry") for entry in accepted_input
+    ]
+    if not projected_inputs:
+        raise AcceptanceFailure(label + " accepted input is empty")
+    projected = {
+        "accepted_input": projected_inputs,
+        "impact_if_missing": public_text(item["impact_if_missing"], label + " impact"),
+        "missing_item": identifier(item["missing_item"], label + " missing item"),
+        "suggested_location": public_text(item["suggested_location"], label + " location"),
+        "supported_without_it": public_text(
+            item["supported_without_it"], label + " supported scope"
+        ),
+        "unsupported_without_it": public_text(
+            item["unsupported_without_it"], label + " unsupported scope"
+        ),
+    }
+    public_text(item["freshness_requirement"], label + " freshness")
+    public_text(item["why_required"], label + " rationale")
+    return projected
+
+
+def project_source(path, expected_code):
+    payload, as_of = load_envelope(path, "source.status")
+    data = exact_dict(payload["data"], SOURCE_DATA_KEYS, "source status data")
+    fund_code = data["fund_code"]
+    if fund_code is not None and (
+        type(fund_code) is not str or FUND_CODE.fullmatch(fund_code) is None
+    ):
+        raise AcceptanceFailure("source status fund code is invalid")
+    if fund_code != expected_code:
+        raise AcceptanceFailure("source status fund code scope is invalid")
+    if data["mode"] != "rapid":
+        raise AcceptanceFailure("source status mode is invalid")
+    projected_fields = []
+    identities = set()
+    for index, value in enumerate(exact_list(data["source_fields"], "source fields")):
+        item = exact_dict(value, SOURCE_FIELD_KEYS, "source field")
+        source_id = identifier(item["source_id"], "source id")
+        field_id = identifier(item["field_id"], "field id")
+        identity = (source_id, field_id)
+        if identity in identities:
+            raise AcceptanceFailure("source fields contain duplicate identities")
+        identities.add(identity)
+        identifier(item["source_kind"], "source kind")
+        public_text(item["source_scope"], "source scope")
+        public_text(item["field_scope"], "field scope")
+        if item["source_tier"] not in SOURCE_TIERS:
+            raise AcceptanceFailure("source tier is invalid")
+        alternatives = exact_list(item["acceptable_alternatives"], "alternatives")
+        for alternative in alternatives:
+            exact_dict(alternative, {"field_id", "source_id"}, "alternative")
+            identifier(alternative["source_id"], "alternative source id")
+            identifier(alternative["field_id"], "alternative field id")
+        if item["state"] not in SOURCE_STATES:
+            raise AcceptanceFailure("source state is invalid")
+        if type(item["consecutive_failures"]) is not int or not (
+            0 <= item["consecutive_failures"] <= 64
+        ):
+            raise AcceptanceFailure("source failure count is invalid")
+        cooldown_until = utc_text(item["cooldown_until"], "cooldown", optional=True)
+        last_failure_at = utc_text(
+            item["last_failure_at"], "last failure", optional=True
+        )
+        last_success_at = utc_text(
+            item["last_success_at"], "last success", optional=True
+        )
+        last_success_data_as_of = utc_text(
+            item["last_success_data_as_of"], "last success data", optional=True
+        )
+        failure_reason = item["last_failure_reason"]
+        if failure_reason is not None:
+            identifier(failure_reason, "last failure reason")
+        if (last_failure_at is None) != (failure_reason is None):
+            raise AcceptanceFailure("source failure evidence is inconsistent")
+        if (last_success_at is None) != (last_success_data_as_of is None):
+            raise AcceptanceFailure("source success evidence is inconsistent")
+        if item["state"] == "not_checked" and any(
+            value is not None
+            for value in (cooldown_until, last_failure_at, last_success_at)
+        ):
+            raise AcceptanceFailure("not-checked source contains attempt evidence")
+        projected_fields.append(
+            {
+                "consecutive_failures": item["consecutive_failures"],
+                "field_id": field_id,
+                "last_failure_at": last_failure_at,
+                "last_failure_reason": failure_reason,
+                "last_success_at": last_success_at,
+                "last_success_data_as_of": last_success_data_as_of,
+                "source_id": source_id,
+                "state": item["state"],
+                "supplementation": project_supplementation(
+                    item["supplementation"], "source supplementation " + str(index)
+                ),
+            }
+        )
+    if not projected_fields:
+        raise AcceptanceFailure("source status fields are empty")
+    projected_resolutions = []
+    resolution_fields = set()
+    for value in exact_list(data["request_field_resolutions"], "field resolutions"):
+        item = exact_dict(value, RESOLUTION_KEYS, "field resolution")
+        if item["action"] != "fact_research" or item["risk_effect"] != "information":
+            raise AcceptanceFailure("field resolution action is invalid")
+        field_id = identifier(item["field_id"], "resolution field id")
+        if field_id in resolution_fields:
+            raise AcceptanceFailure("field resolutions contain duplicates")
+        resolution_fields.add(field_id)
+        if item["resolution"] not in RESOLUTIONS:
+            raise AcceptanceFailure("field resolution is invalid")
+        projected_resolutions.append(
+            {
+                "action": "fact_research",
+                "field_id": field_id,
+                "primary_source_id": identifier(
+                    item["primary_source_id"], "resolution primary source id"
+                ),
+                "resolution": item["resolution"],
+                "risk_effect": "information",
+            }
+        )
+    if not projected_resolutions:
+        raise AcceptanceFailure("field resolutions are empty")
+    projected = {
+        "fund_code": fund_code,
+        "mode": "rapid",
+        "policy_checksum": checksum(data["policy_checksum"], "policy checksum"),
+        "policy_version": identifier(data["policy_version"], "policy version"),
+        "registry_checksum": checksum(data["registry_checksum"], "registry checksum"),
+        "registry_version": identifier(data["registry_version"], "registry version"),
+        "request_field_resolutions": projected_resolutions,
+        "request_id": request_id(data["request_id"], "source request id"),
+        "snapshot_at": utc_text(data["snapshot_at"], "source snapshot"),
+        "source_fields": projected_fields,
+    }
+    return projected_envelope("source.status", as_of, projected)
+
+
+def project_sync(path):
+    payload, as_of = load_envelope(path, "sync.fund-profile")
+    data = exact_dict(payload["data"], SYNC_DATA_KEYS, "sync data")
+    if data["fund_code"] != code:
+        raise AcceptanceFailure("sync fund code is invalid")
+    sections = exact_dict(data["sections"], set(data["sections"]), "sync sections")
+    allowed_sections = {
+        "announcements",
+        "basic_profile",
+        "fee_schedule",
+        "manager_history",
+        "size_history",
+    }
+    allowed_freshness_sections = allowed_sections | {
+        "industry_exposure",
+        "quarterly_holdings",
+    }
+    if not sections or not set(sections).issubset(allowed_sections):
+        raise AcceptanceFailure("sync sections are invalid")
+    projected_sections = {}
+    for section_name, value in sorted(sections.items()):
+        item = exact_dict(value, SECTION_KEYS, "sync section")
+        if item["section"] != section_name:
+            raise AcceptanceFailure("sync section identity is invalid")
+        if type(item["records"]) is not int or item["records"] < 0:
+            raise AcceptanceFailure("sync section record count is invalid")
+        status = identifier(item["status"], "sync section status")
+        freshness = identifier(item["freshness"], "sync section freshness")
+        error_code = item["error_code"]
+        if error_code is not None:
+            identifier(error_code, "sync section error code")
+        projected_sections[section_name] = {
+            "as_of": utc_text(item["as_of"], "sync section as_of", optional=True),
+            "error_code": error_code,
+            "freshness": freshness,
+            "last_attempt_at": utc_text(
+                item["last_attempt_at"], "sync last attempt", optional=True
+            ),
+            "last_success_at": utc_text(
+                item["last_success_at"], "sync last success", optional=True
+            ),
+            "records": item["records"],
+            "section": section_name,
+            "status": status,
+        }
+    request = exact_dict(data["request"], REQUEST_KEYS, "sync request")
+    if request["mode"] != "rapid" or request["terminal_status"] not in {
+        "complete",
+        "partial",
+    }:
+        raise AcceptanceFailure("sync request terminal contract is invalid")
+    projected_request = {
+        "deadline_at": utc_text(request["deadline_at"], "sync deadline"),
+        "mode": "rapid",
+        "omitted_work": identifier_list(request["omitted_work"], "omitted work"),
+        "request_id": request_id(request["request_id"], "sync request id"),
+        "terminal_status": request["terminal_status"],
+    }
+    for source in exact_list(data["sources"], "sync sources"):
+        item = exact_dict(source, SOURCE_DOCUMENT_KEYS, "sync source")
+        if type(item["id"]) is not int or item["id"] <= 0:
+            raise AcceptanceFailure("sync source id is invalid")
+        identifier(item["document_kind"], "sync document kind")
+        public_text(item["title"], "sync source title")
+        public_text(item["url"], "sync source URL")
+        public_text(item["source_name"], "sync source name")
+        public_text(item["publisher"], "sync source publisher")
+        if type(item["source_tier"]) is not int or item["source_tier"] <= 0:
+            raise AcceptanceFailure("sync source tier is invalid")
+        utc_text(item["retrieved_at"], "sync source retrieval")
+        if item["published_at"] is not None:
+            public_text(item["published_at"], "sync source publication date")
+    freshness = exact_dict(data["freshness"], FRESHNESS_KEYS, "sync freshness")
+    utc_text(freshness["as_of"], "sync freshness as_of")
+    freshness_sections = exact_dict(
+        freshness["sections"], set(freshness["sections"]), "freshness sections"
+    )
+    for section_name, value in freshness_sections.items():
+        if section_name not in allowed_freshness_sections:
+            raise AcceptanceFailure("freshness section identity is invalid")
+        item = exact_dict(value, FRESHNESS_SECTION_KEYS, "freshness section")
+        identifier(item["state"], "freshness state")
+        utc_text(item["last_attempted_at"], "freshness attempt", optional=True)
+        utc_text(item["last_success_at"], "freshness success", optional=True)
+        if item["age_days"] is not None and (
+            type(item["age_days"]) is not int or item["age_days"] < 0
+        ):
+            raise AcceptanceFailure("freshness age is invalid")
+    for label in ("warnings", "conflicts"):
+        for entry in exact_list(data[label], "sync " + label):
+            public_text(entry, "sync " + label + " entry")
+    projected_errors = []
+    for value in exact_list(data["errors"], "sync errors"):
+        item = exact_dict(value, SYNC_ERROR_KEYS, "sync error")
+        projected_errors.append(
+            {
+                "code": identifier(item["code"], "sync error code"),
+                "section": identifier(item["section"], "sync error section"),
+            }
+        )
+        public_text(item["message"], "sync error message")
+    return projected_envelope(
+        "sync.fund-profile",
+        as_of,
+        {
+            "fund_code": code,
+            "request": projected_request,
+            "section_errors": projected_errors,
+            "sections": projected_sections,
+        },
+    )
+
+
+def validate_conclusion(value):
+    item = exact_dict(value, CONCLUSION_KEYS, "route conclusion evidence")
+    if item["completeness"] not in {"complete", "partial", "insufficient"}:
+        raise AcceptanceFailure("route evidence completeness is invalid")
+    if item["freshness"] not in {"current", "dated_history", "stale", "unknown"}:
+        raise AcceptanceFailure("route evidence freshness is invalid")
+    if item["source_tier"] not in SOURCE_TIERS:
+        raise AcceptanceFailure("route evidence source tier is invalid")
+    for label in (
+        "conflicts",
+        "lineage_ids",
+        "missing_critical_fields",
+        "source_ids",
+    ):
+        identifier_list(item[label], "route evidence " + label)
+    for label in ("publication_times",):
+        for entry in exact_list(item[label], "route evidence " + label):
+            utc_text(entry, "route evidence publication")
+    for publisher in exact_list(item["publishers"], "route evidence publishers"):
+        public_text(publisher, "route evidence publisher")
+    for label in ("market_as_of", "report_as_of"):
+        utc_text(item[label], "route evidence " + label, optional=True)
+    utc_text(item["retrieved_at"], "route evidence retrieval")
+    if type(item["independent_lineage_count"]) is not int or item[
+        "independent_lineage_count"
+    ] < 0:
+        raise AcceptanceFailure("route evidence lineage count is invalid")
+    if type(item["inferred"]) is not bool:
+        raise AcceptanceFailure("route evidence inferred flag is invalid")
+    coverage = item["coverage_percent"]
+    if coverage is not None:
+        if type(coverage) is not str or re.fullmatch(
+            r"(?:0|[1-9][0-9]{0,2})(?:\.[0-9]+)?", coverage
+        ) is None:
+            raise AcceptanceFailure("route evidence coverage is invalid")
+        if float(coverage) > 100:
+            raise AcceptanceFailure("route evidence coverage is invalid")
+
+
+def project_route(path):
+    payload, as_of = load_envelope(path, "decision.route")
+    data = exact_dict(payload["data"], ROUTE_DATA_KEYS, "route data")
+    if data["mode"] != "rapid" or data["workflow_level"] not in WORKFLOW_LEVELS:
+        raise AcceptanceFailure("route mode is invalid")
+    actions = exact_list(data["actions"], "route actions")
+    if len(actions) != 2:
+        raise AcceptanceFailure("route must contain exactly two actions")
+    projected_actions = []
+    action_names = []
+    for value in actions:
+        item = exact_dict(value, ACTION_KEYS, "route action")
+        action = item["action"]
+        if action not in {"fact_research", "buy_or_add"}:
+            raise AcceptanceFailure("route action is outside the acceptance scope")
+        if item["action_id"] != action:
+            raise AcceptanceFailure("route action id is invalid")
+        if item["action_maturity"] not in ACTION_MATURITIES:
+            raise AcceptanceFailure("route action maturity is invalid")
+        if item["minimum_state"] not in ACTION_STATES:
+            raise AcceptanceFailure("route action state is invalid")
+        if item["risk_effect"] not in RISK_EFFECTS:
+            raise AcceptanceFailure("route risk effect is invalid")
+        if (
+            action == "fact_research" and item["risk_effect"] != "information"
+        ) or (
+            action == "buy_or_add" and item["risk_effect"] != "risk_increasing"
+        ):
+            raise AcceptanceFailure("route action risk contract is invalid")
+        if type(item["research_available"]) is not bool or type(
+            item["exact_amount_available"]
+        ) is not bool:
+            raise AcceptanceFailure("route action booleans are invalid")
+        projected_actions.append(
+            {
+                "action": action,
+                "action_id": action,
+                "action_maturity": item["action_maturity"],
+                "blocking_codes": identifier_list(
+                    item["blocking_codes"], "route blocking codes"
+                ),
+                "exact_amount_available": item["exact_amount_available"],
+                "minimum_state": item["minimum_state"],
+                "required_gates": identifier_list(
+                    item["required_gates"], "route required gates"
+                ),
+                "research_available": item["research_available"],
+                "risk_effect": item["risk_effect"],
+            }
+        )
+        action_names.append(action)
+    if action_names != ["fact_research", "buy_or_add"]:
+        raise AcceptanceFailure("route actions are duplicate or non-canonical")
+    for conclusion in exact_list(data["conclusion_evidence"], "route conclusions"):
+        validate_conclusion(conclusion)
+    projected = {
+        "actions": projected_actions,
+        "created_at": utc_text(data["created_at"], "route creation"),
+        "missing_fields": identifier_list(data["missing_fields"], "route missing fields"),
+        "mode": "rapid",
+        "opposing_evidence": identifier_list(
+            data["opposing_evidence"], "route opposing evidence"
+        ),
+        "policy_checksum": checksum(data["policy_checksum"], "route policy checksum"),
+        "policy_version": identifier(data["policy_version"], "route policy version"),
+        "registry_checksum": checksum(
+            data["registry_checksum"], "route registry checksum"
+        ),
+        "registry_version": identifier(
+            data["registry_version"], "route registry version"
+        ),
+        "request_id": request_id(data["request_id"], "route request id"),
+        "result_checksum": checksum(data["result_checksum"], "route result checksum"),
+        "workflow_level": "rapid_evidence",
+    }
+    return projected_envelope("decision.route", as_of, projected)
+
+
+def write_json_at(directory_fd, filename, value):
+    require_time(publish_deadline, "staging write")
+    payload = (
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("ascii")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    file_fd = os.open(filename, flags, 0o600, dir_fd=directory_fd)
+    try:
+        with os.fdopen(file_fd, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(file_fd)
+        os.fchmod(file_fd, 0o600)
+    finally:
+        os.close(file_fd)
+
+
+def remove_staging(parent_fd, staging_fd, staging_name):
+    if staging_fd is not None:
+        try:
+            for name in os.listdir(staging_fd):
+                try:
+                    os.unlink(name, dir_fd=staging_fd)
+                except FileNotFoundError:
+                    pass
+        except OSError:
+            pass
+        try:
+            os.close(staging_fd)
+        except OSError:
+            pass
+    if staging_name is not None:
+        try:
+            os.rmdir(staging_name, dir_fd=parent_fd)
+        except OSError:
+            pass
+
+
+def exclusive_rename(parent_fd, staging_name, target_name):
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameatx_np = libc.renameatx_np
+    renameatx_np.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameatx_np.restype = ctypes.c_int
+    result = renameatx_np(
+        parent_fd,
+        os.fsencode(staging_name),
+        parent_fd,
+        os.fsencode(target_name),
+        RENAME_EXCL,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise AcceptanceFailure("OUTPUT_DIR appeared before atomic publication")
+        raise AcceptanceFailure("exclusive atomic output publication failed")
+
+
+staging_name = None
+staging_fd = None
+parent_fd = None
+published = False
+try:
+    version_path = run_command("version", ["--json", "version"])
+    source_before_path = run_command(
+        "source_status_before", ["--json", "source", "status"]
+    )
+    sync_path = run_command(
+        "sync_fund_profile",
+        ["--json", "sync", "fund-profile", code, "--mode", "rapid"],
+    )
+    source_after_path = run_command(
+        "source_status_after",
+        ["--json", "source", "status", "--fund-code", code],
+    )
+    route_path = run_command(
+        "decision_route",
+        [
+            "--json",
+            "decision",
+            "route",
+            "--mode",
+            "rapid",
+            "--action",
+            "fact_research",
+            "--action",
+            "buy_or_add",
+        ],
+    )
+
+    version = project_version(version_path)
+    source_before = project_source(source_before_path, None)
+    sync = project_sync(sync_path)
+    source_after = project_source(source_after_path, code)
+    route = project_route(route_path)
+
+    identities = (
+        source_before["data"]["policy_version"],
+        source_before["data"]["policy_checksum"],
+        source_before["data"]["registry_version"],
+        source_before["data"]["registry_checksum"],
+    )
+    for result in (source_after, route):
+        if identities != (
+            result["data"]["policy_version"],
+            result["data"]["policy_checksum"],
+            result["data"]["registry_version"],
+            result["data"]["registry_checksum"],
+        ):
+            raise AcceptanceFailure("policy or registry identity changed during acceptance")
+
+    request_ids = {
+        "source_before": source_before["data"]["request_id"],
+        "sync": sync["data"]["request"]["request_id"],
+        "source_after": source_after["data"]["request_id"],
+        "route": route["data"]["request_id"],
+    }
+    if len(set(request_ids.values())) != 4:
+        raise AcceptanceFailure("acceptance request ids are not distinct")
+
+    source_attempt_count = sum(
+        1
+        for item in source_after["data"]["source_fields"]
+        if item["last_success_at"] is not None or item["last_failure_at"] is not None
+    )
+    if source_attempt_count < 1:
+        raise AcceptanceFailure("no bounded source attempt was recorded")
+    fact_record_count = sum(
+        item["records"]
+        for item in sync["data"]["sections"].values()
+        if item["status"] in {"success", "not_disclosed"} and item["records"] > 0
+    )
+    if fact_record_count < 1:
+        raise AcceptanceFailure("sync returned no obtained public facts")
+    missing_resolutions = [
+        item
+        for item in source_after["data"]["request_field_resolutions"]
+        if item["resolution"] != "usable"
+    ]
+    partial = (
+        sync["data"]["request"]["terminal_status"] == "partial"
+        or bool(missing_resolutions)
+    )
+    if partial:
+        if not missing_resolutions:
+            raise AcceptanceFailure("partial result does not identify missing impact")
+        source_by_identity = {
+            (item["source_id"], item["field_id"]): item
+            for item in source_after["data"]["source_fields"]
+        }
+        for resolution in missing_resolutions:
+            supplementation = source_by_identity.get(
+                (resolution["primary_source_id"], resolution["field_id"]), {}
+            ).get("supplementation")
+            if not supplementation:
+                raise AcceptanceFailure("partial result lacks supplementation")
+            if not supplementation["impact_if_missing"]:
+                raise AcceptanceFailure("partial result lacks missing impact")
+            if not supplementation["suggested_location"] or not supplementation[
+                "accepted_input"
+            ]:
+                raise AcceptanceFailure("partial result lacks supplementation path")
+
+    facts_action, buy_action = route["data"]["actions"]
+    if facts_action["research_available"] is not True:
+        raise AcceptanceFailure("independent fact research is unavailable")
+    if (
+        buy_action["exact_amount_available"] is not False
+        or buy_action["minimum_state"] == "actionable"
+        or buy_action["action_maturity"] == "mature"
+        or not buy_action["blocking_codes"]
+    ):
+        raise AcceptanceFailure("Phase 0 exposed a mature or exact purchase direction")
+
+    summary = {
+        "schema_version": "1",
+        "acceptance": "phase0_amount_free_live",
+        "status": "passed",
+        "fund_code": code,
+        "mode": "rapid",
+        "fresh_isolated_runtime": True,
+        "sync_exit_code": 0,
+        "sync_elapsed_seconds": command_elapsed_seconds["sync_fund_profile"],
+        "global_deadline_seconds": timeout_seconds,
+        "pre_publish_elapsed_seconds": 0,
+        "command_elapsed_seconds": command_elapsed_seconds,
+        "source_attempt_count": source_attempt_count,
+        "fact_record_count": fact_record_count,
+        "partial": partial,
+        "request_ids": request_ids,
+        "checksums": {
+            "policy_version": route["data"]["policy_version"],
+            "policy_checksum": route["data"]["policy_checksum"],
+            "registry_version": route["data"]["registry_version"],
+            "registry_checksum": route["data"]["registry_checksum"],
+            "route_result_checksum": route["data"]["result_checksum"],
+        },
+    }
+
+    require_time(publish_deadline, "output staging")
+    parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_fd = os.open(output_parent_path, parent_flags)
+    staging_name = ".kunjin-phase0-" + secrets.token_hex(16)
+    os.mkdir(staging_name, 0o700, dir_fd=parent_fd)
+    staging_fd = os.open(staging_name, parent_flags, dir_fd=parent_fd)
+    os.fchmod(staging_fd, 0o700)
+    exports = {
+        "decision-route.json": route,
+        "source-status-after.json": source_after,
+        "source-status-before.json": source_before,
+        "sync-fund-profile.json": sync,
+        "version.json": version,
+    }
+    for filename, value in exports.items():
+        write_json_at(staging_fd, filename, value)
+    summary["pre_publish_elapsed_seconds"] = round(time.monotonic() - started, 3)
+    if summary["pre_publish_elapsed_seconds"] > timeout_seconds:
+        raise AcceptanceFailure("pre-publication elapsed time exceeded its budget")
+    write_json_at(staging_fd, "summary.json", summary)
+    expected_files = set(exports) | {"summary.json"}
+    if set(os.listdir(staging_fd)) != expected_files:
+        raise AcceptanceFailure("staging directory contents are invalid")
+    os.fsync(staging_fd)
+    require_time(publish_deadline, "atomic publication")
+    exclusive_rename(parent_fd, staging_name, output_basename)
+    published = True
+    if time.monotonic() > hard_deadline:
+        raise AcceptanceDeadline()
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    os.close(staging_fd)
+    staging_fd = None
+    staging_name = None
+except BaseException:
+    if parent_fd is not None and not published:
+        remove_staging(parent_fd, staging_fd, staging_name)
+    raise
+finally:
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    if parent_fd is not None:
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
+
 PY
-
-/bin/chmod 600 \
-    "${VERSION_JSON}" \
-    "${SOURCE_BEFORE_JSON}" \
-    "${SYNC_JSON}" \
-    "${SOURCE_AFTER_JSON}" \
-    "${ROUTE_JSON}" \
-    "${SUMMARY_JSON}"
-/bin/mkdir "${OUTPUT_DIR}"
-/bin/chmod 700 "${OUTPUT_DIR}"
-/bin/cp \
-    "${VERSION_JSON}" \
-    "${SOURCE_BEFORE_JSON}" \
-    "${SYNC_JSON}" \
-    "${SOURCE_AFTER_JSON}" \
-    "${ROUTE_JSON}" \
-    "${SUMMARY_JSON}" \
-    "${OUTPUT_DIR}/"
-/bin/chmod 600 "${OUTPUT_DIR}"/*.json
+DRIVER_EXIT_CODE=$?
+set -e
+/bin/chmod 600 "${RUNTIME_DIR}/driver.stderr"
+if [[ "${DRIVER_EXIT_CODE}" -ne 0 ]]; then
+    printf 'Phase 0 acceptance failed closed.\n' >&2
+    exit "${DRIVER_EXIT_CODE}"
+fi
 printf 'Phase 0 acceptance passed.\n'
