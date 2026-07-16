@@ -8,13 +8,17 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from kunjin.decision.budget import RequestBudget
 from kunjin.decision.models import RequestMode
-from kunjin.decision.worker import WorkerExecutionError, run_public_worker
+from kunjin.decision.worker import (
+    WorkerExecutionError,
+    _finalize_process_group,
+    run_public_worker,
+)
 from kunjin.decision.worker_protocol import (
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
@@ -120,6 +124,46 @@ def test_worker_contract_rejects_source_field_and_host_impersonation() -> None:
                 "referer": "https://fundf10.eastmoney.com/",
             },
         ),
+        replace(
+            request,
+            arguments={
+                "url": "https://fundf10.eastmoney.com/jbgk_000001.html",
+                "referer": "https://fundf10.eastmoney.com/",
+            },
+        ),
+        replace(
+            request,
+            arguments={
+                "url": "https://fundf10.eastmoney.com/jjjl_000000.html",
+                "referer": "https://fundf10.eastmoney.com/",
+            },
+        ),
+        replace(
+            request,
+            field_id="announcement",
+            arguments={
+                "url": (
+                    "https://api.fund.eastmoney.com/f10/JJGG"
+                    "?fundcode=000000&fundcode=000001"
+                ),
+                "referer": "https://fundf10.eastmoney.com/",
+            },
+        ),
+        replace(
+            request,
+            arguments={
+                "url": "https://fundf10.eastmoney.com/jbgk_000000.html#private",
+                "referer": "https://fundf10.eastmoney.com/",
+            },
+        ),
+        replace(
+            request,
+            arguments={
+                "url": "https://fundf10.eastmoney.com./jbgk_000000.html",
+                "referer": "https://fundf10.eastmoney.com/",
+            },
+        ),
+        replace(request, subject_key="fund:000001"),
     )
     for invalid in invalid_requests:
         with pytest.raises(ValueError, match="worker.*binding"):
@@ -132,6 +176,50 @@ def test_worker_contract_allows_controlled_api_disclosures() -> None:
         field_id="announcement",
         arguments={
             "url": "https://api.fund.eastmoney.com/f10/JJGG?fundcode=000000",
+            "referer": "https://fundf10.eastmoney.com/",
+        },
+    )
+    assert decode_worker_request(encode_worker_request(request)) == request
+
+
+@pytest.mark.parametrize(
+    ("field_id", "url"),
+    (
+        ("basic_profile", "https://fundf10.eastmoney.com/jbgk_519755.html"),
+        ("manager_history", "https://fundf10.eastmoney.com/jjjl_519755.html"),
+        ("fee_schedule", "https://fundf10.eastmoney.com/jjfl_519755.html"),
+        (
+            "size_history",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?type=gmbd&mode=0&code=519755",
+        ),
+        (
+            "quarterly_holdings",
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+            "?type=jjcc&code=519755&topline=10&year=&month=",
+        ),
+        (
+            "industry_exposure",
+            "https://api.fund.eastmoney.com/f10/HYPZ/"
+            "?fundCode=519755&year=2026",
+        ),
+        (
+            "announcement",
+            "https://api.fund.eastmoney.com/f10/JJGG"
+            "?fundcode=519755&pageIndex=1&pageSize=20&type=0",
+        ),
+    ),
+)
+def test_worker_contract_accepts_exact_fund_field_templates(
+    field_id: str,
+    url: str,
+) -> None:
+    request = replace(
+        _request(),
+        subject_key="fund:519755",
+        field_id=field_id,
+        arguments={
+            "url": url,
             "referer": "https://fundf10.eastmoney.com/",
         },
     )
@@ -295,6 +383,35 @@ def test_leader_exit_still_reaps_ignored_term_grandchild(tmp_path: Path) -> None
             process.wait(timeout=1)
 
 
+def test_fast_exited_leader_still_reaps_detached_stdout_grandchild(tmp_path: Path) -> None:
+    pid_path = tmp_path / "fast-grandchild.pid"
+    processes: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def capture(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    try:
+        with (
+            patch("kunjin.decision.worker.subprocess.Popen", side_effect=capture),
+            patch(
+                "kunjin.decision.worker._default_worker_argv",
+                return_value=_argv("fast_orphan_grandchild", str(pid_path)),
+            ),
+        ):
+            with pytest.raises(WorkerExecutionError) as raised:
+                run_public_worker(_request(), _budget())
+        assert raised.value.reason_code == "worker_protocol_error"
+        child_pid = int(pid_path.read_text(encoding="ascii"))
+        assert not _pid_is_alive(child_pid)
+    finally:
+        for process in processes:
+            _kill_process_group(process.pid)
+            process.wait(timeout=1)
+
+
 def test_oversized_output_cancels_kills_and_reaps_worker() -> None:
     processes: list[subprocess.Popen] = []
     real_popen = subprocess.Popen
@@ -357,7 +474,7 @@ def test_cleanup_failure_overrides_and_chains_original_timeout() -> None:
             patch("kunjin.decision.worker.subprocess.Popen", side_effect=capture),
             patch("kunjin.decision.worker._default_worker_argv", return_value=_argv("sleep")),
             patch(
-                "kunjin.decision.worker._terminate_and_reap",
+                "kunjin.decision.worker._finalize_process_group",
                 side_effect=cleanup_error,
             ),
         ):
@@ -398,28 +515,56 @@ def test_launch_isolated_with_anonymous_pipes_and_allowlisted_environment(monkey
     assert "KUNJIN_PRIVATE_TOKEN" not in result.payload.text
 
 
-def test_launch_fails_closed_when_process_group_identity_is_unexpected() -> None:
-    process = subprocess.Popen(
-        _argv("sleep"),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    budget = _budget()
-    try:
-        with (
-            patch("kunjin.decision.worker.subprocess.Popen", return_value=process),
-            patch("kunjin.decision.worker.os.getpgid", return_value=process.pid + 1),
-        ):
-            with pytest.raises(WorkerExecutionError) as raised:
-                run_public_worker(_request(), budget)
-        assert raised.value.reason_code == "worker_launch_failed"
-        assert budget.cancelled
-        assert process.poll() is not None
-    finally:
-        _kill_process_group(process.pid)
-        process.wait(timeout=1)
+def test_finalization_signals_group_before_the_only_wait() -> None:
+    events = []
+    process = MagicMock()
+    process.wait.side_effect = lambda **_kwargs: events.append("wait") or 0
+
+    def record_signal(_pgid, sent_signal):
+        events.append(sent_signal)
+
+    with (
+        patch("kunjin.decision.worker.os.killpg", side_effect=record_signal),
+        patch("kunjin.decision.worker.time.sleep"),
+    ):
+        assert _finalize_process_group(process, 12345) == 0
+    assert events == [signal.SIGTERM, signal.SIGKILL, "wait"]
+    process.wait.assert_called_once()
+
+
+def test_finalization_wait_failure_is_a_cleanup_error() -> None:
+    process = MagicMock()
+    process.wait.side_effect = subprocess.TimeoutExpired(("worker",), 0.1)
+    with (
+        patch("kunjin.decision.worker.os.killpg"),
+        patch("kunjin.decision.worker.time.sleep"),
+    ):
+        with pytest.raises(WorkerExecutionError) as raised:
+            _finalize_process_group(process, 12345)
+    assert raised.value.reason_code == "worker_cleanup_failed"
+    process.wait.assert_called_once()
+
+
+def test_finalization_continues_to_kill_and_wait_after_grace_interruption() -> None:
+    events = []
+    process = MagicMock()
+    process.wait.side_effect = lambda **_kwargs: events.append("wait") or 0
+
+    def record_signal(_pgid, sent_signal):
+        events.append(sent_signal)
+
+    with (
+        patch("kunjin.decision.worker.os.killpg", side_effect=record_signal),
+        patch(
+            "kunjin.decision.worker.time.sleep",
+            side_effect=(SystemExit(23), None),
+        ),
+    ):
+        with pytest.raises(WorkerExecutionError) as raised:
+            _finalize_process_group(process, 12345)
+    assert raised.value.reason_code == "worker_cleanup_failed"
+    assert isinstance(raised.value.__cause__, SystemExit)
+    assert events == [signal.SIGTERM, signal.SIGKILL, "wait"]
 
 
 def test_keyboard_interrupt_cancels_terminates_and_reaps() -> None:

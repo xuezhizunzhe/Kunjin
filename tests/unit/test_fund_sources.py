@@ -341,6 +341,79 @@ class FundTextClientTest(unittest.TestCase):
         self.assertEqual(getaddrinfo.call_count, 2)
         socket_factory.assert_not_called()
 
+    def test_pinned_connection_closes_socket_on_peer_mismatch(self) -> None:
+        raw_socket = MagicMock()
+        raw_socket.getpeername.return_value = ("8.8.8.8", 443)
+        context = SimpleNamespace(
+            verify_mode=ssl.CERT_REQUIRED,
+            check_hostname=True,
+            post_handshake_auth=None,
+            wrap_socket=MagicMock(),
+        )
+        connection = _PinnedHTTPSConnection(
+            "fundf10.eastmoney.com",
+            context=context,
+        )
+        with (
+            patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
+            patch("kunjin.funds.sources.socket.socket", return_value=raw_socket),
+        ):
+            with self.assertRaises(FundSourceError) as raised:
+                connection.connect()
+        self.assertEqual(raised.exception.reason_code, "unsafe_url")
+        self.assertIs(raised.exception.retryable, False)
+        raw_socket.close.assert_called_once()
+
+    def test_pinned_connection_retries_only_prevalidated_public_addresses(self) -> None:
+        addresses = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("1.1.1.1", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", 443)),
+        ]
+        first = MagicMock()
+        first.connect.side_effect = ConnectionResetError("private detail")
+        second = MagicMock()
+        second.getpeername.return_value = ("8.8.8.8", 443)
+        context = SimpleNamespace(
+            verify_mode=ssl.CERT_REQUIRED,
+            check_hostname=True,
+            post_handshake_auth=None,
+            wrap_socket=MagicMock(return_value=MagicMock()),
+        )
+        connection = _PinnedHTTPSConnection(
+            "fundf10.eastmoney.com",
+            context=context,
+        )
+        with (
+            patch("kunjin.funds.sources.socket.getaddrinfo", return_value=addresses),
+            patch("kunjin.funds.sources.socket.socket", side_effect=(first, second)),
+        ):
+            connection.connect()
+        first.close.assert_called_once()
+        first.connect.assert_called_once_with(("1.1.1.1", 443))
+        second.connect.assert_called_once_with(("8.8.8.8", 443))
+
+    def test_pinned_connection_closes_socket_on_certificate_failure(self) -> None:
+        raw_socket = MagicMock()
+        raw_socket.getpeername.return_value = ("1.1.1.1", 443)
+        certificate_error = ssl.SSLCertVerificationError("private certificate detail")
+        context = SimpleNamespace(
+            verify_mode=ssl.CERT_REQUIRED,
+            check_hostname=True,
+            post_handshake_auth=None,
+            wrap_socket=MagicMock(side_effect=certificate_error),
+        )
+        connection = _PinnedHTTPSConnection(
+            "fundf10.eastmoney.com",
+            context=context,
+        )
+        with (
+            patch("kunjin.funds.sources.socket.getaddrinfo", return_value=PUBLIC_DNS_RESULT),
+            patch("kunjin.funds.sources.socket.socket", return_value=raw_socket),
+        ):
+            with self.assertRaises(ssl.SSLCertVerificationError):
+                connection.connect()
+        raw_socket.close.assert_called_once()
+
     def test_failure_reasons_are_stable_and_retryable_only_when_transient(self) -> None:
         url = "https://fundf10.eastmoney.com/jbgk_519755.html"
         cases = (
@@ -349,6 +422,18 @@ class FundTextClientTest(unittest.TestCase):
             (ConnectionResetError("private reset detail"), "transient_network_failure", True),
             (http.client.IncompleteRead(b"partial"), "transient_network_failure", True),
             (http.client.BadStatusLine("private status"), "transient_network_failure", True),
+            (
+                ssl.SSLCertVerificationError("private certificate detail"),
+                "validation_failure",
+                False,
+            ),
+            (
+                urllib.error.URLError(
+                    ssl.SSLCertVerificationError("private wrapped certificate detail")
+                ),
+                "validation_failure",
+                False,
+            ),
             (urllib.error.HTTPError(url, 404, "private header", {}, None), "http_4xx", False),
             (
                 urllib.error.HTTPError(url, 503, "private server error", {}, None),

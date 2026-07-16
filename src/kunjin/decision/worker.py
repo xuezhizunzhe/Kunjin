@@ -10,7 +10,7 @@ import time
 import urllib.parse
 from datetime import timedelta
 from types import MappingProxyType
-from typing import Mapping, Tuple
+from typing import Mapping, Optional, Tuple
 
 from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.worker_protocol import (
@@ -23,10 +23,10 @@ from kunjin.decision.worker_protocol import (
 from kunjin.funds.sources import FETCHABLE_HOSTS
 
 _READ_CHUNK_BYTES = 64 * 1024
-_TERM_GRACE_SECONDS = 0.15
-_KILL_GRACE_SECONDS = 0.10
+_TERM_GRACE_SECONDS = 0.05
+_KILL_GRACE_SECONDS = 0.05
+_REAP_GRACE_SECONDS = 0.10
 _SELECT_SLICE_SECONDS = 0.05
-_GROUP_POLL_SECONDS = 0.01
 _AUDIT_CLOCK_SKEW = timedelta(seconds=1)
 _WORKER_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
     {
@@ -63,86 +63,68 @@ def _validate_worker_argv(value: Tuple[str, ...]) -> Tuple[str, ...]:
     return value
 
 
-def _process_group_exists(pgid: int) -> bool:
+def _signal_cleanup_group(pgid: int, sent_signal: int) -> Optional[WorkerExecutionError]:
     try:
-        os.killpg(pgid, 0)
+        os.killpg(pgid, sent_signal)
     except ProcessLookupError:
-        return False
+        return None
     except PermissionError:
-        return True
-    return True
-
-
-def _wait_for_process_group_exit(
-    process: subprocess.Popen,
-    pgid: int,
-    timeout: float,
-) -> bool:
-    deadline = time.monotonic() + timeout
-    while _process_group_exists(pgid):
-        process.poll()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            return False
-        time.sleep(min(_GROUP_POLL_SECONDS, remaining))
-    process.poll()
-    return True
-
-
-def _signal_process_group(process: subprocess.Popen, pgid: int, sig: int) -> None:
-    try:
-        os.killpg(pgid, sig)
-    except ProcessLookupError:
-        return
+        # Darwin reports EPERM when the unreaped group contains only zombies.
+        return None
     except OSError:
-        try:
-            if sig == signal.SIGTERM:
-                process.terminate()
-            else:
-                process.kill()
-        except OSError:
-            return
-
-
-def _terminate_and_reap(process: subprocess.Popen, pgid: int) -> None:
-    if _process_group_exists(pgid):
-        _signal_process_group(process, pgid, signal.SIGTERM)
-        group_gone = _wait_for_process_group_exit(
-            process,
-            pgid,
-            _TERM_GRACE_SECONDS,
+        return _worker_error(
+            "worker_cleanup_failed",
+            "public source worker process group could not be signalled",
         )
-        if not group_gone:
-            _signal_process_group(process, pgid, signal.SIGKILL)
-            group_gone = _wait_for_process_group_exit(
-                process,
-                pgid,
-                _KILL_GRACE_SECONDS,
-            )
-    else:
-        group_gone = True
+    return None
+
+
+def _finalize_process_group(process: subprocess.Popen, pgid: int) -> int:
+    cleanup_error: Optional[WorkerExecutionError] = None
+    cleanup_cause: Optional[BaseException] = None
+
+    def record_cleanup_failure(cause: BaseException) -> None:
+        nonlocal cleanup_error, cleanup_cause
+        if cleanup_error is not None:
+            return
+        cleanup_error = _worker_error(
+            "worker_cleanup_failed",
+            "public source worker finalization was interrupted",
+        )
+        cleanup_cause = cause
+
     try:
-        process.wait(timeout=_KILL_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        raise WorkerExecutionError(
+        cleanup_error = _signal_cleanup_group(pgid, signal.SIGTERM)
+    except BaseException as exc:
+        record_cleanup_failure(exc)
+    try:
+        time.sleep(_TERM_GRACE_SECONDS)
+    except BaseException as exc:
+        record_cleanup_failure(exc)
+    try:
+        kill_error = _signal_cleanup_group(pgid, signal.SIGKILL)
+    except BaseException as exc:
+        record_cleanup_failure(exc)
+    else:
+        if cleanup_error is None:
+            cleanup_error = kill_error
+    try:
+        time.sleep(_KILL_GRACE_SECONDS)
+    except BaseException as exc:
+        record_cleanup_failure(exc)
+    try:
+        return_code = process.wait(timeout=_REAP_GRACE_SECONDS)
+    except BaseException as exc:
+        wait_error = WorkerExecutionError(
             "worker_cleanup_failed",
             "public source worker could not be reaped",
-        ) from None
-    if not group_gone or _process_group_exists(pgid):
-        raise WorkerExecutionError(
-            "worker_cleanup_failed",
-            "public source worker process group could not be removed",
         )
-
-
-def _cancel_and_terminate(
-    budget: RequestBudget,
-    process: subprocess.Popen,
-    pgid: int,
-    reason: str,
-) -> None:
-    budget.cancel(reason)
-    _terminate_and_reap(process, pgid)
+        raise wait_error from exc
+    if cleanup_error is not None:
+        if cleanup_cause is not None:
+            raise cleanup_error from cleanup_cause
+        raise cleanup_error
+    return return_code
 
 
 def _worker_error(reason_code: str, message: str) -> WorkerExecutionError:
@@ -162,45 +144,6 @@ def _remaining_worker_seconds(budget: RequestBudget) -> float:
         budget.cancel("worker_timeout")
         raise _worker_error("worker_timeout", "public source worker deadline reached")
     return remaining
-
-
-def _terminate_unverified_process(process: subprocess.Popen) -> None:
-    try:
-        process.terminate()
-    except OSError:
-        pass
-    try:
-        process.wait(timeout=_TERM_GRACE_SECONDS)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        process.kill()
-    except OSError:
-        pass
-    try:
-        process.wait(timeout=_KILL_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        raise _worker_error(
-            "worker_cleanup_failed",
-            "unverified public source worker could not be reaped",
-        ) from None
-
-
-def _abort_worker(
-    budget: RequestBudget,
-    process: subprocess.Popen,
-    pgid: int,
-    error: BaseException,
-    reason: str,
-) -> None:
-    try:
-        _cancel_and_terminate(budget, process, pgid, reason)
-    except WorkerExecutionError as cleanup_error:
-        _close_worker_pipes(process)
-        raise cleanup_error from error
-    _close_worker_pipes(process)
-    raise error
 
 
 def _safe_https_host(url: str) -> str:
@@ -349,50 +292,71 @@ def run_public_worker(
         raise _worker_error(
             "worker_launch_failed", "public source worker could not start"
         ) from None
-    try:
-        pgid = os.getpgid(process.pid)
-    except OSError:
-        budget.cancel("worker_launch_failed")
-        _terminate_unverified_process(process)
-        raise _worker_error(
-            "worker_launch_failed",
-            "public source worker process group could not be verified",
-        ) from None
-    if pgid != process.pid:
-        budget.cancel("worker_launch_failed")
-        _terminate_unverified_process(process)
-        raise _worker_error(
-            "worker_launch_failed",
-            "public source worker process group identity is invalid",
-        )
+    pgid = process.pid
+    primary_error: Optional[BaseException] = None
+    result: Optional[WorkerResponse] = None
     try:
         _remaining_worker_seconds(budget)
         response = _exchange_frames(process, frame, budget)
-        remaining = _remaining_worker_seconds(budget)
-        return_code = process.wait(timeout=remaining)
-        if return_code != 0:
-            raise _worker_error("worker_nonzero_exit", "public source worker failed")
         result = decode_worker_response(bytes(response), request)
         _validate_parent_payload(result, request, budget)
         _remaining_worker_seconds(budget)
         budget.require_publishable()
-    except subprocess.TimeoutExpired:
-        error = _worker_error("worker_timeout", "public source worker did not exit")
-        _abort_worker(budget, process, pgid, error, error.reason_code)
     except ValueError as exc:
         reason = (
             "worker_identity_mismatch"
             if "identity" in str(exc) or "schema version" in str(exc)
             else "worker_protocol_error"
         )
-        error = _worker_error(reason, "public source worker returned an invalid response")
-        _abort_worker(budget, process, pgid, error, error.reason_code)
+        primary_error = _worker_error(
+            reason,
+            "public source worker returned an invalid response",
+        )
     except BudgetExpired:
-        error = _worker_error("request_expired", "request result is no longer publishable")
-        _abort_worker(budget, process, pgid, error, error.reason_code)
+        primary_error = _worker_error(
+            "request_expired",
+            "request result is no longer publishable",
+        )
     except BaseException as exc:
-        reason = exc.reason_code if isinstance(exc, WorkerExecutionError) else "worker_aborted"
-        _abort_worker(budget, process, pgid, exc, reason)
+        primary_error = exc
+    if primary_error is not None:
+        reason = (
+            primary_error.reason_code
+            if isinstance(primary_error, WorkerExecutionError)
+            else "worker_aborted"
+        )
+        budget.cancel(reason)
     _close_worker_pipes(process)
-    _terminate_and_reap(process, pgid)
+    try:
+        return_code = _finalize_process_group(process, pgid)
+    except WorkerExecutionError as cleanup_error:
+        if primary_error is not None:
+            raise cleanup_error from primary_error
+        raise
+    if return_code != 0 and (
+        primary_error is None
+        or (
+            isinstance(primary_error, WorkerExecutionError)
+            and primary_error.reason_code == "worker_protocol_error"
+            and return_code > 0
+        )
+    ):
+        primary_error = _worker_error("worker_nonzero_exit", "public source worker failed")
+        budget.cancel("worker_nonzero_exit")
+    if primary_error is not None:
+        raise primary_error
+    try:
+        budget.require_publishable()
+    except BudgetExpired:
+        budget.cancel("request_expired")
+        raise _worker_error(
+            "request_expired",
+            "request result is no longer publishable",
+        ) from None
+    if result is None:
+        budget.cancel("worker_protocol_error")
+        raise _worker_error(
+            "worker_protocol_error",
+            "public source worker returned no result",
+        )
     return result

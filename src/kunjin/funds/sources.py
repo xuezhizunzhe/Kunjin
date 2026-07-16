@@ -5,6 +5,7 @@ import http.client
 import ipaddress
 import re
 import socket
+import ssl
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -480,6 +481,12 @@ class FundTextClient:
                 reason_code="transient_network_failure",
                 retryable=True,
             ) from None
+        except (ssl.SSLCertVerificationError, ssl.CertificateError):
+            raise FundSourceError(
+                "fund source TLS certificate validation failed",
+                reason_code="validation_failure",
+                retryable=False,
+            ) from None
         except (TimeoutError, socket.timeout):
             raise FundSourceError(
                 "fund source network request timed out",
@@ -493,6 +500,15 @@ class FundTextClient:
                 retryable=True,
             ) from None
         except urllib.error.URLError as exc:
+            if isinstance(
+                exc.reason,
+                (ssl.SSLCertVerificationError, ssl.CertificateError),
+            ):
+                raise FundSourceError(
+                    "fund source TLS certificate validation failed",
+                    reason_code="validation_failure",
+                    retryable=False,
+                ) from None
             if isinstance(exc.reason, socket.gaierror):
                 reason_code = "dns_failure"
             elif isinstance(exc.reason, (TimeoutError, socket.timeout)):

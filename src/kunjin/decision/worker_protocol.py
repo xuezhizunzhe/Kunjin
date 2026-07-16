@@ -75,6 +75,18 @@ _WORKER_BINDINGS: Mapping[str, Mapping[str, Mapping[str, frozenset[str]]]] = (
         }
     )
 )
+_F10_STATIC_PATH_PREFIXES: Mapping[str, str] = MappingProxyType(
+    {
+        "announcement": "jjgg",
+        "basic_profile": "jbgk",
+        "fee_schedule": "jjfl",
+        "industry_exposure": "hytz",
+        "manager_history": "jjjl",
+        "quarterly_holdings": "ccmx",
+        "size_history": "gmbd",
+    }
+)
+_IDENTITY_QUERY_KEYS = frozenset({"code", "fundcode", "type"})
 
 
 def _reject_duplicate_pairs(pairs: list) -> Dict[str, Any]:
@@ -159,16 +171,98 @@ def _binding_host(url: object) -> str:
         or port not in (None, 443)
     ):
         raise ValueError("worker request binding requires safe HTTPS")
-    return parsed.hostname.lower().rstrip(".")
+    host = parsed.hostname.lower()
+    if host.endswith("."):
+        raise ValueError("worker request binding host must be canonical")
+    return host
+
+
+def _identity_query(parsed: urllib.parse.ParseResult) -> tuple[Dict[str, str], frozenset[str]]:
+    try:
+        pairs = urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=False,
+        )
+    except ValueError:
+        raise ValueError("worker request binding query is invalid") from None
+    values: Dict[str, str] = {}
+    normalized_keys = set()
+    for key, value in pairs:
+        normalized = key.casefold()
+        if normalized not in _IDENTITY_QUERY_KEYS:
+            continue
+        if normalized in normalized_keys:
+            raise ValueError("worker request binding query repeats identity")
+        normalized_keys.add(normalized)
+        values[key] = value
+    return values, frozenset(normalized_keys)
+
+
+def _validate_bound_fund_url(url: str, field_id: str, fund_code: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.fragment:
+        raise ValueError("worker request binding URL cannot contain a fragment")
+    if (
+        fund_code == "000000"
+        and field_id == "basic_profile"
+        and url == "https://fundf10.eastmoney.com/"
+    ):
+        return
+    host = (parsed.hostname or "").lower().rstrip(".")
+    static_prefix = _F10_STATIC_PATH_PREFIXES[field_id]
+    if host == "fundf10.eastmoney.com":
+        if parsed.path == f"/{static_prefix}_{fund_code}.html" and not parsed.query:
+            return
+        if parsed.path != "/FundArchivesDatas.aspx":
+            raise ValueError("worker request binding path does not match its field")
+        values, normalized_keys = _identity_query(parsed)
+        expected_type = {
+            "quarterly_holdings": "jjcc",
+            "size_history": "gmbd",
+        }.get(field_id)
+        if (
+            expected_type is None
+            or normalized_keys != {"code", "type"}
+            or values.get("code") != fund_code
+            or values.get("type") != expected_type
+        ):
+            raise ValueError("worker request binding query does not match its subject")
+        return
+    values, normalized_keys = _identity_query(parsed)
+    if (
+        host == "api.fund.eastmoney.com"
+        and field_id == "industry_exposure"
+        and parsed.path == "/f10/HYPZ/"
+        and normalized_keys == {"fundcode"}
+        and values.get("fundCode") == fund_code
+    ):
+        return
+    if (
+        host == "api.fund.eastmoney.com"
+        and field_id == "announcement"
+        and parsed.path == "/f10/JJGG"
+        and normalized_keys in ({"fundcode"}, {"fundcode", "type"})
+        and values.get("fundcode") == fund_code
+        and ("type" not in normalized_keys or values.get("type") == "0")
+    ):
+        return
+    raise ValueError("worker request binding URL does not match its field and subject")
 
 
 def _validate_worker_binding(
     operation: object,
     source_id: object,
     field_id: object,
+    subject_key: object,
     arguments: object,
 ) -> None:
-    if type(operation) is not str or type(source_id) is not str or type(field_id) is not str:
+    if (
+        type(operation) is not str
+        or type(source_id) is not str
+        or type(field_id) is not str
+        or type(subject_key) is not str
+    ):
         raise ValueError("worker request binding is invalid")
     source_bindings = _WORKER_BINDINGS.get(operation)
     field_bindings = None if source_bindings is None else source_bindings.get(source_id)
@@ -179,6 +273,11 @@ def _validate_worker_binding(
         raise ValueError("worker request binding host is not allowed")
     if _binding_host(arguments.get("referer")) != "fundf10.eastmoney.com":
         raise ValueError("worker request binding referer is not allowed")
+    _validate_bound_fund_url(
+        arguments["url"],
+        field_id,
+        subject_key.removeprefix("fund:"),
+    )
 
 
 @dataclass(frozen=True)
@@ -207,6 +306,7 @@ class WorkerRequest:
             self.operation,
             self.source_id,
             self.field_id,
+            self.subject_key,
             self.arguments,
         )
 

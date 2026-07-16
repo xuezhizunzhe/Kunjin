@@ -102,6 +102,17 @@ def main() -> int:
         )
         with open(pid_path, "w", encoding="ascii") as handle:
             handle.write(str(child.pid))
+    elif mode == "fast_orphan_grandchild":
+        pid_path = sys.argv[2]
+        child = subprocess.Popen(
+            (sys.executable, __file__, "grandchild"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        with open(pid_path, "w", encoding="ascii") as handle:
+            handle.write(str(child.pid))
     elif mode == "bad_text_checksum":
         sys.stdout.buffer.write(_response(request, text_checksum="f" * 64))
     elif mode == "unsafe_final":
