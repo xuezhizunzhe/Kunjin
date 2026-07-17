@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import os
 import signal
@@ -9,6 +10,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,9 +18,13 @@ import pytest
 from kunjin.decision.budget import RequestBudget
 from kunjin.decision.models import TRANSIENT_SOURCE_ERRORS, RequestMode, SourceErrorCode
 from kunjin.decision.worker import (
+    PRIVATE_KEYCHAIN_WORKER_ENV,
+    PUBLIC_WORKER_ENV,
     WorkerExecutionError,
     _close_worker_pipes,
     _finalize_process_group,
+    _run_framed_worker,
+    _worker_environment,
     run_public_worker,
 )
 from kunjin.decision.worker_protocol import (
@@ -791,6 +797,287 @@ def test_launch_isolated_with_anonymous_pipes_and_allowlisted_environment(monkey
     assert result.payload is not None
     assert "KUNJIN_PRIVATE_TOKEN" not in result.payload.text
     assert "KUNJIN_PHASE0_RUN_ID" in result.payload.text
+
+
+def test_worker_environment_profiles_are_exact_and_do_not_inherit_secrets(monkeypatch) -> None:
+    inherited = {
+        "HOME": "/Users/spoofed",
+        "KUNJIN_PHASE0_RUN_ID": "a" * 32,
+        "KUNJIN_PRIVATE_TOKEN": "private",
+        "HTTP_PROXY": "https://proxy.test",
+        "HTTPS_PROXY": "https://proxy.test",
+        "NO_PROXY": "localhost",
+        "PYTHONPATH": "/private/python",
+        "TMPDIR": "/private/tmp",
+        "COOKIE": "private",
+        "AUTHORIZATION": "private",
+        "CREDENTIALS": "private",
+        "SECURITYSESSIONID": "private",
+        "USER": "example",
+        "LOGNAME": "example",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+
+    common = {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": os.defpath,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+    }
+    assert PUBLIC_WORKER_ENV == "public"
+    assert PRIVATE_KEYCHAIN_WORKER_ENV == "private_keychain"
+    with (
+        patch("kunjin.decision.worker.platform.system", return_value="Darwin"),
+        patch("kunjin.decision.worker.os.getuid", return_value=501),
+        patch(
+            "kunjin.decision.worker.pwd.getpwuid",
+            return_value=SimpleNamespace(pw_dir="/Users/login-owner"),
+        ) as getpwuid,
+    ):
+        assert dict(_worker_environment(PUBLIC_WORKER_ENV)) == {
+            **common,
+            "KUNJIN_PHASE0_RUN_ID": "a" * 32,
+        }
+        getpwuid.assert_not_called()
+        assert dict(_worker_environment(PRIVATE_KEYCHAIN_WORKER_ENV)) == {
+            **common,
+            "HOME": "/Users/login-owner",
+        }
+    getpwuid.assert_called_once_with(501)
+
+
+@pytest.mark.parametrize(
+    "invalid_home",
+    (
+        "",
+        "relative/home",
+        "/",
+        "/Users/example/../other",
+        "/Users/example/",
+        "/Users/\x00example",
+        "/Users/\x1fexample",
+        "/" + "x" * 4_096,
+    ),
+)
+def test_private_worker_environment_requires_canonical_bounded_home(
+    invalid_home: str,
+) -> None:
+    with (
+        patch("kunjin.decision.worker.platform.system", return_value="Darwin"),
+        patch(
+            "kunjin.decision.worker.pwd.getpwuid",
+            return_value=SimpleNamespace(pw_dir=invalid_home),
+        ),
+    ):
+        with pytest.raises(ValueError, match="private worker HOME"):
+            _worker_environment(PRIVATE_KEYCHAIN_WORKER_ENV)
+
+
+def test_worker_environment_rejects_unknown_profile_and_missing_login_home() -> None:
+    with pytest.raises(ValueError, match="profile"):
+        _worker_environment("arbitrary")
+    with (
+        patch("kunjin.decision.worker.platform.system", return_value="Darwin"),
+        patch("kunjin.decision.worker.pwd.getpwuid", side_effect=KeyError("private")),
+    ):
+        with pytest.raises(ValueError, match="private worker HOME"):
+            _worker_environment(PRIVATE_KEYCHAIN_WORKER_ENV)
+
+
+def test_private_worker_environment_sanitizes_login_lookup_failure() -> None:
+    with (
+        patch("kunjin.decision.worker.platform.system", return_value="Darwin"),
+        patch(
+            "kunjin.decision.worker.pwd.getpwuid",
+            side_effect=RuntimeError("private-login-sentinel"),
+        ),
+    ):
+        with pytest.raises(ValueError, match="private worker HOME") as raised:
+            _worker_environment(PRIVATE_KEYCHAIN_WORKER_ENV)
+    assert "private-login-sentinel" not in str(raised.value)
+
+
+def test_private_worker_environment_is_unavailable_outside_darwin() -> None:
+    with (
+        patch("kunjin.decision.worker.platform.system", return_value="Linux"),
+        patch("kunjin.decision.worker.pwd.getpwuid") as getpwuid,
+    ):
+        with pytest.raises(ValueError, match="private worker.*unavailable"):
+            _worker_environment(PRIVATE_KEYCHAIN_WORKER_ENV)
+    getpwuid.assert_not_called()
+
+
+def test_internal_framed_runner_uses_injected_protocol_and_module() -> None:
+    request = _request()
+    budget = _budget()
+    calls = []
+
+    def encoder(value: object) -> bytes:
+        calls.append(("encode", value))
+        return encode_worker_request(value)
+
+    def decoder(frame: bytes, value: object):
+        calls.append(("decode", frame, value))
+        return decode_worker_response(frame, value)
+
+    def validator(result: object, value: object, active_budget: RequestBudget) -> None:
+        calls.append(("validate", result, value, active_budget))
+
+    with patch(
+        "kunjin.decision.worker._default_worker_argv",
+        return_value=_argv("success"),
+    ) as worker_argv:
+        result = _run_framed_worker(
+            request,
+            budget,
+            encoder=encoder,
+            decoder=decoder,
+            validator=validator,
+            module="kunjin.decision.worker_main",
+            max_response_bytes=MAX_RESPONSE_BYTES,
+            environment_profile=PUBLIC_WORKER_ENV,
+        )
+
+    worker_argv.assert_called_once_with("kunjin.decision.worker_main")
+    assert [item[0] for item in calls] == ["encode", "decode", "validate"]
+    assert calls[0][1] is request
+    assert calls[1][2] is request
+    assert calls[2][1] is result
+    assert calls[2][2] is request
+    assert calls[2][3] is budget
+
+
+def test_internal_framed_runner_enforces_injected_response_limit() -> None:
+    with patch(
+        "kunjin.decision.worker._default_worker_argv",
+        return_value=_argv("oversize"),
+    ):
+        with pytest.raises(WorkerExecutionError) as raised:
+            _run_framed_worker(
+                _request(),
+                _budget(),
+                encoder=encode_worker_request,
+                decoder=decode_worker_response,
+                validator=lambda _result, _request, _budget: None,
+                module="kunjin.decision.worker_main",
+                max_response_bytes=1_024,
+                environment_profile=PUBLIC_WORKER_ENV,
+            )
+    assert raised.value.reason_code == "worker_response_oversized"
+
+
+def test_internal_framed_runner_has_no_arbitrary_environment_parameter() -> None:
+    parameters = inspect.signature(_run_framed_worker).parameters
+    assert "environment_profile" in parameters
+    assert "env" not in parameters
+    assert "environment" not in parameters
+
+
+@pytest.mark.parametrize(
+    ("invalid_module", "invalid_profile"),
+    (
+        ("kunjin.decision.worker_main", PRIVATE_KEYCHAIN_WORKER_ENV),
+        ("kunjin.brief.portfolio_worker_main", PUBLIC_WORKER_ENV),
+        ("kunjin.example.worker_main", PUBLIC_WORKER_ENV),
+        ("kunjin.\u5de5\u4f5c", PUBLIC_WORKER_ENV),
+        (7, PUBLIC_WORKER_ENV),
+        (["kunjin.decision.worker_main"], PUBLIC_WORKER_ENV),
+        ("kunjin.decision.worker_main", [PUBLIC_WORKER_ENV]),
+    ),
+)
+def test_internal_framed_runner_requires_exact_worker_target_pair(
+    invalid_module: object,
+    invalid_profile: object,
+) -> None:
+    with patch("kunjin.decision.worker.subprocess.Popen") as popen:
+        with pytest.raises(ValueError, match="module"):
+            _run_framed_worker(
+                _request(),
+                _budget(),
+                encoder=encode_worker_request,
+                decoder=decode_worker_response,
+                validator=lambda _result, _request, _budget: None,
+                module=invalid_module,
+                max_response_bytes=MAX_RESPONSE_BYTES,
+                environment_profile=invalid_profile,
+            )
+    popen.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid_limit", (True, 0, MAX_RESPONSE_BYTES + 1))
+def test_internal_framed_runner_requires_exact_bounded_response_limit(
+    invalid_limit: object,
+) -> None:
+    with patch("kunjin.decision.worker.subprocess.Popen") as popen:
+        with pytest.raises(ValueError, match="limit"):
+            _run_framed_worker(
+                _request(),
+                _budget(),
+                encoder=encode_worker_request,
+                decoder=decode_worker_response,
+                validator=lambda _result, _request, _budget: None,
+                module="kunjin.decision.worker_main",
+                max_response_bytes=invalid_limit,
+                environment_profile=PUBLIC_WORKER_ENV,
+            )
+    popen.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "invalid_request",
+    (
+        object(),
+        SimpleNamespace(request_id="b" * 32),
+        SimpleNamespace(request_id="A" * 32),
+        SimpleNamespace(request_id=7),
+    ),
+)
+def test_internal_framed_runner_rejects_request_identity_before_encoding(
+    invalid_request: object,
+) -> None:
+    encoder = MagicMock(side_effect=AssertionError("encoder called"))
+    with patch("kunjin.decision.worker.subprocess.Popen") as popen:
+        with pytest.raises(ValueError, match="request.*identit"):
+            _run_framed_worker(
+                invalid_request,
+                _budget(),
+                encoder=encoder,
+                decoder=decode_worker_response,
+                validator=lambda _result, _request, _budget: None,
+                module="kunjin.decision.worker_main",
+                max_response_bytes=MAX_RESPONSE_BYTES,
+                environment_profile=PUBLIC_WORKER_ENV,
+            )
+    encoder.assert_not_called()
+    popen.assert_not_called()
+
+
+def test_internal_framed_runner_accepts_private_portfolio_target() -> None:
+    with (
+        patch(
+            "kunjin.decision.worker._default_worker_argv",
+            return_value=_argv("success"),
+        ) as worker_argv,
+        patch("kunjin.decision.worker.platform.system", return_value="Darwin"),
+        patch(
+            "kunjin.decision.worker.pwd.getpwuid",
+            return_value=SimpleNamespace(pw_dir="/Users/login-owner"),
+        ),
+    ):
+        result = _run_framed_worker(
+            _request(),
+            _budget(),
+            encoder=encode_worker_request,
+            decoder=decode_worker_response,
+            validator=lambda _result, _request, _budget: None,
+            module="kunjin.brief.portfolio_worker_main",
+            max_response_bytes=MAX_RESPONSE_BYTES,
+            environment_profile=PRIVATE_KEYCHAIN_WORKER_ENV,
+        )
+    worker_argv.assert_called_once_with("kunjin.brief.portfolio_worker_main")
+    assert result.request_id == "a" * 32
 
 
 def test_launch_rejects_invalid_phase0_run_identity(monkeypatch) -> None:

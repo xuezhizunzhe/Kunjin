@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import platform
+import pwd
 import selectors
 import signal
 import subprocess
@@ -10,7 +12,7 @@ import time
 import urllib.parse
 from datetime import timedelta
 from types import MappingProxyType
-from typing import Mapping, Optional, Tuple
+from typing import Callable, Mapping, Optional, Tuple
 
 from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.worker_protocol import (
@@ -30,6 +32,17 @@ _REAP_GRACE_SECONDS = 0.10
 _SELECT_SLICE_SECONDS = 0.05
 _AUDIT_CLOCK_SKEW = timedelta(seconds=1)
 _PHASE0_RUN_ID_ENV = "KUNJIN_PHASE0_RUN_ID"
+PUBLIC_WORKER_ENV = "public"
+PRIVATE_KEYCHAIN_WORKER_ENV = "private_keychain"
+_PUBLIC_WORKER_MODULE = "kunjin.decision.worker_main"
+_PRIVATE_KEYCHAIN_WORKER_MODULE = "kunjin.brief.portfolio_worker_main"
+_WORKER_TARGETS = frozenset(
+    {
+        (_PUBLIC_WORKER_MODULE, PUBLIC_WORKER_ENV),
+        (_PRIVATE_KEYCHAIN_WORKER_MODULE, PRIVATE_KEYCHAIN_WORKER_ENV),
+    }
+)
+_MAX_WORKER_HOME_CHARS = 4_096
 _WORKER_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
     {
         "LANG": "C.UTF-8",
@@ -41,13 +54,43 @@ _WORKER_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
 )
 
 
-def _worker_environment() -> Mapping[str, str]:
+def _private_worker_home() -> str:
+    if platform.system() != "Darwin":
+        raise ValueError("private worker environment is unavailable")
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        raise ValueError("private worker HOME is unavailable") from None
+    if (
+        type(home) is not str
+        or not home
+        or len(home) > _MAX_WORKER_HOME_CHARS
+        or any(ord(character) <= 0x1F or ord(character) == 0x7F for character in home)
+        or not os.path.isabs(home)
+        or home == os.path.sep
+        or os.path.normpath(home) != home
+    ):
+        raise ValueError("private worker HOME is invalid")
+    return home
+
+
+def _worker_environment(profile: str = PUBLIC_WORKER_ENV) -> Mapping[str, str]:
+    if type(profile) is not str or profile not in {
+        PUBLIC_WORKER_ENV,
+        PRIVATE_KEYCHAIN_WORKER_ENV,
+    }:
+        raise ValueError("worker environment profile is invalid")
     environment = dict(_WORKER_ENVIRONMENT)
-    run_id = os.environ.get(_PHASE0_RUN_ID_ENV)
-    if run_id is not None:
-        if len(run_id) != 32 or any(character not in "0123456789abcdef" for character in run_id):
-            raise ValueError("Phase 0 run identity is invalid")
-        environment[_PHASE0_RUN_ID_ENV] = run_id
+    if profile == PUBLIC_WORKER_ENV:
+        run_id = os.environ.get(_PHASE0_RUN_ID_ENV)
+        if run_id is not None:
+            if len(run_id) != 32 or any(
+                character not in "0123456789abcdef" for character in run_id
+            ):
+                raise ValueError("Phase 0 run identity is invalid")
+            environment[_PHASE0_RUN_ID_ENV] = run_id
+    else:
+        environment["HOME"] = _private_worker_home()
     return environment
 
 
@@ -60,8 +103,26 @@ class WorkerExecutionError(RuntimeError):
         super().__init__(message)
 
 
-def _default_worker_argv() -> Tuple[str, ...]:
-    return (sys.executable, "-I", "-m", "kunjin.decision.worker_main")
+def _validate_worker_module(value: str) -> str:
+    if type(value) is not str or value not in {
+        _PUBLIC_WORKER_MODULE,
+        _PRIVATE_KEYCHAIN_WORKER_MODULE,
+    }:
+        raise ValueError("worker module is invalid")
+    return value
+
+
+def _validate_worker_target(module: str, environment_profile: str) -> None:
+    if (
+        type(module) is not str
+        or type(environment_profile) is not str
+        or (module, environment_profile) not in _WORKER_TARGETS
+    ):
+        raise ValueError("worker module and environment profile are invalid")
+
+
+def _default_worker_argv(module: str = _PUBLIC_WORKER_MODULE) -> Tuple[str, ...]:
+    return (sys.executable, "-I", "-m", _validate_worker_module(module))
 
 
 def _validate_worker_argv(value: Tuple[str, ...]) -> Tuple[str, ...]:
@@ -225,6 +286,7 @@ def _exchange_frames(
     process: subprocess.Popen,
     frame: bytes,
     budget: RequestBudget,
+    max_response_bytes: int,
 ) -> bytes:
     if process.stdin is None or process.stdout is None:
         raise _worker_error("worker_launch_failed", "public source worker pipes are unavailable")
@@ -257,7 +319,7 @@ def _exchange_frames(
                     continue
                 chunk = os.read(
                     stdout_fd,
-                    min(_READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - len(response)),
+                    min(_READ_CHUNK_BYTES, max_response_bytes + 1 - len(response)),
                 )
                 if not chunk:
                     selector.unregister(stdout_fd)
@@ -265,7 +327,7 @@ def _exchange_frames(
                     stdout_open = False
                     break
                 response.extend(chunk)
-                if len(response) > MAX_RESPONSE_BYTES:
+                if len(response) > max_response_bytes:
                     raise _worker_error(
                         "worker_response_oversized",
                         "public source worker response exceeded its limit",
@@ -279,19 +341,41 @@ def _exchange_frames(
     return bytes(response)
 
 
-def run_public_worker(
-    request: WorkerRequest,
+def _run_framed_worker(
+    request: object,
     budget: RequestBudget,
-) -> WorkerResponse:
-    if type(request) is not WorkerRequest:
-        raise ValueError("request must use the exact worker protocol type")
+    *,
+    encoder: Callable[[object], bytes],
+    decoder: Callable[[bytes, object], object],
+    validator: Callable[[object, object, RequestBudget], None],
+    module: str,
+    max_response_bytes: int,
+    environment_profile: str,
+) -> object:
     if type(budget) is not RequestBudget:
         raise ValueError("budget must use the exact request budget type")
-    if request.request_id != budget.request_id:
-        raise ValueError("worker and budget request identities differ")
+    if not callable(encoder) or not callable(decoder) or not callable(validator):
+        raise ValueError("worker transport callables are invalid")
+    _validate_worker_target(module, environment_profile)
+    if (
+        type(max_response_bytes) is not int
+        or max_response_bytes <= 0
+        or max_response_bytes > MAX_RESPONSE_BYTES
+    ):
+        raise ValueError("worker response limit is invalid")
+    request_id = getattr(request, "request_id", None)
+    if (
+        type(request_id) is not str
+        or len(request_id) != 32
+        or any(character not in "0123456789abcdef" for character in request_id)
+        or request_id != budget.request_id
+    ):
+        raise ValueError("worker request identity is invalid")
     _remaining_worker_seconds(budget)
-    frame = encode_worker_request(request)
-    argv = _validate_worker_argv(_default_worker_argv())
+    frame = encoder(request)
+    if type(frame) is not bytes or not frame:
+        raise ValueError("worker request frame is invalid")
+    argv = _validate_worker_argv(_default_worker_argv(module))
     _remaining_worker_seconds(budget)
     try:
         process = subprocess.Popen(
@@ -303,7 +387,7 @@ def run_public_worker(
             close_fds=True,
             restore_signals=True,
             start_new_session=True,
-            env=dict(_worker_environment()),
+            env=dict(_worker_environment(environment_profile)),
         )
     except (OSError, ValueError):
         raise _worker_error(
@@ -311,12 +395,12 @@ def run_public_worker(
         ) from None
     pgid = process.pid
     primary_error: Optional[BaseException] = None
-    result: Optional[WorkerResponse] = None
+    result: Optional[object] = None
     try:
         _remaining_worker_seconds(budget)
-        response = _exchange_frames(process, frame, budget)
-        result = decode_worker_response(bytes(response), request)
-        _validate_parent_payload(result, request, budget)
+        response = _exchange_frames(process, frame, budget, max_response_bytes)
+        result = decoder(bytes(response), request)
+        validator(result, request, budget)
         _remaining_worker_seconds(budget)
         budget.require_publishable()
     except ValueError as exc:
@@ -404,3 +488,25 @@ def run_public_worker(
             "public source worker returned no result",
         )
     return result
+
+
+def run_public_worker(
+    request: WorkerRequest,
+    budget: RequestBudget,
+) -> WorkerResponse:
+    if type(request) is not WorkerRequest:
+        raise ValueError("request must use the exact worker protocol type")
+    if type(budget) is not RequestBudget:
+        raise ValueError("budget must use the exact request budget type")
+    if request.request_id != budget.request_id:
+        raise ValueError("worker and budget request identities differ")
+    return _run_framed_worker(
+        request,
+        budget,
+        encoder=encode_worker_request,
+        decoder=decode_worker_response,
+        validator=_validate_parent_payload,
+        module=_PUBLIC_WORKER_MODULE,
+        max_response_bytes=MAX_RESPONSE_BYTES,
+        environment_profile=PUBLIC_WORKER_ENV,
+    )
