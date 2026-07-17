@@ -52,6 +52,7 @@ _DATED_FALLBACK_AGE = timedelta(days=30)
 _MAX_POSITIONS = 1024
 _MAX_ADJUSTED_OBSERVATIONS = 1024
 _PROVENANCE_MAC_KEY = secrets.token_bytes(32)
+_OWNER_OVERLAY_MAC_KEY = secrets.token_bytes(32)
 _RELATIONSHIP_METRIC_KEYS = {
     "duplicate_holding_identity": frozenset({"multiple_observations"}),
     "share_class_sibling": frozenset({"mutual_source_links", "aggregation_eligible"}),
@@ -597,6 +598,7 @@ class D2RelationshipSet:
     coverage: BriefCoverage
     holdings_coverage: BriefCoverage
     target_portfolio_weight: Optional[str]
+    owner_overlay_mac: str
     economic_exposure_weight: Optional[str]
     economic_exposure_hhi: Optional[str]
     largest_economic_exposure_weight: Optional[str]
@@ -605,6 +607,30 @@ class D2RelationshipSet:
     missing_fields: Tuple[str, ...]
     conflicts: Tuple[str, ...]
     warnings: Tuple[str, ...]
+
+    def owner_overlay_binding_bytes(self) -> bytes:
+        return canonical_json_bytes(
+            {
+                "conflicts": self.conflicts,
+                "coverage": self.coverage,
+                "economic_exposure_hhi": self.economic_exposure_hhi,
+                "economic_exposure_weight": self.economic_exposure_weight,
+                "evidence_facts": self.evidence_facts,
+                "held_fund_codes": self.held_fund_codes,
+                "holdings_coverage": self.holdings_coverage,
+                "largest_economic_exposure_weight": self.largest_economic_exposure_weight,
+                "missing_fields": self.missing_fields,
+                "observed_at": self.observed_at,
+                "portfolio_evidence_state": self.portfolio_evidence_state,
+                "portfolio_provenance_mac": self.portfolio_provenance.binding_mac,
+                "position_present": self.position_present,
+                "relationships": self.relationships,
+                "target_fund_code": self.target_fund_code,
+                "target_portfolio_weight": self.target_portfolio_weight,
+                "valuation_available": self.valuation_available,
+                "warnings": self.warnings,
+            }
+        )
 
     def validate(self) -> None:
         if type(self) is not D2RelationshipSet:
@@ -1031,6 +1057,17 @@ class D2RelationshipSet:
             (self.warnings, "D2 warnings"),
         ):
             validate_identifier_tuple(values, name)
+        validate_checksum(self.owner_overlay_mac, "D2 owner overlay MAC")
+        if not hmac.compare_digest(self.owner_overlay_mac, _owner_overlay_mac(self)):
+            raise ValueError("D2 owner overlay MAC does not match its fields")
+
+
+def _owner_overlay_mac(value: D2RelationshipSet) -> str:
+    return hmac.new(
+        _OWNER_OVERLAY_MAC_KEY,
+        value.owner_overlay_binding_bytes(),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _scoped_fact_id(fund_code: str, local_id: str) -> str:
@@ -2124,6 +2161,7 @@ def build_d2_relationships(
         coverage=coverage,
         holdings_coverage=holdings_coverage,
         target_portfolio_weight=target_weight,
+        owner_overlay_mac="0" * 64,
         economic_exposure_weight=economic_weight,
         economic_exposure_hhi=economic_hhi,
         largest_economic_exposure_weight=largest_economic_weight,
@@ -2133,5 +2171,6 @@ def build_d2_relationships(
         conflicts=tuple(sorted(conflicts)),
         warnings=tuple(sorted(warnings)),
     )
+    result = replace(result, owner_overlay_mac=_owner_overlay_mac(result))
     result.validate()
     return result

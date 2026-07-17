@@ -552,27 +552,32 @@ git commit -m "feat: interpret held fund evidence"
 - Create: src/kunjin/brief/research.py
 - Create: tests/unit/test_brief_research.py
 
-- [ ] **Step 1: Write failing exact-output tests**
+- [x] **Step 1: Write failing exact-output tests**
 
 Require the ten confirmed sections, exact nested keys, stable ordering, canonical sanitized snapshot, valid source references, bounded Chinese text, and no unknown fields. Test all evidence/states/switch output. Search for private sentinels. Forbid translating mature into financial certainty and forbid bare unconditional buy/sell/hold headlines.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/unit/test_brief_research.py
 ~~~
 
-- [ ] **Step 3: Implement the three projections**
+- [x] **Step 3: Implement the three projections**
 
 ~~~python
 def build_snapshot(...) -> BriefSnapshot: ...
-def build_owner_report(snapshot, portfolio_weight) -> HeldFundBriefReport: ...
+def build_owner_report(snapshot, d2_relationship_set) -> HeldFundBriefReport: ...
 def public_payload(report) -> dict[str, object]: ...
 ~~~
 
 Use fixed code-driven Chinese templates for headline, fund identity, portfolio relationship, official events, supporting/opposing evidence, gaps, and change conditions. Stable English codes remain adjacent.
+The owner report validates the exact D2 subject, coverage, relationship set,
+position presence, observation version, and observation time before reading the
+ephemeral target portfolio weight. The weight remains excluded from the
+snapshot, evidence fingerprint, and persisted checksum. The in-memory D2 result
+uses a process-local MAC so replacing a ratio or its bound evidence fails closed.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/unit/test_brief_research.py

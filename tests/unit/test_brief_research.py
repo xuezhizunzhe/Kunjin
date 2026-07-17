@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -17,9 +17,11 @@ from kunjin.brief.models import (
     HeldFundBriefReport,
     OfficialEvent,
     OfficialEventCode,
+    RelationshipEvidence,
     canonical_event_affected_actions,
 )
 from kunjin.brief.research import (
+    _canonical_relationship,
     _merge_facts,
     build_owner_report,
     build_snapshot,
@@ -187,22 +189,28 @@ def _d2(
     fact_set: SourceLinkedFactSet,
     *,
     shares: Decimal = Decimal("1"),
+    positions: tuple[StoredPosition, ...] | None = None,
+    snapshot_complete: bool = True,
+    observation_version: str = "synthetic_portfolio_v1",
 ):
-    position = StoredPosition(
-        account_title="synthetic-account",
-        fund_code=FUND_CODE,
-        fund_name="测试基金A",
-        shares=shares,
-        observed_at=NOW,
-        share_class="A",
-        formal_nav=Decimal("1.2345"),
-        estimated_nav=None,
-        observed_profit=None,
-    )
+    if positions is None:
+        positions = (
+            StoredPosition(
+                account_title="synthetic-account",
+                fund_code=FUND_CODE,
+                fund_name="测试基金A",
+                shares=shares,
+                observed_at=NOW,
+                share_class="A",
+                formal_nav=Decimal("1.2345"),
+                estimated_nav=None,
+                observed_profit=None,
+            ),
+        )
     binding = PortfolioEvidenceBinding(
-        positions=(position,),
-        snapshot_complete=True,
-        observation_version="synthetic_portfolio_v1",
+        positions=positions,
+        snapshot_complete=snapshot_complete,
+        observation_version=observation_version,
         observed_at=NOW,
         source_state="same_request_success",
         request_id=REQUEST_ID,
@@ -273,9 +281,18 @@ def _bundle(
     fact_set: SourceLinkedFactSet | None = None,
     blocked: bool = False,
     shares: Decimal = Decimal("1"),
+    positions: tuple[StoredPosition, ...] | None = None,
+    snapshot_complete: bool = True,
+    observation_version: str = "synthetic_portfolio_v1",
 ):
     fact_set = _fact_set() if fact_set is None else fact_set
-    d2 = _d2(fact_set, shares=shares)
+    d2 = _d2(
+        fact_set,
+        shares=shares,
+        positions=positions,
+        snapshot_complete=snapshot_complete,
+        observation_version=observation_version,
+    )
     route = ActionRouter().route(
         request_id=REQUEST_ID,
         mode=RequestMode.RAPID,
@@ -313,22 +330,21 @@ def test_build_snapshot_persists_complete_replay_state_without_weight(tmp_path) 
     assert snapshot.decision_evidence_status == evaluation.decision_evidence_status
     assert snapshot.coverage == d2.coverage
     assert snapshot.holdings_coverage == d2.holdings_coverage
-    assert snapshot.constraints == evaluation.constraints
+    assert snapshot.constraints == tuple(sorted(evaluation.constraints))
     assert snapshot.position_present is True
     assert snapshot.observation_version == "synthetic_portfolio_v1"
     assert "portfolio_weight" not in snapshot.canonical_json().decode("ascii")
 
 
 def test_owner_weight_is_ephemeral_and_payload_has_exact_sections(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
-    first = build_owner_report(snapshot, "0.125")
-    second = build_owner_report(snapshot, "0.25")
-    payload = public_payload(first)
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    report = build_owner_report(snapshot, d2)
+    payload = public_payload(report)
 
     assert tuple(payload) == TOP_LEVEL_KEYS
     assert tuple(payload["beginner_explanation_zh"]) == BEGINNER_KEYS
-    assert first.persisted_checksum() == second.persisted_checksum() == snapshot.checksum()
-    assert payload["subject"]["portfolio_weight"] == "0.125"
+    assert report.persisted_checksum() == snapshot.checksum()
+    assert payload["subject"]["portfolio_weight"] == d2.target_portfolio_weight
     assert payload["request"]["result_checksum"] == snapshot.checksum()
     assert payload["sync_status"] == snapshot.sync_status.to_canonical_dict()
     assert payload["decision_evidence_status"] == (
@@ -337,8 +353,8 @@ def test_owner_weight_is_ephemeral_and_payload_has_exact_sections(tmp_path) -> N
 
 
 def test_watch_headline_is_conditional_and_not_a_trade_instruction(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
-    payload = public_payload(build_owner_report(snapshot, None))
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    payload = public_payload(build_owner_report(snapshot, d2))
     headline = payload["beginner_explanation_zh"]["headline"]
 
     assert snapshot.primary_state is BriefState.WATCH
@@ -349,8 +365,8 @@ def test_watch_headline_is_conditional_and_not_a_trade_instruction(tmp_path) -> 
 
 
 def test_switch_projection_keeps_reduce_and_buy_legs_independent(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path, ActionKind.SWITCH_FUNDS)
-    payload = public_payload(build_owner_report(snapshot, None))
+    _, _, d2, _, snapshot = _bundle(tmp_path, ActionKind.SWITCH_FUNDS)
+    payload = public_payload(build_owner_report(snapshot, d2))
     interpretations = payload["action_interpretation"]["interpretations"]
     headline_items = payload["beginner_explanation_zh"]["headline"]["items"]
 
@@ -432,8 +448,8 @@ def test_every_state_uses_conditional_fixed_chinese(
         if state is BriefState.REDUCE_OR_EXIT_REVIEW
         else ActionKind.CONTINUE_HOLDING
     )
-    _, _, _, _, snapshot = _bundle(tmp_path, action)
-    projected = public_payload(build_owner_report(_snapshot_with_state(snapshot, state), None))
+    _, _, d2, _, snapshot = _bundle(tmp_path, action)
+    projected = public_payload(build_owner_report(_snapshot_with_state(snapshot, state), d2))
     headline = projected["beginner_explanation_zh"]["headline"]
 
     assert expected_text in headline["text"]
@@ -451,9 +467,9 @@ def test_every_state_uses_conditional_fixed_chinese(
 
 
 def test_mature_is_explained_as_rule_reproducibility_not_financial_certainty(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
+    _, _, d2, _, snapshot = _bundle(tmp_path)
     no_add = _snapshot_with_state(snapshot, BriefState.NO_ADD)
-    maturity_text = public_payload(build_owner_report(no_add, None))["beginner_explanation_zh"][
+    maturity_text = public_payload(build_owner_report(no_add, d2))["beginner_explanation_zh"][
         "headline"
     ]["maturity_text"]
 
@@ -477,7 +493,7 @@ def test_missing_evidence_preserves_each_exact_gap_condition(
     condition: str,
     attribute: str,
 ) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
+    _, _, d2, _, snapshot = _bundle(tmp_path)
     field_id = f"test_{condition}_field"
     replacements = {
         "missing_fields": (),
@@ -501,7 +517,7 @@ def test_missing_evidence_preserves_each_exact_gap_condition(
     )
     updated.validate()
 
-    gaps = public_payload(build_owner_report(updated, None))["missing_evidence"]
+    gaps = public_payload(build_owner_report(updated, d2))["missing_evidence"]
     assert {
         "affected_action_ids": ["continue_holding"],
         "condition": condition,
@@ -519,64 +535,91 @@ def test_missing_evidence_preserves_each_exact_gap_condition(
     ),
 )
 def test_decision_evidence_state_is_not_renamed_or_softened(tmp_path, state) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
+    _, _, d2, _, snapshot = _bundle(tmp_path)
     status = replace(snapshot.decision_evidence_status, state=state)
     updated = replace(snapshot, decision_evidence_status=status, evidence_state=state)
     updated.validate()
 
-    payload = public_payload(build_owner_report(updated, None))
+    payload = public_payload(build_owner_report(updated, d2))
     assert payload["decision_evidence_status"]["state"] == state.value
 
 
 @pytest.mark.parametrize(
-    ("portfolio_state", "position_present", "observed_at", "weight", "expected_weight"),
+    ("position_mode", "expected_presence", "expected_weight"),
     (
-        ("current", True, NOW, None, None),
-        ("current", False, NOW, None, "0"),
-        ("current", False, NOW, "0", "0"),
-        ("unknown", None, None, None, None),
+        ("present", True, "1"),
+        ("absent", False, "0"),
+        ("unknown", None, None),
     ),
 )
 def test_owner_overlay_distinguishes_unknown_absent_and_present_positions(
     tmp_path,
-    portfolio_state,
-    position_present,
-    observed_at,
-    weight,
+    position_mode,
+    expected_presence,
     expected_weight,
 ) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
-    updated = replace(
-        snapshot,
-        portfolio_evidence_state=portfolio_state,
-        position_present=position_present,
-        observed_at=observed_at,
+    positions = () if position_mode == "absent" else None
+    snapshot_complete = position_mode != "unknown"
+    _, _, d2, _, snapshot = _bundle(
+        tmp_path,
+        positions=positions,
+        snapshot_complete=snapshot_complete,
     )
-    updated.validate()
 
-    subject = public_payload(build_owner_report(updated, weight))["subject"]
-    assert subject["position_present"] is position_present
+    subject = public_payload(build_owner_report(snapshot, d2))["subject"]
+    assert subject["position_present"] is expected_presence
     assert subject["portfolio_weight"] == expected_weight
 
 
-def test_unknown_or_absent_position_rejects_nonzero_owner_weight(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
-    unknown = replace(
-        snapshot,
-        portfolio_evidence_state="unknown",
-        position_present=None,
-        observed_at=None,
+def test_owner_report_rejects_d2_from_another_observation(tmp_path) -> None:
+    first_dir = tmp_path / "first_observation"
+    second_dir = tmp_path / "second_observation"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    _, _, _, _, snapshot = _bundle(first_dir)
+    _, _, other_d2, _, _ = _bundle(
+        second_dir,
+        observation_version="different_portfolio_observation",
     )
-    absent = replace(snapshot, position_present=False)
 
-    with pytest.raises(ValueError, match="unknown position"):
-        build_owner_report(unknown, "0.1")
-    with pytest.raises(ValueError, match="absent position"):
-        build_owner_report(absent, "0.1")
+    with pytest.raises(ValueError, match="does not match"):
+        build_owner_report(snapshot, other_d2)
+
+
+def test_owner_report_rejects_forged_d2_weight(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    forged = replace(d2, target_portfolio_weight="0.999")
+
+    with pytest.raises(ValueError, match="owner overlay MAC"):
+        build_owner_report(snapshot, forged)
+
+
+def test_relationship_canonicalization_preserves_side_bound_dates() -> None:
+    left_period = date(2026, 6, 30)
+    right_period = date(2026, 3, 31)
+    left_published = NOW - timedelta(days=1)
+    right_published = NOW - timedelta(days=30)
+    relationship = RelationshipEvidence(
+        relationship_id="side_bound_overlap",
+        relationship_type="top10_disclosed_overlap",
+        fund_codes=("200001", "100001"),
+        evidence_state=BriefEvidenceState.PARTIAL,
+        metrics={"aggregation_eligible": False},
+        evidence_ids=(),
+        report_periods=(left_period, right_period),
+        publication_times=(left_published, right_published),
+        warnings=("right_side_dated", "left_side_partial"),
+    )
+    relationship.validate()
+
+    canonical = _canonical_relationship(relationship)
+    assert canonical.fund_codes == ("200001", "100001")
+    assert canonical.report_periods == (left_period, right_period)
+    assert canonical.publication_times == (left_published, right_published)
 
 
 def test_dynamic_source_text_cannot_inject_a_trade_headline(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
+    _, _, d2, _, snapshot = _bundle(tmp_path)
     identity = snapshot.facts[0]
     injected = replace(
         identity,
@@ -595,7 +638,7 @@ def test_dynamic_source_text_cannot_inject_a_trade_headline(tmp_path) -> None:
         interpretations=(interpretation,),
     )
     updated.validate()
-    payload = public_payload(build_owner_report(updated, None))
+    payload = public_payload(build_owner_report(updated, d2))
     headline = json.dumps(
         payload["beginner_explanation_zh"]["headline"],
         ensure_ascii=False,
@@ -607,8 +650,8 @@ def test_dynamic_source_text_cannot_inject_a_trade_headline(tmp_path) -> None:
 
 
 def test_owner_payload_does_not_leak_private_position_sentinel(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path, shares=Decimal("73129.17"))
-    payload = public_payload(build_owner_report(snapshot, None))
+    _, _, d2, _, snapshot = _bundle(tmp_path, shares=Decimal("73129.17"))
+    payload = public_payload(build_owner_report(snapshot, d2))
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     assert "73129.17" not in encoded
@@ -653,8 +696,12 @@ def test_phase_b_block_and_liquidation_review_are_both_visible(tmp_path) -> None
         ("fact_research", "continue_holding"),
         event_id="liquidation_notice_1",
     )
-    snapshot = _bundle(tmp_path, fact_set=_fact_set(events=(event,)), blocked=True)[-1]
-    payload = public_payload(build_owner_report(snapshot, None))
+    _, _, d2, _, snapshot = _bundle(
+        tmp_path,
+        fact_set=_fact_set(events=(event,)),
+        blocked=True,
+    )
+    payload = public_payload(build_owner_report(snapshot, d2))
 
     assert payload["action_interpretation"]["primary_state"] == "no_add"
     assert payload["action_interpretation"]["triggered_reviews"] == ["fund_liquidation_notice"]
@@ -679,15 +726,15 @@ def test_liquidation_and_redemption_restriction_remain_simultaneous(tmp_path) ->
         "redemption_terms",
         {"fee_condition": "published", "settlement_condition": "published"},
     )
-    snapshot = _bundle(
+    _, _, d2, _, snapshot = _bundle(
         tmp_path,
         ActionKind.FULL_EXIT,
         fact_set=_fact_set(
             events=(liquidation, restriction),
             extra_facts=(redemption_terms,),
         ),
-    )[-1]
-    payload = public_payload(build_owner_report(snapshot, None))
+    )
+    payload = public_payload(build_owner_report(snapshot, d2))
     interpretation = payload["action_interpretation"]["interpretations"][0]
 
     assert "fund_liquidation_notice" in payload["action_interpretation"]["triggered_reviews"]
@@ -704,8 +751,8 @@ def test_inactive_official_event_is_opposing_only(tmp_path, integrity_status: st
         event_id=f"manager_notice_{integrity_status}",
         integrity_status=integrity_status,
     )
-    snapshot = _bundle(tmp_path, fact_set=_fact_set(events=(event,)))[-1]
-    payload = public_payload(build_owner_report(snapshot, None))
+    _, _, d2, _, snapshot = _bundle(tmp_path, fact_set=_fact_set(events=(event,)))
+    payload = public_payload(build_owner_report(snapshot, d2))
     interpretation = payload["action_interpretation"]["interpretations"][0]
 
     assert event.event_id not in interpretation["supporting_evidence_ids"]
@@ -717,8 +764,8 @@ def test_inactive_official_event_is_opposing_only(tmp_path, integrity_status: st
 
 
 def test_missing_evidence_includes_sync_snapshot_and_both_d2_coverages(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
-    gaps = public_payload(build_owner_report(snapshot, None))["missing_evidence"]
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    gaps = public_payload(build_owner_report(snapshot, d2))["missing_evidence"]
     indexed = {(item["scope"], item["field_id"], item["condition"]) for item in gaps}
 
     assert (
@@ -743,7 +790,7 @@ def test_missing_evidence_includes_sync_snapshot_and_both_d2_coverages(tmp_path)
         snapshot,
         missing_fields=tuple(sorted((*snapshot.missing_fields, "snapshot_only_field"))),
     )
-    fallback_gaps = public_payload(build_owner_report(snapshot_only, None))["missing_evidence"]
+    fallback_gaps = public_payload(build_owner_report(snapshot_only, d2))["missing_evidence"]
     assert {
         "affected_action_ids": [],
         "condition": "missing",
@@ -753,7 +800,7 @@ def test_missing_evidence_includes_sync_snapshot_and_both_d2_coverages(tmp_path)
 
 
 def test_owner_overlay_cannot_forge_snapshot_position_or_provenance(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
+    _, _, d2, _, snapshot = _bundle(tmp_path)
     forged_position = HeldFundBriefReport(
         snapshot=snapshot,
         owner_overlay={
@@ -823,7 +870,7 @@ def test_resolution_input_order_does_not_change_snapshot_or_fingerprint(tmp_path
 
 
 def test_fund_identity_dates_exclude_nav_and_unrelated_fact_dates(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
+    _, _, d2, _, snapshot = _bundle(tmp_path)
     nav_date = NOW - timedelta(days=30)
     facts = tuple(
         replace(fact, data_as_of=nav_date, published_at=nav_date)
@@ -833,7 +880,7 @@ def test_fund_identity_dates_exclude_nav_and_unrelated_fact_dates(tmp_path) -> N
     )
     updated = replace(snapshot, facts=facts)
     updated.validate()
-    identity = public_payload(build_owner_report(updated, None))["beginner_explanation_zh"][
+    identity = public_payload(build_owner_report(updated, d2))["beginner_explanation_zh"][
         "fund_identity"
     ]
 
@@ -842,8 +889,8 @@ def test_fund_identity_dates_exclude_nav_and_unrelated_fact_dates(tmp_path) -> N
 
 
 def test_beginner_projection_exposes_coverage_unknowns_and_change_triggers(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
-    explanation = public_payload(build_owner_report(snapshot, None))["beginner_explanation_zh"]
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    explanation = public_payload(build_owner_report(snapshot, d2))["beginner_explanation_zh"]
     relationship = explanation["portfolio_relationship"]
     change = explanation["change_conditions"]["items"][0]
 
@@ -863,8 +910,8 @@ def test_beginner_projection_exposes_coverage_unknowns_and_change_triggers(tmp_p
 
 
 def test_strict_nested_projection_keys_are_stable(tmp_path) -> None:
-    _, _, _, _, snapshot = _bundle(tmp_path)
-    payload = public_payload(build_owner_report(snapshot, "0.125"))
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    payload = public_payload(build_owner_report(snapshot, d2))
 
     assert set(payload["request"]) == {
         "action_ids",
@@ -902,3 +949,286 @@ def test_strict_nested_projection_keys_are_stable(tmp_path) -> None:
         set(item) == {"affected_action_ids", "condition", "field_id", "scope"}
         for item in payload["missing_evidence"]
     )
+    status_keys = {
+        "acceptable_alternative_ids",
+        "conflicted_fields",
+        "cooldown_fields",
+        "manual_supplementation_codes",
+        "missing_fields",
+        "obtained_fields",
+        "required_fields",
+        "stale_fields",
+        "state",
+        "supported_interpretations",
+        "unsupported_fields",
+        "unsupported_interpretations",
+    }
+    assert set(payload["sync_status"]) == status_keys
+    assert set(payload["decision_evidence_status"]) == status_keys
+    assert set(payload["beginner_explanation_zh"]["headline"]) == {
+        "action_maturity",
+        "items",
+        "maturity_scope",
+        "maturity_text",
+        "primary_state",
+        "text",
+    }
+    assert set(payload["beginner_explanation_zh"]["fund_identity"]) == {
+        "data_dates",
+        "evidence_ids",
+        "text",
+    }
+    assert set(payload["beginner_explanation_zh"]["portfolio_relationship"]) == {
+        "coverage_ids",
+        "relationship_ids",
+        "text",
+        "unknown_fields",
+    }
+    assert set(payload["beginner_explanation_zh"]["recent_official_events"]) == {
+        "event_ids",
+        "inactive_items",
+        "text",
+    }
+    assert set(payload["beginner_explanation_zh"]["why_this_state"]) == {
+        "items",
+        "text",
+    }
+    assert set(payload["beginner_explanation_zh"]["evidence_gaps"]) == {"items", "text"}
+    assert set(payload["beginner_explanation_zh"]["change_conditions"]) == {
+        "items",
+        "text",
+    }
+
+
+def test_reduce_review_without_hard_event_does_not_claim_a_sell_trigger(tmp_path) -> None:
+    redemption_terms = _fact(
+        "redemption_terms",
+        {"fee_condition": "published", "settlement_condition": "published"},
+    )
+    _, _, d2, _, snapshot = _bundle(
+        tmp_path,
+        ActionKind.REDUCE_TO_CASH,
+        fact_set=_fact_set(extra_facts=(redemption_terms,)),
+    )
+    assert snapshot.primary_state is BriefState.REDUCE_OR_EXIT_REVIEW
+    assert snapshot.triggered_reviews == ()
+    headline = public_payload(build_owner_report(snapshot, d2))["beginner_explanation_zh"][
+        "headline"
+    ]["text"]
+
+    assert "本次规则结果进入减仓或退出复核流程" in headline
+    assert "已触发减仓或退出复核" not in headline
+    assert "不表示系统发现了确定卖出信号" in headline
+
+
+def test_liquidation_restriction_has_explicit_beginner_execution_warning(tmp_path) -> None:
+    action_ids = ("fact_research", "full_exit")
+    liquidation = _event(
+        OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+        action_ids,
+        event_id="liquidation_notice_beginner",
+    )
+    restriction = _event(
+        OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE,
+        action_ids,
+        event_id="redemption_restriction_beginner",
+    )
+    redemption_terms = _fact(
+        "redemption_terms",
+        {"fee_condition": "published", "settlement_condition": "published"},
+    )
+    _, _, d2, _, snapshot = _bundle(
+        tmp_path,
+        ActionKind.FULL_EXIT,
+        fact_set=_fact_set(
+            events=(liquidation, restriction),
+            extra_facts=(redemption_terms,),
+        ),
+    )
+    headline = public_payload(build_owner_report(snapshot, d2))["beginner_explanation_zh"][
+        "headline"
+    ]
+    item = headline["items"][0]
+
+    assert "当前不能形成可执行赎回安排" in item["text"]
+    assert "不表示永久无法赎回" in item["text"]
+    assert "当前不能形成可执行赎回安排" in headline["text"]
+
+
+def test_switch_beginner_evidence_and_maturity_are_scoped_per_leg(tmp_path) -> None:
+    action_ids = ("fact_research", "switch_reduce", "switch_buy")
+    liquidation = _event(
+        OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+        action_ids,
+        event_id="switch_liquidation_notice",
+    )
+    redemption_terms = _fact(
+        "redemption_terms",
+        {"fee_condition": "published", "settlement_condition": "published"},
+    )
+    _, _, d2, _, snapshot = _bundle(
+        tmp_path,
+        ActionKind.SWITCH_FUNDS,
+        fact_set=_fact_set(events=(liquidation,), extra_facts=(redemption_terms,)),
+    )
+    explanation = public_payload(build_owner_report(snapshot, d2))["beginner_explanation_zh"]
+    headline = explanation["headline"]
+    why_items = explanation["why_this_state"]["items"]
+
+    assert headline["maturity_scope"] == "primary_state_only"
+    assert "转入腿仍以自己的 experimental_shadow 和 abstain 为准" in headline["maturity_text"]
+    assert [item["action_id"] for item in why_items] == ["switch_reduce", "switch_buy"]
+    assert liquidation.event_id in why_items[0]["supporting_evidence_ids"]
+    assert liquidation.event_id not in why_items[1]["supporting_evidence_ids"]
+
+
+def test_switch_buy_owns_d2_coverage_gaps(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path, ActionKind.SWITCH_FUNDS)
+    gaps = public_payload(build_owner_report(snapshot, d2))["missing_evidence"]
+    d2_gaps = [
+        item
+        for item in gaps
+        if item["scope"] in {"minimum_relationship_coverage", "disclosed_holdings_coverage"}
+    ]
+
+    assert d2_gaps
+    assert all("switch_buy" in item["affected_action_ids"] for item in d2_gaps)
+
+
+def test_risk_reducing_action_does_not_inherit_unrequired_d2_gaps(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path, ActionKind.FULL_EXIT)
+    gaps = public_payload(build_owner_report(snapshot, d2))["missing_evidence"]
+    d2_gaps = [
+        item
+        for item in gaps
+        if item["scope"] in {"minimum_relationship_coverage", "disclosed_holdings_coverage"}
+    ]
+
+    assert d2_gaps
+    assert all(item["affected_action_ids"] == [] for item in d2_gaps)
+
+
+@pytest.mark.parametrize("integrity_status", ("corrected", "retracted"))
+def test_inactive_event_has_beginner_integrity_explanation(
+    tmp_path,
+    integrity_status: str,
+) -> None:
+    event = _event(
+        OfficialEventCode.MANAGER_CHANGE_NOTICE,
+        ("fact_research", "continue_holding"),
+        event_id=f"beginner_manager_notice_{integrity_status}",
+        integrity_status=integrity_status,
+    )
+    _, _, d2, _, snapshot = _bundle(tmp_path, fact_set=_fact_set(events=(event,)))
+    section = public_payload(build_owner_report(snapshot, d2))["beginner_explanation_zh"][
+        "recent_official_events"
+    ]
+
+    assert {
+        "event_code": "manager_change_notice",
+        "event_id": event.event_id,
+        "integrity_status": integrity_status,
+    } in section["inactive_items"]
+    assert "不作为当前行动依据" in section["text"]
+
+
+def test_evidence_fingerprint_excludes_policy_explanation_changes(tmp_path) -> None:
+    route, fact_set, d2, evaluation, first = _bundle(tmp_path)
+    changed_evaluation = replace(
+        evaluation,
+        constraints=(*evaluation.constraints, "presentation_policy_note"),
+    )
+    changed_evaluation.validate()
+    second = build_snapshot(
+        request_run_id=11,
+        decision_snapshot_id=17,
+        route=route,
+        fact_set=fact_set,
+        d2=d2,
+        evaluation=changed_evaluation,
+    )
+
+    assert first.evidence_fingerprint == second.evidence_fingerprint
+    assert first.checksum() != second.checksum()
+
+
+def test_evidence_fingerprint_includes_explicit_evidence_gaps_and_warnings(tmp_path) -> None:
+    route, fact_set, d2, evaluation, first = _bundle(tmp_path)
+    changed_fact_set = replace(
+        fact_set,
+        missing_fields=("new_public_evidence_gap",),
+        warnings=("new_public_source_warning",),
+    )
+    changed_fact_set.validate()
+    second = build_snapshot(
+        request_run_id=11,
+        decision_snapshot_id=17,
+        route=route,
+        fact_set=changed_fact_set,
+        d2=d2,
+        evaluation=evaluation,
+    )
+
+    assert first.evidence_fingerprint != second.evidence_fingerprint
+
+
+def test_internal_set_permutations_keep_snapshot_canonical(tmp_path) -> None:
+    route, fact_set, d2, evaluation, first = _bundle(tmp_path)
+    interpretation = evaluation.interpretations[0]
+    permuted_interpretation = replace(
+        interpretation,
+        supporting_evidence_ids=tuple(reversed(interpretation.supporting_evidence_ids)),
+        opposing_evidence_ids=tuple(reversed(interpretation.opposing_evidence_ids)),
+        blocking_codes=tuple(reversed(interpretation.blocking_codes)),
+        missing_fields=tuple(reversed(interpretation.missing_fields)),
+        unavailable_actions=tuple(reversed(interpretation.unavailable_actions)),
+    )
+    sync_status = evaluation.sync_status
+    decision_status = evaluation.decision_evidence_status
+    permuted_evaluation = replace(
+        evaluation,
+        sync_status=replace(
+            sync_status,
+            required_fields=tuple(reversed(sync_status.required_fields)),
+            obtained_fields=tuple(reversed(sync_status.obtained_fields)),
+            missing_fields=tuple(reversed(sync_status.missing_fields)),
+        ),
+        decision_evidence_status=replace(
+            decision_status,
+            required_fields=tuple(reversed(decision_status.required_fields)),
+            obtained_fields=tuple(reversed(decision_status.obtained_fields)),
+            missing_fields=tuple(reversed(decision_status.missing_fields)),
+        ),
+        interpretations=(permuted_interpretation,),
+        constraints=tuple(reversed(evaluation.constraints)),
+        blocking_codes=tuple(reversed(evaluation.blocking_codes)),
+        missing_fields=tuple(reversed(evaluation.missing_fields)),
+        conflicts=tuple(reversed(evaluation.conflicts)),
+    )
+    permuted_evaluation.validate()
+    second = build_snapshot(
+        request_run_id=11,
+        decision_snapshot_id=17,
+        route=route,
+        fact_set=replace(fact_set, facts=tuple(reversed(fact_set.facts))),
+        d2=d2,
+        evaluation=permuted_evaluation,
+    )
+
+    assert first.canonical_json() == second.canonical_json()
+    assert first.evidence_fingerprint == second.evidence_fingerprint
+    assert first.checksum() == second.checksum()
+
+
+def test_beginner_projection_fails_closed_when_text_exceeds_bound(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    oversized_conditions = tuple(f"{index:02d}-" + "长" * 3990 for index in range(20))
+    interpretation = replace(
+        snapshot.interpretations[0],
+        invalidation_conditions=oversized_conditions,
+    )
+    oversized = replace(snapshot, interpretations=(interpretation,))
+    oversized.validate()
+
+    with pytest.raises(ValueError, match="bounded output size"):
+        public_payload(build_owner_report(oversized, d2))

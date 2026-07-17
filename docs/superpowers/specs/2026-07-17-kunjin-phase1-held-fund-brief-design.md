@@ -428,6 +428,12 @@ The persisted evidence fingerprint and result checksum exclude personal
 position weight and every value derived from an amount. The owner-local weight
 is an ephemeral output overlay. Snapshot bindings may retain only position
 presence, the opaque source observation version, and its timestamp.
+The overlay may be built only from the same validated D2 relationship result:
+fund subject, coverage, relationships, position presence, observation version,
+and observation time must match the snapshot before its target weight is read.
+The in-memory D2 result authenticates its amount-free ratios with a process-local
+MAC; changing the weight or any bound evidence invalidates the result. The MAC
+and weight are never copied into the persisted brief snapshot.
 
 Each completed source attempt and its validated public fact/cache mutation are
 committed by the parent under the authenticated request so source health and

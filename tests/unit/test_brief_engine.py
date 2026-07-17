@@ -1057,19 +1057,25 @@ def test_future_official_event_is_rejected_before_action_interpretation() -> Non
 
 
 def test_engine_rejects_cross_type_evidence_identifier_collision() -> None:
-    fact_set = _fact_set()
-    d2 = _d2(fact_set)
-    colliding = replace(
-        d2,
-        coverage=replace(d2.coverage, coverage_id="formal_nav"),
+    original = _fact_set()
+    fact_set = replace(
+        original,
+        facts=tuple(
+            replace(fact, fact_id="d2_minimum_relationship_coverage")
+            if fact.field_id == "formal_nav"
+            else fact
+            for fact in original.facts
+        ),
     )
-    colliding.validate()
+    fact_set.validate()
+    d2 = _d2(fact_set)
+    d2.validate()
 
     with pytest.raises(ValueError, match="conflicting identifier"):
         HeldFundBriefEngine().evaluate(
             route=_route(ActionKind.CONTINUE_HOLDING),
             fact_set=fact_set,
-            d2=colliding,
+            d2=d2,
             source_resolutions=(),
             confirmed_thesis=None,
         )
