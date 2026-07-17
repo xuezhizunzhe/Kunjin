@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -2889,5 +2889,410 @@ WHEN NOT (
 )
 BEGIN
     SELECT RAISE(ABORT, 'source attempt authorization binding is invalid');
+END;
+"""
+
+SCHEMA_V16 = """
+CREATE TABLE brief_policy_versions (
+    version TEXT PRIMARY KEY CHECK(
+        typeof(version) = 'text' AND version = '1'
+    ),
+    canonical_policy_json TEXT NOT NULL CHECK(
+        typeof(canonical_policy_json) = 'text'
+        AND instr(canonical_policy_json, char(0)) = 0
+        AND json_valid(canonical_policy_json)
+        AND json_type(canonical_policy_json) = 'object'
+        AND canonical_policy_json = json(canonical_policy_json)
+        AND length(CAST(canonical_policy_json AS BLOB)) <= 65536
+    ),
+    policy_checksum TEXT NOT NULL CHECK(
+        typeof(policy_checksum) = 'text'
+        AND length(CAST(policy_checksum AS BLOB)) = 64
+        AND policy_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL CHECK(
+        typeof(created_at) = 'text'
+        AND julianday(created_at) IS NOT NULL
+        AND substr(created_at, -6) = '+00:00'
+        AND substr(created_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', created_at) = substr(created_at, 1, 19)
+        AND (
+            length(created_at) = 25 OR (
+                length(created_at) = 32
+                AND substr(created_at, 20, 1) = '.'
+                AND substr(created_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(created_at, 21, 6) != '000000'
+            )
+        )
+    )
+) WITHOUT ROWID;
+
+CREATE TRIGGER brief_policy_no_replace
+BEFORE INSERT ON brief_policy_versions
+WHEN EXISTS (
+    SELECT 1 FROM brief_policy_versions WHERE version = NEW.version
+)
+BEGIN
+    SELECT RAISE(ABORT, 'brief policy versions cannot be replaced');
+END;
+
+CREATE TRIGGER brief_policy_no_update
+BEFORE UPDATE ON brief_policy_versions
+BEGIN
+    SELECT RAISE(ABORT, 'brief policy versions are immutable');
+END;
+
+CREATE TRIGGER brief_policy_no_delete
+BEFORE DELETE ON brief_policy_versions
+BEGIN
+    SELECT RAISE(ABORT, 'brief policy versions are immutable');
+END;
+
+CREATE TABLE fund_brief_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    request_run_id INTEGER NOT NULL UNIQUE CHECK(
+        typeof(request_run_id) = 'integer' AND request_run_id > 0
+    ) REFERENCES request_runs(id) ON DELETE RESTRICT,
+    decision_snapshot_id INTEGER NOT NULL UNIQUE CHECK(
+        typeof(decision_snapshot_id) = 'integer' AND decision_snapshot_id > 0
+    ) REFERENCES decision_snapshots(id) ON DELETE RESTRICT,
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code) = 'text'
+        AND length(CAST(fund_code AS BLOB)) = 6
+        AND fund_code NOT GLOB '*[^0-9]*'
+    ),
+    action_ids_json TEXT NOT NULL CHECK(
+        typeof(action_ids_json) = 'text'
+        AND action_ids_json IN (
+            '["fact_research","continue_holding"]',
+            '["fact_research","reduce_to_cash"]',
+            '["fact_research","full_exit"]',
+            '["fact_research","switch_reduce","switch_buy"]'
+        )
+    ),
+    primary_state TEXT NOT NULL CHECK(
+        typeof(primary_state) = 'text'
+        AND primary_state IN ('no_add', 'hold', 'watch', 'reduce_or_exit_review', 'abstain')
+    ),
+    action_maturity TEXT NOT NULL CHECK(
+        typeof(action_maturity) = 'text'
+        AND action_maturity IN ('mature', 'experimental_shadow')
+    ),
+    triggered_reviews_json TEXT NOT NULL CHECK(
+        typeof(triggered_reviews_json) = 'text'
+        AND json_valid(triggered_reviews_json)
+        AND json_type(triggered_reviews_json) = 'array'
+        AND triggered_reviews_json = json(triggered_reviews_json)
+        AND json_array_length(triggered_reviews_json) <= 128
+        AND length(CAST(triggered_reviews_json AS BLOB)) <= 16384
+    ),
+    affected_action_abstentions_json TEXT NOT NULL CHECK(
+        typeof(affected_action_abstentions_json) = 'text'
+        AND json_valid(affected_action_abstentions_json)
+        AND json_type(affected_action_abstentions_json) = 'array'
+        AND affected_action_abstentions_json = json(affected_action_abstentions_json)
+        AND json_array_length(affected_action_abstentions_json) <= 128
+        AND length(CAST(affected_action_abstentions_json AS BLOB)) <= 16384
+    ),
+    blocking_codes_json TEXT NOT NULL CHECK(
+        typeof(blocking_codes_json) = 'text'
+        AND json_valid(blocking_codes_json)
+        AND json_type(blocking_codes_json) = 'array'
+        AND blocking_codes_json = json(blocking_codes_json)
+        AND json_array_length(blocking_codes_json) <= 128
+        AND length(CAST(blocking_codes_json AS BLOB)) <= 16384
+    ),
+    evidence_state TEXT NOT NULL CHECK(
+        typeof(evidence_state) = 'text'
+        AND evidence_state IN ('complete', 'partial', 'insufficient')
+    ),
+    missing_fields_json TEXT NOT NULL CHECK(
+        typeof(missing_fields_json) = 'text'
+        AND json_valid(missing_fields_json)
+        AND json_type(missing_fields_json) = 'array'
+        AND missing_fields_json = json(missing_fields_json)
+        AND json_array_length(missing_fields_json) <= 128
+        AND length(CAST(missing_fields_json AS BLOB)) <= 16384
+    ),
+    conflicts_json TEXT NOT NULL CHECK(
+        typeof(conflicts_json) = 'text'
+        AND json_valid(conflicts_json)
+        AND json_type(conflicts_json) = 'array'
+        AND conflicts_json = json(conflicts_json)
+        AND json_array_length(conflicts_json) <= 128
+        AND length(CAST(conflicts_json AS BLOB)) <= 16384
+    ),
+    source_lineage_ids_json TEXT NOT NULL CHECK(
+        typeof(source_lineage_ids_json) = 'text'
+        AND json_valid(source_lineage_ids_json)
+        AND json_type(source_lineage_ids_json) = 'array'
+        AND source_lineage_ids_json = json(source_lineage_ids_json)
+        AND json_array_length(source_lineage_ids_json) <= 128
+        AND length(CAST(source_lineage_ids_json AS BLOB)) <= 16384
+    ),
+    evidence_fingerprint TEXT NOT NULL CHECK(
+        typeof(evidence_fingerprint) = 'text'
+        AND length(CAST(evidence_fingerprint AS BLOB)) = 64
+        AND evidence_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    canonical_snapshot_json TEXT NOT NULL CHECK(
+        typeof(canonical_snapshot_json) = 'text'
+        AND instr(canonical_snapshot_json, char(0)) = 0
+        AND json_valid(canonical_snapshot_json)
+        AND json_type(canonical_snapshot_json) = 'object'
+        AND canonical_snapshot_json = json(canonical_snapshot_json)
+        AND length(CAST(canonical_snapshot_json AS BLOB)) <= 4194304
+    ),
+    result_checksum TEXT NOT NULL CHECK(
+        typeof(result_checksum) = 'text'
+        AND length(CAST(result_checksum AS BLOB)) = 64
+        AND result_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    conclusion_changed INTEGER NOT NULL CHECK(
+        typeof(conclusion_changed) = 'integer' AND conclusion_changed IN (0, 1)
+    ),
+    created_at TEXT NOT NULL CHECK(
+        typeof(created_at) = 'text'
+        AND julianday(created_at) IS NOT NULL
+        AND substr(created_at, -6) = '+00:00'
+        AND substr(created_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', created_at) = substr(created_at, 1, 19)
+        AND (
+            length(created_at) = 25 OR (
+                length(created_at) = 32
+                AND substr(created_at, 20, 1) = '.'
+                AND substr(created_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(created_at, 21, 6) != '000000'
+            )
+        )
+    )
+);
+
+CREATE INDEX fund_brief_snapshots_history
+ON fund_brief_snapshots(fund_code, created_at DESC, id DESC);
+
+CREATE TRIGGER fund_brief_snapshot_insert_guard
+BEFORE INSERT ON fund_brief_snapshots
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM request_runs
+    JOIN decision_snapshots
+      ON decision_snapshots.request_run_id = request_runs.id
+    WHERE request_runs.id = NEW.request_run_id
+      AND request_runs.status = 'running'
+      AND decision_snapshots.id = NEW.decision_snapshot_id
+      AND json_extract(NEW.canonical_snapshot_json, '$.request_run_id') = NEW.request_run_id
+      AND json_extract(NEW.canonical_snapshot_json, '$.decision_snapshot_id')
+          = NEW.decision_snapshot_id
+      AND json_extract(NEW.canonical_snapshot_json, '$.fund_code') = NEW.fund_code
+      AND json_extract(NEW.canonical_snapshot_json, '$.action_ids')
+          = json(NEW.action_ids_json)
+      AND json_extract(NEW.canonical_snapshot_json, '$.primary_state') = NEW.primary_state
+      AND json_extract(NEW.canonical_snapshot_json, '$.action_maturity')
+          = NEW.action_maturity
+      AND json_extract(NEW.canonical_snapshot_json, '$.triggered_reviews')
+          = json(NEW.triggered_reviews_json)
+      AND json_extract(NEW.canonical_snapshot_json, '$.affected_action_abstentions')
+          = json(NEW.affected_action_abstentions_json)
+      AND json_extract(NEW.canonical_snapshot_json, '$.blocking_codes')
+          = json(NEW.blocking_codes_json)
+      AND json_extract(NEW.canonical_snapshot_json, '$.evidence_state') = NEW.evidence_state
+      AND json_extract(NEW.canonical_snapshot_json, '$.missing_fields')
+          = json(NEW.missing_fields_json)
+      AND json_extract(NEW.canonical_snapshot_json, '$.conflicts')
+          = json(NEW.conflicts_json)
+      AND json_extract(NEW.canonical_snapshot_json, '$.source_lineage_ids')
+          = json(NEW.source_lineage_ids_json)
+      AND json_extract(NEW.canonical_snapshot_json, '$.evidence_fingerprint')
+          = NEW.evidence_fingerprint
+      AND json_extract(NEW.canonical_snapshot_json, '$.created_at') = NEW.created_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'brief snapshot request binding failed');
+END;
+
+CREATE TRIGGER fund_brief_snapshot_array_guard
+BEFORE INSERT ON fund_brief_snapshots
+WHEN EXISTS (
+    SELECT 1 FROM json_each(NEW.triggered_reviews_json)
+    WHERE type != 'text' OR length(value) NOT BETWEEN 1 AND 64
+       OR substr(value, 1, 1) NOT GLOB '[a-z]'
+       OR value GLOB '*[^a-z0-9_]*'
+) OR EXISTS (
+    SELECT 1 FROM json_each(NEW.affected_action_abstentions_json)
+    WHERE type != 'text' OR length(value) NOT BETWEEN 1 AND 64
+       OR substr(value, 1, 1) NOT GLOB '[a-z]'
+       OR value GLOB '*[^a-z0-9_]*'
+) OR EXISTS (
+    SELECT 1 FROM json_each(NEW.blocking_codes_json)
+    WHERE type != 'text' OR length(value) NOT BETWEEN 1 AND 64
+       OR substr(value, 1, 1) NOT GLOB '[a-z]'
+       OR value GLOB '*[^a-z0-9_]*'
+) OR EXISTS (
+    SELECT 1 FROM json_each(NEW.missing_fields_json)
+    WHERE type != 'text' OR length(value) NOT BETWEEN 1 AND 64
+       OR substr(value, 1, 1) NOT GLOB '[a-z]'
+       OR value GLOB '*[^a-z0-9_]*'
+) OR EXISTS (
+    SELECT 1 FROM json_each(NEW.conflicts_json)
+    WHERE type != 'text' OR length(value) NOT BETWEEN 1 AND 64
+       OR substr(value, 1, 1) NOT GLOB '[a-z]'
+       OR value GLOB '*[^a-z0-9_]*'
+) OR EXISTS (
+    SELECT 1 FROM json_each(NEW.source_lineage_ids_json)
+    WHERE type != 'text' OR length(value) NOT BETWEEN 1 AND 64
+       OR substr(value, 1, 1) NOT GLOB '[a-z]'
+       OR value GLOB '*[^a-z0-9_]*'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'brief snapshot arrays must contain bounded identifiers');
+END;
+
+CREATE TRIGGER fund_brief_snapshot_private_key_guard
+BEFORE INSERT ON fund_brief_snapshots
+WHEN EXISTS (
+    SELECT 1
+    FROM (
+        SELECT
+            lower(
+                replace(replace(replace(key, '-', '_'), ' ', '_'), '.', '_')
+            ) AS normalized_key,
+            fullkey AS full_key,
+            type AS json_value_type
+        FROM json_tree(NEW.canonical_snapshot_json)
+        WHERE key IS NOT NULL
+    )
+    WHERE
+        (
+            instr('_' || normalized_key || '_', '_amount_') > 0
+            AND NOT (
+                full_key GLOB
+                    '$.interpretations[[]*[]]."exact_amount_available"'
+                AND length(full_key) >
+                    length('$.interpretations[')
+                    + length(']."exact_amount_available"')
+                AND substr(
+                    full_key,
+                    length('$.interpretations[') + 1,
+                    length(full_key)
+                    - length('$.interpretations[')
+                    - length(']."exact_amount_available"')
+                ) NOT GLOB '*[^0-9]*'
+                AND json_value_type = 'false'
+            )
+        )
+        OR instr('_' || normalized_key || '_', '_ciphertext_') > 0
+        OR instr('_' || normalized_key || '_', '_cost_') > 0
+        OR instr('_' || normalized_key || '_', '_credential_') > 0
+        OR instr('_' || normalized_key || '_', '_debt_') > 0
+        OR instr('_' || normalized_key || '_', '_income_') > 0
+        OR instr('_' || normalized_key || '_', '_nonce_') > 0
+        OR instr('_' || normalized_key || '_', '_private_') > 0
+        OR instr('_' || normalized_key || '_', '_profit_') > 0
+        OR instr('_' || normalized_key || '_', '_reserve_') > 0
+        OR instr('_' || normalized_key || '_', '_shares_') > 0
+        OR instr('_' || normalized_key || '_', '_token_') > 0
+        OR (
+            (
+                instr('_' || normalized_key || '_', '_asset_') > 0
+                OR instr('_' || normalized_key || '_', '_assets_') > 0
+            )
+            AND normalized_key NOT IN ('asset_class', 'candidate_asset_coverage')
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_current_') > 0
+            AND instr('_' || normalized_key || '_', '_value_') > 0
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_position_') > 0
+            AND instr('_' || normalized_key || '_', '_value_') > 0
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_local_') > 0
+            AND instr('_' || normalized_key || '_', '_path_') > 0
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_managed_') > 0
+            AND instr('_' || normalized_key || '_', '_path_') > 0
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_loss_') > 0
+            AND instr('_' || normalized_key || '_', '_budget_') > 0
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_portfolio_') > 0
+            AND instr('_' || normalized_key || '_', '_weight_') > 0
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_owner_') > 0
+            AND instr('_' || normalized_key || '_', '_weight_') > 0
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_position_') > 0
+            AND instr('_' || normalized_key || '_', '_weight_') > 0
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_purchase_') > 0
+            AND instr('_' || normalized_key || '_', '_lots_') > 0
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_raw_') > 0
+            AND instr('_' || normalized_key || '_', '_body_') > 0
+        )
+        OR (
+            instr('_' || normalized_key || '_', '_response_') > 0
+            AND instr('_' || normalized_key || '_', '_body_') > 0
+        )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'brief snapshot contains a private key');
+END;
+
+CREATE TRIGGER fund_brief_snapshot_duplicate_guard
+BEFORE INSERT ON fund_brief_snapshots
+WHEN EXISTS (
+    SELECT value FROM json_each(NEW.triggered_reviews_json)
+    GROUP BY value HAVING count(*) > 1
+) OR EXISTS (
+    SELECT value FROM json_each(NEW.affected_action_abstentions_json)
+    GROUP BY value HAVING count(*) > 1
+) OR EXISTS (
+    SELECT value FROM json_each(NEW.blocking_codes_json)
+    GROUP BY value HAVING count(*) > 1
+) OR EXISTS (
+    SELECT value FROM json_each(NEW.missing_fields_json)
+    GROUP BY value HAVING count(*) > 1
+) OR EXISTS (
+    SELECT value FROM json_each(NEW.conflicts_json)
+    GROUP BY value HAVING count(*) > 1
+) OR EXISTS (
+    SELECT value FROM json_each(NEW.source_lineage_ids_json)
+    GROUP BY value HAVING count(*) > 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'brief snapshot arrays contain duplicates');
+END;
+
+CREATE TRIGGER fund_brief_snapshot_no_replace
+BEFORE INSERT ON fund_brief_snapshots
+WHEN EXISTS (
+    SELECT 1 FROM fund_brief_snapshots
+    WHERE request_run_id = NEW.request_run_id
+       OR decision_snapshot_id = NEW.decision_snapshot_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'brief snapshots cannot be replaced');
+END;
+
+CREATE TRIGGER fund_brief_snapshot_no_update
+BEFORE UPDATE ON fund_brief_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'brief snapshots are immutable');
+END;
+
+CREATE TRIGGER fund_brief_snapshot_no_delete
+BEFORE DELETE ON fund_brief_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'brief snapshots are immutable');
 END;
 """

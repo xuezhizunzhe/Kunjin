@@ -278,9 +278,16 @@ class SchemaV15Test(unittest.TestCase):
                 "FROM request_runs"
             ).fetchone()
 
-        self.assertEqual(SCHEMA_VERSION, 15)
-        self.assertEqual(versions, tuple(range(1, 16)))
-        self.assertEqual(tables_after - tables_before, {"source_work_authorizations"})
+        self.assertEqual(SCHEMA_VERSION, 16)
+        self.assertEqual(versions, tuple(range(1, 17)))
+        self.assertEqual(
+            tables_after - tables_before,
+            {
+                "source_work_authorizations",
+                "brief_policy_versions",
+                "fund_brief_snapshots",
+            },
+        )
         self.assertEqual(tuple(before), tuple(after))
         self.assertEqual(
             authorization_columns,
@@ -313,6 +320,7 @@ class SchemaV15Test(unittest.TestCase):
             attempt_foreign_keys,
         )
         self.assertIn("source_attempts_authorization_consumed", indexes)
+        self.assertIn("fund_brief_snapshots_history", indexes)
         self.assertTrue(
             {
                 "source_work_authorization_insert_guard",
@@ -320,6 +328,16 @@ class SchemaV15Test(unittest.TestCase):
                 "source_work_authorization_no_update",
                 "source_work_authorization_no_delete",
                 "source_attempt_authorization_guard",
+                "brief_policy_no_replace",
+                "brief_policy_no_update",
+                "brief_policy_no_delete",
+                "fund_brief_snapshot_insert_guard",
+                "fund_brief_snapshot_private_key_guard",
+                "fund_brief_snapshot_array_guard",
+                "fund_brief_snapshot_duplicate_guard",
+                "fund_brief_snapshot_no_replace",
+                "fund_brief_snapshot_no_update",
+                "fund_brief_snapshot_no_delete",
             }
             <= triggers
         )

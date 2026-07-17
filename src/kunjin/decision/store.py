@@ -553,33 +553,45 @@ class DecisionAuditStore:
         omitted_work: Tuple[str, ...],
         *,
         budget: Optional[RequestBudget] = None,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> None:
         _positive_id(request_run_id, "request run id")
         if type(status) is not RequestTerminalStatus:
             raise ValueError("status must be an exact RequestTerminalStatus")
         if budget is not None and type(budget) is not RequestBudget:
             raise ValueError("budget must be an exact RequestBudget or None")
+        if connection is not None and type(connection) is not sqlite3.Connection:
+            raise ValueError("connection must be an exact sqlite3.Connection or None")
         if budget is not None:
             budget.require_publishable()
         finished_text = _utc_text(finished_at, "request finish")
         validate_identifier_tuple(omitted_work, "omitted work")
         omitted_json = canonical_json_bytes(omitted_work).decode("ascii")
-        try:
-            with self.repository.connect() as connection, connection:
-                connection.execute("BEGIN IMMEDIATE")
-                if budget is not None:
-                    self._authenticate_budget_request(connection, request_run_id, budget)
-                self._finalize_request_in_transaction(
-                    connection,
-                    request_run_id,
-                    status,
-                    finished_text,
-                    omitted_work,
-                    omitted_json,
+
+        def finalize(active_connection: sqlite3.Connection) -> None:
+            if budget is not None:
+                self._authenticate_budget_request(
+                    active_connection, request_run_id, budget
                 )
-                if budget is not None:
-                    budget.require_publishable()
-                connection.commit()
+            self._finalize_request_in_transaction(
+                active_connection,
+                request_run_id,
+                status,
+                finished_text,
+                omitted_work,
+                omitted_json,
+            )
+            if budget is not None:
+                budget.require_publishable()
+
+        try:
+            if connection is not None:
+                finalize(connection)
+                return
+            with self.repository.connect() as owned_connection, owned_connection:
+                owned_connection.execute("BEGIN IMMEDIATE")
+                finalize(owned_connection)
+                owned_connection.commit()
         except (DecisionAuditStoreError, BudgetExpired):
             raise
         except sqlite3.DatabaseError:
@@ -595,6 +607,7 @@ class DecisionAuditStore:
         *,
         budget: Optional[RequestBudget] = None,
         complete_request_at: Optional[datetime] = None,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> StoredDecisionSnapshot:
         _positive_id(request_run_id, "request run id")
         if type(route) is not DecisionRoute:
@@ -605,6 +618,8 @@ class DecisionAuditStore:
             raise ValueError("registry must be an exact SourceRegistryV1")
         if budget is not None and type(budget) is not RequestBudget:
             raise ValueError("budget must be an exact RequestBudget or None")
+        if connection is not None and type(connection) is not sqlite3.Connection:
+            raise ValueError("connection must be an exact sqlite3.Connection or None")
         if complete_request_at is not None and budget is None:
             raise ValueError("atomic request completion requires an exact RequestBudget")
         if budget is not None:
@@ -640,76 +655,85 @@ class DecisionAuditStore:
         policy_json = policy_json_bytes.decode("ascii")
         registry_json = registry_json_bytes.decode("ascii")
         route_json = route_json_bytes.decode("ascii")
-        try:
-            with self.repository.connect() as connection, connection:
-                connection.execute("BEGIN IMMEDIATE")
-                run = connection.execute(
-                    """
-                    SELECT request_id, mode, status, started_at, deadline_at
-                    FROM request_runs WHERE id = ?
-                    """,
-                    (request_run_id,),
-                ).fetchone()
-                if run is None:
-                    raise DecisionAuditStoreError("request run does not exist")
-                if run["status"] != "running":
-                    raise DecisionAuditStoreError("request run is not running")
-                if budget is not None:
-                    self._authenticate_budget_request(connection, request_run_id, budget)
-                    budget.require_publishable()
-                request_start = _stored_datetime(run["started_at"], "request start")
-                request_deadline = _stored_datetime(run["deadline_at"], "request deadline")
-                snapshot_created = _stored_datetime(created_text, "snapshot creation")
-                if not request_start <= snapshot_created <= request_deadline:
-                    raise DecisionAuditStoreError(
-                        "snapshot creation is outside its request lifetime"
-                    )
-                if route.request_id != run["request_id"] or route.mode.value != run["mode"]:
-                    raise DecisionAuditStoreError("snapshot request binding failed")
-                connection.execute(
-                    """
-                    INSERT INTO decision_snapshots(
-                        request_run_id, evidence_policy_version,
-                        evidence_policy_json, evidence_policy_checksum,
-                        source_registry_version, source_registry_json,
-                        source_registry_checksum, canonical_route_json,
-                        result_checksum, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        request_run_id,
-                        policy.version,
-                        policy_json,
-                        policy_checksum,
-                        registry.version,
-                        registry_json,
-                        registry_checksum,
-                        route_json,
-                        hashlib.sha256(route_json_bytes).hexdigest(),
-                        created_text,
-                    ),
+
+        def persist(active_connection: sqlite3.Connection) -> StoredDecisionSnapshot:
+            run = active_connection.execute(
+                """
+                SELECT request_id, mode, status, started_at, deadline_at
+                FROM request_runs WHERE id = ?
+                """,
+                (request_run_id,),
+            ).fetchone()
+            if run is None:
+                raise DecisionAuditStoreError("request run does not exist")
+            if run["status"] != "running":
+                raise DecisionAuditStoreError("request run is not running")
+            if budget is not None:
+                self._authenticate_budget_request(
+                    active_connection, request_run_id, budget
                 )
-                if complete_text is not None:
-                    completed_at = _stored_datetime(complete_text, "request finish")
-                    if not snapshot_created <= completed_at <= request_deadline:
-                        raise DecisionAuditStoreError(
-                            "request completion is outside its publishable lifetime"
-                        )
-                    self._finalize_request_in_transaction(
-                        connection,
-                        request_run_id,
-                        RequestTerminalStatus.COMPLETE,
-                        complete_text,
-                        (),
-                        "[]",
-                    )
-                snapshot = self._load_decision_snapshot(
+                budget.require_publishable()
+            request_start = _stored_datetime(run["started_at"], "request start")
+            request_deadline = _stored_datetime(run["deadline_at"], "request deadline")
+            snapshot_created = _stored_datetime(created_text, "snapshot creation")
+            if not request_start <= snapshot_created <= request_deadline:
+                raise DecisionAuditStoreError(
+                    "snapshot creation is outside its request lifetime"
+                )
+            if route.request_id != run["request_id"] or route.mode.value != run["mode"]:
+                raise DecisionAuditStoreError("snapshot request binding failed")
+            active_connection.execute(
+                """
+                INSERT INTO decision_snapshots(
+                    request_run_id, evidence_policy_version,
+                    evidence_policy_json, evidence_policy_checksum,
+                    source_registry_version, source_registry_json,
+                    source_registry_checksum, canonical_route_json,
+                    result_checksum, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
                     request_run_id,
-                    connection=connection,
+                    policy.version,
+                    policy_json,
+                    policy_checksum,
+                    registry.version,
+                    registry_json,
+                    registry_checksum,
+                    route_json,
+                    hashlib.sha256(route_json_bytes).hexdigest(),
+                    created_text,
+                ),
+            )
+            if complete_text is not None:
+                completed_at = _stored_datetime(complete_text, "request finish")
+                if not snapshot_created <= completed_at <= request_deadline:
+                    raise DecisionAuditStoreError(
+                        "request completion is outside its publishable lifetime"
+                    )
+                self._finalize_request_in_transaction(
+                    active_connection,
+                    request_run_id,
+                    RequestTerminalStatus.COMPLETE,
+                    complete_text,
+                    (),
+                    "[]",
                 )
-                if budget is not None:
-                    budget.require_publishable()
-                connection.commit()
+            snapshot = self._load_decision_snapshot(
+                request_run_id,
+                connection=active_connection,
+            )
+            if budget is not None:
+                budget.require_publishable()
+            return snapshot
+
+        try:
+            if connection is not None:
+                return persist(connection)
+            with self.repository.connect() as owned_connection, owned_connection:
+                owned_connection.execute("BEGIN IMMEDIATE")
+                snapshot = persist(owned_connection)
+                owned_connection.commit()
                 return snapshot
         except (DecisionAuditStoreError, BudgetExpired):
             raise

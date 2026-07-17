@@ -373,6 +373,70 @@ def test_complete_conclusion_evidence_round_trips_without_field_loss(tmp_path) -
     assert snapshot.route.canonical_json() == route.canonical_json()
 
 
+def test_caller_owned_connection_is_not_committed_rolled_back_or_closed(tmp_path) -> None:
+    repository, store = _store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+
+    with repository.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        snapshot = store.save_decision_snapshot(
+            request_run_id,
+            _route(),
+            EvidencePolicyV1(),
+            SourceRegistryV1(),
+            NOW + timedelta(seconds=1),
+            connection=connection,
+        )
+        assert snapshot.id > 0
+        assert connection.in_transaction
+        connection.rollback()
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+
+    with repository.connect() as connection:
+        assert connection.execute(
+            "SELECT 1 FROM decision_snapshots WHERE request_run_id = ?",
+            (request_run_id,),
+        ).fetchone() is None
+
+    with repository.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        store.finalize_request(
+            request_run_id,
+            RequestTerminalStatus.PARTIAL,
+            NOW + timedelta(seconds=2),
+            ("formal_nav",),
+            connection=connection,
+        )
+        assert connection.in_transaction
+        connection.rollback()
+    with repository.connect() as connection:
+        assert connection.execute(
+            "SELECT status FROM request_runs WHERE id = ?", (request_run_id,)
+        ).fetchone()[0] == "running"
+
+
+def test_caller_owned_connection_must_be_exact_sqlite_connection(tmp_path) -> None:
+    _, store = _store(tmp_path)
+    request_run_id = store.begin_request(_budget())
+    with pytest.raises(ValueError, match="exact sqlite3.Connection"):
+        store.save_decision_snapshot(
+            request_run_id,
+            _route(),
+            EvidencePolicyV1(),
+            SourceRegistryV1(),
+            NOW + timedelta(seconds=1),
+            connection=object(),
+        )
+    with pytest.raises(ValueError, match="exact sqlite3.Connection"):
+        store.finalize_request(
+            request_run_id,
+            RequestTerminalStatus.PARTIAL,
+            NOW + timedelta(seconds=2),
+            (),
+            connection=object(),
+        )
+
+
 def test_attempts_are_sequential_bounded_and_history_is_newest_first(tmp_path) -> None:
     _, store = _store(tmp_path)
     budget = _budget()

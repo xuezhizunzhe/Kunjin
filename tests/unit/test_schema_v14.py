@@ -236,7 +236,7 @@ class SchemaV14Test(unittest.TestCase):
                         if version >= 13
                         else None
                     )
-                self.assertEqual(versions, tuple(range(1, 16)))
+                self.assertEqual(versions, tuple(range(1, 17)))
                 self.assertEqual(tuple(classification_after), tuple(classification_before))
                 if selection_before is not None:
                     self.assertEqual(tuple(selection_after), tuple(selection_before))
@@ -250,8 +250,8 @@ class SchemaV14Test(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             )
-        self.assertEqual(SCHEMA_VERSION, 15)
-        self.assertEqual(versions, tuple(range(1, 16)))
+        self.assertEqual(SCHEMA_VERSION, 16)
+        self.assertEqual(versions, tuple(range(1, 17)))
 
     def test_failed_v14_migration_rolls_back_objects_marker_and_prior_bytes(self) -> None:
         repository = self._create_at_version(13)
@@ -677,6 +677,8 @@ class SchemaV14Test(unittest.TestCase):
                 "source_attempts",
                 "source_work_authorizations",
                 "decision_snapshots",
+                "brief_policy_versions",
+                "fund_brief_snapshots",
             },
         )
         self.assertEqual(
@@ -748,7 +750,12 @@ class SchemaV14Test(unittest.TestCase):
             {("request_run_id", "request_runs", "id", "RESTRICT")},
         )
         self.assertTrue(
-            {"source_attempts_request", "source_attempts_history"} <= indexes
+            {
+                "source_attempts_request",
+                "source_attempts_history",
+                "fund_brief_snapshots_history",
+            }
+            <= indexes
         )
         self.assertTrue(
             {
@@ -762,6 +769,16 @@ class SchemaV14Test(unittest.TestCase):
                 "decision_snapshot_no_replace",
                 "decision_snapshot_no_update",
                 "decision_snapshot_no_delete",
+                "brief_policy_no_replace",
+                "brief_policy_no_update",
+                "brief_policy_no_delete",
+                "fund_brief_snapshot_insert_guard",
+                "fund_brief_snapshot_private_key_guard",
+                "fund_brief_snapshot_array_guard",
+                "fund_brief_snapshot_duplicate_guard",
+                "fund_brief_snapshot_no_replace",
+                "fund_brief_snapshot_no_update",
+                "fund_brief_snapshot_no_delete",
             }
             <= triggers
         )

@@ -405,7 +405,7 @@ class SchemaV9Test(unittest.TestCase):
             )
 
     def test_current_schema_version_is_thirteen(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 15)
+        self.assertEqual(SCHEMA_VERSION, 16)
 
     def test_fresh_migration_adds_exact_tables_columns_indexes_and_versions(self) -> None:
         repository = self.repository()
@@ -428,7 +428,7 @@ class SchemaV9Test(unittest.TestCase):
                 ).fetchall()
             }
 
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 16)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 17)))
         self.assertEqual(
             [str(row["name"]) for row in policy_columns],
             [
@@ -473,7 +473,7 @@ class SchemaV9Test(unittest.TestCase):
                     versions = connection.execute(
                         "SELECT version FROM schema_migrations ORDER BY version"
                     ).fetchall()
-                self.assertEqual([int(row["version"]) for row in versions], list(range(1, 16)))
+                self.assertEqual([int(row["version"]) for row in versions], list(range(1, 17)))
                 self.assertIn("allocation_policy_versions", repository.table_names())
                 self.assertIn("allocation_assessments", repository.table_names())
 
@@ -492,7 +492,7 @@ class SchemaV9Test(unittest.TestCase):
             assessments = connection.execute(
                 "SELECT COUNT(*) FROM suitability_assessments"
             ).fetchone()[0]
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 16)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 17)))
         self.assertEqual(policies, 0)
         self.assertEqual(assessments, 0)
 
@@ -1215,7 +1215,7 @@ class SchemaV9Test(unittest.TestCase):
             versions = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 16)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 17)))
 
     def test_foreign_keys_restrict_profile_suitability_and_policy_deletion(self) -> None:
         repository = self.prepared_repository()
