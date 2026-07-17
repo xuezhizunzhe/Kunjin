@@ -9,7 +9,12 @@ from decimal import Decimal
 from typing import Dict, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
-from kunjin.brief.models import BriefFact, OfficialEvent, OfficialEventCode
+from kunjin.brief.models import (
+    BriefFact,
+    OfficialEvent,
+    OfficialEventCode,
+    canonical_event_affected_actions,
+)
 from kunjin.brief.policy import MAX_FACTS, MAX_OFFICIAL_EVENTS
 from kunjin.decision.models import (
     EvidenceCompleteness,
@@ -54,49 +59,6 @@ _ACTION_SHAPES = frozenset(
         ("fact_research", "switch_reduce", "switch_buy"),
     }
 )
-_EVENT_ACTIONS = {
-    OfficialEventCode.FUND_LIQUIDATION_NOTICE: frozenset(
-        {
-            "fact_research",
-            "continue_holding",
-            "reduce_to_cash",
-            "full_exit",
-            "switch_reduce",
-        }
-    ),
-    OfficialEventCode.FUND_TERMINATION_NOTICE: frozenset(
-        {
-            "fact_research",
-            "continue_holding",
-            "reduce_to_cash",
-            "full_exit",
-            "switch_reduce",
-        }
-    ),
-    OfficialEventCode.MANAGER_CHANGE_NOTICE: frozenset(
-        {"fact_research", "continue_holding", "switch_buy"}
-    ),
-    OfficialEventCode.SUBSCRIPTION_SUSPENSION_NOTICE: frozenset(
-        {"fact_research", "continue_holding", "switch_buy"}
-    ),
-    OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE: frozenset(
-        {"fact_research", "reduce_to_cash", "full_exit", "switch_reduce"}
-    ),
-    OfficialEventCode.FEE_CHANGE_NOTICE: frozenset(
-        {
-            "fact_research",
-            "continue_holding",
-            "reduce_to_cash",
-            "full_exit",
-            "switch_reduce",
-            "switch_buy",
-        }
-    ),
-    OfficialEventCode.BENCHMARK_CHANGE_NOTICE: frozenset(
-        {"fact_research", "continue_holding", "switch_buy"}
-    ),
-    OfficialEventCode.OTHER_OFFICIAL_PRODUCT_NOTICE: frozenset({"fact_research"}),
-}
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -616,7 +578,7 @@ def _affected_actions(
     event_code: OfficialEventCode,
     action_ids: Tuple[str, ...],
 ) -> Tuple[str, ...]:
-    return tuple(action for action in action_ids if action in _EVENT_ACTIONS[event_code])
+    return canonical_event_affected_actions(event_code, action_ids)
 
 
 def _project_disclosure(

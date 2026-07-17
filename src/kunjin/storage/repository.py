@@ -1682,6 +1682,27 @@ class Repository:
             )
             return int(cursor.lastrowid)
 
+    def get_thesis(self, thesis_id: int) -> Optional[InvestmentThesis]:
+        if type(thesis_id) is not int or thesis_id <= 0:
+            raise ValueError("thesis id must be a positive integer")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM investment_theses WHERE id = ?",
+                (thesis_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        thesis = InvestmentThesis(
+            fund_code=str(row["fund_code"]),
+            rationale=str(row["rationale"]),
+            horizon=str(row["horizon"]),
+            invalidation=str(row["invalidation"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            active=bool(row["active"]),
+        )
+        thesis.validate()
+        return thesis
+
     def list_theses(self, fund_code: Optional[str] = None) -> List[InvestmentThesis]:
         query = "SELECT * FROM investment_theses"
         parameters: Tuple[str, ...] = ()

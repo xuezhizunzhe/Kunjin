@@ -14,9 +14,11 @@ from kunjin.brief.models import (
     BriefCoverage,
     BriefEvidenceState,
     BriefFact,
+    BriefResolutionBinding,
     BriefSnapshot,
     BriefState,
     RelationshipEvidence,
+    thesis_record_fingerprint,
 )
 from kunjin.brief.policy import HeldFundBriefPolicyV1
 from kunjin.brief.store import (
@@ -38,11 +40,13 @@ from kunjin.decision.models import (
     DecisionRoute,
     EvidenceCompleteness,
     EvidenceFreshness,
+    RequestFieldResolution,
     RequestMode,
     RequestTerminalStatus,
     RiskEffect,
     SourceAttempt,
     SourceAttemptOutcome,
+    SourceFieldState,
     SourceTier,
     WorkflowLevel,
 )
@@ -52,6 +56,7 @@ from kunjin.decision.source_registry import (
     SourceRegistryV1,
 )
 from kunjin.decision.store import DecisionAuditStore
+from kunjin.models import InvestmentThesis
 from kunjin.storage.repository import Repository
 
 NOW = datetime(2026, 7, 17, 6, 0, tzinfo=timezone.utc)
@@ -79,7 +84,7 @@ def _budget(request_id: str = "1" * 32) -> RequestBudget:
     )
 
 
-def _route(request_id: str = "1" * 32) -> DecisionRoute:
+def _route(request_id: str = "1" * 32, *, blocked: bool = False) -> DecisionRoute:
     return DecisionRoute(
         request_id=request_id,
         mode=RequestMode.RAPID,
@@ -101,11 +106,13 @@ def _route(request_id: str = "1" * 32) -> DecisionRoute:
                 action=ActionKind.CONTINUE_HOLDING,
                 risk_effect=RiskEffect.RISK_MAINTAINING,
                 required_gates=("phase_b_context", "phase_e_policy"),
-                blocking_codes=(),
+                blocking_codes=(("phase_b_blocked",) if blocked else ()),
                 research_available=True,
                 exact_amount_available=False,
-                minimum_state=ActionState.EXPERIMENTAL_SHADOW,
-                action_maturity=ActionMaturity.EXPERIMENTAL_SHADOW,
+                minimum_state=(ActionState.NO_ADD if blocked else ActionState.EXPERIMENTAL_SHADOW),
+                action_maturity=(
+                    ActionMaturity.MATURE if blocked else ActionMaturity.EXPERIMENTAL_SHADOW
+                ),
             ),
         ),
         conclusion_evidence=(),
@@ -150,6 +157,10 @@ def _snapshot(
     *,
     state: BriefState = BriefState.WATCH,
     created_at: datetime = NOW + timedelta(seconds=1),
+    resolution_lineage_ids: tuple[str, ...] = (),
+    resolution_bindings: tuple[BriefResolutionBinding, ...] | None = None,
+    state_inputs: object | None = None,
+    invalidation_conditions: tuple[str, ...] = ("Review when verified evidence changes.",),
 ) -> BriefSnapshot:
     facts = (
         _fact("formal_nav_1", "formal_nav", "1.2345", "nav_lineage"),
@@ -176,18 +187,36 @@ def _snapshot(
         unknown_fields=("industry_exposure",),
         evidence_ids=("same_manager_1",),
     )
+    if resolution_bindings is None:
+        resolution_bindings = tuple(
+            BriefResolutionBinding(
+                action_id="continue_holding",
+                field_id="identity_active_status",
+                resolution=RequestFieldResolution.USABLE,
+                source_states=(SourceFieldState.HEALTHY,),
+                source_attempt_id=int(lineage_id.removeprefix("source_attempt_")),
+                source_id="eastmoney_f10",
+                source_field_id="identity_active_status",
+                evaluated_at=NOW + timedelta(microseconds=1),
+            )
+            for lineage_id in resolution_lineage_ids
+        )
     interpretation = BriefActionInterpretation(
         action_id="continue_holding",
         state=state,
-        action_maturity=ActionMaturity.EXPERIMENTAL_SHADOW,
+        action_maturity=(
+            ActionMaturity.MATURE
+            if state is BriefState.NO_ADD
+            else ActionMaturity.EXPERIMENTAL_SHADOW
+        ),
         supporting_evidence_ids=("formal_nav_1",),
         opposing_evidence_ids=(),
         blocking_codes=(),
-        missing_fields=("owner_confirmed_thesis",),
-        invalidation_conditions=("Review when verified evidence changes.",),
+        missing_fields=(() if state is BriefState.HOLD else ("owner_confirmed_thesis",)),
+        invalidation_conditions=invalidation_conditions,
         unavailable_actions=("exact_amount",),
         exact_amount_available=False,
-        state_inputs={"owner_confirmed_thesis": False},
+        state_inputs=({"owner_confirmed_thesis": False} if state_inputs is None else state_inputs),
     )
     return BriefSnapshot(
         request_run_id=request_run_id,
@@ -201,16 +230,26 @@ def _snapshot(
         coverage=coverage,
         interpretations=(interpretation,),
         primary_state=state,
-        action_maturity=ActionMaturity.EXPERIMENTAL_SHADOW,
+        action_maturity=(
+            ActionMaturity.MATURE
+            if state is BriefState.NO_ADD
+            else ActionMaturity.EXPERIMENTAL_SHADOW
+        ),
         triggered_reviews=(),
         affected_action_abstentions=(),
         blocking_codes=(),
         evidence_state=BriefEvidenceState.PARTIAL,
-        missing_fields=("owner_confirmed_thesis", "industry_exposure"),
+        missing_fields=(
+            ("industry_exposure",)
+            if state is BriefState.HOLD
+            else ("owner_confirmed_thesis", "industry_exposure")
+        ),
         conflicts=(),
-        source_lineage_ids=("nav_lineage", "manager_lineage"),
+        source_lineage_ids=("nav_lineage", "manager_lineage", *resolution_lineage_ids),
         evidence_fingerprint=CHECKSUM,
         created_at=created_at,
+        resolution_lineage_ids=resolution_lineage_ids,
+        resolution_bindings=resolution_bindings,
     )
 
 
@@ -260,9 +299,7 @@ def _direct_insert_snapshot(
         "source_lineage_ids_json": '["nav_lineage","manager_lineage"]',
         "evidence_fingerprint": snapshot.evidence_fingerprint,
         "canonical_snapshot_json": canonical_snapshot_json,
-        "result_checksum": hashlib.sha256(
-            canonical_snapshot_json.encode("ascii")
-        ).hexdigest(),
+        "result_checksum": hashlib.sha256(canonical_snapshot_json.encode("ascii")).hexdigest(),
         "conclusion_changed": 0,
         "created_at": snapshot.created_at.isoformat(),
     }
@@ -285,9 +322,62 @@ def _publish(
     created_at: datetime = NOW + timedelta(seconds=1),
     status: RequestTerminalStatus = RequestTerminalStatus.PARTIAL,
     omitted_work: tuple[str, ...] = ("industry_exposure",),
+    resolution_lineage_ids: tuple[str, ...] = (),
+    record_resolution_attempt: bool = False,
+    resolution_attempt_request_id: str | None = None,
+    resolution_subject_key: str = "fund:123456",
+    resolution_finished_at: datetime = NOW + timedelta(microseconds=1),
+    resolution_source_id: str = "eastmoney_f10",
+    resolution_source_field_id: str = "identity_active_status",
+    resolution_action_id: str = "continue_holding",
+    resolution_field_id: str = "identity_active_status",
+    resolution_outcome: SourceAttemptOutcome = SourceAttemptOutcome.SUCCESS,
+    resolution_data_as_of: datetime = NOW,
+    snapshot_state_inputs: object | None = None,
+    snapshot_invalidation_conditions: tuple[str, ...] = ("Review when verified evidence changes.",),
+    blocked_route: bool = False,
 ):
     budget = _budget(request_id)
     request_run_id = decision_store.begin_request(budget)
+    if record_resolution_attempt:
+        attempt_run_id = request_run_id
+        if resolution_attempt_request_id is not None:
+            attempt_run_id = decision_store.begin_request(_budget(resolution_attempt_request_id))
+        attempt_id = decision_store.record_source_attempt(
+            attempt_run_id,
+            SourceAttempt(
+                source_id=resolution_source_id,
+                field_id=resolution_source_field_id,
+                subject_key=resolution_subject_key,
+                attempt_number=1,
+                outcome=resolution_outcome,
+                started_at=NOW,
+                finished_at=resolution_finished_at,
+                data_as_of=resolution_data_as_of,
+                error_code=None,
+                cooldown_until=None,
+                force_actor=None,
+                force_reason=None,
+                registry_version="1",
+                registry_checksum=SOURCE_REGISTRY_V1_CHECKSUM,
+                response_bytes=10,
+            ),
+        )
+        resolution_lineage_ids = (f"source_attempt_{attempt_id}",)
+        resolution_bindings = (
+            BriefResolutionBinding(
+                action_id=resolution_action_id,
+                field_id=resolution_field_id,
+                resolution=RequestFieldResolution.USABLE,
+                source_states=(SourceFieldState.HEALTHY,),
+                source_attempt_id=attempt_id,
+                source_id=resolution_source_id,
+                source_field_id=resolution_source_field_id,
+                evaluated_at=resolution_finished_at,
+            ),
+        )
+    else:
+        resolution_bindings = None
     calls = []
 
     def factory(real_request_run_id: int, real_decision_snapshot_id: int) -> BriefSnapshot:
@@ -297,11 +387,15 @@ def _publish(
             real_decision_snapshot_id,
             state=state,
             created_at=created_at,
+            resolution_lineage_ids=resolution_lineage_ids,
+            resolution_bindings=resolution_bindings,
+            state_inputs=snapshot_state_inputs,
+            invalidation_conditions=snapshot_invalidation_conditions,
         )
 
     stored = brief_store.publish(
         request_run_id=request_run_id,
-        route=_route(request_id),
+        route=_route(request_id, blocked=blocked_route),
         evidence_policy=EvidencePolicyV1(),
         source_registry=SourceRegistryV1(),
         brief_policy=HeldFundBriefPolicyV1(),
@@ -384,6 +478,227 @@ def test_publish_uses_real_ids_once_and_atomically_authenticates_round_trip(tmp_
     assert decision_count == brief_count == 1
 
 
+def test_publish_rejects_nonexistent_resolution_lineage(tmp_path) -> None:
+    repository, decision_store, brief_store = _stores(tmp_path)
+
+    with pytest.raises(BriefStoreError, match="resolution lineage"):
+        _publish(
+            decision_store,
+            brief_store,
+            resolution_lineage_ids=("source_attempt_999999",),
+        )
+
+    with repository.connect() as connection:
+        assert connection.execute("SELECT count(*) FROM source_attempts").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM fund_brief_snapshots").fetchone()[0] == 0
+
+
+def test_publish_round_trips_authenticated_resolution_lineage(tmp_path) -> None:
+    _, decision_store, brief_store = _stores(tmp_path)
+
+    _, _, stored = _publish(
+        decision_store,
+        brief_store,
+        record_resolution_attempt=True,
+    )
+    history = brief_store.history("123456")
+
+    assert stored.snapshot.resolution_lineage_ids == ("source_attempt_1",)
+    assert history[0].snapshot.resolution_lineage_ids == ("source_attempt_1",)
+
+
+def test_publish_round_trips_authenticated_hold_thesis_and_official_review(tmp_path) -> None:
+    repository, decision_store, brief_store = _stores(tmp_path)
+    thesis = InvestmentThesis(
+        fund_code="123456",
+        rationale="继续观察基金角色",
+        horizon="一年",
+        invalidation="基金经理离任",
+        created_at=NOW - timedelta(days=1),
+    )
+    thesis_id = repository.add_thesis(thesis)
+    reviewed_at = NOW + timedelta(microseconds=1)
+    state_inputs = {
+        "owner_confirmed_thesis": True,
+        "opposing_codes": (),
+        "research_available": True,
+        "thesis_fingerprint": thesis_record_fingerprint(thesis_id, thesis),
+        "thesis_record_id": str(thesis_id),
+        "thesis_review_source_lineage_id": "source_attempt_1",
+        "thesis_review_state": "intact",
+        "thesis_reviewed_at": reviewed_at,
+    }
+
+    _, _, stored = _publish(
+        decision_store,
+        brief_store,
+        state=BriefState.HOLD,
+        record_resolution_attempt=True,
+        resolution_source_id="fund_manager_official_documents",
+        resolution_source_field_id="fund_manager_product_announcement",
+        resolution_field_id="official_events",
+        snapshot_state_inputs=state_inputs,
+        snapshot_invalidation_conditions=(thesis.invalidation,),
+    )
+    history = brief_store.history("123456")
+
+    assert stored.snapshot.primary_state is BriefState.HOLD
+    assert history[0].snapshot.interpretations[0].state_inputs["thesis_record_id"] == str(thesis_id)
+
+
+def test_publish_rejects_hold_without_authenticated_thesis_or_official_review(tmp_path) -> None:
+    _, decision_store, brief_store = _stores(tmp_path)
+
+    with pytest.raises(BriefStoreError):
+        _publish(
+            decision_store,
+            brief_store,
+            state=BriefState.HOLD,
+        )
+
+
+def test_publish_rejects_valid_looking_hold_when_thesis_row_is_missing(tmp_path) -> None:
+    repository, decision_store, brief_store = _stores(tmp_path)
+    assert repository.get_thesis(999) is None
+    reviewed_at = NOW + timedelta(microseconds=1)
+
+    with pytest.raises(BriefStoreError, match="thesis authentication"):
+        _publish(
+            decision_store,
+            brief_store,
+            state=BriefState.HOLD,
+            record_resolution_attempt=True,
+            resolution_source_id="fund_manager_official_documents",
+            resolution_source_field_id="fund_manager_product_announcement",
+            resolution_field_id="official_events",
+            snapshot_state_inputs={
+                "owner_confirmed_thesis": True,
+                "thesis_fingerprint": "a" * 64,
+                "thesis_record_id": "999",
+                "thesis_review_source_lineage_id": "source_attempt_1",
+                "thesis_review_state": "intact",
+                "thesis_reviewed_at": reviewed_at,
+            },
+        )
+
+
+def test_publish_rejects_hold_with_tampered_thesis_invalidation_condition(tmp_path) -> None:
+    repository, decision_store, brief_store = _stores(tmp_path)
+    thesis = InvestmentThesis(
+        fund_code="123456",
+        rationale="继续观察基金角色",
+        horizon="一年",
+        invalidation="基金经理离任",
+        created_at=NOW - timedelta(days=1),
+    )
+    thesis_id = repository.add_thesis(thesis)
+    reviewed_at = NOW + timedelta(microseconds=1)
+
+    with pytest.raises(BriefStoreError, match="thesis authentication"):
+        _publish(
+            decision_store,
+            brief_store,
+            state=BriefState.HOLD,
+            record_resolution_attempt=True,
+            resolution_source_id="fund_manager_official_documents",
+            resolution_source_field_id="fund_manager_product_announcement",
+            resolution_field_id="official_events",
+            snapshot_state_inputs={
+                "owner_confirmed_thesis": True,
+                "thesis_fingerprint": thesis_record_fingerprint(thesis_id, thesis),
+                "thesis_record_id": str(thesis_id),
+                "thesis_review_source_lineage_id": "source_attempt_1",
+                "thesis_review_state": "intact",
+                "thesis_reviewed_at": reviewed_at,
+            },
+            snapshot_invalidation_conditions=("与原始 thesis 无关的退出条件",),
+        )
+
+
+def test_publish_rejects_phase_b_blocked_route_forged_as_hold(tmp_path) -> None:
+    repository, decision_store, brief_store = _stores(tmp_path)
+    thesis = InvestmentThesis(
+        fund_code="123456",
+        rationale="继续观察基金角色",
+        horizon="一年",
+        invalidation="基金经理离任",
+        created_at=NOW - timedelta(days=1),
+    )
+    thesis_id = repository.add_thesis(thesis)
+    reviewed_at = NOW + timedelta(microseconds=1)
+
+    with pytest.raises(BriefStoreError, match="snapshot binding"):
+        _publish(
+            decision_store,
+            brief_store,
+            state=BriefState.HOLD,
+            record_resolution_attempt=True,
+            resolution_source_id="fund_manager_official_documents",
+            resolution_source_field_id="fund_manager_product_announcement",
+            resolution_field_id="official_events",
+            snapshot_state_inputs={
+                "owner_confirmed_thesis": True,
+                "thesis_fingerprint": thesis_record_fingerprint(thesis_id, thesis),
+                "thesis_record_id": str(thesis_id),
+                "thesis_review_source_lineage_id": "source_attempt_1",
+                "thesis_review_state": "intact",
+                "thesis_reviewed_at": reviewed_at,
+            },
+            snapshot_invalidation_conditions=(thesis.invalidation,),
+            blocked_route=True,
+        )
+
+
+def test_publish_rejects_unblocked_route_forged_as_no_add(tmp_path) -> None:
+    _, decision_store, brief_store = _stores(tmp_path)
+
+    with pytest.raises(BriefStoreError, match="snapshot binding"):
+        _publish(
+            decision_store,
+            brief_store,
+            state=BriefState.NO_ADD,
+        )
+
+
+@pytest.mark.parametrize(
+    "attempt_overrides",
+    (
+        {"resolution_attempt_request_id": "2" * 32},
+        {"resolution_subject_key": "fund:654321"},
+        {"resolution_finished_at": NOW + timedelta(seconds=2)},
+    ),
+)
+def test_publish_rejects_mismatched_resolution_lineage(tmp_path, attempt_overrides) -> None:
+    repository, decision_store, brief_store = _stores(tmp_path)
+
+    with pytest.raises(BriefStoreError, match="resolution lineage"):
+        _publish(
+            decision_store,
+            brief_store,
+            record_resolution_attempt=True,
+            **attempt_overrides,
+        )
+
+    with repository.connect() as connection:
+        assert connection.execute("SELECT count(*) FROM fund_brief_snapshots").fetchone()[0] == 0
+
+
+def test_publish_rejects_stale_cache_bound_as_usable_resolution(tmp_path) -> None:
+    repository, decision_store, brief_store = _stores(tmp_path)
+
+    with pytest.raises(BriefStoreError, match="resolution lineage"):
+        _publish(
+            decision_store,
+            brief_store,
+            record_resolution_attempt=True,
+            resolution_outcome=SourceAttemptOutcome.CACHE_HIT,
+            resolution_data_as_of=NOW - timedelta(days=365),
+        )
+
+    with repository.connect() as connection:
+        assert connection.execute("SELECT count(*) FROM fund_brief_snapshots").fetchone()[0] == 0
+
+
 def test_publish_rejects_factory_contract_and_rolls_back_sanitized(tmp_path) -> None:
     repository, decision_store, brief_store = _stores(tmp_path)
     budget = _budget()
@@ -429,20 +744,32 @@ def test_publish_rejects_factory_contract_and_rolls_back_sanitized(tmp_path) -> 
     assert "private-factory-sentinel" not in str(raised.value)
     assert len(calls) == 1
     with repository.connect() as connection:
-        assert connection.execute(
-            "SELECT status FROM request_runs WHERE id = ?", (request_run_id,)
-        ).fetchone()[0] == "running"
-        assert connection.execute(
-            "SELECT count(*) FROM decision_snapshots WHERE request_run_id = ?",
-            (request_run_id,),
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT count(*) FROM fund_brief_snapshots WHERE request_run_id = ?",
-            (request_run_id,),
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT id FROM source_attempts WHERE id = ?", (attempt_id,)
-        ).fetchone() is not None
+        assert (
+            connection.execute(
+                "SELECT status FROM request_runs WHERE id = ?", (request_run_id,)
+            ).fetchone()[0]
+            == "running"
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM decision_snapshots WHERE request_run_id = ?",
+                (request_run_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM fund_brief_snapshots WHERE request_run_id = ?",
+                (request_run_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT id FROM source_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            is not None
+        )
 
     with pytest.raises(ValueError, match="callable"):
         brief_store.publish(
@@ -486,10 +813,13 @@ def test_factory_must_return_exact_snapshot_with_real_bindings(tmp_path) -> None
                 budget=budget,
             )
         with repository.connect() as connection:
-            assert connection.execute(
-                "SELECT count(*) FROM decision_snapshots WHERE request_run_id = ?",
-                (request_run_id,),
-            ).fetchone()[0] == 0
+            assert (
+                connection.execute(
+                    "SELECT count(*) FROM decision_snapshots WHERE request_run_id = ?",
+                    (request_run_id,),
+                ).fetchone()[0]
+                == 0
+            )
 
 
 def test_history_authenticates_is_bounded_and_uses_sanitized_conclusion(tmp_path) -> None:
@@ -585,9 +915,7 @@ def test_direct_sql_rejects_nested_exact_amount_availability_key(tmp_path) -> No
     repository, decision_store, _ = _stores(tmp_path)
     snapshot = _direct_snapshot_context(decision_store, "e" * 32)
     payload = json.loads(snapshot.canonical_json())
-    payload["interpretations"][0]["state_inputs"]["nested"] = [
-        {"exact_amount_available": False}
-    ]
+    payload["interpretations"][0]["state_inputs"]["nested"] = [{"exact_amount_available": False}]
     tampered = json.dumps(
         payload,
         ensure_ascii=True,
@@ -735,10 +1063,13 @@ def test_publish_rejects_backdated_fund_history_and_preserves_prior_snapshot(
             ("b" * 32,),
         ).fetchone()
         assert poisoned_run["status"] == "running"
-        assert connection.execute(
-            "SELECT count(*) FROM decision_snapshots WHERE request_run_id = ?",
-            (poisoned_run["id"],),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM decision_snapshots WHERE request_run_id = ?",
+                (poisoned_run["id"],),
+            ).fetchone()[0]
+            == 0
+        )
     assert [item.id for item in brief_store.history("123456")] == [first.id]
 
     equal = _publish(
@@ -781,17 +1112,26 @@ def test_factory_base_exceptions_propagate_after_atomic_rollback(
             budget=budget,
         )
     with repository.connect() as connection:
-        assert connection.execute(
-            "SELECT status FROM request_runs WHERE id = ?", (request_run_id,)
-        ).fetchone()[0] == "running"
-        assert connection.execute(
-            "SELECT count(*) FROM decision_snapshots WHERE request_run_id = ?",
-            (request_run_id,),
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT count(*) FROM fund_brief_snapshots WHERE request_run_id = ?",
-            (request_run_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT status FROM request_runs WHERE id = ?", (request_run_id,)
+            ).fetchone()[0]
+            == "running"
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM decision_snapshots WHERE request_run_id = ?",
+                (request_run_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM fund_brief_snapshots WHERE request_run_id = ?",
+                (request_run_id,),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize(
@@ -825,10 +1165,13 @@ def test_publish_requires_exact_terminal_omitted_work_semantics(
             budget=budget,
         )
     with repository.connect() as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM decision_snapshots WHERE request_run_id = ?",
-            (request_run_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM decision_snapshots WHERE request_run_id = ?",
+                (request_run_id,),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize(
@@ -891,10 +1234,7 @@ def test_history_accepts_task1_maximum_public_tree_depth(tmp_path) -> None:
 
     history = brief_store.history("123456")
     assert len(history) == 1
-    assert (
-        history[0].snapshot.interpretations[0].to_canonical_dict()["state_inputs"]
-        == expected
-    )
+    assert history[0].snapshot.interpretations[0].to_canonical_dict()["state_inputs"] == expected
 
 
 def test_store_bounds_are_finite_and_checked_before_json_decode(tmp_path) -> None:
@@ -956,7 +1296,5 @@ def test_direct_sql_rejects_oversized_policy_snapshot_and_summary(tmp_path) -> N
             connection,
             too_many,
             canonical_snapshot_json=too_many_json,
-            overrides={
-                "triggered_reviews_json": json.dumps(identifiers, separators=(",", ":"))
-            },
+            overrides={"triggered_reviews_json": json.dumps(identifiers, separators=(",", ":"))},
         )

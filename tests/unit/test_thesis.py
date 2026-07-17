@@ -20,9 +20,11 @@ class ThesisTest(unittest.TestCase):
                 datetime.now(timezone.utc),
             )
 
-            repository.add_thesis(thesis)
+            thesis_id = repository.add_thesis(thesis)
 
             self.assertEqual(repository.list_theses("017811")[0].invalidation, thesis.invalidation)
+            self.assertEqual(repository.get_thesis(thesis_id), thesis)
+            self.assertIsNone(repository.get_thesis(thesis_id + 1))
 
     def test_empty_invalidation_is_rejected(self) -> None:
         thesis = InvestmentThesis("017811", "理由", "一年", "", datetime.now(timezone.utc))
@@ -32,4 +34,3 @@ class ThesisTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

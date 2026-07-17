@@ -12,6 +12,7 @@ from kunjin.brief.models import (
     BriefCoverage,
     BriefEvidenceState,
     BriefFact,
+    BriefResolutionBinding,
     BriefSnapshot,
     BriefState,
     HeldFundBriefReport,
@@ -33,7 +34,9 @@ from kunjin.decision.models import (
     ActionMaturity,
     EvidenceCompleteness,
     EvidenceFreshness,
+    RequestFieldResolution,
     RequestMode,
+    SourceFieldState,
     SourceTier,
 )
 
@@ -102,7 +105,7 @@ def _event(**overrides: object) -> OfficialEvent:
         "quoted_source_id": None,
         "content_fingerprint": CHECKSUM,
         "integrity_status": "active",
-        "affected_action_ids": ("continue_holding",),
+        "affected_action_ids": ("fact_research", "continue_holding"),
     }
     values.update(overrides)
     return OfficialEvent(**values)
@@ -155,6 +158,21 @@ def _interpretation(**overrides: object) -> BriefActionInterpretation:
     }
     values.update(overrides)
     return BriefActionInterpretation(**values)
+
+
+def _resolution_binding(**overrides: object) -> BriefResolutionBinding:
+    values = {
+        "action_id": "continue_holding",
+        "field_id": "official_events",
+        "resolution": RequestFieldResolution.USABLE,
+        "source_states": (SourceFieldState.HEALTHY,),
+        "source_attempt_id": 7,
+        "source_id": "fund_manager_official_documents",
+        "source_field_id": "fund_manager_product_announcement",
+        "evaluated_at": NOW - timedelta(minutes=1),
+    }
+    values.update(overrides)
+    return BriefResolutionBinding(**values)
 
 
 def _snapshot(**overrides: object) -> BriefSnapshot:
@@ -212,6 +230,317 @@ def test_brief_enums_are_exact() -> None:
         "benchmark_change_notice",
         "other_official_product_notice",
     )
+
+
+def test_switch_primary_preserves_reduce_leg_and_phase_b_no_add() -> None:
+    reduce_leg = _interpretation(
+        action_id="switch_reduce",
+        state=BriefState.REDUCE_OR_EXIT_REVIEW,
+        blocking_codes=("fees_missing",),
+        unavailable_actions=("exact_amount", "automatic_trade"),
+    )
+    buy_leg = _interpretation(
+        action_id="switch_buy",
+        state=BriefState.ABSTAIN,
+        blocking_codes=("phase_b_blocked", "d3_missing"),
+        missing_fields=("d3",),
+    )
+    snapshot = _snapshot(
+        action_ids=("fact_research", "switch_reduce", "switch_buy"),
+        official_events=(),
+        interpretations=(reduce_leg, buy_leg),
+        primary_state=BriefState.NO_ADD,
+        action_maturity=ActionMaturity.MATURE,
+        affected_action_abstentions=("switch_buy",),
+        blocking_codes=("fees_missing", "phase_b_blocked", "d3_missing"),
+        missing_fields=("owner_confirmed_thesis", "d3", "industry_exposure"),
+        source_lineage_ids=("eastmoney_nav_123456", "eastmoney_manager_123456"),
+    )
+
+    snapshot.validate()
+    assert snapshot.interpretations[0].state is BriefState.REDUCE_OR_EXIT_REVIEW
+    assert snapshot.primary_state is BriefState.NO_ADD
+
+
+def test_snapshot_persists_authenticated_resolution_lineage() -> None:
+    snapshot = _snapshot(
+        source_lineage_ids=(
+            "eastmoney_nav_123456",
+            "eastmoney_manager_123456",
+            "official_announcement_1",
+            "source_attempt_7",
+        ),
+        resolution_lineage_ids=("source_attempt_7",),
+        resolution_bindings=(_resolution_binding(),),
+    )
+
+    snapshot.validate()
+    assert snapshot.to_canonical_dict()["resolution_lineage_ids"] == ["source_attempt_7"]
+    assert snapshot.to_canonical_dict()["resolution_bindings"][0]["action_id"] == (
+        "continue_holding"
+    )
+
+
+def test_hold_requires_thesis_and_official_resolution_binding() -> None:
+    hold = _interpretation(
+        state=BriefState.HOLD,
+        missing_fields=(),
+        state_inputs={"owner_confirmed_thesis": False},
+    )
+    snapshot = _snapshot(
+        official_events=(),
+        interpretations=(hold,),
+        primary_state=BriefState.HOLD,
+        missing_fields=("industry_exposure",),
+        source_lineage_ids=("eastmoney_nav_123456", "eastmoney_manager_123456"),
+    )
+
+    with pytest.raises(ValueError, match="hold requires"):
+        snapshot.validate()
+
+
+@pytest.mark.parametrize(
+    "state",
+    (BriefState.HOLD, BriefState.WATCH, BriefState.ABSTAIN),
+)
+def test_experimental_states_reject_mature_label(state: BriefState) -> None:
+    interpretation = _interpretation(
+        state=state,
+        action_maturity=ActionMaturity.MATURE,
+    )
+
+    with pytest.raises(ValueError, match="maturity"):
+        interpretation.validate()
+
+
+def test_no_add_rejects_experimental_label() -> None:
+    interpretation = _interpretation(
+        state=BriefState.NO_ADD,
+        action_maturity=ActionMaturity.EXPERIMENTAL_SHADOW,
+    )
+
+    with pytest.raises(ValueError, match="maturity"):
+        interpretation.validate()
+
+
+def test_mature_exit_review_requires_active_hard_official_event() -> None:
+    interpretation = _interpretation(
+        action_id="full_exit",
+        state=BriefState.REDUCE_OR_EXIT_REVIEW,
+        action_maturity=ActionMaturity.MATURE,
+        supporting_evidence_ids=("formal_nav_1",),
+        missing_fields=(),
+    )
+    snapshot = _snapshot(
+        action_ids=("fact_research", "full_exit"),
+        official_events=(),
+        interpretations=(interpretation,),
+        primary_state=BriefState.REDUCE_OR_EXIT_REVIEW,
+        action_maturity=ActionMaturity.MATURE,
+        missing_fields=("industry_exposure",),
+        source_lineage_ids=("eastmoney_nav_123456", "eastmoney_manager_123456"),
+    )
+
+    with pytest.raises(ValueError, match="hard official event"):
+        snapshot.validate()
+
+
+def test_holding_action_rejects_experimental_exit_review() -> None:
+    interpretation = _interpretation(
+        state=BriefState.REDUCE_OR_EXIT_REVIEW,
+        action_maturity=ActionMaturity.EXPERIMENTAL_SHADOW,
+    )
+    snapshot = _snapshot(
+        interpretations=(interpretation,),
+        primary_state=BriefState.REDUCE_OR_EXIT_REVIEW,
+    )
+
+    with pytest.raises(ValueError, match="action state"):
+        snapshot.validate()
+
+
+def test_switch_buy_rejects_watch_state() -> None:
+    reduce_leg = _interpretation(
+        action_id="switch_reduce",
+        state=BriefState.REDUCE_OR_EXIT_REVIEW,
+        action_maturity=ActionMaturity.EXPERIMENTAL_SHADOW,
+    )
+    buy_leg = _interpretation(
+        action_id="switch_buy",
+        state=BriefState.WATCH,
+    )
+    snapshot = _snapshot(
+        action_ids=("fact_research", "switch_reduce", "switch_buy"),
+        official_events=(),
+        interpretations=(reduce_leg, buy_leg),
+        primary_state=BriefState.REDUCE_OR_EXIT_REVIEW,
+        source_lineage_ids=("eastmoney_nav_123456", "eastmoney_manager_123456"),
+    )
+
+    with pytest.raises(ValueError, match="action state"):
+        snapshot.validate()
+
+
+def test_active_liquidation_cannot_be_persisted_as_hold() -> None:
+    liquidation = _event(
+        event_id="liquidation_1",
+        event_code=OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+    )
+    binding = _resolution_binding()
+    hold = _interpretation(
+        state=BriefState.HOLD,
+        supporting_evidence_ids=(liquidation.event_id,),
+        missing_fields=(),
+        invalidation_conditions=("基金进入清盘程序",),
+        state_inputs={
+            "owner_confirmed_thesis": True,
+            "thesis_fingerprint": CHECKSUM,
+            "thesis_record_id": "1",
+            "thesis_review_source_lineage_id": binding.lineage_id,
+            "thesis_review_state": "intact",
+            "thesis_reviewed_at": binding.evaluated_at,
+        },
+    )
+    snapshot = _snapshot(
+        official_events=(liquidation,),
+        interpretations=(hold,),
+        primary_state=BriefState.HOLD,
+        triggered_reviews=(OfficialEventCode.FUND_LIQUIDATION_NOTICE.value,),
+        resolution_bindings=(binding,),
+        resolution_lineage_ids=(binding.lineage_id,),
+        source_lineage_ids=(
+            "eastmoney_nav_123456",
+            "eastmoney_manager_123456",
+            liquidation.original_source_id,
+            binding.lineage_id,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="hard official event"):
+        snapshot.validate()
+
+
+def test_triggered_reviews_exactly_match_active_hard_events() -> None:
+    snapshot = _snapshot(
+        triggered_reviews=(OfficialEventCode.FUND_TERMINATION_NOTICE.value,),
+    )
+
+    with pytest.raises(ValueError, match="triggered reviews"):
+        snapshot.validate()
+
+
+def test_event_cannot_narrow_its_canonical_affected_actions() -> None:
+    liquidation = _event(
+        event_code=OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+        affected_action_ids=("fact_research",),
+    )
+    snapshot = _snapshot(
+        official_events=(liquidation,),
+        triggered_reviews=(OfficialEventCode.FUND_LIQUIDATION_NOTICE.value,),
+    )
+
+    with pytest.raises(ValueError, match="affected actions"):
+        snapshot.validate()
+
+
+def test_redemption_restriction_cannot_be_ignored_by_exit_review() -> None:
+    restriction = _event(
+        event_id="redemption_restriction_1",
+        event_code=OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE,
+        affected_action_ids=("fact_research", "full_exit"),
+    )
+    interpretation = _interpretation(
+        action_id="full_exit",
+        state=BriefState.REDUCE_OR_EXIT_REVIEW,
+        supporting_evidence_ids=(restriction.event_id,),
+        missing_fields=(),
+        unavailable_actions=("exact_amount", "automatic_trade"),
+    )
+    snapshot = _snapshot(
+        action_ids=("fact_research", "full_exit"),
+        official_events=(restriction,),
+        interpretations=(interpretation,),
+        primary_state=BriefState.REDUCE_OR_EXIT_REVIEW,
+        missing_fields=("industry_exposure",),
+        source_lineage_ids=(
+            "eastmoney_nav_123456",
+            "eastmoney_manager_123456",
+            restriction.original_source_id,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="redemption restriction"):
+        snapshot.validate()
+
+
+@pytest.mark.parametrize(
+    "event_code",
+    (
+        OfficialEventCode.MANAGER_CHANGE_NOTICE,
+        OfficialEventCode.FEE_CHANGE_NOTICE,
+        OfficialEventCode.BENCHMARK_CHANGE_NOTICE,
+        OfficialEventCode.SUBSCRIPTION_SUSPENSION_NOTICE,
+    ),
+)
+def test_active_watch_event_cannot_be_persisted_as_hold(event_code) -> None:
+    event = _event(event_code=event_code)
+    binding = _resolution_binding()
+    hold = _interpretation(
+        state=BriefState.HOLD,
+        supporting_evidence_ids=(event.event_id,),
+        missing_fields=(),
+        state_inputs={
+            "owner_confirmed_thesis": True,
+            "thesis_fingerprint": CHECKSUM,
+            "thesis_record_id": "1",
+            "thesis_review_source_lineage_id": binding.lineage_id,
+            "thesis_review_state": "intact",
+            "thesis_reviewed_at": binding.evaluated_at,
+        },
+    )
+    snapshot = _snapshot(
+        official_events=(event,),
+        interpretations=(hold,),
+        primary_state=BriefState.HOLD,
+        resolution_bindings=(binding,),
+        resolution_lineage_ids=(binding.lineage_id,),
+        source_lineage_ids=(
+            "eastmoney_nav_123456",
+            "eastmoney_manager_123456",
+            event.original_source_id,
+            binding.lineage_id,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="risk event"):
+        snapshot.validate()
+
+
+def test_subscription_suspension_must_keep_buy_or_add_unavailable() -> None:
+    suspension = _event(event_code=OfficialEventCode.SUBSCRIPTION_SUSPENSION_NOTICE)
+    watch = _interpretation(
+        state=BriefState.WATCH,
+        supporting_evidence_ids=(suspension.event_id,),
+        unavailable_actions=("exact_amount",),
+    )
+    snapshot = _snapshot(
+        official_events=(suspension,),
+        interpretations=(watch,),
+    )
+
+    with pytest.raises(ValueError, match="subscription suspension"):
+        snapshot.validate()
+
+
+@pytest.mark.parametrize("integrity_status", ("corrected", "retracted"))
+def test_inactive_event_requires_affected_action_abstention(integrity_status) -> None:
+    inactive = _event(integrity_status=integrity_status)
+    snapshot = _snapshot(
+        official_events=(inactive,),
+    )
+
+    with pytest.raises(ValueError, match="inactive official event"):
+        snapshot.validate()
 
 
 def test_snapshot_is_canonical_ascii_and_owner_overlay_is_ephemeral() -> None:
@@ -324,9 +653,7 @@ def test_persisted_snapshot_rejects_decimal_at_every_nested_path(
     (
         _snapshot(facts=(replace(_fact(), value=1.25),)),
         _snapshot(relationships=(replace(_relationship(), metrics={"nested": {"ratio": 0.5}}),)),
-        _snapshot(
-            interpretations=(replace(_interpretation(), state_inputs={"confidence": 0.5}),)
-        ),
+        _snapshot(interpretations=(replace(_interpretation(), state_inputs={"confidence": 0.5}),)),
     ),
 )
 def test_persisted_snapshot_rejects_float(snapshot: BriefSnapshot) -> None:
@@ -382,9 +709,7 @@ def test_persisted_snapshot_rejects_private_mapping_paths(private_key: str) -> N
 @pytest.mark.parametrize("public_key", ("asset_class", "candidate_asset_coverage"))
 def test_public_asset_paths_are_not_false_positive_private_paths(public_key: str) -> None:
     snapshot = _snapshot(
-        interpretations=(
-            replace(_interpretation(), state_inputs={public_key: "public_value"}),
-        )
+        interpretations=(replace(_interpretation(), state_inputs={public_key: "public_value"}),)
     )
     snapshot.validate()
 
@@ -410,8 +735,7 @@ def test_canonical_public_url_allows_non_ascii_path_with_ascii_host() -> None:
     replace(
         _fact(),
         canonical_url=(
-            "https://example.test/"
-            "\N{CJK UNIFIED IDEOGRAPH-516C}\N{CJK UNIFIED IDEOGRAPH-544A}"
+            "https://example.test/\N{CJK UNIFIED IDEOGRAPH-516C}\N{CJK UNIFIED IDEOGRAPH-544A}"
         ),
     ).validate()
 
@@ -498,21 +822,27 @@ def test_snapshot_rejects_noncanonical_action_shapes(action_ids: tuple) -> None:
 
 
 def test_switch_requires_both_exact_interpretations() -> None:
-    switch_reduce = replace(_interpretation(), action_id="switch_reduce")
+    switch_reduce = replace(
+        _interpretation(),
+        action_id="switch_reduce",
+        state=BriefState.REDUCE_OR_EXIT_REVIEW,
+    )
     switch_buy = replace(
         _interpretation(),
         action_id="switch_buy",
-        state=BriefState.NO_ADD,
+        state=BriefState.ABSTAIN,
         blocking_codes=("phase_b_blocked",),
     )
     switch_event = replace(
         _event(),
-        affected_action_ids=("switch_reduce", "switch_buy"),
+        affected_action_ids=("fact_research", "switch_buy"),
     )
     switch = _snapshot(
         action_ids=("fact_research", "switch_reduce", "switch_buy"),
         official_events=(switch_event,),
         interpretations=(switch_reduce, switch_buy),
+        primary_state=BriefState.NO_ADD,
+        action_maturity=ActionMaturity.MATURE,
         blocking_codes=("phase_b_blocked",),
     )
     switch.validate()
@@ -527,17 +857,9 @@ def test_snapshot_requires_unambiguous_resolved_evidence_references() -> None:
                 replace(_interpretation(), supporting_evidence_ids=("missing_evidence",)),
             )
         ),
-        _snapshot(
-            relationships=(
-                replace(_relationship(), evidence_ids=("missing_evidence",)),
-            )
-        ),
+        _snapshot(relationships=(replace(_relationship(), evidence_ids=("missing_evidence",)),)),
         _snapshot(coverage=replace(_coverage(), evidence_ids=("missing_evidence",))),
-        _snapshot(
-            official_events=(
-                replace(_event(), affected_action_ids=("full_exit",)),
-            )
-        ),
+        _snapshot(official_events=(replace(_event(), affected_action_ids=("full_exit",)),)),
         _snapshot(
             source_lineage_ids=("eastmoney_nav_123456", "official_announcement_1"),
         ),
@@ -567,11 +889,15 @@ def test_interpretation_may_cite_coverage_as_noncolliding_evidence() -> None:
 
 def test_switch_top_level_cannot_hide_action_gaps_or_fact_conflicts() -> None:
     conflicted_fact = replace(_fact(), conflict_ids=("identity_conflict",))
-    switch_reduce = replace(_interpretation(), action_id="switch_reduce")
+    switch_reduce = replace(
+        _interpretation(),
+        action_id="switch_reduce",
+        state=BriefState.REDUCE_OR_EXIT_REVIEW,
+    )
     switch_buy = replace(
         _interpretation(),
         action_id="switch_buy",
-        state=BriefState.NO_ADD,
+        state=BriefState.ABSTAIN,
         blocking_codes=("phase_b_blocked",),
         missing_fields=("phase_b",),
     )
@@ -581,10 +907,12 @@ def test_switch_top_level_cannot_hide_action_gaps_or_fact_conflicts() -> None:
         official_events=(
             replace(
                 _event(),
-                affected_action_ids=("switch_reduce", "switch_buy"),
+                affected_action_ids=("fact_research", "switch_buy"),
             ),
         ),
         interpretations=(switch_reduce, switch_buy),
+        primary_state=BriefState.NO_ADD,
+        action_maturity=ActionMaturity.MATURE,
         blocking_codes=("phase_b_blocked",),
         missing_fields=("owner_confirmed_thesis", "phase_b", "industry_exposure"),
         conflicts=("identity_conflict",),

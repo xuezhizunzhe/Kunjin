@@ -16,7 +16,9 @@ from kunjin.decision.models import (
     ActionMaturity,
     EvidenceCompleteness,
     EvidenceFreshness,
+    RequestFieldResolution,
     RequestMode,
+    SourceFieldState,
     SourceTier,
     canonical_decimal,
     canonical_json_bytes,
@@ -29,6 +31,7 @@ from kunjin.decision.models import (
     validate_public_text,
     validate_public_text_tuple,
 )
+from kunjin.models import InvestmentThesis
 
 _FUND_CODE_PATTERN = re.compile(r"^[0-9]{6}$")
 _PRIVATE_PATH_TOKENS = frozenset(
@@ -100,6 +103,84 @@ class OfficialEventCode(str, Enum):
     OTHER_OFFICIAL_PRODUCT_NOTICE = "other_official_product_notice"
 
 
+_OFFICIAL_EVENT_ACTIONS = {
+    OfficialEventCode.FUND_LIQUIDATION_NOTICE: frozenset(
+        {
+            "fact_research",
+            "continue_holding",
+            "reduce_to_cash",
+            "full_exit",
+            "switch_reduce",
+        }
+    ),
+    OfficialEventCode.FUND_TERMINATION_NOTICE: frozenset(
+        {
+            "fact_research",
+            "continue_holding",
+            "reduce_to_cash",
+            "full_exit",
+            "switch_reduce",
+        }
+    ),
+    OfficialEventCode.MANAGER_CHANGE_NOTICE: frozenset(
+        {"fact_research", "continue_holding", "switch_buy"}
+    ),
+    OfficialEventCode.SUBSCRIPTION_SUSPENSION_NOTICE: frozenset(
+        {"fact_research", "continue_holding", "switch_buy"}
+    ),
+    OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE: frozenset(
+        {"fact_research", "reduce_to_cash", "full_exit", "switch_reduce"}
+    ),
+    OfficialEventCode.FEE_CHANGE_NOTICE: frozenset(
+        {
+            "fact_research",
+            "continue_holding",
+            "reduce_to_cash",
+            "full_exit",
+            "switch_reduce",
+            "switch_buy",
+        }
+    ),
+    OfficialEventCode.BENCHMARK_CHANGE_NOTICE: frozenset(
+        {"fact_research", "continue_holding", "switch_buy"}
+    ),
+    OfficialEventCode.OTHER_OFFICIAL_PRODUCT_NOTICE: frozenset({"fact_research"}),
+}
+
+
+def canonical_event_affected_actions(
+    event_code: OfficialEventCode,
+    action_ids: Tuple[str, ...],
+) -> Tuple[str, ...]:
+    if type(event_code) is not OfficialEventCode:
+        raise ValueError("event code must be an exact OfficialEventCode")
+    validate_identifier_tuple(action_ids, "event action ids", allow_empty=False)
+    return tuple(
+        action_id for action_id in action_ids if action_id in _OFFICIAL_EVENT_ACTIONS[event_code]
+    )
+
+
+def thesis_record_fingerprint(thesis_id: int, thesis: InvestmentThesis) -> str:
+    if type(thesis_id) is not int or thesis_id <= 0:
+        raise ValueError("thesis id must be a positive integer")
+    if type(thesis) is not InvestmentThesis:
+        raise ValueError("thesis must be an exact InvestmentThesis")
+    thesis.validate()
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "active": thesis.active,
+                "created_at": thesis.created_at,
+                "fund_code": thesis.fund_code,
+                "horizon": thesis.horizon,
+                "invalidation": thesis.invalidation,
+                "rationale": thesis.rationale,
+                "thesis_id": thesis_id,
+            }
+        )
+    ).hexdigest()
+
+
 def _validate_exact_record(value: object, expected_type: type, name: str) -> None:
     if type(value) is not expected_type:
         raise ValueError(f"{name} must be an exact {expected_type.__name__}")
@@ -146,9 +227,7 @@ def _validate_https_url(value: object, name: str) -> str:
     if type(value) is not str or not value or len(value) > MAX_PUBLIC_TEXT_CHARS:
         raise ValueError(error)
     if any(
-        ord(character) <= 0x1F
-        or ord(character) == 0x7F
-        or 0xD800 <= ord(character) <= 0xDFFF
+        ord(character) <= 0x1F or ord(character) == 0x7F or 0xD800 <= ord(character) <= 0xDFFF
         for character in value
     ):
         raise ValueError(error)
@@ -202,9 +281,7 @@ def _is_private_path(value: str) -> bool:
 
 def _freeze_public_tree(value: object) -> object:
     if type(value) in {dict, _MAPPING_PROXY_TYPE}:
-        return MappingProxyType(
-            {key: _freeze_public_tree(item) for key, item in value.items()}
-        )
+        return MappingProxyType({key: _freeze_public_tree(item) for key, item in value.items()})
     if type(value) is tuple:
         return tuple(_freeze_public_tree(item) for item in value)
     return value
@@ -528,6 +605,64 @@ class BriefCoverage:
 
 
 @dataclass(frozen=True)
+class BriefResolutionBinding:
+    action_id: str
+    field_id: str
+    resolution: RequestFieldResolution
+    source_states: Tuple[SourceFieldState, ...]
+    source_attempt_id: int
+    source_id: str
+    source_field_id: str
+    evaluated_at: datetime
+
+    def validate(self) -> None:
+        _validate_exact_record(self, BriefResolutionBinding, "brief resolution binding")
+        validate_identifier(self.action_id, "resolution binding action id")
+        validate_identifier(self.field_id, "resolution binding field id")
+        if type(self.resolution) is not RequestFieldResolution:
+            raise ValueError("resolution binding must use an exact resolution")
+        if type(self.source_states) is not tuple or not self.source_states:
+            raise ValueError("resolution binding source states must be a non-empty tuple")
+        if any(type(item) is not SourceFieldState for item in self.source_states):
+            raise ValueError("resolution binding source states must be exact")
+        if len(self.source_states) != len(set(self.source_states)):
+            raise ValueError("resolution binding source states must be unique")
+        if type(self.source_attempt_id) is not int or self.source_attempt_id <= 0:
+            raise ValueError("resolution binding source attempt id must be positive")
+        validate_identifier(self.source_id, "resolution binding source id")
+        validate_identifier(self.source_field_id, "resolution binding source field id")
+        _validate_utc_datetime(self.evaluated_at, "resolution binding evaluation time")
+        if self.field_id == "official_events" and (
+            self.source_id != "fund_manager_official_documents"
+            or self.source_field_id != "fund_manager_product_announcement"
+        ):
+            raise ValueError("official event resolution requires the official announcement source")
+        if self.field_id != "official_events" and self.source_field_id != self.field_id:
+            raise ValueError("resolution binding field does not match its source field")
+        if self.resolution is RequestFieldResolution.USABLE and (
+            SourceFieldState.HEALTHY not in self.source_states
+        ):
+            raise ValueError("usable resolution binding requires a healthy source state")
+
+    def to_canonical_dict(self) -> dict:
+        self.validate()
+        return {
+            "action_id": self.action_id,
+            "evaluated_at": canonical_value(self.evaluated_at),
+            "field_id": self.field_id,
+            "resolution": self.resolution.value,
+            "source_attempt_id": self.source_attempt_id,
+            "source_field_id": self.source_field_id,
+            "source_id": self.source_id,
+            "source_states": [item.value for item in self.source_states],
+        }
+
+    @property
+    def lineage_id(self) -> str:
+        return f"source_attempt_{self.source_attempt_id}"
+
+
+@dataclass(frozen=True)
 class BriefActionInterpretation:
     action_id: str
     state: BriefState
@@ -551,6 +686,13 @@ class BriefActionInterpretation:
             raise ValueError("interpretation state must be an exact BriefState")
         if type(self.action_maturity) is not ActionMaturity:
             raise ValueError("interpretation maturity must be an exact ActionMaturity")
+        if self.state is BriefState.NO_ADD:
+            if self.action_maturity is not ActionMaturity.MATURE:
+                raise ValueError("no-add interpretation maturity must be mature")
+        elif self.state in {BriefState.HOLD, BriefState.WATCH, BriefState.ABSTAIN} and (
+            self.action_maturity is not ActionMaturity.EXPERIMENTAL_SHADOW
+        ):
+            raise ValueError("hold, watch, and abstain maturity must remain experimental")
         validate_identifier_tuple(self.supporting_evidence_ids, "supporting evidence ids")
         validate_identifier_tuple(self.opposing_evidence_ids, "opposing evidence ids")
         validate_identifier_tuple(self.blocking_codes, "interpretation blocking codes")
@@ -603,6 +745,8 @@ class BriefSnapshot:
     source_lineage_ids: Tuple[str, ...]
     evidence_fingerprint: str
     created_at: datetime
+    resolution_lineage_ids: Tuple[str, ...] = ()
+    resolution_bindings: Tuple[BriefResolutionBinding, ...] = ()
 
     def validate(self) -> None:
         _validate_exact_record(self, BriefSnapshot, "brief snapshot")
@@ -648,9 +792,7 @@ class BriefSnapshot:
         interpretation_ids = tuple(item.action_id for item in self.interpretations)
         expected_interpretation_ids = self.action_ids[1:]
         if interpretation_ids != expected_interpretation_ids:
-            raise ValueError(
-                "interpretation action ids must exactly match all non-fact action ids"
-            )
+            raise ValueError("interpretation action ids must exactly match all non-fact action ids")
 
         fact_ids = tuple(item.fact_id for item in self.facts)
         event_ids = tuple(item.event_id for item in self.official_events)
@@ -660,9 +802,7 @@ class BriefSnapshot:
             raise ValueError("evidence namespace ids must be globally unique")
         if self.coverage.coverage_id in set(base_evidence_namespace_ids):
             raise ValueError("coverage id must not collide with an evidence namespace id")
-        evidence_namespace_ids = base_evidence_namespace_ids + (
-            self.coverage.coverage_id,
-        )
+        evidence_namespace_ids = base_evidence_namespace_ids + (self.coverage.coverage_id,)
 
         fact_or_event_ids = set(fact_ids + event_ids)
         fact_or_relationship_ids = set(fact_ids + relationship_ids)
@@ -674,24 +814,173 @@ class BriefSnapshot:
             raise ValueError("coverage evidence ids must resolve to facts or relationships")
         for interpretation in self.interpretations:
             interpretation_evidence = set(
-                interpretation.supporting_evidence_ids
-                + interpretation.opposing_evidence_ids
+                interpretation.supporting_evidence_ids + interpretation.opposing_evidence_ids
             )
             if not interpretation_evidence.issubset(all_evidence_ids):
-                raise ValueError(
-                    "interpretation evidence ids must resolve to snapshot evidence"
-                )
+                raise ValueError("interpretation evidence ids must resolve to snapshot evidence")
         action_id_set = set(self.action_ids)
         for event in self.official_events:
-            if not set(event.affected_action_ids).issubset(action_id_set):
-                raise ValueError("event affected action ids must bind to snapshot action ids")
+            expected_affected_actions = canonical_event_affected_actions(
+                event.event_code,
+                self.action_ids,
+            )
+            if event.affected_action_ids != expected_affected_actions:
+                raise ValueError("event affected actions must exactly match the canonical scope")
 
+        hard_event_codes = {
+            OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+            OfficialEventCode.FUND_TERMINATION_NOTICE,
+        }
+        ordered_active_hard_events = tuple(
+            event
+            for event in sorted(
+                self.official_events,
+                key=lambda item: (item.published_at, item.event_id),
+            )
+            if event.integrity_status == "active" and event.event_code in hard_event_codes
+        )
+        expected_triggered_reviews = tuple(
+            dict.fromkeys(event.event_code.value for event in ordered_active_hard_events)
+        )
+        if self.triggered_reviews != expected_triggered_reviews:
+            raise ValueError("snapshot triggered reviews must exactly match active hard events")
+        allowed_action_states = {
+            "continue_holding": {
+                BriefState.NO_ADD,
+                BriefState.HOLD,
+                BriefState.WATCH,
+                BriefState.REDUCE_OR_EXIT_REVIEW,
+                BriefState.ABSTAIN,
+            },
+            "reduce_to_cash": {BriefState.REDUCE_OR_EXIT_REVIEW, BriefState.ABSTAIN},
+            "full_exit": {BriefState.REDUCE_OR_EXIT_REVIEW, BriefState.ABSTAIN},
+            "switch_reduce": {BriefState.REDUCE_OR_EXIT_REVIEW, BriefState.ABSTAIN},
+            "switch_buy": {BriefState.ABSTAIN},
+        }
+        watch_event_codes = {
+            OfficialEventCode.MANAGER_CHANGE_NOTICE,
+            OfficialEventCode.SUBSCRIPTION_SUSPENSION_NOTICE,
+            OfficialEventCode.FEE_CHANGE_NOTICE,
+            OfficialEventCode.BENCHMARK_CHANGE_NOTICE,
+        }
+        for interpretation in self.interpretations:
+            active_action_events = tuple(
+                event
+                for event in self.official_events
+                if event.integrity_status == "active"
+                and interpretation.action_id in event.affected_action_ids
+            )
+            inactive_action_events = tuple(
+                event
+                for event in self.official_events
+                if event.integrity_status != "active"
+                and interpretation.action_id in event.affected_action_ids
+            )
+            hard_events = tuple(
+                event
+                for event in ordered_active_hard_events
+                if interpretation.action_id in event.affected_action_ids
+            )
+            watch_events = tuple(
+                event for event in active_action_events if event.event_code in watch_event_codes
+            )
+            redemption_restrictions = tuple(
+                event
+                for event in active_action_events
+                if event.event_code is OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE
+            )
+            if interpretation.state not in allowed_action_states[interpretation.action_id] or (
+                interpretation.action_id == "continue_holding"
+                and interpretation.state is BriefState.REDUCE_OR_EXIT_REVIEW
+                and interpretation.action_maturity is not ActionMaturity.MATURE
+            ):
+                raise ValueError("interpretation action state is outside the Phase 1 matrix")
+            if hard_events:
+                phase_b_no_add = (
+                    interpretation.state is BriefState.NO_ADD
+                    and "phase_b_blocked" in interpretation.blocking_codes
+                )
+                if not phase_b_no_add and not (
+                    interpretation.state is BriefState.REDUCE_OR_EXIT_REVIEW
+                    and interpretation.action_maturity is ActionMaturity.MATURE
+                ):
+                    raise ValueError("active hard official event requires exit review or no-add")
+                if not {event.event_id for event in hard_events}.issubset(
+                    interpretation.supporting_evidence_ids
+                ):
+                    raise ValueError("hard official event must be supporting evidence")
+                if "immediate_sale" not in interpretation.unavailable_actions:
+                    raise ValueError("hard official event must keep immediate sale unavailable")
+            elif (
+                interpretation.state is BriefState.REDUCE_OR_EXIT_REVIEW
+                and interpretation.action_maturity is ActionMaturity.MATURE
+            ):
+                raise ValueError("mature exit review requires an active hard official event")
+            if watch_events and interpretation.state is BriefState.HOLD:
+                raise ValueError("active risk event cannot retain a hold interpretation")
+            if (
+                any(
+                    event.event_code is OfficialEventCode.SUBSCRIPTION_SUSPENSION_NOTICE
+                    for event in watch_events
+                )
+                and "buy_or_add" not in interpretation.unavailable_actions
+            ):
+                raise ValueError("subscription suspension must keep buy or add unavailable")
+            if redemption_restrictions and (
+                not {event.event_id for event in redemption_restrictions}.issubset(
+                    interpretation.supporting_evidence_ids
+                )
+                or OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE.value
+                not in interpretation.blocking_codes
+                or "executable_redemption" not in interpretation.unavailable_actions
+                or interpretation.action_id not in self.affected_action_abstentions
+            ):
+                raise ValueError("redemption restriction must remain an affected action block")
+            if inactive_action_events and (
+                interpretation.state is not BriefState.ABSTAIN
+                or not {event.event_id for event in inactive_action_events}.issubset(
+                    interpretation.opposing_evidence_ids
+                )
+                or not {
+                    f"official_event_{event.integrity_status}_{event.event_id}"
+                    for event in inactive_action_events
+                }.issubset(interpretation.blocking_codes)
+                or interpretation.action_id not in self.affected_action_abstentions
+            ):
+                raise ValueError("inactive official event requires affected action abstention")
+
+        if type(self.resolution_bindings) is not tuple:
+            raise ValueError("snapshot resolution bindings must be an exact tuple")
+        resolution_keys = []
+        for binding in self.resolution_bindings:
+            if type(binding) is not BriefResolutionBinding:
+                raise ValueError("snapshot resolution bindings must contain exact records")
+            binding.validate()
+            if binding.action_id not in action_id_set:
+                raise ValueError("resolution binding action is outside the snapshot")
+            resolution_keys.append((binding.action_id, binding.field_id))
+        if len(resolution_keys) != len(set(resolution_keys)):
+            raise ValueError("snapshot resolution action and field bindings must be unique")
+
+        validate_identifier_tuple(
+            self.resolution_lineage_ids,
+            "snapshot resolution lineage ids",
+        )
+        expected_resolution_lineages = tuple(
+            dict.fromkeys(binding.lineage_id for binding in self.resolution_bindings)
+        )
+        if self.resolution_lineage_ids != expected_resolution_lineages:
+            raise ValueError("snapshot resolution lineages must exactly match their bindings")
         expected_lineage_ids = []
-        for lineage_id in tuple(item.source_lineage_id for item in self.facts) + tuple(
-            source_id
-            for event in self.official_events
-            for source_id in (event.original_source_id, event.quoted_source_id)
-            if source_id is not None
+        for lineage_id in (
+            tuple(item.source_lineage_id for item in self.facts)
+            + tuple(
+                source_id
+                for event in self.official_events
+                for source_id in (event.original_source_id, event.quoted_source_id)
+                if source_id is not None
+            )
+            + self.resolution_lineage_ids
         ):
             if lineage_id not in expected_lineage_ids:
                 expected_lineage_ids.append(lineage_id)
@@ -703,15 +992,56 @@ class BriefSnapshot:
             raise ValueError("primary state must be an exact BriefState")
         if type(self.action_maturity) is not ActionMaturity:
             raise ValueError("snapshot maturity must be an exact ActionMaturity")
-        primary = next(
-            (item for item in self.interpretations if item.action_id != "fact_research"),
-            None,
-        )
-        if primary is not None and (
-            primary.state is not self.primary_state
-            or primary.action_maturity is not self.action_maturity
+        if any("phase_b_blocked" in item.blocking_codes for item in self.interpretations):
+            expected_primary_state = BriefState.NO_ADD
+            expected_primary_maturity = ActionMaturity.MATURE
+        else:
+            primary = next(
+                (
+                    item
+                    for item in self.interpretations
+                    if item.state is BriefState.REDUCE_OR_EXIT_REVIEW
+                ),
+                self.interpretations[0],
+            )
+            expected_primary_state = primary.state
+            expected_primary_maturity = primary.action_maturity
+        if (
+            self.primary_state is not expected_primary_state
+            or self.action_maturity is not expected_primary_maturity
         ):
-            raise ValueError("primary state and maturity must match the primary interpretation")
+            raise ValueError("primary state and maturity do not follow brief precedence")
+        for interpretation in self.interpretations:
+            if interpretation.state is not BriefState.HOLD:
+                continue
+            inputs = interpretation.state_inputs
+            official_binding = next(
+                (
+                    binding
+                    for binding in self.resolution_bindings
+                    if binding.action_id == interpretation.action_id
+                    and binding.field_id == "official_events"
+                    and binding.resolution is RequestFieldResolution.USABLE
+                ),
+                None,
+            )
+            record_id = inputs.get("thesis_record_id")
+            fingerprint = inputs.get("thesis_fingerprint")
+            if (
+                inputs.get("owner_confirmed_thesis") is not True
+                or not interpretation.invalidation_conditions
+                or inputs.get("thesis_review_state") != "intact"
+                or official_binding is None
+                or type(record_id) is not str
+                or not record_id.isascii()
+                or not record_id.isdigit()
+                or record_id.startswith("0")
+                or type(fingerprint) is not str
+                or inputs.get("thesis_review_source_lineage_id") != official_binding.lineage_id
+                or inputs.get("thesis_reviewed_at") != official_binding.evaluated_at
+            ):
+                raise ValueError("hold requires an authenticated thesis and official review")
+            validate_checksum(fingerprint, "hold thesis fingerprint")
         for value, name in (
             (self.triggered_reviews, "triggered reviews"),
             (self.affected_action_abstentions, "affected action abstentions"),
@@ -721,6 +1051,8 @@ class BriefSnapshot:
             (self.source_lineage_ids, "snapshot source lineage ids"),
         ):
             validate_identifier_tuple(value, name)
+        if not set(self.affected_action_abstentions).issubset(interpretation_ids):
+            raise ValueError("affected action abstentions must resolve to interpretations")
         required_blocking_codes = {
             code
             for interpretation in self.interpretations
@@ -741,9 +1073,7 @@ class BriefSnapshot:
                 "snapshot missing fields must include action and coverage missing fields"
             )
         required_conflicts = {
-            conflict_id
-            for fact in self.facts
-            for conflict_id in fact.conflict_ids
+            conflict_id for fact in self.facts for conflict_id in fact.conflict_ids
         }
         if not required_conflicts.issubset(self.conflicts):
             raise ValueError("snapshot conflicts must include every fact conflict")
@@ -774,6 +1104,8 @@ class BriefSnapshot:
             "primary_state": self.primary_state.value,
             "relationships": [item.to_canonical_dict() for item in self.relationships],
             "request_run_id": self.request_run_id,
+            "resolution_bindings": [item.to_canonical_dict() for item in self.resolution_bindings],
+            "resolution_lineage_ids": list(self.resolution_lineage_ids),
             "source_lineage_ids": list(self.source_lineage_ids),
             "triggered_reviews": list(self.triggered_reviews),
         }

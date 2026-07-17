@@ -10,16 +10,19 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Callable, Mapping, Optional, Tuple
 
+from kunjin.brief.engine import source_attempt_resolution
 from kunjin.brief.models import (
     BriefActionInterpretation,
     BriefCoverage,
     BriefEvidenceState,
     BriefFact,
+    BriefResolutionBinding,
     BriefSnapshot,
     BriefState,
     OfficialEvent,
     OfficialEventCode,
     RelationshipEvidence,
+    thesis_record_fingerprint,
 )
 from kunjin.brief.policy import HeldFundBriefPolicyV1
 from kunjin.decision.budget import BudgetExpired, RequestBudget
@@ -28,8 +31,10 @@ from kunjin.decision.models import (
     DecisionRoute,
     EvidenceCompleteness,
     EvidenceFreshness,
+    RequestFieldResolution,
     RequestMode,
     RequestTerminalStatus,
+    SourceFieldState,
     SourceTier,
     canonical_json_bytes,
     validate_identifier_tuple,
@@ -46,6 +51,7 @@ MAX_BRIEF_SUMMARY_ITEMS = 128
 MAX_BRIEF_SUMMARY_JSON_BYTES = 16 * 1024
 MAX_BRIEF_PUBLIC_TREE_DEPTH = 12
 _FUND_CODE_PATTERN = re.compile(r"^[0-9]{6}$")
+_SOURCE_ATTEMPT_LINEAGE_PATTERN = re.compile(r"^source_attempt_([1-9][0-9]*)$")
 
 
 class BriefStoreError(RuntimeError):
@@ -112,12 +118,8 @@ class BriefStore:
         if type(budget) is not RequestBudget:
             raise ValueError("budget must be an exact RequestBudget")
         validate_identifier_tuple(omitted_work, "omitted work")
-        if (
-            status is RequestTerminalStatus.COMPLETE
-            and omitted_work
-        ) or (
-            status is RequestTerminalStatus.PARTIAL
-            and not omitted_work
+        if (status is RequestTerminalStatus.COMPLETE and omitted_work) or (
+            status is RequestTerminalStatus.PARTIAL and not omitted_work
         ):
             raise ValueError("terminal status and omitted work are inconsistent")
         created_text = _utc_text(created_at, "brief creation time")
@@ -150,11 +152,10 @@ class BriefStore:
                     except Exception:
                         raise BriefStoreError("brief snapshot factory failed") from None
                     if type(snapshot) is not BriefSnapshot:
-                        raise BriefStoreError(
-                            "brief snapshot factory returned an invalid record"
-                        )
+                        raise BriefStoreError("brief snapshot factory returned an invalid record")
                     snapshot.validate()
                     self._validate_snapshot_bindings(
+                        connection,
                         snapshot,
                         request_run_id,
                         decision.id,
@@ -216,19 +217,12 @@ class BriefStore:
                 )
                 result = []
                 for index, item in enumerate(authenticated[:BRIEF_HISTORY_LIMIT]):
-                    previous = (
-                        None
-                        if index + 1 >= len(authenticated)
-                        else authenticated[index + 1]
-                    )
+                    previous = None if index + 1 >= len(authenticated) else authenticated[index + 1]
                     derived_changed = previous is not None and (
-                        _conclusion_bytes(previous.snapshot)
-                        != _conclusion_bytes(item.snapshot)
+                        _conclusion_bytes(previous.snapshot) != _conclusion_bytes(item.snapshot)
                     )
                     if item.conclusion_changed is not derived_changed:
-                        raise BriefStoreError(
-                            "brief conclusion history authentication failed"
-                        )
+                        raise BriefStoreError("brief conclusion history authentication failed")
                     result.append(item)
                 return tuple(result)
         except BriefStoreError:
@@ -306,8 +300,9 @@ class BriefStore:
         )
         return policy
 
-    @staticmethod
     def _validate_snapshot_bindings(
+        self,
+        connection: sqlite3.Connection,
         snapshot: BriefSnapshot,
         request_run_id: int,
         decision_snapshot_id: int,
@@ -323,6 +318,37 @@ class BriefStore:
             or snapshot.created_at != created_at
         ):
             raise BriefStoreError("brief snapshot binding failed")
+        interpretations = {item.action_id: item for item in snapshot.interpretations}
+        for action in route.actions:
+            if action.action_id == "fact_research":
+                continue
+            interpretation = interpretations[action.action_id]
+            route_requires_no_add = action.minimum_state.value == BriefState.NO_ADD.value
+            if (
+                not set(action.blocking_codes).issubset(interpretation.blocking_codes)
+                or interpretation.exact_amount_available is not action.exact_amount_available
+                or (interpretation.state is BriefState.NO_ADD) is not route_requires_no_add
+                or (
+                    not action.research_available and interpretation.state is not BriefState.ABSTAIN
+                )
+                or (
+                    route_requires_no_add
+                    and (
+                        interpretation.state is not BriefState.NO_ADD
+                        or interpretation.action_maturity is not ActionMaturity.MATURE
+                    )
+                )
+            ):
+                raise BriefStoreError("brief snapshot binding failed")
+        phase_b_blocked = any(
+            "phase_b_blocked" in action.blocking_codes for action in route.actions
+        )
+        if (snapshot.primary_state is BriefState.NO_ADD) is not phase_b_blocked or (
+            phase_b_blocked and snapshot.action_maturity is not ActionMaturity.MATURE
+        ):
+            raise BriefStoreError("brief snapshot binding failed")
+        _authenticate_resolution_bindings(snapshot, self.decision_store)
+        _authenticate_thesis_bindings(snapshot, self.repository)
 
     def _conclusion_changed(
         self,
@@ -435,6 +461,8 @@ class BriefStore:
         if hashlib.sha256(snapshot_bytes).hexdigest() != checksum:
             raise BriefStoreError("brief snapshot authentication failed")
         snapshot = _decode_snapshot(snapshot_bytes)
+        _authenticate_resolution_bindings(snapshot, self.decision_store)
+        _authenticate_thesis_bindings(snapshot, self.repository)
         if snapshot.canonical_json() != snapshot_bytes:
             raise BriefStoreError("brief snapshot authentication failed")
         projections = {
@@ -445,9 +473,7 @@ class BriefStore:
             "primary_state": snapshot.primary_state.value,
             "action_maturity": snapshot.action_maturity.value,
             "triggered_reviews_json": _array_json(snapshot.triggered_reviews),
-            "affected_action_abstentions_json": _array_json(
-                snapshot.affected_action_abstentions
-            ),
+            "affected_action_abstentions_json": _array_json(snapshot.affected_action_abstentions),
             "blocking_codes_json": _array_json(snapshot.blocking_codes),
             "evidence_state": snapshot.evidence_state.value,
             "missing_fields_json": _array_json(snapshot.missing_fields),
@@ -465,8 +491,7 @@ class BriefStore:
         if (
             decision.id != snapshot.decision_snapshot_id
             or decision.route.mode is not snapshot.mode
-            or tuple(item.action_id for item in decision.route.actions)
-            != snapshot.action_ids
+            or tuple(item.action_id for item in decision.route.actions) != snapshot.action_ids
         ):
             raise BriefStoreError("brief snapshot decision binding failed")
         if require_terminal:
@@ -500,9 +525,7 @@ def _authenticate_terminal_request(
     started_at = _stored_utc(row["started_at"], "request start")
     deadline_at = _stored_utc(row["deadline_at"], "request deadline")
     finished_at = _stored_utc(row["finished_at"], "request finish")
-    if not (
-        started_at <= snapshot.created_at <= finished_at <= deadline_at
-    ):
+    if not (started_at <= snapshot.created_at <= finished_at <= deadline_at):
         raise BriefStoreError("brief request lifetime authentication failed")
     omitted_bytes = _ascii_bytes(
         row["omitted_work_json"],
@@ -523,6 +546,92 @@ def _authenticate_terminal_request(
         row["status"] == "partial" and not omitted_work
     ):
         raise BriefStoreError("brief request terminal authentication failed")
+
+
+def _authenticate_resolution_bindings(
+    snapshot: BriefSnapshot,
+    decision_store: DecisionAuditStore,
+) -> None:
+    for binding in snapshot.resolution_bindings:
+        try:
+            stored = decision_store.authenticated_source_attempt(binding.source_attempt_id)
+            resolution, source_states = source_attempt_resolution(stored.attempt)
+        except (DecisionAuditStoreError, TypeError, ValueError):
+            raise BriefStoreError("brief resolution lineage authentication failed")
+        attempt = stored.attempt
+        if (
+            stored.request_run_id != snapshot.request_run_id
+            or attempt.subject_key != f"fund:{snapshot.fund_code}"
+            or attempt.finished_at > snapshot.created_at
+            or binding.source_id != attempt.source_id
+            or binding.source_field_id != attempt.field_id
+            or binding.evaluated_at != attempt.finished_at
+            or binding.resolution is not resolution
+            or binding.source_states != source_states
+        ):
+            raise BriefStoreError("brief resolution lineage authentication failed")
+
+
+def _authenticate_thesis_bindings(
+    snapshot: BriefSnapshot,
+    repository: Repository,
+) -> None:
+    for interpretation in snapshot.interpretations:
+        inputs = interpretation.state_inputs
+        if inputs.get("owner_confirmed_thesis") is not True:
+            if interpretation.state is BriefState.HOLD:
+                raise BriefStoreError("brief thesis authentication failed")
+            continue
+        record_id = inputs.get("thesis_record_id")
+        fingerprint = inputs.get("thesis_fingerprint")
+        review_state = inputs.get("thesis_review_state")
+        review_lineage = inputs.get("thesis_review_source_lineage_id")
+        reviewed_at = inputs.get("thesis_reviewed_at")
+        if (
+            type(record_id) is not str
+            or not record_id.isascii()
+            or not record_id.isdigit()
+            or record_id.startswith("0")
+            or type(fingerprint) is not str
+            or review_state not in {"intact", "triggered", "unknown"}
+            or type(review_lineage) is not str
+        ):
+            raise BriefStoreError("brief thesis authentication failed")
+        binding = next(
+            (
+                item
+                for item in snapshot.resolution_bindings
+                if item.action_id == interpretation.action_id
+                and item.field_id == "official_events"
+                and item.lineage_id == review_lineage
+                and item.resolution is RequestFieldResolution.USABLE
+                and item.source_states == (SourceFieldState.HEALTHY,)
+            ),
+            None,
+        )
+        if binding is None:
+            raise BriefStoreError("brief thesis authentication failed")
+        if review_state == "unknown":
+            if reviewed_at is not None:
+                raise BriefStoreError("brief thesis authentication failed")
+        elif reviewed_at != binding.evaluated_at:
+            raise BriefStoreError("brief thesis authentication failed")
+        try:
+            thesis = repository.get_thesis(int(record_id))
+        except (TypeError, ValueError):
+            raise BriefStoreError("brief thesis authentication failed") from None
+        if (
+            thesis is None
+            or not thesis.active
+            or thesis.fund_code != snapshot.fund_code
+            or thesis.created_at.tzinfo is None
+            or thesis_record_fingerprint(int(record_id), thesis) != fingerprint
+            or interpretation.invalidation_conditions != (thesis.invalidation,)
+            or (review_state == "unknown" and thesis.created_at <= binding.evaluated_at)
+            or (review_state != "unknown" and thesis.created_at > binding.evaluated_at)
+            or (interpretation.state is BriefState.HOLD and review_state != "intact")
+        ):
+            raise BriefStoreError("brief thesis authentication failed")
 
 
 def _decode_snapshot(payload: bytes) -> BriefSnapshot:
@@ -549,6 +658,8 @@ def _decode_snapshot(payload: bytes) -> BriefSnapshot:
             "primary_state",
             "relationships",
             "request_run_id",
+            "resolution_bindings",
+            "resolution_lineage_ids",
             "source_lineage_ids",
             "triggered_reviews",
         },
@@ -565,8 +676,7 @@ def _decode_snapshot(payload: bytes) -> BriefSnapshot:
             _decode_event(item) for item in _list(value["official_events"], "events")
         ),
         relationships=tuple(
-            _decode_relationship(item)
-            for item in _list(value["relationships"], "relationships")
+            _decode_relationship(item) for item in _list(value["relationships"], "relationships")
         ),
         coverage=_decode_coverage(value["coverage"]),
         interpretations=tuple(
@@ -586,9 +696,49 @@ def _decode_snapshot(payload: bytes) -> BriefSnapshot:
         source_lineage_ids=_string_tuple(value["source_lineage_ids"], "lineage ids"),
         evidence_fingerprint=value["evidence_fingerprint"],
         created_at=_stored_utc(value["created_at"], "brief creation time"),
+        resolution_bindings=tuple(
+            _decode_resolution_binding(item)
+            for item in _list(value["resolution_bindings"], "resolution bindings")
+        ),
+        resolution_lineage_ids=_string_tuple(
+            value["resolution_lineage_ids"],
+            "resolution lineage ids",
+        ),
     )
     snapshot.validate()
     return snapshot
+
+
+def _decode_resolution_binding(value: object) -> BriefResolutionBinding:
+    _keys(
+        value,
+        {
+            "action_id",
+            "evaluated_at",
+            "field_id",
+            "resolution",
+            "source_attempt_id",
+            "source_field_id",
+            "source_id",
+            "source_states",
+        },
+        "brief resolution binding",
+    )
+    binding = BriefResolutionBinding(
+        action_id=value["action_id"],
+        field_id=value["field_id"],
+        resolution=RequestFieldResolution(value["resolution"]),
+        source_states=tuple(
+            SourceFieldState(item)
+            for item in _list(value["source_states"], "resolution source states")
+        ),
+        source_attempt_id=value["source_attempt_id"],
+        source_id=value["source_id"],
+        source_field_id=value["source_field_id"],
+        evaluated_at=_stored_utc(value["evaluated_at"], "resolution evaluation time"),
+    )
+    binding.validate()
+    return binding
 
 
 def _decode_fact(value: object) -> BriefFact:
@@ -753,6 +903,14 @@ def _decode_interpretation(value: object) -> BriefActionInterpretation:
         },
         "interpretation",
     )
+    state_inputs = _restore_public(value["state_inputs"])
+    if type(state_inputs) is dict and "thesis_reviewed_at" in state_inputs:
+        reviewed_at = state_inputs["thesis_reviewed_at"]
+        if reviewed_at is not None:
+            state_inputs["thesis_reviewed_at"] = _stored_utc(
+                reviewed_at,
+                "thesis review time",
+            )
     return BriefActionInterpretation(
         action_id=value["action_id"],
         state=BriefState(value["state"]),
@@ -761,12 +919,10 @@ def _decode_interpretation(value: object) -> BriefActionInterpretation:
         opposing_evidence_ids=_string_tuple(value["opposing_evidence_ids"], "opposition"),
         blocking_codes=_string_tuple(value["blocking_codes"], "blocks"),
         missing_fields=_string_tuple(value["missing_fields"], "missing"),
-        invalidation_conditions=_string_tuple(
-            value["invalidation_conditions"], "conditions"
-        ),
+        invalidation_conditions=_string_tuple(value["invalidation_conditions"], "conditions"),
         unavailable_actions=_string_tuple(value["unavailable_actions"], "unavailable"),
         exact_amount_available=value["exact_amount_available"],
-        state_inputs=_restore_public(value["state_inputs"]),
+        state_inputs=state_inputs,
     )
 
 
@@ -852,10 +1008,7 @@ def _restore_public(value: object, *, depth: int = 0) -> object:
     if type(value) is list:
         return tuple(_restore_public(item, depth=depth + 1) for item in value)
     if type(value) is dict:
-        return {
-            key: _restore_public(item, depth=depth + 1)
-            for key, item in value.items()
-        }
+        return {key: _restore_public(item, depth=depth + 1) for key, item in value.items()}
     return value
 
 
