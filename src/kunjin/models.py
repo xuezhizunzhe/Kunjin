@@ -87,12 +87,20 @@ class FundNavObservation:
     daily_growth: Optional[Decimal]
     source: str
     retrieved_at: datetime
+    corporate_action_state: str = "unknown"
+    source_attempt_id: Optional[int] = None
 
     def validate(self) -> None:
         if not FUND_CODE_PATTERN.fullmatch(self.fund_code):
             raise ValueError(f"invalid fund code: {self.fund_code}")
         if self.unit_nav <= 0:
             raise ValueError("unit NAV must be positive")
+        if self.corporate_action_state not in {"none", "present", "unknown"}:
+            raise ValueError("corporate action state is invalid")
+        if self.source_attempt_id is not None and (
+            type(self.source_attempt_id) is not int or self.source_attempt_id <= 0
+        ):
+            raise ValueError("source attempt id must be a positive exact integer or None")
 
 
 @dataclass(frozen=True)

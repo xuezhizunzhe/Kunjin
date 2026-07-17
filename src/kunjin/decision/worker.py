@@ -15,11 +15,17 @@ from types import MappingProxyType
 from typing import Callable, Mapping, Optional, Tuple
 
 from kunjin.decision.budget import BudgetExpired, RequestBudget
+from kunjin.decision.models import RequestMode
 from kunjin.decision.worker_protocol import (
+    MAX_NAV_RESPONSE_BYTES,
     MAX_RESPONSE_BYTES,
+    FundNavWorkerRequest,
+    FundNavWorkerResponse,
     WorkerRequest,
     WorkerResponse,
+    decode_fund_nav_response,
     decode_worker_response,
+    encode_fund_nav_request,
     encode_worker_request,
     validate_worker_result_url,
 )
@@ -267,6 +273,28 @@ def _validate_parent_payload(
         raise ValueError("worker retrieval time is outside request audit window")
 
 
+def _validate_parent_nav_payload(
+    result: FundNavWorkerResponse,
+    request: FundNavWorkerRequest,
+    budget: RequestBudget,
+) -> None:
+    if type(result) is not FundNavWorkerResponse:
+        raise ValueError("NAV worker result must use the exact response type")
+    if not result.ok:
+        return
+    payload = result.payload
+    if payload is None:
+        raise ValueError("NAV worker success payload is missing")
+    if payload.fund_code != request.arguments["fund_code"]:
+        raise ValueError("NAV worker response identity does not match request")
+    if not (
+        budget.started_at - _AUDIT_CLOCK_SKEW
+        <= payload.retrieved_at
+        <= budget.deadline_at + _AUDIT_CLOCK_SKEW
+    ):
+        raise ValueError("NAV worker retrieval time is outside request audit window")
+
+
 def _close_worker_pipes(process: subprocess.Popen) -> Optional[BaseException]:
     first_error: Optional[BaseException] = None
     for pipe in (process.stdin, process.stdout):
@@ -508,5 +536,30 @@ def run_public_worker(
         validator=_validate_parent_payload,
         module=_PUBLIC_WORKER_MODULE,
         max_response_bytes=MAX_RESPONSE_BYTES,
+        environment_profile=PUBLIC_WORKER_ENV,
+    )
+
+
+def run_fund_nav_worker(
+    request: FundNavWorkerRequest,
+    budget: RequestBudget,
+) -> FundNavWorkerResponse:
+    if type(request) is not FundNavWorkerRequest:
+        raise ValueError("request must use the exact NAV worker protocol type")
+    if type(budget) is not RequestBudget:
+        raise ValueError("budget must use the exact request budget type")
+    if request.request_id != budget.request_id:
+        raise ValueError("NAV worker and budget request identities differ")
+    expected_pages = "6" if budget.mode is RequestMode.RAPID else "50"
+    if request.arguments.get("max_pages") != expected_pages:
+        raise ValueError("NAV worker page limit does not match request mode")
+    return _run_framed_worker(
+        request,
+        budget,
+        encoder=encode_fund_nav_request,
+        decoder=decode_fund_nav_response,
+        validator=_validate_parent_nav_payload,
+        module=_PUBLIC_WORKER_MODULE,
+        max_response_bytes=MAX_NAV_RESPONSE_BYTES,
         environment_profile=PUBLIC_WORKER_ENV,
     )

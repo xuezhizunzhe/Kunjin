@@ -1,6 +1,10 @@
 import http.client
 import json
+import socket
+import ssl
 import unittest
+import urllib.error
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -65,6 +69,54 @@ class EastmoneyTest(unittest.TestCase):
         self.assertEqual(payload, {"data": {}})
         self.assertEqual(urlopen.call_count, 2)
 
+    def test_http_client_exposes_stable_failure_reasons(self) -> None:
+        url = "https://api.fund.eastmoney.com/f10/lsjz"
+        cases = (
+            (socket.gaierror("private dns detail"), "dns_failure", True),
+            (TimeoutError("private timeout detail"), "network_timeout", True),
+            (
+                ConnectionResetError("private reset detail"),
+                "transient_network_failure",
+                True,
+            ),
+            (
+                urllib.error.HTTPError(url, 429, "private rate detail", {}, None),
+                "transient_network_failure",
+                True,
+            ),
+            (
+                urllib.error.HTTPError(url, 503, "private server detail", {}, None),
+                "transient_network_failure",
+                True,
+            ),
+            (
+                urllib.error.HTTPError(url, 404, "private missing detail", {}, None),
+                "http_not_found",
+                False,
+            ),
+            (
+                ssl.SSLCertVerificationError("private certificate detail"),
+                "validation_failure",
+                False,
+            ),
+        )
+        for exception, reason_code, retryable in cases:
+            with (
+                self.subTest(reason_code=reason_code),
+                patch(
+                    "kunjin.adapters.eastmoney.urllib.request.urlopen",
+                    side_effect=exception,
+                ),
+            ):
+                with self.assertRaises(PublicDataError) as raised:
+                    HttpsJsonClient(retries=0).request_json(
+                        url,
+                        "https://fundf10.eastmoney.com/",
+                    )
+                self.assertEqual(raised.exception.reason_code, reason_code)
+                self.assertIs(raised.exception.retryable, retryable)
+                self.assertNotIn("private", str(raised.exception))
+
     def test_fund_nav_is_normalized(self) -> None:
         http = FakeHttp(fixture("fund_nav.json"))
         client = EastmoneyFundClient(http)
@@ -76,12 +128,42 @@ class EastmoneyTest(unittest.TestCase):
         self.assertEqual(fund_type, "混合型")
         self.assertEqual(str(history[0].unit_nav), "1.20")
 
+    def test_fund_nav_projects_only_bounded_corporate_action_states(self) -> None:
+        cases = (("", "none"), ("每10份派0.1元", "present"))
+        for source_value, expected in cases:
+            payload = fixture("fund_nav.json")
+            for item in payload["Data"]["LSJZList"]:
+                item["FHFCZ"] = source_value
+            with self.subTest(expected=expected):
+                *_, actions = EastmoneyFundClient(FakeHttp(payload)).fetch_nav_history_with_actions(
+                    "017811"
+                )
+                self.assertEqual(set(actions), {expected})
+
+        missing = fixture("fund_nav.json")
+        *_, actions = EastmoneyFundClient(FakeHttp(missing)).fetch_nav_history_with_actions(
+            "017811"
+        )
+        self.assertEqual(set(actions), {"unknown"})
+
     def test_fund_nav_reads_additional_pages(self) -> None:
         first_page = fixture("fund_nav.json")
-        first_page["Data"]["LSJZList"] = first_page["Data"]["LSJZList"] * 5
+        template = first_page["Data"]["LSJZList"][0]
+        first_page["Data"]["LSJZList"] = [
+            {
+                **template,
+                "FSRQ": (date(2026, 7, 10) - timedelta(days=index)).isoformat(),
+            }
+            for index in range(20)
+        ]
         first_page["TotalCount"] = 21
         second_page = fixture("fund_nav.json")
-        second_page["Data"]["LSJZList"] = second_page["Data"]["LSJZList"][:1]
+        second_page["Data"]["LSJZList"] = [
+            {
+                **second_page["Data"]["LSJZList"][0],
+                "FSRQ": (date(2026, 7, 10) - timedelta(days=20)).isoformat(),
+            }
+        ]
         second_page["TotalCount"] = 21
         http = PaginatedHttp([first_page, second_page])
 

@@ -7,13 +7,15 @@ import json
 import re
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional
 
 from kunjin.decision.models import (
     TRANSIENT_SOURCE_ERRORS,
     SourceErrorCode,
+    canonical_decimal,
     validate_checksum,
     validate_identifier,
     validate_public_text,
@@ -23,6 +25,7 @@ from kunjin.decision.models import (
 SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 16 * 1024
 MAX_RESPONSE_BYTES = 12 * 1024 * 1024
+MAX_NAV_RESPONSE_BYTES = 1024 * 1024
 MAX_URL_CHARS = 4 * 1024
 MAX_ERROR_MESSAGE_CHARS = 512
 _SUBJECT_KEY_PATTERN = re.compile(r"^fund:[0-9]{6}$")
@@ -49,6 +52,28 @@ _PAYLOAD_KEYS = frozenset(
         "content_type",
     }
 )
+_NAV_PAYLOAD_KEYS = frozenset(
+    {
+        "fund_code",
+        "fund_name",
+        "fund_type",
+        "observation_count",
+        "retrieved_at",
+        "rows",
+    }
+)
+_NAV_ROW_KEYS = frozenset(
+    {
+        "nav_date",
+        "unit_nav",
+        "accumulated_nav",
+        "daily_growth",
+        "corporate_action_state",
+    }
+)
+_NAV_ARGUMENT_KEYS = frozenset({"fund_code", "max_pages"})
+_NAV_MAX_ROWS = {"6": 120, "50": 1_000}
+_DECIMAL_PATTERN = re.compile(r"^-?(?:0|[1-9][0-9]{0,15})(?:\.[0-9]{1,16})?$")
 _SOURCE_ERROR_CODES = frozenset(item.value for item in SourceErrorCode)
 _TRANSIENT_ERROR_CODES = frozenset(item.value for item in TRANSIENT_SOURCE_ERRORS)
 _SAFE_WORKER_ERROR_MESSAGES: Mapping[str, str] = MappingProxyType(
@@ -398,6 +423,335 @@ class WorkerResponse:
     reason_code: Optional[str]
     retryable: Optional[bool]
     message: Optional[str]
+
+
+@dataclass(frozen=True)
+class FundNavWorkerRequest:
+    schema_version: int
+    request_id: str
+    source_id: str
+    field_id: str
+    subject_key: str
+    operation: str
+    arguments: Dict[str, str]
+
+    def validate(self) -> None:
+        if type(self) is not FundNavWorkerRequest or set(vars(self)) != _REQUEST_KEYS:
+            raise ValueError("NAV worker request shape is invalid")
+        _validate_schema(self.schema_version)
+        validate_request_id(self.request_id)
+        _validate_subject_key(self.subject_key)
+        if (
+            self.source_id != "eastmoney_nav"
+            or self.field_id != "formal_nav"
+            or self.operation != "fund_nav_fetch"
+            or type(self.arguments) is not dict
+            or set(self.arguments) != _NAV_ARGUMENT_KEYS
+            or type(self.arguments["fund_code"]) is not str
+            or self.arguments["fund_code"] != self.subject_key.removeprefix("fund:")
+            or type(self.arguments["max_pages"]) is not str
+            or self.arguments["max_pages"] not in _NAV_MAX_ROWS
+        ):
+            raise ValueError("NAV worker request binding is invalid")
+
+    def to_dict(self) -> Dict[str, Any]:
+        self.validate()
+        return {
+            "arguments": dict(self.arguments),
+            "field_id": self.field_id,
+            "operation": self.operation,
+            "request_id": self.request_id,
+            "schema_version": self.schema_version,
+            "source_id": self.source_id,
+            "subject_key": self.subject_key,
+        }
+
+
+@dataclass(frozen=True)
+class FundNavRow:
+    nav_date: str
+    unit_nav: str
+    accumulated_nav: Optional[str]
+    daily_growth: Optional[str]
+    corporate_action_state: str = "unknown"
+
+
+@dataclass(frozen=True)
+class FundNavPayload:
+    fund_code: str
+    fund_name: Optional[str]
+    fund_type: Optional[str]
+    retrieved_at: datetime
+    observation_count: int
+    rows: tuple[FundNavRow, ...]
+
+
+@dataclass(frozen=True)
+class FundNavWorkerResponse:
+    schema_version: int
+    request_id: str
+    source_id: str
+    field_id: str
+    subject_key: str
+    operation: str
+    ok: bool
+    payload: Optional[FundNavPayload]
+    reason_code: Optional[str]
+    retryable: Optional[bool]
+    message: Optional[str]
+
+
+def _validate_nav_decimal(
+    value: object,
+    name: str,
+    *,
+    positive: bool,
+    allow_none: bool,
+) -> Optional[str]:
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"NAV {name} is invalid")
+    if type(value) is not str or _DECIMAL_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"NAV {name} is invalid")
+    try:
+        number = Decimal(value)
+    except InvalidOperation:
+        raise ValueError(f"NAV {name} is invalid") from None
+    if not number.is_finite() or (positive and number <= 0):
+        raise ValueError(f"NAV {name} is invalid")
+    if canonical_decimal(number) != value:
+        raise ValueError(f"NAV {name} is not canonical")
+    return value
+
+
+def _validate_nav_payload(
+    request: FundNavWorkerRequest,
+    payload: FundNavPayload,
+) -> FundNavPayload:
+    request.validate()
+    if type(payload) is not FundNavPayload:
+        raise ValueError("NAV worker payload must use the exact protocol type")
+    if payload.fund_code != request.arguments["fund_code"]:
+        raise ValueError("NAV payload fund code does not match request binding")
+    for value, name in ((payload.fund_name, "fund name"), (payload.fund_type, "fund type")):
+        if value is not None:
+            validate_public_text(value, f"NAV {name}")
+    if (
+        type(payload.retrieved_at) is not datetime
+        or payload.retrieved_at.tzinfo is None
+        or payload.retrieved_at.utcoffset() != timedelta(0)
+    ):
+        raise ValueError("NAV retrieval time must be UTC")
+    if (
+        type(payload.rows) is not tuple
+        or not payload.rows
+        or len(payload.rows) > _NAV_MAX_ROWS[request.arguments["max_pages"]]
+        or type(payload.observation_count) is not int
+        or payload.observation_count != len(payload.rows)
+    ):
+        raise ValueError("NAV rows exceed the request limit or are empty")
+    previous_date: Optional[date] = None
+    for row in payload.rows:
+        if type(row) is not FundNavRow:
+            raise ValueError("NAV rows must use the exact protocol type")
+        try:
+            nav_date = date.fromisoformat(row.nav_date)
+        except (TypeError, ValueError):
+            raise ValueError("NAV date is invalid") from None
+        if previous_date is not None and nav_date >= previous_date:
+            raise ValueError("NAV dates must be unique and strictly descending")
+        if nav_date > payload.retrieved_at.date():
+            raise ValueError("NAV date cannot follow the retrieval date")
+        if row.corporate_action_state not in {"none", "present", "unknown"}:
+            raise ValueError("NAV corporate action state is invalid")
+        previous_date = nav_date
+        _validate_nav_decimal(
+            row.unit_nav,
+            "unit value",
+            positive=True,
+            allow_none=False,
+        )
+        _validate_nav_decimal(
+            row.accumulated_nav,
+            "accumulated value",
+            positive=True,
+            allow_none=True,
+        )
+        _validate_nav_decimal(
+            row.daily_growth,
+            "daily growth",
+            positive=False,
+            allow_none=True,
+        )
+    return payload
+
+
+def encode_fund_nav_request(request: FundNavWorkerRequest) -> bytes:
+    if type(request) is not FundNavWorkerRequest:
+        raise ValueError("NAV worker request must use the exact protocol type")
+    frame = _canonical_json_bytes(request.to_dict())
+    if len(frame) > MAX_REQUEST_BYTES:
+        raise ValueError("NAV worker request exceeds frame limit")
+    return frame
+
+
+def decode_fund_nav_request(frame: bytes) -> FundNavWorkerRequest:
+    value = _load_json_frame(frame, maximum=MAX_REQUEST_BYTES, name="NAV request")
+    if set(value) != _REQUEST_KEYS:
+        raise ValueError("NAV worker request shape is invalid")
+    request = FundNavWorkerRequest(
+        schema_version=value["schema_version"],
+        request_id=value["request_id"],
+        source_id=value["source_id"],
+        field_id=value["field_id"],
+        subject_key=value["subject_key"],
+        operation=value["operation"],
+        arguments=value["arguments"],
+    )
+    request.validate()
+    return request
+
+
+def _nav_identity_dict(request: FundNavWorkerRequest) -> Dict[str, Any]:
+    return {
+        "field_id": request.field_id,
+        "operation": request.operation,
+        "request_id": request.request_id,
+        "schema_version": request.schema_version,
+        "source_id": request.source_id,
+        "subject_key": request.subject_key,
+    }
+
+
+def encode_fund_nav_success(
+    request: FundNavWorkerRequest,
+    payload: FundNavPayload,
+) -> bytes:
+    payload = _validate_nav_payload(request, payload)
+    value = _nav_identity_dict(request)
+    value.update(
+        {
+            "ok": True,
+            "payload": {
+                "fund_code": payload.fund_code,
+                "fund_name": payload.fund_name,
+                "fund_type": payload.fund_type,
+                "observation_count": payload.observation_count,
+                "retrieved_at": payload.retrieved_at.astimezone(timezone.utc).isoformat(),
+                "rows": [
+                    {
+                        "accumulated_nav": row.accumulated_nav,
+                        "corporate_action_state": row.corporate_action_state,
+                        "daily_growth": row.daily_growth,
+                        "nav_date": row.nav_date,
+                        "unit_nav": row.unit_nav,
+                    }
+                    for row in payload.rows
+                ],
+            },
+        }
+    )
+    frame = _canonical_json_bytes(value)
+    if len(frame) > MAX_NAV_RESPONSE_BYTES:
+        raise ValueError("NAV worker response exceeds frame limit")
+    return frame
+
+
+def encode_fund_nav_error(
+    request: FundNavWorkerRequest,
+    *,
+    reason_code: str,
+    retryable: bool,
+    message: str,
+) -> bytes:
+    request.validate()
+    validate_identifier(reason_code, "NAV worker reason code")
+    if reason_code not in _SOURCE_ERROR_CODES:
+        raise ValueError("NAV worker reason code is not supported")
+    if type(retryable) is not bool or retryable != (reason_code in _TRANSIENT_ERROR_CODES):
+        raise ValueError("NAV worker retryable does not match its reason code")
+    if message != worker_error_message(reason_code):
+        raise ValueError("NAV worker error message does not match its reason code")
+    value = _nav_identity_dict(request)
+    value.update(
+        {
+            "message": message,
+            "ok": False,
+            "reason_code": reason_code,
+            "retryable": retryable,
+        }
+    )
+    return _canonical_json_bytes(value)
+
+
+def decode_fund_nav_response(
+    frame: bytes,
+    request: FundNavWorkerRequest,
+) -> FundNavWorkerResponse:
+    request.validate()
+    value = _load_json_frame(frame, maximum=MAX_NAV_RESPONSE_BYTES, name="NAV response")
+    expected = _nav_identity_dict(request)
+    if any(value.get(key) != expected[key] for key in _IDENTITY_KEYS):
+        raise ValueError("NAV worker response identity does not match request")
+    ok = value.get("ok")
+    if type(ok) is not bool:
+        raise ValueError("NAV worker response status is invalid")
+    if ok:
+        if set(value) != _IDENTITY_KEYS | {"ok", "payload"}:
+            raise ValueError("NAV worker success response shape is invalid")
+        raw_payload = value["payload"]
+        if type(raw_payload) is not dict or set(raw_payload) != _NAV_PAYLOAD_KEYS:
+            raise ValueError("NAV worker payload shape is invalid")
+        raw_rows = raw_payload["rows"]
+        if type(raw_rows) is not list:
+            raise ValueError("NAV worker rows shape is invalid")
+        rows = []
+        for raw_row in raw_rows:
+            if type(raw_row) is not dict or set(raw_row) != _NAV_ROW_KEYS:
+                raise ValueError("NAV worker row shape is invalid")
+            rows.append(FundNavRow(**raw_row))
+        try:
+            retrieved_at = datetime.fromisoformat(raw_payload["retrieved_at"])
+        except (TypeError, ValueError):
+            raise ValueError("NAV retrieval time is invalid") from None
+        payload = FundNavPayload(
+            fund_code=raw_payload["fund_code"],
+            fund_name=raw_payload["fund_name"],
+            fund_type=raw_payload["fund_type"],
+            retrieved_at=retrieved_at,
+            observation_count=raw_payload["observation_count"],
+            rows=tuple(rows),
+        )
+        _validate_nav_payload(request, payload)
+        return FundNavWorkerResponse(
+            **expected,
+            ok=True,
+            payload=payload,
+            reason_code=None,
+            retryable=None,
+            message=None,
+        )
+    if set(value) != _IDENTITY_KEYS | {"ok", "reason_code", "retryable", "message"}:
+        raise ValueError("NAV worker error response shape is invalid")
+    reason_code = validate_identifier(value["reason_code"], "NAV worker reason code")
+    retryable = value["retryable"]
+    message = value["message"]
+    if (
+        reason_code not in _SOURCE_ERROR_CODES
+        or type(retryable) is not bool
+        or retryable != (reason_code in _TRANSIENT_ERROR_CODES)
+        or message != worker_error_message(reason_code)
+    ):
+        raise ValueError("NAV worker error response is invalid")
+    return FundNavWorkerResponse(
+        **expected,
+        ok=False,
+        payload=None,
+        reason_code=reason_code,
+        retryable=retryable,
+        message=message,
+    )
 
 
 def encode_worker_request(request: WorkerRequest) -> bytes:

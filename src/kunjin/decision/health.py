@@ -4,7 +4,7 @@ import math
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.models import (
@@ -479,26 +479,64 @@ class SourceHealthService:
             raise ValueError("attempt number must be exactly 1 or 2")
         if force_reason is None:
             return None
+        authorizations = self.force_authorizations(
+            budget,
+            (SourceFieldRef(source_id, field_id),),
+            subject_key,
+            force_reason,
+            request_run_id=request_run_id,
+            attempt_number=attempt_number,
+        )
+        if authorizations is None:
+            return None
+        authorization = authorizations[0]
+        authorization.validate()
+        return authorization
+
+    def force_authorizations(
+        self,
+        budget: RequestBudget,
+        references: Tuple[SourceFieldRef, ...],
+        subject_key: str,
+        force_reason: ForceReasonCode,
+        *,
+        request_run_id: int,
+        attempt_number: int,
+    ) -> Optional[Tuple[ForceAuthorization, ...]]:
+        if type(budget) is not RequestBudget:
+            raise ValueError("budget must be an exact RequestBudget")
+        if type(references) is not tuple or not references:
+            raise ValueError("force references must be a non-empty exact tuple")
+        for reference in references:
+            if type(reference) is not SourceFieldRef:
+                raise ValueError("force references must contain exact references")
+            reference.validate()
+            self._field_policy(reference.source_id, reference.field_id)
+        if (
+            type(subject_key) is not str
+            or _SUBJECT_KEY_PATTERN.fullmatch(subject_key) is None
+        ):
+            raise ValueError("subject key must be fund: followed by exactly six digits")
         if type(force_reason) is not ForceReasonCode:
             raise ValueError("force reason must be an exact ForceReasonCode")
         if budget.mode is not RequestMode.DEEP:
             raise ValueError("force requires deep mode")
-        if attempt_number != 1:
+        if type(attempt_number) is not int or attempt_number != 1:
             raise ValueError("force is allowed only on the first attempt")
         authorized_at = self._trusted_authorization_time(budget)
-        authorization = self.audit_store.reserve_force(
+        authorizations = self.audit_store.reserve_force_group(
             request_run_id,
             budget,
-            source_id,
-            field_id,
+            references,
             subject_key,
             authorized_at,
             force_reason,
         )
-        if authorization is None:
+        if authorizations is None:
             return None
-        authorization.validate()
-        return authorization
+        for authorization in authorizations:
+            authorization.validate()
+        return authorizations
 
     def _validate_requirement_bindings(self) -> None:
         registry_fields = {

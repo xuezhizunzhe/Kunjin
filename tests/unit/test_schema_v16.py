@@ -23,6 +23,7 @@ from kunjin.storage.schema import (
     SCHEMA_V14,
     SCHEMA_V15,
     SCHEMA_V16,
+    SCHEMA_V17,
     SCHEMA_VERSION,
 )
 
@@ -45,6 +46,7 @@ SCHEMAS = {
     14: SCHEMA_V14,
     15: SCHEMA_V15,
     16: SCHEMA_V16,
+    17: SCHEMA_V17,
 }
 
 
@@ -95,8 +97,8 @@ def test_v16_migration_is_additive_and_preserves_prior_bytes(
                 "SELECT CAST(error_message AS BLOB) FROM sync_runs"
             ).fetchone()[0]
         )
-    assert SCHEMA_VERSION == 16
-    assert versions == tuple(range(1, 17))
+    assert SCHEMA_VERSION == 17
+    assert versions == tuple(range(1, 18))
     assert after == before
 
 
@@ -182,6 +184,72 @@ def test_v16_has_exact_brief_tables_columns_foreign_keys_and_immutability(
         "fund_brief_snapshot_no_delete",
     } <= triggers
     assert "fund_brief_snapshots_history" in indexes
+
+
+def test_v17_adds_bounded_corporate_action_state_and_preserves_nav_rows(
+    tmp_path: Path,
+) -> None:
+    repository = _create_version(tmp_path / "v16-nav.db", 16)
+    with repository.connect() as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO funds(fund_code, fund_name, fund_type, source, observed_at)
+            VALUES ('123456', '测试基金', '混合型', 'eastmoney', ?)
+            """,
+            (UTC,),
+        )
+        connection.execute(
+            """
+            INSERT INTO fund_nav(
+                fund_code, nav_date, unit_nav, accumulated_nav,
+                daily_growth, source, retrieved_at
+            ) VALUES ('123456', '2026-07-16', '1.2', '2.2', '0.1', 'eastmoney', ?)
+            """,
+            (UTC,),
+        )
+
+    repository.migrate()
+
+    with repository.connect() as connection:
+        columns = tuple(
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(fund_nav)")
+        )
+        row = connection.execute(
+            "SELECT * FROM fund_nav WHERE fund_code = '123456'"
+        ).fetchone()
+        versions = tuple(
+            int(item["version"])
+            for item in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        )
+        assert row is not None
+        assert row["corporate_action_state"] == "unknown"
+        assert row["source_attempt_id"] is None
+        assert "corporate_action_state" in columns
+        assert "source_attempt_id" in columns
+        assert versions == tuple(range(1, 18))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO fund_nav(
+                    fund_code, nav_date, unit_nav, source, retrieved_at,
+                    corporate_action_state
+                ) VALUES ('123456', '2026-07-17', '1.3', 'eastmoney', ?, 'raw text')
+                """,
+                (UTC,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO fund_nav(
+                    fund_code, nav_date, unit_nav, source, retrieved_at,
+                    source_attempt_id
+                ) VALUES ('123456', '2026-07-18', '1.4', 'eastmoney', ?, 999999)
+                """,
+                (UTC,),
+            )
 
 
 def test_failed_v16_migration_rolls_back_objects_marker_and_prior_bytes(

@@ -277,6 +277,8 @@ class DecisionAuditStore:
         subject_key: str,
         reserved_at: datetime,
         reason: ForceReasonCode,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> Optional[ForceAuthorization]:
         reservation = self._reserve_source_work(
             request_run_id,
@@ -289,12 +291,53 @@ class DecisionAuditStore:
             parent=None,
             actor="local_owner",
             reason=reason,
+            connection=connection,
         )
         if reservation is None:
             return None
         authorization = ForceAuthorization(reservation)
         authorization.validate()
         return authorization
+
+    def reserve_force_group(
+        self,
+        request_run_id: int,
+        budget: RequestBudget,
+        references: Tuple[SourceFieldRef, ...],
+        subject_key: str,
+        reserved_at: datetime,
+        reason: ForceReasonCode,
+    ) -> Optional[Tuple[ForceAuthorization, ...]]:
+        if type(references) is not tuple or not references or len(references) > 128:
+            raise ValueError("force references must be a bounded non-empty exact tuple")
+        identities = []
+        for reference in references:
+            if type(reference) is not SourceFieldRef:
+                raise ValueError("force references must contain exact source field references")
+            reference.validate()
+            identities.append((reference.source_id, reference.field_id))
+        if len(identities) != len(set(identities)):
+            raise ValueError("force references must be unique")
+        with self.repository.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            authorizations = []
+            for reference in references:
+                authorization = self.reserve_force(
+                    request_run_id,
+                    budget,
+                    reference.source_id,
+                    reference.field_id,
+                    subject_key,
+                    reserved_at,
+                    reason,
+                    connection=connection,
+                )
+                if authorization is None:
+                    connection.rollback()
+                    return None
+                authorizations.append(authorization)
+            connection.commit()
+        return tuple(authorizations)
 
     def reserve_retry(
         self,
@@ -342,6 +385,7 @@ class DecisionAuditStore:
         actor: Optional[str],
         reason: Optional[ForceReasonCode],
         minimum_worker_seconds: Optional[float] = None,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> Optional[SourceWorkAuthorization]:
         _positive_id(request_run_id, "request run id")
         if type(budget) is not RequestBudget:
@@ -368,10 +412,17 @@ class DecisionAuditStore:
             or reason is not None
         ):
             raise ValueError("retry reservation requires only an exact parent attempt")
+        owns_connection = connection is None
+        if not owns_connection and type(connection) is not sqlite3.Connection:
+            raise ValueError("connection must be an exact sqlite3.Connection or None")
+        manager = self.repository.connect() if owns_connection else nullcontext(connection)
         try:
-            with self.repository.connect() as connection, connection:
-                connection.execute("BEGIN IMMEDIATE")
-                run = self._authenticate_budget_request(connection, request_run_id, budget)
+            with manager as active_connection:
+                if owns_connection:
+                    active_connection.execute("BEGIN IMMEDIATE")
+                run = self._authenticate_budget_request(
+                    active_connection, request_run_id, budget
+                )
                 budget.require_publishable()
                 if (
                     minimum_worker_seconds is not None
@@ -382,7 +433,7 @@ class DecisionAuditStore:
                     raise DecisionAuditStoreError("reservation is outside the request lifetime")
                 if kind is SourceWorkKind.FORCE and run["mode"] != RequestMode.DEEP.value:
                     raise DecisionAuditStoreError("force reservation requires a deep request")
-                if kind is SourceWorkKind.FORCE and connection.execute(
+                if kind is SourceWorkKind.FORCE and active_connection.execute(
                     """
                     SELECT 1 FROM source_attempts
                     WHERE request_run_id = ? AND source_id = ? AND field_id = ?
@@ -405,7 +456,7 @@ class DecisionAuditStore:
                         or parent.attempt.outcome is not SourceAttemptOutcome.TRANSIENT_FAILURE
                     ):
                         raise DecisionAuditStoreError("retry parent binding failed")
-                    parent_row = connection.execute(
+                    parent_row = active_connection.execute(
                         """
                         SELECT source_attempts.*, request_runs.request_id AS request_id
                         FROM source_attempts
@@ -416,7 +467,7 @@ class DecisionAuditStore:
                     ).fetchone()
                     if parent_row is None or _stored_attempt(parent_row) != parent:
                         raise DecisionAuditStoreError("retry parent authentication failed")
-                    if connection.execute(
+                    if active_connection.execute(
                         """
                         SELECT 1 FROM source_attempts
                         WHERE request_run_id = ? AND source_id = ? AND field_id = ?
@@ -426,7 +477,7 @@ class DecisionAuditStore:
                     ).fetchone() is not None:
                         raise DecisionAuditStoreError("retry attempt already exists")
                     parent_id = parent.id
-                existing = connection.execute(
+                existing = active_connection.execute(
                     """
                     SELECT id FROM source_work_authorizations
                     WHERE request_run_id = ? AND kind = ? AND source_id = ?
@@ -436,7 +487,7 @@ class DecisionAuditStore:
                 ).fetchone()
                 if existing is not None:
                     return None
-                cursor = connection.execute(
+                cursor = active_connection.execute(
                     """
                     INSERT INTO source_work_authorizations(
                         request_run_id, kind, parent_attempt_id, source_id,
@@ -459,10 +510,13 @@ class DecisionAuditStore:
                         registry.checksum(),
                     ),
                 )
-                return self._load_source_work_authorization(
+                authorization = self._load_source_work_authorization(
                     int(cursor.lastrowid),
-                    connection=connection,
+                    connection=active_connection,
                 )
+                if owns_connection:
+                    active_connection.commit()
+                return authorization
         except (DecisionAuditStoreError, BudgetExpired):
             raise
         except sqlite3.IntegrityError:
@@ -822,6 +876,27 @@ class DecisionAuditStore:
                     (source_id, field_id, subject_key, SOURCE_HISTORY_LIMIT),
                 ).fetchall()
             return tuple(_stored_attempt(row) for row in rows)
+        except DecisionAuditStoreError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError):
+            raise DecisionAuditStoreError("source attempt authentication failed") from None
+
+    def authenticated_source_attempt(self, attempt_id: int) -> StoredSourceAttempt:
+        _positive_id(attempt_id, "source attempt id")
+        try:
+            with self.repository.connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT source_attempts.*, request_runs.request_id AS request_id
+                    FROM source_attempts
+                    JOIN request_runs ON request_runs.id = source_attempts.request_run_id
+                    WHERE source_attempts.id = ?
+                    """,
+                    (attempt_id,),
+                ).fetchone()
+            if row is None:
+                raise DecisionAuditStoreError("source attempt does not exist")
+            return _stored_attempt(row)
         except DecisionAuditStoreError:
             raise
         except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError):

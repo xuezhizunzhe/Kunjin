@@ -67,7 +67,7 @@ class SchemaV7Test(unittest.TestCase):
             ).fetchall()
 
         self.assertIn("financial_profile_versions", repository.table_names())
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 17)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 18)))
 
     def test_migration_preserves_populated_version_six_data(self) -> None:
         repository = self.repository("version-six.db")
@@ -165,7 +165,7 @@ class SchemaV7Test(unittest.TestCase):
                 "SELECT rule_key, status FROM fund_peer_groups WHERE id = 1"
             ).fetchone()
 
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 17)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 18)))
         self.assertEqual(dict(transaction), {"fund_code": "519755", "amount": "20.00"})
         self.assertEqual(dict(nav), {"nav_date": "2026-07-10", "unit_nav": "1.6680"})
         self.assertEqual(

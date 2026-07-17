@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -3295,4 +3295,20 @@ BEFORE DELETE ON fund_brief_snapshots
 BEGIN
     SELECT RAISE(ABORT, 'brief snapshots are immutable');
 END;
+"""
+
+SCHEMA_V17 = """
+ALTER TABLE fund_nav
+ADD COLUMN corporate_action_state TEXT NOT NULL DEFAULT 'unknown'
+CHECK(
+    typeof(corporate_action_state) = 'text'
+    AND corporate_action_state IN ('none', 'present', 'unknown')
+);
+
+ALTER TABLE fund_nav
+ADD COLUMN source_attempt_id INTEGER
+REFERENCES source_attempts(id) ON DELETE RESTRICT;
+
+CREATE INDEX fund_nav_source_attempt
+ON fund_nav(source_attempt_id, retrieved_at);
 """

@@ -42,6 +42,7 @@ from kunjin.storage.schema import (
     SCHEMA_V14,
     SCHEMA_V15,
     SCHEMA_V16,
+    SCHEMA_V17,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -171,6 +172,7 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (14, SCHEMA_V14),
         (15, SCHEMA_V15),
         (16, SCHEMA_V16),
+        (17, SCHEMA_V17),
     )
 
 
@@ -1325,6 +1327,99 @@ class Repository:
         fund_type: Optional[str],
         source: str,
         observations: Sequence[FundNavObservation],
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        if connection is not None and type(connection) is not sqlite3.Connection:
+            raise ValueError("connection must be an exact sqlite3.Connection or None")
+        if any(item.source_attempt_id is not None for item in observations):
+            raise ValueError("generic NAV history writes must remain unbound")
+        self._save_fund_history(
+            fund_code,
+            fund_name,
+            fund_type,
+            source,
+            observations,
+            source_attempt_id=None,
+            connection=connection,
+        )
+
+    def save_authenticated_fund_history(
+        self,
+        fund_code: str,
+        fund_name: Optional[str],
+        fund_type: Optional[str],
+        source: str,
+        observations: Sequence[FundNavObservation],
+        *,
+        source_attempt_id: int,
+        connection: sqlite3.Connection,
+    ) -> None:
+        if type(connection) is not sqlite3.Connection:
+            raise ValueError("authenticated NAV write requires an exact connection")
+        if type(source_attempt_id) is not int or source_attempt_id <= 0:
+            raise ValueError("source attempt id must be a positive exact integer")
+        if source != "eastmoney":
+            raise ValueError("authenticated NAV write requires eastmoney source")
+        if any(item.source_attempt_id is not None for item in observations):
+            raise ValueError("input NAV observations must not carry persistence bindings")
+        if not observations:
+            raise ValueError("authenticated NAV write requires observations")
+        latest = max(observations, key=lambda item: item.nav_date)
+        retrieval_times = {item.retrieved_at for item in observations}
+        if len(retrieval_times) != 1:
+            raise ValueError("authenticated NAV batch must share one retrieval time")
+        retrieved_at = next(iter(retrieval_times))
+        if retrieved_at.tzinfo is None or retrieved_at.utcoffset() is None:
+            raise ValueError("authenticated NAV retrieval time must be aware")
+        retrieved_at = retrieved_at.astimezone(timezone.utc)
+        expected_data_as_of = datetime.combine(
+            latest.nav_date,
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        ).isoformat()
+        attempt = connection.execute(
+            """
+            SELECT * FROM source_attempts
+            WHERE id = ?
+              AND source_id = 'eastmoney_nav'
+              AND field_id = 'formal_nav'
+              AND subject_key = ?
+              AND outcome = 'success'
+              AND data_as_of = ?
+              AND started_at COLLATE BINARY <= ? COLLATE BINARY
+              AND finished_at COLLATE BINARY >= ? COLLATE BINARY
+            """,
+            (
+                source_attempt_id,
+                f"fund:{fund_code}",
+                expected_data_as_of,
+                retrieved_at.isoformat(),
+                retrieved_at.isoformat(),
+            ),
+        ).fetchone()
+        if attempt is None:
+            raise ValueError("NAV source attempt binding is invalid")
+        self._save_fund_history(
+            fund_code,
+            fund_name,
+            fund_type,
+            source,
+            observations,
+            source_attempt_id=source_attempt_id,
+            connection=connection,
+        )
+
+    def _save_fund_history(
+        self,
+        fund_code: str,
+        fund_name: Optional[str],
+        fund_type: Optional[str],
+        source: str,
+        observations: Sequence[FundNavObservation],
+        *,
+        source_attempt_id: Optional[int],
+        connection: Optional[sqlite3.Connection],
     ) -> None:
         for observation in observations:
             observation.validate()
@@ -1334,8 +1429,9 @@ class Repository:
             (item.retrieved_at for item in observations),
             default=_utc_now(),
         ).isoformat()
-        with self.connect() as connection, connection:
-            connection.execute(
+
+        def write(active_connection: sqlite3.Connection) -> None:
+            active_connection.execute(
                 """
                 INSERT INTO funds(fund_code, fund_name, fund_type, source, observed_at)
                 VALUES (?, ?, ?, ?, ?)
@@ -1348,17 +1444,20 @@ class Repository:
                 (fund_code, fund_name, fund_type, source, observed_at),
             )
             for item in observations:
-                connection.execute(
+                active_connection.execute(
                     """
                     INSERT INTO fund_nav(
                         fund_code, nav_date, unit_nav, accumulated_nav,
-                        daily_growth, source, retrieved_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        daily_growth, source, retrieved_at,
+                        corporate_action_state, source_attempt_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(fund_code, nav_date, source) DO UPDATE SET
                         unit_nav = excluded.unit_nav,
                         accumulated_nav = excluded.accumulated_nav,
                         daily_growth = excluded.daily_growth,
-                        retrieved_at = excluded.retrieved_at
+                        retrieved_at = excluded.retrieved_at,
+                        corporate_action_state = excluded.corporate_action_state,
+                        source_attempt_id = excluded.source_attempt_id
                     """,
                     (
                         item.fund_code,
@@ -1368,8 +1467,16 @@ class Repository:
                         _as_text(item.daily_growth),
                         item.source,
                         item.retrieved_at.isoformat(),
+                        item.corporate_action_state,
+                        source_attempt_id,
                     ),
                 )
+
+        if connection is not None:
+            write(connection)
+            return
+        with self.connect() as owned_connection, owned_connection:
+            write(owned_connection)
 
     def fund_history(self, fund_code: str) -> List[FundNavObservation]:
         with self.connect() as connection:
@@ -1388,6 +1495,12 @@ class Repository:
                 daily_growth=_as_decimal(row["daily_growth"]),
                 source=str(row["source"]),
                 retrieved_at=datetime.fromisoformat(str(row["retrieved_at"])),
+                corporate_action_state=str(row["corporate_action_state"]),
+                source_attempt_id=(
+                    None
+                    if row["source_attempt_id"] is None
+                    else int(row["source_attempt_id"])
+                ),
             )
             for row in rows
         ]

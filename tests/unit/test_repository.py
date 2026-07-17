@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import kunjin.storage.repository as repository_module
-from kunjin.models import AccountObservation, PositionObservation
+from kunjin.models import AccountObservation, FundNavObservation, PositionObservation
 from kunjin.storage.repository import Repository
 
 
@@ -52,6 +52,68 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual(len(stored), 1)
         self.assertEqual(stored[0].fund_code, "000001")
         self.assertEqual(stored[0].formal_nav, Decimal("1.2"))
+
+    def test_save_fund_history_supports_caller_owned_transaction(self) -> None:
+        observation = FundNavObservation(
+            fund_code="123456",
+            nav_date=self.now.date(),
+            unit_nav=Decimal("1.25"),
+            accumulated_nav=Decimal("2.50"),
+            daily_growth=Decimal("0.10"),
+            source="eastmoney",
+            retrieved_at=self.now,
+            corporate_action_state="none",
+        )
+        with self.repository.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self.repository.save_fund_history(
+                "123456",
+                "测试基金",
+                "混合型",
+                "eastmoney",
+                [observation],
+                connection=connection,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM fund_nav WHERE fund_code = '123456'"
+                ).fetchone()[0],
+                1,
+            )
+            connection.rollback()
+        self.assertEqual(self.repository.fund_history("123456"), [])
+
+    def test_save_fund_history_rejects_nonexact_connection(self) -> None:
+        with self.assertRaisesRegex(ValueError, "connection"):
+            self.repository.save_fund_history(
+                "123456",
+                None,
+                None,
+                "eastmoney",
+                [],
+                connection=object(),
+            )
+
+    def test_generic_fund_history_write_rejects_attempt_binding(self) -> None:
+        observation = FundNavObservation(
+            fund_code="123456",
+            nav_date=self.now.date(),
+            unit_nav=Decimal("1.25"),
+            accumulated_nav=Decimal("2.50"),
+            daily_growth=Decimal("0.10"),
+            source="eastmoney",
+            retrieved_at=self.now,
+            corporate_action_state="none",
+            source_attempt_id=1,
+        )
+        with self.assertRaisesRegex(ValueError, "unbound"):
+            self.repository.save_fund_history(
+                "123456",
+                "测试基金",
+                "混合型",
+                "eastmoney",
+                [observation],
+            )
 
     def test_enable_wal_retries_database_locked_once(self) -> None:
         class Connection:

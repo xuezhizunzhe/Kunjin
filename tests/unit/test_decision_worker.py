@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import io
 import json
 import os
 import signal
@@ -9,12 +10,15 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import kunjin.decision.worker_main as worker_main_module
+from kunjin.adapters.eastmoney import PublicDataError
 from kunjin.decision.budget import RequestBudget
 from kunjin.decision.models import TRANSIENT_SOURCE_ERRORS, RequestMode, SourceErrorCode
 from kunjin.decision.worker import (
@@ -25,14 +29,24 @@ from kunjin.decision.worker import (
     _finalize_process_group,
     _run_framed_worker,
     _worker_environment,
+    run_fund_nav_worker,
     run_public_worker,
 )
 from kunjin.decision.worker_protocol import (
+    MAX_NAV_RESPONSE_BYTES,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
+    FundNavPayload,
+    FundNavRow,
+    FundNavWorkerRequest,
+    FundNavWorkerResponse,
     WorkerRequest,
+    decode_fund_nav_request,
+    decode_fund_nav_response,
     decode_worker_request,
     decode_worker_response,
+    encode_fund_nav_request,
+    encode_fund_nav_success,
     encode_worker_error,
     encode_worker_request,
     validate_worker_result_url,
@@ -125,6 +139,195 @@ def test_protocol_binds_exact_identity_schema_and_sizes() -> None:
     assert result.schema_version == 1
     assert result.payload is not None
     assert result.payload.text == "fixture result"
+
+
+def _nav_request(max_pages: str = "6") -> FundNavWorkerRequest:
+    return FundNavWorkerRequest(
+        schema_version=1,
+        request_id="a" * 32,
+        source_id="eastmoney_nav",
+        field_id="formal_nav",
+        subject_key="fund:123456",
+        operation="fund_nav_fetch",
+        arguments={"fund_code": "123456", "max_pages": max_pages},
+    )
+
+
+def _nav_payload() -> FundNavPayload:
+    return FundNavPayload(
+        fund_code="123456",
+        fund_name="测试基金",
+        fund_type="混合型",
+        retrieved_at=datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc),
+        observation_count=2,
+        rows=(
+            FundNavRow("2026-07-16", "1.2345", "2.3456", "0.1"),
+            FundNavRow("2026-07-15", "1.23", None, None),
+        ),
+    )
+
+
+@pytest.mark.parametrize("max_pages", ("6", "50"))
+def test_nav_worker_protocol_roundtrips_exact_request_and_rows(max_pages: str) -> None:
+    request = _nav_request(max_pages)
+    assert decode_fund_nav_request(encode_fund_nav_request(request)) == request
+    frame = encode_fund_nav_success(request, _nav_payload())
+    assert len(frame) <= MAX_NAV_RESPONSE_BYTES
+    response = decode_fund_nav_response(frame, request)
+    assert response == FundNavWorkerResponse(
+        schema_version=1,
+        request_id=request.request_id,
+        source_id="eastmoney_nav",
+        field_id="formal_nav",
+        subject_key="fund:123456",
+        operation="fund_nav_fetch",
+        ok=True,
+        payload=_nav_payload(),
+        reason_code=None,
+        retryable=None,
+        message=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "nav_request",
+    (
+        replace(_nav_request(), arguments={"fund_code": "654321", "max_pages": "6"}),
+        replace(_nav_request(), arguments={"fund_code": "123456", "max_pages": "7"}),
+        replace(_nav_request(), source_id="eastmoney_f10"),
+        replace(_nav_request(), field_id="adjusted_return_series"),
+    ),
+)
+def test_nav_worker_request_rejects_identity_and_argument_drift(
+    nav_request: FundNavWorkerRequest,
+) -> None:
+    with pytest.raises(ValueError, match="NAV|nav|binding"):
+        encode_fund_nav_request(nav_request)
+
+
+@pytest.mark.parametrize(
+    "row",
+    (
+        FundNavRow("2026-07-16", "NaN", None, None),
+        FundNavRow("2026-07-16", "0", None, None),
+        FundNavRow("not-a-date", "1.0", None, None),
+        FundNavRow("2026-07-16", "1.0", "Infinity", None),
+    ),
+)
+def test_nav_worker_payload_rejects_malformed_rows(row: FundNavRow) -> None:
+    payload = replace(_nav_payload(), rows=(row,))
+    with pytest.raises(ValueError, match="NAV|nav"):
+        encode_fund_nav_success(_nav_request(), payload)
+
+
+def test_nav_worker_payload_rejects_duplicate_or_non_descending_dates() -> None:
+    duplicate = replace(
+        _nav_payload(),
+        rows=(
+            FundNavRow("2026-07-16", "1.2", None, None),
+            FundNavRow("2026-07-16", "1.1", None, None),
+        ),
+    )
+    ascending = replace(
+        _nav_payload(),
+        rows=(
+            FundNavRow("2026-07-15", "1.1", None, None),
+            FundNavRow("2026-07-16", "1.2", None, None),
+        ),
+    )
+    for payload in (duplicate, ascending):
+        with pytest.raises(ValueError, match="NAV|nav"):
+            encode_fund_nav_success(_nav_request(), payload)
+
+
+def test_nav_worker_payload_rejects_observation_count_drift() -> None:
+    with pytest.raises(ValueError, match="NAV|nav"):
+        encode_fund_nav_success(
+            _nav_request(),
+            replace(_nav_payload(), observation_count=3),
+        )
+
+
+def test_nav_worker_payload_rejects_nav_date_after_retrieval_date() -> None:
+    payload = replace(
+        _nav_payload(),
+        observation_count=1,
+        rows=(FundNavRow("2026-07-17", "1.2", "2.3", "0.1"),),
+    )
+    with pytest.raises(ValueError, match="NAV|nav|future|retriev"):
+        encode_fund_nav_success(_nav_request(), payload)
+
+
+@pytest.mark.parametrize(
+    "row",
+    (
+        FundNavRow("2026-07-16", "1.0", "2", "0.1"),
+        FundNavRow("2026-07-16", "1", "2.0", "0.1"),
+        FundNavRow("2026-07-16", "1", "2", "0.10"),
+    ),
+)
+def test_nav_worker_payload_requires_unique_canonical_decimal_text(
+    row: FundNavRow,
+) -> None:
+    payload = replace(_nav_payload(), observation_count=1, rows=(row,))
+    with pytest.raises(ValueError, match="NAV|nav|canonical"):
+        encode_fund_nav_success(_nav_request(), payload)
+
+
+def test_nav_worker_maps_network_public_data_error_to_transient_failure() -> None:
+    request = _nav_request()
+    output = io.BytesIO()
+    source_error = PublicDataError(
+        "public source request failed",
+        reason_code="transient_network_failure",
+        retryable=True,
+    )
+    with (
+        patch.object(
+            worker_main_module,
+            "_read_request",
+            return_value=encode_fund_nav_request(request),
+        ),
+        patch.object(
+            worker_main_module.EastmoneyFundClient,
+            "fetch_nav_history_with_actions",
+            side_effect=source_error,
+        ),
+        patch.object(
+            worker_main_module.sys,
+            "stdout",
+            SimpleNamespace(buffer=output),
+        ),
+    ):
+        assert worker_main_module.main() == 0
+
+    response = decode_fund_nav_response(output.getvalue(), request)
+    assert response.ok is False
+    assert response.reason_code == "transient_network_failure"
+    assert response.retryable is True
+
+
+def test_run_fund_nav_worker_injects_public_transport_contract() -> None:
+    request = _nav_request()
+    expected = FundNavWorkerResponse(
+        schema_version=1,
+        request_id=request.request_id,
+        source_id=request.source_id,
+        field_id=request.field_id,
+        subject_key=request.subject_key,
+        operation=request.operation,
+        ok=True,
+        payload=_nav_payload(),
+        reason_code=None,
+        retryable=None,
+        message=None,
+    )
+    with patch("kunjin.decision.worker._run_framed_worker", return_value=expected) as runner:
+        assert run_fund_nav_worker(request, _budget()) is expected
+    kwargs = runner.call_args.kwargs
+    assert kwargs["module"] == "kunjin.decision.worker_main"
+    assert kwargs["environment_profile"] == PUBLIC_WORKER_ENV
+    assert kwargs["max_response_bytes"] == MAX_NAV_RESPONSE_BYTES
 
 
 def test_request_frame_limit_is_enforced_before_launch() -> None:
@@ -1387,9 +1590,24 @@ def _ast_import_names(
     module_name: str,
     *,
     is_package: bool = False,
+    top_level_only: bool = False,
 ) -> set[str]:
     names = set()
-    for node in ast.walk(ast.parse(source)):
+    tree = ast.parse(source)
+    nodes = []
+    if top_level_only:
+        pending = list(tree.body)
+        lazy_scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        while pending:
+            node = pending.pop()
+            nodes.append(node)
+            if not isinstance(node, lazy_scopes):
+                for child in ast.iter_child_nodes(node):
+                    if not isinstance(child, lazy_scopes):
+                        pending.append(child)
+    else:
+        nodes = list(ast.walk(tree))
+    for node in nodes:
         if isinstance(node, ast.Name) and node.id in {"__import__", "import_module"}:
             names.add(_DYNAMIC_IMPORT)
         elif isinstance(node, ast.Attribute) and node.attr in {
@@ -1477,6 +1695,7 @@ def _worker_local_dependency_closure(
             module_path.read_text(encoding="utf-8"),
             module_name,
             is_package=module_path.name == "__init__.py",
+            top_level_only=True,
         )
         all_imports.update(imported)
         for imported_name in imported:
@@ -1549,6 +1768,8 @@ def test_all_worker_reachable_local_modules_use_strict_allowlist() -> None:
     )
     allowed = {
         "kunjin",
+        "kunjin.adapters",
+        "kunjin.adapters.eastmoney",
         "kunjin.decision",
         "kunjin.decision.budget",
         "kunjin.decision.models",
@@ -1561,6 +1782,7 @@ def test_all_worker_reachable_local_modules_use_strict_allowlist() -> None:
         "kunjin.funds.models",
         "kunjin.funds.official_domains",
         "kunjin.funds.sources",
+        "kunjin.models",
     }
     assert _DYNAMIC_IMPORT not in imported
     assert not any(
@@ -1569,6 +1791,28 @@ def test_all_worker_reachable_local_modules_use_strict_allowlist() -> None:
         for blocked in forbidden
     )
     assert reachable == allowed
+
+
+def test_eastmoney_worker_import_keeps_yangjibao_lazy() -> None:
+    source_root = Path(__file__).parents[2] / "src"
+    script = (
+        "import sys\n"
+        "import kunjin.adapters.eastmoney\n"
+        "assert 'kunjin.adapters.yangjibao' not in sys.modules\n"
+        "from kunjin.adapters import YangjibaoClient\n"
+        "from kunjin.adapters.yangjibao import YangjibaoClient as Direct\n"
+        "assert YangjibaoClient is Direct\n"
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(source_root)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_production_worker_entrypoint_rejects_unbound_url_before_launch() -> None:

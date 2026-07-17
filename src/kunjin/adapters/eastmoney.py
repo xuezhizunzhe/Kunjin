@@ -3,6 +3,8 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -10,6 +12,8 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
+from kunjin.decision.models import TRANSIENT_SOURCE_ERRORS, SourceErrorCode
+from kunjin.funds.sources import FundSourceError
 from kunjin.models import FundNavObservation, SectorObservation
 
 FUND_CODE = re.compile(r"^\d{6}$")
@@ -17,7 +21,7 @@ FUND_NAV_PAGE_SIZE = 20
 FUND_NAV_MAX_PAGES = 50
 
 
-class PublicDataError(RuntimeError):
+class PublicDataError(FundSourceError):
     code = "public_data_error"
 
 
@@ -27,7 +31,43 @@ def _decimal(value: Any) -> Optional[Decimal]:
     try:
         return Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
-        raise PublicDataError(f"invalid numeric public-data value: {value!r}") from exc
+        raise PublicDataError(
+            "public data contains an invalid numeric value",
+            reason_code=SourceErrorCode.VALIDATION_FAILURE.value,
+        ) from exc
+
+
+def _public_data_error(exception: BaseException) -> PublicDataError:
+    cause = exception.reason if isinstance(exception, urllib.error.URLError) else exception
+    if isinstance(cause, socket.gaierror):
+        reason = SourceErrorCode.DNS_FAILURE
+    elif isinstance(cause, (TimeoutError, socket.timeout)):
+        reason = SourceErrorCode.NETWORK_TIMEOUT
+    elif isinstance(cause, ssl.SSLCertVerificationError):
+        reason = SourceErrorCode.VALIDATION_FAILURE
+    else:
+        reason = SourceErrorCode.TRANSIENT_NETWORK_FAILURE
+    return PublicDataError(
+        f"public source error: {reason.value}",
+        reason_code=reason.value,
+        retryable=reason in TRANSIENT_SOURCE_ERRORS,
+    )
+
+
+def _http_error(exception: urllib.error.HTTPError) -> PublicDataError:
+    if exception.code == 404:
+        reason = SourceErrorCode.HTTP_NOT_FOUND
+    elif exception.code == 410:
+        reason = SourceErrorCode.HTTP_GONE
+    elif exception.code in {408, 429} or 500 <= exception.code <= 599:
+        reason = SourceErrorCode.TRANSIENT_NETWORK_FAILURE
+    else:
+        reason = SourceErrorCode.HTTP_4XX
+    return PublicDataError(
+        f"public source error: {reason.value}",
+        reason_code=reason.value,
+        retryable=reason in TRANSIENT_SOURCE_ERRORS,
+    )
 
 
 class HttpsJsonClient:
@@ -37,7 +77,10 @@ class HttpsJsonClient:
 
     def request_json(self, url: str, referer: str) -> Dict[str, Any]:
         if urllib.parse.urlparse(url).scheme != "https":
-            raise PublicDataError("public data requires HTTPS")
+            raise PublicDataError(
+                "public data requires HTTPS",
+                reason_code=SourceErrorCode.UNSAFE_URL.value,
+            )
         request = urllib.request.Request(
             url,
             headers={
@@ -53,20 +96,34 @@ class HttpsJsonClient:
                     payload = json.loads(response.read().decode("utf-8"))
                 break
             except urllib.error.HTTPError as exc:
-                raise PublicDataError(f"public data HTTP error: {exc.code}") from exc
+                error = _http_error(exc)
+                if error.retryable and attempt < self.retries:
+                    continue
+                raise error from exc
             except (
                 urllib.error.URLError,
                 TimeoutError,
                 http.client.RemoteDisconnected,
                 ConnectionResetError,
+                http.client.IncompleteRead,
+                http.client.BadStatusLine,
+                socket.gaierror,
+                ssl.SSLCertVerificationError,
             ) as exc:
-                if attempt < self.retries:
+                error = _public_data_error(exc)
+                if error.retryable and attempt < self.retries:
                     continue
-                raise PublicDataError("public data network request failed") from exc
+                raise error from exc
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise PublicDataError("public data returned malformed JSON") from exc
+                raise PublicDataError(
+                    "public data returned malformed JSON",
+                    reason_code=SourceErrorCode.DECODE_FAILURE.value,
+                ) from exc
         if not isinstance(payload, dict):
-            raise PublicDataError("public data response is not an object")
+            raise PublicDataError(
+                "public data response is not an object",
+                reason_code=SourceErrorCode.VALIDATION_FAILURE.value,
+            )
         return payload
 
 
@@ -80,6 +137,23 @@ class EastmoneyFundClient:
         page_size: int = FUND_NAV_PAGE_SIZE,
         max_pages: int = FUND_NAV_MAX_PAGES,
     ) -> Tuple[Dict[str, Any], Optional[str], Optional[str], List[FundNavObservation]]:
+        payload, name, fund_type, observations, _actions = (
+            self.fetch_nav_history_with_actions(fund_code, page_size, max_pages)
+        )
+        return payload, name, fund_type, observations
+
+    def fetch_nav_history_with_actions(
+        self,
+        fund_code: str,
+        page_size: int = FUND_NAV_PAGE_SIZE,
+        max_pages: int = FUND_NAV_MAX_PAGES,
+    ) -> Tuple[
+        Dict[str, Any],
+        Optional[str],
+        Optional[str],
+        List[FundNavObservation],
+        Tuple[str, ...],
+    ]:
         if not FUND_CODE.fullmatch(fund_code):
             raise ValueError(f"invalid fund code: {fund_code}")
         if not 1 <= page_size <= FUND_NAV_PAGE_SIZE:
@@ -89,10 +163,12 @@ class EastmoneyFundClient:
 
         retrieved_at = datetime.now(timezone.utc)
         observations: List[FundNavObservation] = []
+        corporate_actions: List[str] = []
         first_payload: Optional[Dict[str, Any]] = None
         name: Optional[Any] = None
         fund_type: Optional[Any] = None
         total_count: Optional[int] = None
+        previous_nav_date: Optional[date] = None
 
         for page_index in range(1, max_pages + 1):
             query = urllib.parse.urlencode(
@@ -111,10 +187,13 @@ class EastmoneyFundClient:
             if first_payload is None:
                 first_payload = payload
             if payload.get("ErrCode") not in (None, 0):
-                raise PublicDataError(str(payload.get("ErrMsg") or "fund NAV business error"))
+                raise PublicDataError("fund NAV business error")
             data = payload.get("Data")
             if not isinstance(data, dict) or not isinstance(data.get("LSJZList"), list):
-                raise PublicDataError("fund NAV response is incomplete")
+                raise PublicDataError(
+                    "fund NAV response is incomplete",
+                    reason_code=SourceErrorCode.VALIDATION_FAILURE.value,
+                )
             items = data["LSJZList"]
             name = name or data.get("FundName") or payload.get("FundName")
             fund_type = fund_type or data.get("FundType")
@@ -123,18 +202,43 @@ class EastmoneyFundClient:
 
             for item in items:
                 if not isinstance(item, dict) or not item.get("FSRQ") or not item.get("DWJZ"):
-                    continue
+                    raise PublicDataError(
+                        "fund NAV row is incomplete",
+                        reason_code=SourceErrorCode.VALIDATION_FAILURE.value,
+                    )
+                action_value = item.get("FHFCZ")
+                if "FHFCZ" not in item or not isinstance(action_value, str):
+                    action_state = "unknown"
+                elif action_value.strip():
+                    action_state = "present"
+                else:
+                    action_state = "none"
+                try:
+                    nav_date = date.fromisoformat(str(item["FSRQ"]))
+                except ValueError:
+                    raise PublicDataError(
+                        "fund NAV date is invalid",
+                        reason_code=SourceErrorCode.VALIDATION_FAILURE.value,
+                    ) from None
+                if previous_nav_date is not None and nav_date >= previous_nav_date:
+                    raise PublicDataError(
+                        "fund NAV dates are not strictly descending",
+                        reason_code=SourceErrorCode.VALIDATION_FAILURE.value,
+                    )
+                previous_nav_date = nav_date
                 observation = FundNavObservation(
                     fund_code=fund_code,
-                    nav_date=date.fromisoformat(str(item["FSRQ"])),
+                    nav_date=nav_date,
                     unit_nav=_decimal(item["DWJZ"]) or Decimal("0"),
                     accumulated_nav=_decimal(item.get("LJJZ")),
                     daily_growth=_decimal(item.get("JZZZL")),
                     source="eastmoney",
                     retrieved_at=retrieved_at,
+                    corporate_action_state=action_state,
                 )
                 observation.validate()
                 observations.append(observation)
+                corporate_actions.append(action_state)
 
             if len(items) < page_size or (
                 total_count is not None and len(observations) >= total_count
@@ -148,6 +252,7 @@ class EastmoneyFundClient:
             None if name is None else str(name),
             None if fund_type is None else str(fund_type),
             observations,
+            tuple(corporate_actions),
         )
 
 
