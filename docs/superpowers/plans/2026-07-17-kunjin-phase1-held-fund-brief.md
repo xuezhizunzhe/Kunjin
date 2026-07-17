@@ -554,7 +554,7 @@ git commit -m "feat: interpret held fund evidence"
 
 - [ ] **Step 1: Write failing exact-output tests**
 
-Require the nine confirmed sections, exact nested keys, stable ordering, canonical sanitized snapshot, valid source references, bounded Chinese text, and no unknown fields. Test all evidence/states/switch output. Search for private sentinels. Forbid translating mature into financial certainty and forbid bare unconditional buy/sell/hold headlines.
+Require the ten confirmed sections, exact nested keys, stable ordering, canonical sanitized snapshot, valid source references, bounded Chinese text, and no unknown fields. Test all evidence/states/switch output. Search for private sentinels. Forbid translating mature into financial certainty and forbid bare unconditional buy/sell/hold headlines.
 
 - [ ] **Step 2: Confirm red**
 

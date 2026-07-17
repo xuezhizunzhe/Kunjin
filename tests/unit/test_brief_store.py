@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,7 @@ from kunjin.brief.models import (
     BriefActionInterpretation,
     BriefCoverage,
     BriefEvidenceState,
+    BriefEvidenceStatus,
     BriefFact,
     BriefResolutionBinding,
     BriefSnapshot,
@@ -187,6 +189,28 @@ def _snapshot(
         unknown_fields=("industry_exposure",),
         evidence_ids=("same_manager_1",),
     )
+    holdings_coverage = replace(
+        coverage,
+        coverage_id="disclosed_holdings_coverage",
+    )
+    sync_status = BriefEvidenceStatus(
+        state=BriefEvidenceState.PARTIAL,
+        required_fields=("identity_active_status",),
+        obtained_fields=("identity_active_status",),
+        missing_fields=(),
+        stale_fields=(),
+        conflicted_fields=(),
+        unsupported_fields=(),
+        cooldown_fields=(),
+        supported_interpretations=("continue_holding",),
+        unsupported_interpretations=(),
+        acceptable_alternative_ids=(),
+        manual_supplementation_codes=(),
+    )
+    decision_status = replace(
+        sync_status,
+        missing_fields=(() if state is BriefState.HOLD else ("owner_confirmed_thesis",)),
+    )
     if resolution_bindings is None:
         resolution_bindings = tuple(
             BriefResolutionBinding(
@@ -228,6 +252,9 @@ def _snapshot(
         official_events=(),
         relationships=(relationship,),
         coverage=coverage,
+        holdings_coverage=holdings_coverage,
+        sync_status=sync_status,
+        decision_evidence_status=decision_status,
         interpretations=(interpretation,),
         primary_state=state,
         action_maturity=(
@@ -235,6 +262,7 @@ def _snapshot(
             if state is BriefState.NO_ADD
             else ActionMaturity.EXPERIMENTAL_SHADOW
         ),
+        constraints=(),
         triggered_reviews=(),
         affected_action_abstentions=(),
         blocking_codes=(),
@@ -248,6 +276,10 @@ def _snapshot(
         source_lineage_ids=("nav_lineage", "manager_lineage", *resolution_lineage_ids),
         evidence_fingerprint=CHECKSUM,
         created_at=created_at,
+        portfolio_evidence_state="current",
+        position_present=True,
+        observation_version="portfolio_observation_1",
+        observed_at=NOW,
         resolution_lineage_ids=resolution_lineage_ids,
         resolution_bindings=resolution_bindings,
     )
@@ -455,12 +487,14 @@ def _insert_terminal_snapshot_with_state_inputs(
 def test_publish_uses_real_ids_once_and_atomically_authenticates_round_trip(tmp_path) -> None:
     repository, decision_store, brief_store = _stores(tmp_path)
     request_run_id, calls, stored = _publish(decision_store, brief_store)
+    history = brief_store.history("123456")
 
     assert calls == [(request_run_id, stored.snapshot.decision_snapshot_id)]
     assert stored.snapshot.request_run_id == request_run_id
     assert stored.policy == HeldFundBriefPolicyV1()
     assert stored.result_checksum == stored.snapshot.checksum()
     assert stored.conclusion_changed is False
+    assert history[0].snapshot.canonical_json() == stored.snapshot.canonical_json()
     with repository.connect() as connection:
         run = connection.execute(
             "SELECT status, omitted_work_json FROM request_runs WHERE id = ?",

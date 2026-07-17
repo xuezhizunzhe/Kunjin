@@ -15,6 +15,7 @@ from kunjin.brief.models import (
     BriefActionInterpretation,
     BriefCoverage,
     BriefEvidenceState,
+    BriefEvidenceStatus,
     BriefFact,
     BriefResolutionBinding,
     BriefSnapshot,
@@ -644,6 +645,7 @@ def _decode_snapshot(payload: bytes) -> BriefSnapshot:
             "affected_action_abstentions",
             "blocking_codes",
             "conflicts",
+            "constraints",
             "coverage",
             "created_at",
             "decision_snapshot_id",
@@ -651,16 +653,23 @@ def _decode_snapshot(payload: bytes) -> BriefSnapshot:
             "evidence_state",
             "facts",
             "fund_code",
+            "holdings_coverage",
             "interpretations",
             "missing_fields",
             "mode",
             "official_events",
+            "observation_version",
+            "observed_at",
+            "portfolio_evidence_state",
+            "position_present",
             "primary_state",
             "relationships",
             "request_run_id",
             "resolution_bindings",
             "resolution_lineage_ids",
             "source_lineage_ids",
+            "sync_status",
+            "decision_evidence_status",
             "triggered_reviews",
         },
         "brief snapshot",
@@ -679,12 +688,16 @@ def _decode_snapshot(payload: bytes) -> BriefSnapshot:
             _decode_relationship(item) for item in _list(value["relationships"], "relationships")
         ),
         coverage=_decode_coverage(value["coverage"]),
+        holdings_coverage=_decode_coverage(value["holdings_coverage"]),
+        sync_status=_decode_evidence_status(value["sync_status"]),
+        decision_evidence_status=_decode_evidence_status(value["decision_evidence_status"]),
         interpretations=tuple(
             _decode_interpretation(item)
             for item in _list(value["interpretations"], "interpretations")
         ),
         primary_state=BriefState(value["primary_state"]),
         action_maturity=ActionMaturity(value["action_maturity"]),
+        constraints=_string_tuple(value["constraints"], "constraints"),
         triggered_reviews=_string_tuple(value["triggered_reviews"], "reviews"),
         affected_action_abstentions=_string_tuple(
             value["affected_action_abstentions"], "abstentions"
@@ -696,6 +709,10 @@ def _decode_snapshot(payload: bytes) -> BriefSnapshot:
         source_lineage_ids=_string_tuple(value["source_lineage_ids"], "lineage ids"),
         evidence_fingerprint=value["evidence_fingerprint"],
         created_at=_stored_utc(value["created_at"], "brief creation time"),
+        portfolio_evidence_state=value["portfolio_evidence_state"],
+        position_present=value["position_present"],
+        observation_version=value["observation_version"],
+        observed_at=_optional_utc(value["observed_at"], "portfolio observation time"),
         resolution_bindings=tuple(
             _decode_resolution_binding(item)
             for item in _list(value["resolution_bindings"], "resolution bindings")
@@ -707,6 +724,55 @@ def _decode_snapshot(payload: bytes) -> BriefSnapshot:
     )
     snapshot.validate()
     return snapshot
+
+
+def _decode_evidence_status(value: object) -> BriefEvidenceStatus:
+    _keys(
+        value,
+        {
+            "acceptable_alternative_ids",
+            "conflicted_fields",
+            "cooldown_fields",
+            "manual_supplementation_codes",
+            "missing_fields",
+            "obtained_fields",
+            "required_fields",
+            "stale_fields",
+            "state",
+            "supported_interpretations",
+            "unsupported_fields",
+            "unsupported_interpretations",
+        },
+        "brief evidence status",
+    )
+    status = BriefEvidenceStatus(
+        state=BriefEvidenceState(value["state"]),
+        required_fields=_string_tuple(value["required_fields"], "required fields"),
+        obtained_fields=_string_tuple(value["obtained_fields"], "obtained fields"),
+        missing_fields=_string_tuple(value["missing_fields"], "missing fields"),
+        stale_fields=_string_tuple(value["stale_fields"], "stale fields"),
+        conflicted_fields=_string_tuple(value["conflicted_fields"], "conflicted fields"),
+        unsupported_fields=_string_tuple(value["unsupported_fields"], "unsupported fields"),
+        cooldown_fields=_string_tuple(value["cooldown_fields"], "cooldown fields"),
+        supported_interpretations=_string_tuple(
+            value["supported_interpretations"],
+            "supported interpretations",
+        ),
+        unsupported_interpretations=_string_tuple(
+            value["unsupported_interpretations"],
+            "unsupported interpretations",
+        ),
+        acceptable_alternative_ids=_string_tuple(
+            value["acceptable_alternative_ids"],
+            "acceptable alternative ids",
+        ),
+        manual_supplementation_codes=_string_tuple(
+            value["manual_supplementation_codes"],
+            "manual supplementation codes",
+        ),
+    )
+    status.validate()
+    return status
 
 
 def _decode_resolution_binding(value: object) -> BriefResolutionBinding:

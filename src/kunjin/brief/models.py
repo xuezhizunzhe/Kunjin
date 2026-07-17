@@ -92,6 +92,60 @@ class BriefEvidenceState(str, Enum):
     INSUFFICIENT = "insufficient"
 
 
+@dataclass(frozen=True)
+class BriefEvidenceStatus:
+    state: BriefEvidenceState
+    required_fields: Tuple[str, ...]
+    obtained_fields: Tuple[str, ...]
+    missing_fields: Tuple[str, ...]
+    stale_fields: Tuple[str, ...]
+    conflicted_fields: Tuple[str, ...]
+    unsupported_fields: Tuple[str, ...]
+    cooldown_fields: Tuple[str, ...]
+    supported_interpretations: Tuple[str, ...]
+    unsupported_interpretations: Tuple[str, ...]
+    acceptable_alternative_ids: Tuple[str, ...]
+    manual_supplementation_codes: Tuple[str, ...]
+
+    def validate(self) -> None:
+        _validate_exact_record(self, BriefEvidenceStatus, "brief evidence status")
+        if type(self.state) is not BriefEvidenceState:
+            raise ValueError("brief evidence status state must be exact")
+        for values, name in (
+            (self.required_fields, "required fields"),
+            (self.obtained_fields, "obtained fields"),
+            (self.missing_fields, "missing fields"),
+            (self.stale_fields, "stale fields"),
+            (self.conflicted_fields, "conflicted fields"),
+            (self.unsupported_fields, "unsupported fields"),
+            (self.cooldown_fields, "cooldown fields"),
+            (self.supported_interpretations, "supported interpretations"),
+            (self.unsupported_interpretations, "unsupported interpretations"),
+            (self.acceptable_alternative_ids, "acceptable alternative ids"),
+            (self.manual_supplementation_codes, "manual supplementation codes"),
+        ):
+            validate_identifier_tuple(values, f"brief evidence status {name}")
+        if set(self.supported_interpretations).intersection(self.unsupported_interpretations):
+            raise ValueError("brief evidence interpretation states must not overlap")
+
+    def to_canonical_dict(self) -> dict:
+        self.validate()
+        return {
+            "acceptable_alternative_ids": list(self.acceptable_alternative_ids),
+            "conflicted_fields": list(self.conflicted_fields),
+            "cooldown_fields": list(self.cooldown_fields),
+            "manual_supplementation_codes": list(self.manual_supplementation_codes),
+            "missing_fields": list(self.missing_fields),
+            "obtained_fields": list(self.obtained_fields),
+            "required_fields": list(self.required_fields),
+            "stale_fields": list(self.stale_fields),
+            "state": self.state.value,
+            "supported_interpretations": list(self.supported_interpretations),
+            "unsupported_fields": list(self.unsupported_fields),
+            "unsupported_interpretations": list(self.unsupported_interpretations),
+        }
+
+
 class OfficialEventCode(str, Enum):
     FUND_LIQUIDATION_NOTICE = "fund_liquidation_notice"
     FUND_TERMINATION_NOTICE = "fund_termination_notice"
@@ -733,9 +787,13 @@ class BriefSnapshot:
     official_events: Tuple[OfficialEvent, ...]
     relationships: Tuple[RelationshipEvidence, ...]
     coverage: BriefCoverage
+    holdings_coverage: BriefCoverage
+    sync_status: BriefEvidenceStatus
+    decision_evidence_status: BriefEvidenceStatus
     interpretations: Tuple[BriefActionInterpretation, ...]
     primary_state: BriefState
     action_maturity: ActionMaturity
+    constraints: Tuple[str, ...]
     triggered_reviews: Tuple[str, ...]
     affected_action_abstentions: Tuple[str, ...]
     blocking_codes: Tuple[str, ...]
@@ -745,6 +803,10 @@ class BriefSnapshot:
     source_lineage_ids: Tuple[str, ...]
     evidence_fingerprint: str
     created_at: datetime
+    portfolio_evidence_state: str
+    position_present: Optional[bool]
+    observation_version: str
+    observed_at: Optional[datetime]
     resolution_lineage_ids: Tuple[str, ...] = ()
     resolution_bindings: Tuple[BriefResolutionBinding, ...] = ()
 
@@ -782,6 +844,19 @@ class BriefSnapshot:
         if type(self.coverage) is not BriefCoverage:
             raise ValueError("coverage must be an exact BriefCoverage")
         self.coverage.validate()
+        if type(self.holdings_coverage) is not BriefCoverage:
+            raise ValueError("holdings coverage must be an exact BriefCoverage")
+        self.holdings_coverage.validate()
+        if self.holdings_coverage.coverage_id == self.coverage.coverage_id:
+            raise ValueError("snapshot coverage ids must be distinct")
+        if type(self.sync_status) is not BriefEvidenceStatus:
+            raise ValueError("snapshot sync status must be exact")
+        if type(self.decision_evidence_status) is not BriefEvidenceStatus:
+            raise ValueError("snapshot decision evidence status must be exact")
+        self.sync_status.validate()
+        self.decision_evidence_status.validate()
+        if self.evidence_state is not self.decision_evidence_status.state:
+            raise ValueError("snapshot evidence state must match decision evidence status")
         _validate_record_tuple(
             self.interpretations,
             BriefActionInterpretation,
@@ -800,9 +875,10 @@ class BriefSnapshot:
         base_evidence_namespace_ids = fact_ids + event_ids + relationship_ids
         if len(base_evidence_namespace_ids) != len(set(base_evidence_namespace_ids)):
             raise ValueError("evidence namespace ids must be globally unique")
-        if self.coverage.coverage_id in set(base_evidence_namespace_ids):
+        coverage_ids = (self.coverage.coverage_id, self.holdings_coverage.coverage_id)
+        if set(coverage_ids).intersection(base_evidence_namespace_ids):
             raise ValueError("coverage id must not collide with an evidence namespace id")
-        evidence_namespace_ids = base_evidence_namespace_ids + (self.coverage.coverage_id,)
+        evidence_namespace_ids = base_evidence_namespace_ids + coverage_ids
 
         fact_or_event_ids = set(fact_ids + event_ids)
         fact_or_relationship_ids = set(fact_ids + relationship_ids)
@@ -812,6 +888,10 @@ class BriefSnapshot:
                 raise ValueError("relationship evidence ids must resolve to facts or events")
         if not set(self.coverage.evidence_ids).issubset(fact_or_relationship_ids):
             raise ValueError("coverage evidence ids must resolve to facts or relationships")
+        if not set(self.holdings_coverage.evidence_ids).issubset(fact_or_relationship_ids):
+            raise ValueError(
+                "holdings coverage evidence ids must resolve to facts or relationships"
+            )
         for interpretation in self.interpretations:
             interpretation_evidence = set(
                 interpretation.supporting_evidence_ids + interpretation.opposing_evidence_ids
@@ -1043,6 +1123,7 @@ class BriefSnapshot:
                 raise ValueError("hold requires an authenticated thesis and official review")
             validate_checksum(fingerprint, "hold thesis fingerprint")
         for value, name in (
+            (self.constraints, "snapshot constraints"),
             (self.triggered_reviews, "triggered reviews"),
             (self.affected_action_abstentions, "affected action abstentions"),
             (self.blocking_codes, "snapshot blocking codes"),
@@ -1063,6 +1144,9 @@ class BriefSnapshot:
                 "snapshot blocking codes must include every interpretation blocking code"
             )
         required_missing_fields = set(self.coverage.unknown_fields)
+        required_missing_fields.update(self.holdings_coverage.unknown_fields)
+        required_missing_fields.update(self.sync_status.missing_fields)
+        required_missing_fields.update(self.decision_evidence_status.missing_fields)
         required_missing_fields.update(
             field_id
             for interpretation in self.interpretations
@@ -1077,8 +1161,18 @@ class BriefSnapshot:
         }
         if not required_conflicts.issubset(self.conflicts):
             raise ValueError("snapshot conflicts must include every fact conflict")
-        if type(self.evidence_state) is not BriefEvidenceState:
-            raise ValueError("snapshot evidence state must be an exact BriefEvidenceState")
+        if self.portfolio_evidence_state not in {"current", "dated", "unknown"}:
+            raise ValueError("snapshot portfolio evidence state is unsupported")
+        if self.position_present is not None and type(self.position_present) is not bool:
+            raise ValueError("snapshot position presence must be boolean or None")
+        validate_identifier(self.observation_version, "snapshot observation version")
+        if self.portfolio_evidence_state == "unknown":
+            if self.position_present is not None or self.observed_at is not None:
+                raise ValueError("unknown portfolio evidence cannot claim position facts")
+        elif self.observed_at is None:
+            raise ValueError("known portfolio evidence requires an observation time")
+        if self.observed_at is not None:
+            _validate_utc_datetime(self.observed_at, "snapshot portfolio observation time")
         validate_checksum(self.evidence_fingerprint, "brief evidence fingerprint")
         _validate_utc_datetime(self.created_at, "brief snapshot creation time")
 
@@ -1090,6 +1184,7 @@ class BriefSnapshot:
             "affected_action_abstentions": list(self.affected_action_abstentions),
             "blocking_codes": list(self.blocking_codes),
             "conflicts": list(self.conflicts),
+            "constraints": list(self.constraints),
             "coverage": self.coverage.to_canonical_dict(),
             "created_at": canonical_value(self.created_at),
             "decision_snapshot_id": self.decision_snapshot_id,
@@ -1098,15 +1193,24 @@ class BriefSnapshot:
             "facts": [item.to_canonical_dict() for item in self.facts],
             "fund_code": self.fund_code,
             "interpretations": [item.to_canonical_dict() for item in self.interpretations],
+            "holdings_coverage": self.holdings_coverage.to_canonical_dict(),
             "missing_fields": list(self.missing_fields),
             "mode": self.mode.value,
             "official_events": [item.to_canonical_dict() for item in self.official_events],
             "primary_state": self.primary_state.value,
+            "portfolio_evidence_state": self.portfolio_evidence_state,
+            "position_present": self.position_present,
+            "observation_version": self.observation_version,
+            "observed_at": (
+                None if self.observed_at is None else canonical_value(self.observed_at)
+            ),
             "relationships": [item.to_canonical_dict() for item in self.relationships],
             "request_run_id": self.request_run_id,
             "resolution_bindings": [item.to_canonical_dict() for item in self.resolution_bindings],
             "resolution_lineage_ids": list(self.resolution_lineage_ids),
             "source_lineage_ids": list(self.source_lineage_ids),
+            "sync_status": self.sync_status.to_canonical_dict(),
+            "decision_evidence_status": self.decision_evidence_status.to_canonical_dict(),
             "triggered_reviews": list(self.triggered_reviews),
         }
 
@@ -1150,21 +1254,38 @@ class HeldFundBriefReport:
             raise ValueError("unknown owner overlay keys are not accepted")
         if set(self.owner_overlay) != allowed:
             raise ValueError("owner overlay must contain its exact four public fields")
-        if type(self.owner_overlay["position_present"]) is not bool:
-            raise ValueError("owner overlay position presence must be an exact boolean")
+        position_present = self.owner_overlay["position_present"]
+        if position_present is not None and type(position_present) is not bool:
+            raise ValueError("owner overlay position presence must be boolean or None")
+        if position_present is not self.snapshot.position_present:
+            raise ValueError("owner overlay position presence must match the snapshot")
         weight = self.owner_overlay["portfolio_weight"]
-        if type(weight) is not str:
-            raise ValueError("owner overlay portfolio weight must be a canonical string")
-        try:
-            parsed_weight = Decimal(weight)
-        except Exception:
-            raise ValueError("owner overlay portfolio weight must be canonical") from None
-        if canonical_decimal(parsed_weight) != weight or not (
-            Decimal("0") <= parsed_weight <= Decimal("1")
-        ):
-            raise ValueError("owner overlay portfolio weight must be canonical and in [0, 1]")
-        _validate_utc_datetime(self.owner_overlay["observed_at"], "owner overlay observation time")
+        if weight is not None:
+            if type(weight) is not str:
+                raise ValueError("owner overlay portfolio weight must be canonical or None")
+            try:
+                parsed_weight = Decimal(weight)
+            except Exception:
+                raise ValueError("owner overlay portfolio weight must be canonical") from None
+            if canonical_decimal(parsed_weight) != weight or not (
+                Decimal("0") <= parsed_weight <= Decimal("1")
+            ):
+                raise ValueError("owner overlay portfolio weight must be canonical and in [0, 1]")
+        if position_present is None and weight is not None:
+            raise ValueError("unknown position cannot claim a portfolio weight")
+        if position_present is False and weight != "0":
+            raise ValueError("absent position must use zero portfolio weight")
+        observed_at = self.owner_overlay["observed_at"]
+        if observed_at is not None:
+            _validate_utc_datetime(observed_at, "owner overlay observation time")
+        if position_present is None and observed_at is not None:
+            raise ValueError("unknown position cannot claim an observation time")
         validate_identifier(self.owner_overlay["observation_version"], "observation version")
+        if (
+            self.owner_overlay["observation_version"] != self.snapshot.observation_version
+            or observed_at != self.snapshot.observed_at
+        ):
+            raise ValueError("owner overlay provenance must match the snapshot")
 
     def to_canonical_dict(self) -> dict:
         self.validate()
@@ -1172,7 +1293,11 @@ class HeldFundBriefReport:
         if self.owner_overlay is not None:
             overlay = {
                 "observation_version": self.owner_overlay["observation_version"],
-                "observed_at": canonical_value(self.owner_overlay["observed_at"]),
+                "observed_at": (
+                    None
+                    if self.owner_overlay["observed_at"] is None
+                    else canonical_value(self.owner_overlay["observed_at"])
+                ),
                 "portfolio_weight": self.owner_overlay["portfolio_weight"],
                 "position_present": self.owner_overlay["position_present"],
             }

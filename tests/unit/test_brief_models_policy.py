@@ -11,6 +11,7 @@ from kunjin.brief.models import (
     BriefActionInterpretation,
     BriefCoverage,
     BriefEvidenceState,
+    BriefEvidenceStatus,
     BriefFact,
     BriefResolutionBinding,
     BriefSnapshot,
@@ -142,6 +143,25 @@ def _coverage(**overrides: object) -> BriefCoverage:
     return BriefCoverage(**values)
 
 
+def _evidence_status(**overrides: object) -> BriefEvidenceStatus:
+    values = {
+        "state": BriefEvidenceState.PARTIAL,
+        "required_fields": ("identity_active_status",),
+        "obtained_fields": ("identity_active_status",),
+        "missing_fields": (),
+        "stale_fields": (),
+        "conflicted_fields": (),
+        "unsupported_fields": (),
+        "cooldown_fields": (),
+        "supported_interpretations": ("continue_holding",),
+        "unsupported_interpretations": (),
+        "acceptable_alternative_ids": (),
+        "manual_supplementation_codes": (),
+    }
+    values.update(overrides)
+    return BriefEvidenceStatus(**values)
+
+
 def _interpretation(**overrides: object) -> BriefActionInterpretation:
     values = {
         "action_id": "continue_holding",
@@ -186,9 +206,15 @@ def _snapshot(**overrides: object) -> BriefSnapshot:
         "official_events": (_event(),),
         "relationships": (_relationship(),),
         "coverage": _coverage(),
+        "holdings_coverage": _coverage(
+            coverage_id="disclosed_holdings_coverage",
+        ),
+        "sync_status": _evidence_status(),
+        "decision_evidence_status": _evidence_status(),
         "interpretations": (_interpretation(),),
         "primary_state": BriefState.WATCH,
         "action_maturity": ActionMaturity.EXPERIMENTAL_SHADOW,
+        "constraints": (),
         "triggered_reviews": (),
         "affected_action_abstentions": (),
         "blocking_codes": (),
@@ -202,6 +228,10 @@ def _snapshot(**overrides: object) -> BriefSnapshot:
         ),
         "evidence_fingerprint": CHECKSUM,
         "created_at": NOW,
+        "portfolio_evidence_state": "current",
+        "position_present": True,
+        "observation_version": "portfolio_observation_1",
+        "observed_at": NOW,
     }
     values.update(overrides)
     return BriefSnapshot(**values)

@@ -13,6 +13,7 @@ from kunjin.brief.facts import SourceLinkedFactSet
 from kunjin.brief.models import (
     BriefActionInterpretation,
     BriefEvidenceState,
+    BriefEvidenceStatus,
     BriefResolutionBinding,
     BriefState,
     OfficialEvent,
@@ -464,41 +465,7 @@ def load_confirmed_thesis_state(
     return state
 
 
-@dataclass(frozen=True)
-class EvidenceStatus:
-    state: BriefEvidenceState
-    required_fields: Tuple[str, ...]
-    obtained_fields: Tuple[str, ...]
-    missing_fields: Tuple[str, ...]
-    stale_fields: Tuple[str, ...]
-    conflicted_fields: Tuple[str, ...]
-    unsupported_fields: Tuple[str, ...]
-    cooldown_fields: Tuple[str, ...]
-    supported_interpretations: Tuple[str, ...]
-    unsupported_interpretations: Tuple[str, ...]
-    acceptable_alternative_ids: Tuple[str, ...]
-    manual_supplementation_codes: Tuple[str, ...]
-
-    def validate(self) -> None:
-        if type(self) is not EvidenceStatus:
-            raise ValueError("evidence status subclasses are not accepted")
-        validate_exact_dataclass_state(self, "brief evidence status")
-        if type(self.state) is not BriefEvidenceState:
-            raise ValueError("evidence status state must be an exact BriefEvidenceState")
-        for values, name in (
-            (self.required_fields, "required fields"),
-            (self.obtained_fields, "obtained fields"),
-            (self.missing_fields, "missing fields"),
-            (self.stale_fields, "stale fields"),
-            (self.conflicted_fields, "conflicted fields"),
-            (self.unsupported_fields, "unsupported fields"),
-            (self.cooldown_fields, "cooldown fields"),
-            (self.supported_interpretations, "supported interpretations"),
-            (self.unsupported_interpretations, "unsupported interpretations"),
-            (self.acceptable_alternative_ids, "acceptable alternative ids"),
-            (self.manual_supplementation_codes, "manual supplementation codes"),
-        ):
-            validate_identifier_tuple(values, f"evidence status {name}")
+EvidenceStatus = BriefEvidenceStatus
 
 
 @dataclass(frozen=True)
