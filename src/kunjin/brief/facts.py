@@ -261,6 +261,7 @@ class AuthenticatedAnnouncementContent:
 
 @dataclass(frozen=True)
 class SourceLinkedFactSet:
+    fund_code: str
     facts: Tuple[BriefFact, ...]
     official_events: Tuple[OfficialEvent, ...]
     missing_fields: Tuple[str, ...]
@@ -271,6 +272,8 @@ class SourceLinkedFactSet:
         if type(self) is not SourceLinkedFactSet:
             raise ValueError("source-linked fact set subclasses are not accepted")
         validate_exact_dataclass_state(self, "source-linked fact set")
+        if type(self.fund_code) is not str or _FUND_CODE.fullmatch(self.fund_code) is None:
+            raise ValueError("source-linked fact set fund code must be six ASCII digits")
         if type(self.facts) is not tuple or len(self.facts) > MAX_FACTS:
             raise ValueError("source-linked facts exceed their bound")
         fact_ids = []
@@ -1293,6 +1296,7 @@ def build_source_linked_facts(
         events = events[:MAX_OFFICIAL_EVENTS]
         warnings.add("official_event_limit_reached")
     result = SourceLinkedFactSet(
+        bundle.fund_code,
         tuple(facts),
         tuple(events),
         tuple(sorted(_stable_code("missing", item) for item in missing)),

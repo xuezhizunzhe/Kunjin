@@ -249,6 +249,7 @@ def test_disclosure_projection_preserves_selection_dates_and_fee_classes() -> No
         action_ids=("fact_research", "continue_holding"),
     )
 
+    assert result.fund_code == "519755"
     current = [fact for fact in result.facts if fact.field_id == "current_manager_team"]
     former_facts = [fact for fact in result.facts if fact.field_id == "former_manager_history"]
     fees = [fact for fact in result.facts if fact.field_id == "fees_share_class_relationship"]
