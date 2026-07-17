@@ -446,7 +446,7 @@ elif argv[:4] == ["--json", "sync", "fund-profile", "000001"]:
                     "age_days": None,
                 }
                 for name in (
-                    "announcements",
+                    "announcement",
                     "basic_profile",
                     "fee_schedule",
                     "industry_exposure",

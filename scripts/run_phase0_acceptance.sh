@@ -1167,9 +1167,14 @@ def project_sync(path):
         "manager_history",
         "size_history",
     }
-    allowed_freshness_sections = allowed_sections | {
+    allowed_freshness_sections = {
+        "announcement",
+        "basic_profile",
+        "fee_schedule",
         "industry_exposure",
+        "manager_history",
         "quarterly_holdings",
+        "size_history",
     }
     if not sections or not set(sections).issubset(allowed_sections):
         raise AcceptanceFailure("sync sections are invalid")
