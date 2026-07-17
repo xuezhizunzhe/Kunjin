@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
+import secrets
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import AbstractSet, Dict, Mapping, Optional, Sequence, Tuple, cast
 
+from kunjin.brief.nav import ValidatedAdjustedNavSeries
+from kunjin.decision.models import (
+    canonical_json_bytes,
+    validate_checksum,
+    validate_exact_dataclass_state,
+)
 from kunjin.funds.models import (
     FundHolding,
     FundIndustryExposure,
@@ -15,7 +25,295 @@ from kunjin.funds.peers.models import PairwiseOverlap, SharedExposure, WindowMet
 from kunjin.models import FundNavObservation
 
 PEER_CALCULATION_VERSION = "1"
+ADJUSTED_CORRELATION_VERSION = "1"
 START_TOLERANCE_DAYS = 7
+_ADJUSTED_CORRELATION_MAC_KEY = secrets.token_bytes(32)
+
+
+@dataclass(frozen=True)
+class AdjustedReturnCorrelationResult:
+    left_fund_code: str
+    right_fund_code: str
+    left_source_attempt_id: int
+    right_source_attempt_id: int
+    left_series_binding_mac: str
+    right_series_binding_mac: str
+    status: str
+    correlation: Optional[Decimal]
+    samples: int
+    aligned_observations: int
+    left_observations: int
+    right_observations: int
+    effective_start: Optional[date]
+    effective_end: Optional[date]
+    calculation_version: str
+    insufficiency_codes: Tuple[str, ...]
+    binding_mac: str
+
+    def binding_bytes(self) -> bytes:
+        return canonical_json_bytes(
+            {
+                "aligned_observations": self.aligned_observations,
+                "calculation_version": self.calculation_version,
+                "correlation": self.correlation,
+                "effective_end": self.effective_end,
+                "effective_start": self.effective_start,
+                "insufficiency_codes": self.insufficiency_codes,
+                "left_fund_code": self.left_fund_code,
+                "left_observations": self.left_observations,
+                "left_series_binding_mac": self.left_series_binding_mac,
+                "left_source_attempt_id": self.left_source_attempt_id,
+                "right_fund_code": self.right_fund_code,
+                "right_observations": self.right_observations,
+                "right_series_binding_mac": self.right_series_binding_mac,
+                "right_source_attempt_id": self.right_source_attempt_id,
+                "samples": self.samples,
+                "status": self.status,
+            }
+        )
+
+    def validate(self) -> None:
+        if type(self) is not AdjustedReturnCorrelationResult:
+            raise ValueError("adjusted correlation result subclasses are not accepted")
+        validate_exact_dataclass_state(self, "adjusted correlation result")
+        validate_checksum(self.binding_mac, "adjusted correlation result binding MAC")
+        if not hmac.compare_digest(self.binding_mac, _adjusted_correlation_mac(self)):
+            raise ValueError("adjusted correlation result binding MAC does not match")
+        if (
+            type(self.left_fund_code) is not str
+            or re.fullmatch(r"[0-9]{6}", self.left_fund_code) is None
+            or type(self.right_fund_code) is not str
+            or re.fullmatch(r"[0-9]{6}", self.right_fund_code) is None
+            or self.left_fund_code == self.right_fund_code
+        ):
+            raise ValueError("adjusted correlation requires two distinct fund codes")
+        for value, name in (
+            (self.left_source_attempt_id, "left source attempt id"),
+            (self.right_source_attempt_id, "right source attempt id"),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"adjusted correlation {name} must be positive")
+        validate_checksum(self.left_series_binding_mac, "left series binding MAC")
+        validate_checksum(self.right_series_binding_mac, "right series binding MAC")
+        if self.status not in {"success", "insufficient_data"}:
+            raise ValueError("adjusted correlation status is invalid")
+        for value, name in (
+            (self.samples, "samples"),
+            (self.aligned_observations, "aligned observations"),
+            (self.left_observations, "left observations"),
+            (self.right_observations, "right observations"),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"adjusted correlation {name} must be non-negative")
+        if self.aligned_observations and self.samples != self.aligned_observations - 1:
+            raise ValueError("adjusted correlation sample and alignment counts differ")
+        if (self.effective_start is None) != (self.effective_end is None):
+            raise ValueError("adjusted correlation dates must be present together")
+        if self.effective_start is not None and (
+            type(self.effective_start) is not date
+            or type(self.effective_end) is not date
+            or self.effective_end < self.effective_start
+        ):
+            raise ValueError("adjusted correlation dates are invalid")
+        if self.calculation_version != ADJUSTED_CORRELATION_VERSION:
+            raise ValueError("adjusted correlation calculation version is invalid")
+        if (
+            type(self.insufficiency_codes) is not tuple
+            or len(self.insufficiency_codes) != len(set(self.insufficiency_codes))
+            or any(type(item) is not str or not item for item in self.insufficiency_codes)
+        ):
+            raise ValueError("adjusted correlation insufficiency codes are invalid")
+        if self.status == "success":
+            if (
+                type(self.correlation) is not Decimal
+                or not self.correlation.is_finite()
+                or not Decimal("-1") <= self.correlation <= Decimal("1")
+                or self.samples <= 0
+                or self.effective_start is None
+                or self.insufficiency_codes
+            ):
+                raise ValueError("successful adjusted correlation is incomplete")
+        elif self.correlation is not None or not self.insufficiency_codes:
+            raise ValueError("insufficient adjusted correlation has invalid conclusions")
+
+
+def _adjusted_correlation_result(
+    left: ValidatedAdjustedNavSeries,
+    right: ValidatedAdjustedNavSeries,
+    *,
+    status: str,
+    correlation: Optional[Decimal],
+    samples: int,
+    aligned_dates: Sequence[date],
+    insufficiency_codes: Tuple[str, ...],
+) -> AdjustedReturnCorrelationResult:
+    result = AdjustedReturnCorrelationResult(
+        left_fund_code=left.fund_code,
+        right_fund_code=right.fund_code,
+        left_source_attempt_id=left.source_attempt_id,
+        right_source_attempt_id=right.source_attempt_id,
+        left_series_binding_mac=left.binding_mac,
+        right_series_binding_mac=right.binding_mac,
+        status=status,
+        correlation=correlation,
+        samples=samples,
+        aligned_observations=len(aligned_dates),
+        left_observations=len(left.observations),
+        right_observations=len(right.observations),
+        effective_start=None if not aligned_dates else aligned_dates[0],
+        effective_end=None if not aligned_dates else aligned_dates[-1],
+        calculation_version=ADJUSTED_CORRELATION_VERSION,
+        insufficiency_codes=insufficiency_codes,
+        binding_mac="0" * 64,
+    )
+    result = replace(result, binding_mac=_adjusted_correlation_mac(result))
+    result.validate()
+    return result
+
+
+def _adjusted_correlation_mac(value: AdjustedReturnCorrelationResult) -> str:
+    return hmac.new(
+        _ADJUSTED_CORRELATION_MAC_KEY,
+        value.binding_bytes(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def decimal_adjusted_return_correlation(
+    left: ValidatedAdjustedNavSeries,
+    right: ValidatedAdjustedNavSeries,
+    *,
+    minimum_samples: int,
+) -> AdjustedReturnCorrelationResult:
+    if (
+        type(left) is not ValidatedAdjustedNavSeries
+        or type(right) is not ValidatedAdjustedNavSeries
+    ):
+        raise ValueError("adjusted correlation requires exact validated NAV series")
+    if type(minimum_samples) is not int or minimum_samples <= 0:
+        raise ValueError("minimum correlation samples must be a positive exact integer")
+    if left.fund_code == right.fund_code:
+        raise ValueError("adjusted correlation requires two distinct funds")
+
+    issue_codes = {
+        "duplicate_date": "adjusted_return_duplicate_date",
+        "subject_mismatch": "adjusted_return_subject_mismatch",
+        "accumulated_nav_unavailable": "adjusted_return_accumulated_nav_unavailable",
+        "corporate_action_unresolved": "adjusted_return_corporate_action_unresolved",
+        "discontinuity": "adjusted_return_discontinuity",
+        "samples_insufficient": "adjusted_return_series_samples_insufficient",
+        "source_binding_invalid": "adjusted_return_source_binding_invalid",
+        "observation_invalid": "adjusted_return_observation_invalid",
+        "date_order_invalid": "adjusted_return_date_order_invalid",
+    }
+    issues = []
+    for side, series in (("left", left), ("right", right)):
+        issue = series.validation_issue()
+        if issue is not None:
+            issues.append(f"{issue_codes.get(issue, 'adjusted_return_series_invalid')}_{side}")
+    if issues:
+        return _adjusted_correlation_result(
+            left,
+            right,
+            status="insufficient_data",
+            correlation=None,
+            samples=0,
+            aligned_dates=(),
+            insufficiency_codes=tuple(issues),
+        )
+    left.validate()
+    right.validate()
+
+    left_by_date = {item.nav_date: item for item in left.observations}
+    right_by_date = {item.nav_date: item for item in right.observations}
+    common_start = max(min(left_by_date), min(right_by_date))
+    common_end = min(max(left_by_date), max(right_by_date))
+    if common_start <= common_end:
+        left_window_dates = {item for item in left_by_date if common_start <= item <= common_end}
+        right_window_dates = {item for item in right_by_date if common_start <= item <= common_end}
+        if left_window_dates != right_window_dates:
+            aligned_dates = tuple(sorted(left_window_dates & right_window_dates))
+            return _adjusted_correlation_result(
+                left,
+                right,
+                status="insufficient_data",
+                correlation=None,
+                samples=max(0, len(aligned_dates) - 1),
+                aligned_dates=aligned_dates,
+                insufficiency_codes=("adjusted_return_asymmetric_dates",),
+            )
+    aligned_dates = tuple(sorted(left_by_date.keys() & right_by_date.keys()))
+    samples = max(0, len(aligned_dates) - 1)
+    if samples < minimum_samples:
+        return _adjusted_correlation_result(
+            left,
+            right,
+            status="insufficient_data",
+            correlation=None,
+            samples=samples,
+            aligned_dates=aligned_dates,
+            insufficiency_codes=("adjusted_return_samples_insufficient",),
+        )
+
+    with localcontext() as context:
+        context.prec = 28
+        left_returns = tuple(
+            left_by_date[newer].unit_nav / left_by_date[older].unit_nav - Decimal("1")
+            for older, newer in zip(aligned_dates, aligned_dates[1:])
+        )
+        right_returns = tuple(
+            right_by_date[newer].unit_nav / right_by_date[older].unit_nav - Decimal("1")
+            for older, newer in zip(aligned_dates, aligned_dates[1:])
+        )
+        sample_count = Decimal(samples)
+        left_mean = sum(left_returns, Decimal("0")) / sample_count
+        right_mean = sum(right_returns, Decimal("0")) / sample_count
+        left_variance_sum = sum(((item - left_mean) ** 2 for item in left_returns), Decimal("0"))
+        right_variance_sum = sum(((item - right_mean) ** 2 for item in right_returns), Decimal("0"))
+        zero_variance_codes = []
+        if left_variance_sum == 0:
+            zero_variance_codes.append("adjusted_return_zero_variance_left")
+        if right_variance_sum == 0:
+            zero_variance_codes.append("adjusted_return_zero_variance_right")
+        if zero_variance_codes:
+            return _adjusted_correlation_result(
+                left,
+                right,
+                status="insufficient_data",
+                correlation=None,
+                samples=samples,
+                aligned_dates=aligned_dates,
+                insufficiency_codes=tuple(zero_variance_codes),
+            )
+        covariance_sum = sum(
+            (
+                (left_value - left_mean) * (right_value - right_mean)
+                for left_value, right_value in zip(left_returns, right_returns)
+            ),
+            Decimal("0"),
+        )
+        denominator = (left_variance_sum * right_variance_sum).sqrt()
+        correlation = covariance_sum / denominator
+        if not correlation.is_finite() or correlation < Decimal("-1") or correlation > Decimal("1"):
+            return _adjusted_correlation_result(
+                left,
+                right,
+                status="insufficient_data",
+                correlation=None,
+                samples=samples,
+                aligned_dates=aligned_dates,
+                insufficiency_codes=("adjusted_return_correlation_invalid",),
+            )
+
+    return _adjusted_correlation_result(
+        left,
+        right,
+        status="success",
+        correlation=correlation,
+        samples=samples,
+        aligned_dates=aligned_dates,
+        insufficiency_codes=(),
+    )
 
 
 def _quarter_ordinal(value: date) -> int:
@@ -77,12 +375,8 @@ def pairwise_overlap(
     right: Sequence[FundHolding],
 ) -> PairwiseOverlap:
     left_period, right_period, period_warnings = select_overlap_periods(left, right)
-    selected_left = cast(
-        Sequence[FundHolding], _selected_period_records(left, left_period)
-    )
-    selected_right = cast(
-        Sequence[FundHolding], _selected_period_records(right, right_period)
-    )
+    selected_left = cast(Sequence[FundHolding], _selected_period_records(left, left_period))
+    selected_right = cast(Sequence[FundHolding], _selected_period_records(right, right_period))
     left_published_at = _publication_date(selected_left)
     right_published_at = _publication_date(selected_right)
     left_by_key = _holding_map(selected_left)
@@ -94,9 +388,7 @@ def pairwise_overlap(
         left_record = left_by_key[(exposure_type, exposure_code)]
         right_record = right_by_key[(exposure_type, exposure_code)]
         if left_record.security_name != right_record.security_name:
-            warnings.append(
-                f"exposure_name_mismatch:{exposure_type}:{exposure_code}"
-            )
+            warnings.append(f"exposure_name_mismatch:{exposure_type}:{exposure_code}")
         shared.append(
             SharedExposure(
                 exposure_type=exposure_type,
@@ -114,8 +406,7 @@ def pairwise_overlap(
         metric_name=(
             "top10_disclosed_overlap"
             if any(
-                record.disclosure_scope == "top10"
-                for record in (*selected_left, *selected_right)
+                record.disclosure_scope == "top10" for record in (*selected_left, *selected_right)
             )
             else "disclosed_overlap"
         ),
@@ -123,12 +414,8 @@ def pairwise_overlap(
         right_report_period=right_period,
         left_published_at=left_published_at,
         right_published_at=right_published_at,
-        left_disclosed_weight=sum(
-            (record.weight for record in selected_left), Decimal("0")
-        ),
-        right_disclosed_weight=sum(
-            (record.weight for record in selected_right), Decimal("0")
-        ),
+        left_disclosed_weight=sum((record.weight for record in selected_left), Decimal("0")),
+        right_disclosed_weight=sum((record.weight for record in selected_right), Decimal("0")),
         overlap=sum((exposure.shared_weight for exposure in shared), Decimal("0")),
         shared=tuple(shared),
         warnings=tuple(warnings),
@@ -202,12 +489,8 @@ def pairwise_industry_overlap(
         right_report_period=right_period,
         left_published_at=left_published_at,
         right_published_at=right_published_at,
-        left_disclosed_weight=sum(
-            (record.weight for record in selected_left), Decimal("0")
-        ),
-        right_disclosed_weight=sum(
-            (record.weight for record in selected_right), Decimal("0")
-        ),
+        left_disclosed_weight=sum((record.weight for record in selected_left), Decimal("0")),
+        right_disclosed_weight=sum((record.weight for record in selected_right), Decimal("0")),
         overlap=sum((exposure.shared_weight for exposure in shared), Decimal("0")),
         shared=tuple(shared),
         warnings=tuple(warnings),
@@ -287,10 +570,7 @@ def portfolio_overlap(
     for key in sorted(exposures):
         exposure = exposures[key]
         contributors = cast(list, exposure["contributors"])
-        weights = [
-            cast(Decimal, contributor["lookthrough_weight"])
-            for contributor in contributors
-        ]
+        weights = [cast(Decimal, contributor["lookthrough_weight"]) for contributor in contributors]
         total_weight = sum(weights, Decimal("0"))
         duplicated = total_weight - max(weights)
         total_exposure += total_weight
@@ -356,9 +636,7 @@ def calculate_window_metric(
 
     earliest_baseline = target_start - timedelta(days=START_TOLERANCE_DAYS)
     baseline_dates = [
-        nav_date
-        for nav_date in by_date
-        if earliest_baseline <= nav_date <= target_start
+        nav_date for nav_date in by_date if earliest_baseline <= nav_date <= target_start
     ]
     if not baseline_dates:
         return None, unavailable
@@ -379,9 +657,9 @@ def calculate_window_metric(
     annualized_volatility: Optional[Decimal] = None
     if daily_returns:
         mean = sum(daily_returns, Decimal("0")) / Decimal(len(daily_returns))
-        variance = sum(
-            (daily_return - mean) ** 2 for daily_return in daily_returns
-        ) / Decimal(len(daily_returns))
+        variance = sum((daily_return - mean) ** 2 for daily_return in daily_returns) / Decimal(
+            len(daily_returns)
+        )
         annualized_volatility = variance.sqrt() * Decimal(252).sqrt()
 
     peak_nav = ordered[0].unit_nav
@@ -407,8 +685,7 @@ def calculate_window_metric(
             (
                 observation.nav_date
                 for observation in ordered
-                if observation.nav_date > trough_date
-                and observation.unit_nav >= drawdown_peak_nav
+                if observation.nav_date > trough_date and observation.unit_nav >= drawdown_peak_nav
             ),
             None,
         )
@@ -437,8 +714,7 @@ def current_manager_team_start(
     active_starts = [
         tenure.start_date
         for tenure in tenures
-        if tenure.start_date <= as_of
-        and (tenure.end_date is None or tenure.end_date >= as_of)
+        if tenure.start_date <= as_of and (tenure.end_date is None or tenure.end_date >= as_of)
     ]
     return max(active_starts) if active_starts else None
 

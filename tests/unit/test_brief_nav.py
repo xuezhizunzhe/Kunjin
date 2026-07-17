@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from kunjin.brief.nav import BoundedNavService
+from kunjin.brief.nav import BoundedNavService, ValidatedAdjustedNavSeries
 from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.health import SourceHealthService
 from kunjin.decision.models import (
@@ -131,9 +131,7 @@ def test_bounded_nav_uses_mode_page_limit_one_worker_and_two_attempts(
     ) + context.audit_store.source_attempt_history(
         "eastmoney_nav", "adjusted_return_series", "fund:123456"
     )
-    assert {item.attempt.outcome for item in attempts} == {
-        SourceAttemptOutcome.SUCCESS
-    }
+    assert {item.attempt.outcome for item in attempts} == {SourceAttemptOutcome.SUCCESS}
 
 
 def test_formal_nav_persists_when_adjusted_series_is_insufficient(tmp_path) -> None:
@@ -263,6 +261,102 @@ def test_valid_adjusted_series_remains_authenticated_on_cache_hit(tmp_path) -> N
     assert second.status == "cache_hit"
     assert second.formal_nav_status == "success"
     assert second.adjusted_series_status == "cache"
+
+
+def test_validated_adjusted_series_returns_only_the_authenticated_batch(tmp_path) -> None:
+    repository = Repository(tmp_path / "kunjin.db")
+    repository.migrate()
+    expected = datetime(2026, 7, 16, tzinfo=timezone.utc)
+    context, _ticks = _context(repository, RequestMode.RAPID, "2" * 32)
+    service = BoundedNavService(
+        repository,
+        worker_runner=lambda request, _budget: _response(request, _rows(61)),
+    )
+    result = service.sync(
+        "123456",
+        context,
+        latest_expected_data_as_of=expected,
+    )
+    assert result.adjusted_series_status == "success"
+
+    series = service.validated_adjusted_series(
+        "123456",
+        context,
+        latest_expected_data_as_of=expected,
+    )
+
+    assert type(series) is ValidatedAdjustedNavSeries
+    assert series.fund_code == "123456"
+    assert len(series.observations) == 61
+    assert tuple(item.nav_date for item in series.observations) == tuple(
+        sorted(item.nav_date for item in series.observations)
+    )
+    assert series.data_as_of == date(2026, 7, 16)
+    assert series.retrieved_at == NOW
+    assert series.source_attempt_id > 0
+    assert {item.source_attempt_id for item in series.observations} == {series.source_attempt_id}
+
+
+def test_validated_adjusted_series_rejects_mixed_or_unbound_selected_batch(tmp_path) -> None:
+    repository = Repository(tmp_path / "kunjin.db")
+    repository.migrate()
+    expected = datetime(2026, 7, 16, tzinfo=timezone.utc)
+    context, _ticks = _context(repository, RequestMode.RAPID, "4" * 32)
+    service = BoundedNavService(
+        repository,
+        worker_runner=lambda request, _budget: _response(request, _rows(61)),
+    )
+    result = service.sync(
+        "123456",
+        context,
+        latest_expected_data_as_of=expected,
+    )
+    assert result.adjusted_series_status == "success"
+
+    with repository.connect() as connection, connection:
+        connection.execute(
+            """
+            UPDATE fund_nav
+            SET source_attempt_id = NULL
+            WHERE fund_code = '123456' AND nav_date = '2026-06-30'
+            """
+        )
+
+    assert (
+        service.validated_adjusted_series(
+            "123456",
+            context,
+            latest_expected_data_as_of=expected,
+        )
+        is None
+    )
+
+    repository.save_fund_history(
+        "123456",
+        "测试基金",
+        "混合型",
+        "eastmoney",
+        (
+            FundNavObservation(
+                fund_code="123456",
+                nav_date=date(2026, 7, 17),
+                unit_nav=Decimal("1.3"),
+                accumulated_nav=Decimal("2.3"),
+                daily_growth=Decimal("0.1"),
+                source="eastmoney",
+                retrieved_at=NOW + timedelta(seconds=1),
+                corporate_action_state="none",
+            ),
+        ),
+    )
+    assert (
+        service.validated_adjusted_series(
+            "123456",
+            context,
+            latest_expected_data_as_of=expected,
+        )
+        is None
+    )
 
 
 def test_cache_quality_uses_only_latest_authenticated_retrieval_batch(
@@ -486,9 +580,7 @@ def test_source_attempt_finished_at_uses_trusted_parent_clock(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("cooldown_field", ("formal_nav", "adjusted_return_series"))
-def test_cooldown_on_either_field_blocks_shared_worker_group(
-    tmp_path, cooldown_field: str
-) -> None:
+def test_cooldown_on_either_field_blocks_shared_worker_group(tmp_path, cooldown_field: str) -> None:
     repository = Repository(tmp_path / "kunjin.db")
     repository.migrate()
     context, _ticks = _context(repository, RequestMode.RAPID, "b" * 32)
@@ -504,9 +596,7 @@ def test_cooldown_on_either_field_blocks_shared_worker_group(
                 attempts=(
                     (
                         SimpleNamespace(
-                            attempt=SimpleNamespace(
-                                cooldown_until=NOW + timedelta(hours=1)
-                            )
+                            attempt=SimpleNamespace(cooldown_until=NOW + timedelta(hours=1))
                         ),
                     )
                     if field == cooldown_field
@@ -527,9 +617,9 @@ def test_cooldown_on_either_field_blocks_shared_worker_group(
     worker.assert_not_called()
     assert result.status == "skipped_cooldown"
     for field in ("formal_nav", "adjusted_return_series"):
-        attempt = context.audit_store.source_attempt_history(
-            "eastmoney_nav", field, "fund:123456"
-        )[0].attempt
+        attempt = context.audit_store.source_attempt_history("eastmoney_nav", field, "fund:123456")[
+            0
+        ].attempt
         assert attempt.outcome is SourceAttemptOutcome.SKIPPED_COOLDOWN
 
 
@@ -547,18 +637,14 @@ def test_deep_force_bypasses_group_cooldown_with_two_field_authorizations(
     projections = tuple(
         SimpleNamespace(
             state=(
-                SourceFieldState.COOLDOWN
-                if field == "formal_nav"
-                else SourceFieldState.NOT_CHECKED
+                SourceFieldState.COOLDOWN if field == "formal_nav" else SourceFieldState.NOT_CHECKED
             ),
             history=SimpleNamespace(
                 reference=SourceFieldRef("eastmoney_nav", field),
                 attempts=(
                     (
                         SimpleNamespace(
-                            attempt=SimpleNamespace(
-                                cooldown_until=NOW + timedelta(hours=1)
-                            )
+                            attempt=SimpleNamespace(cooldown_until=NOW + timedelta(hours=1))
                         ),
                     )
                     if field == "formal_nav"
@@ -589,9 +675,9 @@ def test_deep_force_bypasses_group_cooldown_with_two_field_authorizations(
     assert result.status == "success"
     assert len(calls) == 1
     for field in ("formal_nav", "adjusted_return_series"):
-        stored = context.audit_store.source_attempt_history(
-            "eastmoney_nav", field, "fund:123456"
-        )[0]
+        stored = context.audit_store.source_attempt_history("eastmoney_nav", field, "fund:123456")[
+            0
+        ]
         assert stored.authorization_id is not None
         assert stored.attempt.force_actor == "local_owner"
 
@@ -726,9 +812,10 @@ def test_nav_and_both_attempts_roll_back_when_second_attempt_write_fails(
             BoundedNavService(repository, worker_runner=worker).sync("123456", context)
 
     assert repository.fund_history("123456") == []
-    assert context.audit_store.source_attempt_history(
-        "eastmoney_nav", "formal_nav", "fund:123456"
-    ) == ()
+    assert (
+        context.audit_store.source_attempt_history("eastmoney_nav", "formal_nav", "fund:123456")
+        == ()
+    )
 
 
 def test_cancelled_late_worker_result_never_reaches_sqlite(tmp_path) -> None:
@@ -745,6 +832,7 @@ def test_cancelled_late_worker_result_never_reaches_sqlite(tmp_path) -> None:
         BoundedNavService(repository, worker_runner=worker).sync("123456", context)
 
     assert repository.fund_history("123456") == []
-    assert context.audit_store.source_attempt_history(
-        "eastmoney_nav", "formal_nav", "fund:123456"
-    ) == ()
+    assert (
+        context.audit_store.source_attempt_history("eastmoney_nav", "formal_nav", "fund:123456")
+        == ()
+    )

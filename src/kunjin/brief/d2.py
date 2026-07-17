@@ -17,12 +17,15 @@ from kunjin.brief.models import (
     BriefFact,
     RelationshipEvidence,
 )
-from kunjin.brief.policy import MAX_FACTS, MAX_RELATIONSHIPS
+from kunjin.brief.nav import ValidatedAdjustedNavSeries
+from kunjin.brief.policy import MAX_FACTS, MAX_RELATIONSHIPS, MIN_CORRELATION_SAMPLES
 from kunjin.decision.models import (
     MAX_TUPLE_ITEMS,
     EvidenceCompleteness,
     EvidenceFreshness,
     RequestMode,
+    SourceAttemptOutcome,
+    SourceTier,
     canonical_decimal,
     canonical_json_bytes,
     validate_aware_datetime,
@@ -32,12 +35,22 @@ from kunjin.decision.models import (
     validate_identifier_tuple,
     validate_request_id,
 )
+from kunjin.decision.store import DecisionAuditStore, DecisionAuditStoreError
+from kunjin.funds.models import AssetType, FundHolding
+from kunjin.funds.peers.analytics import (
+    PEER_CALCULATION_VERSION,
+    AdjustedReturnCorrelationResult,
+    decimal_adjusted_return_correlation,
+    pairwise_overlap,
+)
+from kunjin.funds.peers.models import PairwiseOverlap
 from kunjin.models import StoredPosition
 
 _FUND_CODE = re.compile(r"^[0-9]{6}$")
 _CURRENT_AGE = timedelta(days=1)
 _DATED_FALLBACK_AGE = timedelta(days=30)
 _MAX_POSITIONS = 1024
+_MAX_ADJUSTED_OBSERVATIONS = 1024
 _PROVENANCE_MAC_KEY = secrets.token_bytes(32)
 _RELATIONSHIP_METRIC_KEYS = {
     "duplicate_holding_identity": frozenset({"multiple_observations"}),
@@ -45,6 +58,53 @@ _RELATIONSHIP_METRIC_KEYS = {
     "same_manager": frozenset({"shared_manager_name"}),
     "same_company": frozenset({"company_name"}),
     "same_current_benchmark": frozenset({"benchmark_description", "exact_text_match"}),
+    "top10_disclosed_overlap": frozenset(
+        {
+            "calculation_version",
+            "left_scope",
+            "right_scope",
+            "left_disclosed_percent",
+            "right_disclosed_percent",
+            "left_unknown_percent",
+            "right_unknown_percent",
+            "overlap_percent",
+            "shared_exposures",
+        }
+    ),
+    "disclosed_overlap": frozenset(
+        {
+            "calculation_version",
+            "left_scope",
+            "right_scope",
+            "left_disclosed_percent",
+            "right_disclosed_percent",
+            "left_unknown_percent",
+            "right_unknown_percent",
+            "overlap_percent",
+            "shared_exposures",
+        }
+    ),
+    "adjusted_return_correlation": frozenset(
+        {
+            "aligned_observations",
+            "calculation_binding_mac",
+            "calculation_version",
+            "correlation",
+            "coverage",
+            "end_date",
+            "common_end_date",
+            "left_observations",
+            "left_series_binding_mac",
+            "left_source_attempt_id",
+            "left_fund_code",
+            "right_observations",
+            "right_series_binding_mac",
+            "right_source_attempt_id",
+            "right_fund_code",
+            "samples",
+            "start_date",
+        }
+    ),
 }
 
 
@@ -82,6 +142,146 @@ def _validate_relationship_semantics(relationship: RelationshipEvidence) -> None
             and relationship.evidence_state is BriefEvidenceState.PARTIAL
             and "benchmark_text_is_not_index_identity" in relationship.warnings
         )
+    elif relation_type in {"top10_disclosed_overlap", "disclosed_overlap"}:
+        shared = metrics["shared_exposures"]
+        valid = (
+            two_sided
+            and metrics["calculation_version"] == PEER_CALCULATION_VERSION
+            and metrics["left_scope"] in {"top10", "complete"}
+            and metrics["right_scope"] in {"top10", "complete"}
+            and type(shared) is tuple
+            and len(relationship.report_periods) == 2
+            and len(relationship.publication_times) == 2
+        )
+        for key in (
+            "left_disclosed_percent",
+            "right_disclosed_percent",
+            "left_unknown_percent",
+            "right_unknown_percent",
+            "overlap_percent",
+        ):
+            valid = valid and _is_canonical_percent(metrics[key])
+        if relation_type == "top10_disclosed_overlap":
+            valid = (
+                valid
+                and "top10" in {metrics["left_scope"], metrics["right_scope"]}
+                and relationship.evidence_state is BriefEvidenceState.PARTIAL
+                and "top10_scope_is_partial" in relationship.warnings
+            )
+        else:
+            valid = (
+                valid
+                and metrics["left_scope"] == "complete"
+                and metrics["right_scope"] == "complete"
+            )
+        expected_overlap = Decimal("0")
+        for item in shared:
+            valid = (
+                valid
+                and isinstance(item, Mapping)
+                and set(item)
+                == {
+                    "asset_class",
+                    "security_code",
+                    "security_name",
+                    "left_disclosed_percent",
+                    "right_disclosed_percent",
+                    "shared_percent",
+                }
+            )
+            if not valid:
+                break
+            valid = (
+                type(item["asset_class"]) is str
+                and item["asset_class"] in {member.value for member in AssetType}
+                and type(item["security_code"]) is str
+                and bool(item["security_code"])
+                and type(item["security_name"]) is str
+                and bool(item["security_name"])
+                and _is_canonical_percent(item["left_disclosed_percent"])
+                and _is_canonical_percent(item["right_disclosed_percent"])
+                and _is_canonical_percent(item["shared_percent"])
+            )
+            if valid:
+                shared_percent = Decimal(item["shared_percent"])
+                valid = shared_percent == min(
+                    Decimal(item["left_disclosed_percent"]),
+                    Decimal(item["right_disclosed_percent"]),
+                )
+                expected_overlap += shared_percent
+        valid = valid and canonical_decimal(expected_overlap) == metrics["overlap_percent"]
+    elif relation_type == "adjusted_return_correlation":
+        try:
+            correlation = Decimal(metrics["correlation"])
+            samples = int(metrics["samples"])
+            aligned_observations = int(metrics["aligned_observations"])
+            left_observations = int(metrics["left_observations"])
+            right_observations = int(metrics["right_observations"])
+            left_source_attempt_id = int(metrics["left_source_attempt_id"])
+            right_source_attempt_id = int(metrics["right_source_attempt_id"])
+            start_date = date.fromisoformat(metrics["start_date"])
+            end_date = date.fromisoformat(metrics["end_date"])
+            common_end_date = date.fromisoformat(metrics["common_end_date"])
+            authenticated_result = AdjustedReturnCorrelationResult(
+                left_fund_code=metrics["left_fund_code"],
+                right_fund_code=metrics["right_fund_code"],
+                left_source_attempt_id=left_source_attempt_id,
+                right_source_attempt_id=right_source_attempt_id,
+                left_series_binding_mac=metrics["left_series_binding_mac"],
+                right_series_binding_mac=metrics["right_series_binding_mac"],
+                status="success",
+                correlation=correlation,
+                samples=samples,
+                aligned_observations=aligned_observations,
+                left_observations=left_observations,
+                right_observations=right_observations,
+                effective_start=start_date,
+                effective_end=end_date,
+                calculation_version=metrics["calculation_version"],
+                insufficiency_codes=(),
+                binding_mac=metrics["calculation_binding_mac"],
+            )
+            authenticated_result.validate()
+        except (ArithmeticError, TypeError, ValueError):
+            valid = False
+        else:
+            valid = (
+                two_sided
+                and not relationship.report_periods
+                and relationship.evidence_state is BriefEvidenceState.COMPLETE
+                and set(relationship.fund_codes)
+                == {metrics["left_fund_code"], metrics["right_fund_code"]}
+                and metrics["calculation_version"] == "1"
+                and type(metrics["correlation"]) is str
+                and correlation.is_finite()
+                and canonical_decimal(correlation) == metrics["correlation"]
+                and Decimal("-1") <= correlation <= Decimal("1")
+                and type(metrics["samples"]) is str
+                and str(samples) == metrics["samples"]
+                and samples >= MIN_CORRELATION_SAMPLES
+                and all(
+                    type(metrics[key]) is str and str(value) == metrics[key]
+                    for key, value in (
+                        ("aligned_observations", aligned_observations),
+                        ("left_observations", left_observations),
+                        ("right_observations", right_observations),
+                        ("left_source_attempt_id", left_source_attempt_id),
+                        ("right_source_attempt_id", right_source_attempt_id),
+                    )
+                )
+                and aligned_observations == samples + 1
+                and left_observations >= aligned_observations
+                and right_observations >= aligned_observations
+                and type(metrics["start_date"]) is str
+                and type(metrics["end_date"]) is str
+                and type(metrics["common_end_date"]) is str
+                and start_date <= end_date == common_end_date
+                and metrics["coverage"] in {"full_input_alignment", "minimum_aligned_window"}
+                and (
+                    (metrics["coverage"] == "full_input_alignment")
+                    is (left_observations == right_observations == aligned_observations)
+                )
+            )
     else:
         valid = False
     if not valid or len(relationship.evidence_ids) != len(set(relationship.evidence_ids)):
@@ -109,6 +309,20 @@ def _ratio(value: Optional[str], name: str) -> None:
         raise ValueError(f"{name} must be a canonical ratio string or None") from None
     if canonical_decimal(parsed) != value or not Decimal("0") <= parsed <= Decimal("1"):
         raise ValueError(f"{name} must be in the closed interval [0, 1]")
+
+
+def _is_canonical_percent(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        parsed = Decimal(value)
+    except Exception:
+        return False
+    return (
+        parsed.is_finite()
+        and canonical_decimal(parsed) == value
+        and Decimal("0") <= parsed <= Decimal("100")
+    )
 
 
 @dataclass(frozen=True)
@@ -347,6 +561,31 @@ def _provenance_mac(value: D2PortfolioProvenance) -> str:
 
 
 @dataclass(frozen=True)
+class AdjustedReturnSeriesEvidence:
+    fund_code: str
+    series: ValidatedAdjustedNavSeries
+    evidence_fact: BriefFact
+
+    def validate(self) -> None:
+        if type(self) is not AdjustedReturnSeriesEvidence:
+            raise ValueError("adjusted return evidence subclasses are not accepted")
+        validate_exact_dataclass_state(self, "adjusted return series evidence")
+        _fund_code(self.fund_code, "adjusted return evidence fund code")
+        if type(self.series) is not ValidatedAdjustedNavSeries:
+            raise ValueError("adjusted return evidence requires an exact validated series")
+        if (
+            len(self.series.observations) > _MAX_ADJUSTED_OBSERVATIONS
+            or self.series.fund_code != self.fund_code
+        ):
+            raise ValueError("adjusted return series does not match its evidence subject")
+        if type(self.evidence_fact) is not BriefFact:
+            raise ValueError("adjusted return evidence requires an exact BriefFact")
+        self.evidence_fact.validate()
+        if self.evidence_fact.field_id != "adjusted_return_series":
+            raise ValueError("adjusted return evidence fact has the wrong field")
+
+
+@dataclass(frozen=True)
 class D2RelationshipSet:
     target_fund_code: str
     held_fund_codes: Tuple[str, ...]
@@ -356,6 +595,7 @@ class D2RelationshipSet:
     relationships: Tuple[RelationshipEvidence, ...]
     evidence_facts: Tuple[BriefFact, ...]
     coverage: BriefCoverage
+    holdings_coverage: BriefCoverage
     target_portfolio_weight: Optional[str]
     economic_exposure_weight: Optional[str]
     economic_exposure_hhi: Optional[str]
@@ -438,6 +678,9 @@ class D2RelationshipSet:
             "same_manager": "current_manager_team",
             "same_company": "identity_active_status",
             "same_current_benchmark": "current_benchmark",
+            "top10_disclosed_overlap": "holdings_industries",
+            "disclosed_overlap": "holdings_industries",
+            "adjusted_return_correlation": "adjusted_return_series",
         }
         for relationship in self.relationships:
             expected_field = expected_fields.get(relationship.relationship_type)
@@ -496,10 +739,84 @@ class D2RelationshipSet:
                         or _value(fact, "fund_company") != expected_company
                     ):
                         raise ValueError("D2 company evidence does not match its metric")
-            else:
+            elif relationship.relationship_type == "same_current_benchmark":
                 expected_benchmark = relationship.metrics["benchmark_description"]
                 if any(_value(fact, "description") != expected_benchmark for fact in supporting):
                     raise ValueError("D2 benchmark evidence does not match its metric")
+            elif relationship.relationship_type in {
+                "top10_disclosed_overlap",
+                "disclosed_overlap",
+            }:
+                holdings_by_subject: Dict[str, Tuple[FundHolding, ...]] = {}
+                for evidence_id, fact in zip(relationship.evidence_ids, supporting):
+                    subject = subject_by_id[evidence_id]
+                    records, _, issue, _ = _validated_holdings_fact(
+                        subject,
+                        (fact,),
+                        self.portfolio_provenance.as_of,
+                    )
+                    if issue is not None:
+                        raise ValueError("D2 overlap evidence is no longer valid")
+                    holdings_by_subject[subject] = records
+                left_code, right_code = relationship.fund_codes
+                try:
+                    overlap = pairwise_overlap(
+                        left_code,
+                        right_code,
+                        holdings_by_subject[left_code],
+                        holdings_by_subject[right_code],
+                    )
+                except ValueError:
+                    raise ValueError("D2 overlap cannot be reproduced") from None
+                left_scope = (
+                    "top10"
+                    if any(
+                        item.disclosure_scope == "top10"
+                        for item in holdings_by_subject[left_code]
+                        if item.report_period == overlap.left_report_period
+                    )
+                    else "complete"
+                )
+                right_scope = (
+                    "top10"
+                    if any(
+                        item.disclosure_scope == "top10"
+                        for item in holdings_by_subject[right_code]
+                        if item.report_period == overlap.right_report_period
+                    )
+                    else "complete"
+                )
+                if (
+                    relationship.relationship_type != overlap.metric_name
+                    or dict(relationship.metrics)
+                    != _overlap_metrics(overlap, left_scope, right_scope)
+                    or relationship.report_periods
+                    != (overlap.left_report_period, overlap.right_report_period)
+                    or relationship.publication_times
+                    != (
+                        _utc(overlap.left_published_at, "left holdings publication"),
+                        _utc(overlap.right_published_at, "right holdings publication"),
+                    )
+                    or relationship.warnings != _overlap_warnings(overlap)
+                ):
+                    raise ValueError("D2 overlap metrics do not match their evidence")
+            elif relationship.relationship_type == "adjusted_return_correlation":
+                attempt_by_code = {
+                    relationship.metrics["left_fund_code"]: relationship.metrics[
+                        "left_source_attempt_id"
+                    ],
+                    relationship.metrics["right_fund_code"]: relationship.metrics[
+                        "right_source_attempt_id"
+                    ],
+                }
+                for evidence_id, fact in zip(relationship.evidence_ids, supporting):
+                    subject = subject_by_id[evidence_id]
+                    if _value(fact, "fund_code") != subject or _value(
+                        fact, "source_attempt_id"
+                    ) != attempt_by_code.get(subject):
+                        raise ValueError(
+                            "D2 correlation evidence does not match its authenticated input"
+                        )
         if type(self.coverage) is not BriefCoverage:
             raise ValueError("D2 coverage must be an exact BriefCoverage")
         self.coverage.validate()
@@ -564,6 +881,76 @@ class D2RelationshipSet:
             expected_coverage_state = BriefEvidenceState.COMPLETE
         if self.coverage.evidence_state is not expected_coverage_state:
             raise ValueError("D2 coverage state does not match its evidence")
+        if type(self.holdings_coverage) is not BriefCoverage:
+            raise ValueError("D2 holdings coverage must be an exact BriefCoverage")
+        self.holdings_coverage.validate()
+        if (
+            self.holdings_coverage.scope != "disclosed_holdings_overlap"
+            or self.holdings_coverage.known_percent is not None
+        ):
+            raise ValueError("D2 holdings coverage has an invalid scope")
+        if set(self.holdings_coverage.included_fund_codes) | set(
+            self.holdings_coverage.omitted_fund_codes
+        ) != set(self.held_fund_codes):
+            raise ValueError("D2 holdings coverage does not partition held funds")
+        if set(self.holdings_coverage.evidence_ids) - available_evidence:
+            raise ValueError("D2 holdings coverage evidence does not resolve")
+        holdings_facts = tuple(facts_by_id[item] for item in self.holdings_coverage.evidence_ids)
+        if any(item.field_id != "holdings_industries" for item in holdings_facts):
+            raise ValueError("D2 holdings coverage contains unrelated evidence")
+        holdings_subjects = {
+            next(
+                (
+                    code
+                    for code in self.holdings_coverage.included_fund_codes
+                    if fact.fact_id.startswith(f"fund_{code}_")
+                ),
+                self.target_fund_code,
+            )
+            for fact in holdings_facts
+        }
+        if holdings_subjects != set(self.holdings_coverage.included_fund_codes):
+            raise ValueError("D2 holdings coverage evidence subjects are incomplete")
+        required_holdings_unknowns = {
+            f"holdings_industries_{code}" for code in self.holdings_coverage.omitted_fund_codes
+        }
+        if not required_holdings_unknowns.issubset(set(self.holdings_coverage.unknown_fields)):
+            raise ValueError("D2 holdings coverage conceals omitted evidence")
+        overlap_pairs = {
+            relationship.fund_codes
+            for relationship in self.relationships
+            if relationship.relationship_type in {"top10_disclosed_overlap", "disclosed_overlap"}
+        }
+        for candidate in self.held_fund_codes:
+            if (
+                candidate == self.target_fund_code
+                or self.target_fund_code not in self.holdings_coverage.included_fund_codes
+                or candidate not in self.holdings_coverage.included_fund_codes
+            ):
+                continue
+            pair = tuple(sorted((self.target_fund_code, candidate)))
+            unknown = f"holdings_pair_comparability_{pair[0]}_{pair[1]}"
+            if (pair in overlap_pairs) is (unknown in self.holdings_coverage.unknown_fields):
+                raise ValueError("D2 holdings coverage does not resolve pair comparability")
+        if (
+            self.portfolio_evidence_state == "unknown"
+            or not self.holdings_coverage.included_fund_codes
+        ):
+            expected_holdings_state = BriefEvidenceState.INSUFFICIENT
+        elif (
+            self.holdings_coverage.omitted_fund_codes
+            or self.holdings_coverage.unknown_fields
+            or any(
+                fact.completeness is not EvidenceCompleteness.COMPLETE
+                or fact.freshness is not EvidenceFreshness.CURRENT
+                for fact in holdings_facts
+            )
+        ):
+            expected_holdings_state = BriefEvidenceState.PARTIAL
+        else:
+            expected_holdings_state = BriefEvidenceState.COMPLETE
+        if self.holdings_coverage.evidence_state is not expected_holdings_state:
+            raise ValueError("D2 holdings coverage state does not match its evidence")
         ratio_fields = (
             (self.target_portfolio_weight, "target portfolio weight"),
             (self.economic_exposure_weight, "economic exposure weight"),
@@ -584,6 +971,9 @@ class D2RelationshipSet:
                 or self.coverage.included_fund_codes
                 or self.coverage.omitted_fund_codes
                 or self.coverage.evidence_ids
+                or self.holdings_coverage.included_fund_codes
+                or self.holdings_coverage.omitted_fund_codes
+                or self.holdings_coverage.evidence_ids
                 or self.position_present is not None
                 or any(value is not None for value, _ in ratio_fields)
             ):
@@ -683,6 +1073,251 @@ def _relationship_state(facts: Tuple[BriefFact, ...]) -> BriefEvidenceState:
     return BriefEvidenceState.PARTIAL
 
 
+def _validated_holdings_fact(
+    fund_code: str,
+    facts: Tuple[BriefFact, ...],
+    as_of: datetime,
+) -> Tuple[Tuple[FundHolding, ...], Optional[BriefFact], Optional[str], bool]:
+    selected = _field_facts(facts, "holdings_industries")
+    if not selected:
+        return (), None, f"holdings_evidence_missing_{fund_code}", False
+    if len(selected) != 1:
+        return (), None, f"holdings_evidence_conflict_{fund_code}", True
+    fact = selected[0]
+    if fact.retrieved_at > as_of:
+        return (), None, f"holdings_evidence_future_{fund_code}", True
+    if fact.freshness is not EvidenceFreshness.CURRENT:
+        return (), None, f"holdings_evidence_stale_{fund_code}", False
+    if fact.conflict_ids:
+        return (), None, f"holdings_evidence_conflict_{fund_code}", True
+    value = fact.value
+    if not isinstance(value, Mapping):
+        return (), None, f"holdings_evidence_malformed_{fund_code}", True
+    try:
+        report_period_raw = value["report_period"]
+        scopes = value["disclosure_scope"]
+        items = value["items"]
+        if type(report_period_raw) is not str:
+            raise ValueError
+        report_period = date.fromisoformat(report_period_raw)
+        if (
+            type(scopes) is not tuple
+            or len(scopes) != 1
+            or scopes[0] not in {"top10", "complete"}
+            or type(items) is not tuple
+            or not items
+            or len(items) > MAX_TUPLE_ITEMS
+            or fact.published_at is None
+            or fact.data_as_of is None
+            or fact.data_as_of.date() != report_period
+        ):
+            raise ValueError
+        scope = scopes[0]
+        holdings: List[FundHolding] = []
+        exposure_keys: set[Tuple[str, str]] = set()
+        ranks: set[int] = set()
+        for item in items:
+            if not isinstance(item, Mapping) or set(item) != {
+                "rank",
+                "security_code",
+                "security_name",
+                "asset_class",
+                "disclosed_weight",
+            }:
+                raise ValueError
+            rank_raw = item["rank"]
+            security_code = item["security_code"]
+            security_name = item["security_name"]
+            asset_class = item["asset_class"]
+            weight_raw = item["disclosed_weight"]
+            if (
+                type(rank_raw) is not str
+                or not rank_raw.isascii()
+                or not rank_raw.isdigit()
+                or str(int(rank_raw)) != rank_raw
+                or int(rank_raw) <= 0
+                or type(security_code) is not str
+                or not security_code
+                or type(security_name) is not str
+                or not security_name
+                or type(asset_class) is not str
+                or type(weight_raw) is not str
+            ):
+                raise ValueError
+            asset_type = AssetType(asset_class)
+            weight = Decimal(weight_raw)
+            if (
+                not weight.is_finite()
+                or canonical_decimal(weight) != weight_raw
+                or not Decimal("0") <= weight <= Decimal("100")
+            ):
+                raise ValueError
+            exposure_key = (asset_type.value, security_code)
+            if exposure_key in exposure_keys:
+                return (), None, f"holdings_duplicate_exposure_{fund_code}", True
+            if int(rank_raw) in ranks:
+                raise ValueError
+            exposure_keys.add(exposure_key)
+            ranks.add(int(rank_raw))
+            holding = FundHolding(
+                fund_code=fund_code,
+                report_period=report_period,
+                published_at=fact.published_at,
+                rank=int(rank_raw),
+                security_code=security_code,
+                security_name=security_name,
+                asset_type=asset_type,
+                weight=weight,
+                disclosure_scope=scope,
+                source_document_id=None,
+            )
+            holding.validate()
+            holdings.append(holding)
+        if sum((item.weight for item in holdings), Decimal("0")) > Decimal("100"):
+            raise ValueError
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return (), None, f"holdings_evidence_malformed_{fund_code}", True
+    return tuple(holdings), fact, None, False
+
+
+def _overlap_metrics(
+    overlap: PairwiseOverlap,
+    left_scope: str,
+    right_scope: str,
+) -> Dict[str, object]:
+    return {
+        "calculation_version": PEER_CALCULATION_VERSION,
+        "left_scope": left_scope,
+        "right_scope": right_scope,
+        "left_disclosed_percent": canonical_decimal(overlap.left_disclosed_weight),
+        "right_disclosed_percent": canonical_decimal(overlap.right_disclosed_weight),
+        "left_unknown_percent": canonical_decimal(Decimal("100") - overlap.left_disclosed_weight),
+        "right_unknown_percent": canonical_decimal(Decimal("100") - overlap.right_disclosed_weight),
+        "overlap_percent": canonical_decimal(overlap.overlap),
+        "shared_exposures": tuple(
+            {
+                "asset_class": item.exposure_type,
+                "security_code": item.exposure_code,
+                "security_name": item.exposure_name,
+                "left_disclosed_percent": canonical_decimal(item.left_weight),
+                "right_disclosed_percent": canonical_decimal(item.right_weight),
+                "shared_percent": canonical_decimal(item.shared_weight),
+            }
+            for item in overlap.shared
+        ),
+    }
+
+
+def _overlap_warnings(overlap: PairwiseOverlap) -> Tuple[str, ...]:
+    warnings = list(overlap.warnings)
+    if overlap.metric_name == "top10_disclosed_overlap":
+        warnings.append("top10_scope_is_partial")
+    return tuple(dict.fromkeys(warnings))
+
+
+def _validated_adjusted_series(
+    fund_code: str,
+    evidence: AdjustedReturnSeriesEvidence,
+    as_of: datetime,
+    audit_store: DecisionAuditStore,
+) -> Tuple[Optional[ValidatedAdjustedNavSeries], BriefFact, Optional[str], bool]:
+    evidence.validate()
+    fact = evidence.evidence_fact
+    if evidence.fund_code != fund_code:
+        return None, fact, f"adjusted_return_subject_mismatch_{fund_code}", True
+    if fact.retrieved_at > as_of:
+        return None, fact, f"adjusted_return_evidence_future_{fund_code}", True
+    if fact.freshness is not EvidenceFreshness.CURRENT:
+        return None, fact, f"adjusted_return_evidence_stale_{fund_code}", False
+    if fact.completeness is not EvidenceCompleteness.COMPLETE:
+        return None, fact, f"adjusted_return_evidence_incomplete_{fund_code}", False
+    if fact.conflict_ids:
+        return None, fact, f"adjusted_return_evidence_conflict_{fund_code}", True
+    series = evidence.series
+    observations = series.observations
+    if not observations:
+        return None, fact, f"adjusted_return_samples_insufficient_{fund_code}", False
+    try:
+        stored_attempt = audit_store.authenticated_source_attempt(series.source_attempt_id)
+    except (DecisionAuditStoreError, TypeError, ValueError):
+        return None, fact, f"adjusted_return_source_binding_invalid_{fund_code}", True
+    attempt = stored_attempt.attempt
+    expected_data_as_of = datetime.combine(
+        series.data_as_of,
+        datetime.min.time(),
+        tzinfo=timezone.utc,
+    )
+    if (
+        attempt.source_id != "eastmoney_nav"
+        or attempt.field_id != "formal_nav"
+        or attempt.subject_key != f"fund:{fund_code}"
+        or attempt.outcome is not SourceAttemptOutcome.SUCCESS
+        or attempt.data_as_of != expected_data_as_of
+        or not attempt.started_at <= series.retrieved_at <= attempt.finished_at
+        or attempt.finished_at > as_of
+    ):
+        return None, fact, f"adjusted_return_source_binding_invalid_{fund_code}", True
+    value = fact.value
+    expected_lineage = f"source_attempt_{series.source_attempt_id}"
+    expected_value = {
+        "fund_code": fund_code,
+        "sample_count": str(len(observations)),
+        "start_date": observations[0].nav_date.isoformat(),
+        "end_date": observations[-1].nav_date.isoformat(),
+        "corporate_action_state": "none",
+        "calculation_version": "1",
+        "source_attempt_id": str(series.source_attempt_id),
+    }
+    if (
+        not isinstance(value, Mapping)
+        or dict(value) != expected_value
+        or fact.source_id != "eastmoney_nav"
+        or fact.source_tier is not SourceTier.TIER_2
+        or fact.publisher != "东方财富"
+        or fact.canonical_url != f"https://fund.eastmoney.com/{fund_code}.html"
+        or not fact.calculated
+        or fact.retrieved_at != series.retrieved_at
+        or fact.data_as_of != expected_data_as_of
+        or fact.source_lineage_id != expected_lineage
+    ):
+        return None, fact, f"adjusted_return_evidence_binding_invalid_{fund_code}", True
+    return series, fact, None, False
+
+
+def _correlation_insufficiency_code(
+    code: str,
+    target_fund_code: str,
+    candidate_fund_code: str,
+) -> Tuple[str, bool]:
+    side_code = candidate_fund_code
+    base = code
+    if code.endswith("_left"):
+        side_code = target_fund_code
+        base = code[: -len("_left")]
+    elif code.endswith("_right"):
+        side_code = candidate_fund_code
+        base = code[: -len("_right")]
+    aliases = {
+        "adjusted_return_series_samples_insufficient": "adjusted_return_samples_insufficient",
+        "adjusted_return_accumulated_nav_unavailable": "adjusted_return_accumulated_nav_missing",
+        "adjusted_return_corporate_action_unresolved": "adjusted_return_discontinuity",
+    }
+    base = aliases.get(base, base)
+    is_conflict = any(
+        marker in base
+        for marker in (
+            "duplicate",
+            "subject_mismatch",
+            "discontinuity",
+            "source_binding_invalid",
+            "observation_invalid",
+            "date_order_invalid",
+            "correlation_invalid",
+        )
+    )
+    return f"{base}_{side_code}", is_conflict
+
+
 def build_d2_relationships(
     target_fund_code: str,
     portfolio: PortfolioEvidenceBinding,
@@ -691,6 +1326,8 @@ def build_d2_relationships(
     *,
     request_id: str,
     request_mode: RequestMode,
+    adjusted_series_by_fund: Optional[Mapping[str, AdjustedReturnSeriesEvidence]] = None,
+    decision_audit_store: Optional[DecisionAuditStore] = None,
 ) -> D2RelationshipSet:
     target_fund_code = _fund_code(target_fund_code, "target fund code")
     validate_request_id(request_id)
@@ -701,6 +1338,17 @@ def build_d2_relationships(
     portfolio.validate()
     if not isinstance(facts_by_fund, Mapping):
         raise ValueError("D2 facts must be a fund-code mapping")
+    adjusted_requested = adjusted_series_by_fund is not None
+    if adjusted_requested and type(decision_audit_store) is not DecisionAuditStore:
+        raise ValueError("D2 adjusted return evidence requires an exact audit store")
+    if adjusted_series_by_fund is None:
+        adjusted_series_by_fund = {}
+    if not isinstance(adjusted_series_by_fund, Mapping):
+        raise ValueError("D2 adjusted return evidence must be a fund-code mapping")
+    for code, evidence in adjusted_series_by_fund.items():
+        _fund_code(code, "D2 adjusted return mapping key")
+        if type(evidence) is not AdjustedReturnSeriesEvidence:
+            raise ValueError("D2 adjusted return mapping requires exact evidence")
     as_of = _utc(as_of, "D2 as-of time")
 
     missing: set[str] = set()
@@ -974,19 +1622,16 @@ def build_d2_relationships(
 
     relationships: List[RelationshipEvidence] = []
     projected: Dict[Tuple[str, str], BriefFact] = {}
-    target_fact_count = len({item.fact_id for item in facts.get(target_fund_code, ())})
-    candidate_fact_budget = max(0, MAX_FACTS - target_fact_count)
 
     def candidate_projection_fits(
         supporting: Tuple[Tuple[str, BriefFact], ...],
     ) -> bool:
-        new_candidate_keys = {
+        new_keys = {
             (code, fact.fact_id)
             for code, fact in supporting
-            if code != target_fund_code and (code, fact.fact_id) not in projected
+            if (code, fact.fact_id) not in projected
         }
-        projected_candidate_count = sum(1 for code, _ in projected if code != target_fund_code)
-        return projected_candidate_count + len(new_candidate_keys) <= candidate_fact_budget
+        return len(projected) + len(new_keys) <= MAX_FACTS
 
     def evidence_id(code: str, fact: BriefFact) -> str:
         key = (code, fact.fact_id)
@@ -1033,6 +1678,8 @@ def build_d2_relationships(
         *,
         force_partial: bool = False,
         relationship_warnings: Tuple[str, ...] = (),
+        report_periods: Tuple[date, ...] = (),
+        publication_times: Optional[Tuple[datetime, ...]] = None,
     ) -> Optional[RelationshipEvidence]:
         if len(relationships) >= MAX_RELATIONSHIPS:
             warnings.add("relationship_limit_reached")
@@ -1050,8 +1697,12 @@ def build_d2_relationships(
             evidence_state=state,
             metrics=dict(metrics),
             evidence_ids=tuple(evidence_id(code, fact) for code, fact in supporting),
-            report_periods=(),
-            publication_times=_publication_times(support_facts),
+            report_periods=report_periods,
+            publication_times=(
+                _publication_times(support_facts)
+                if publication_times is None
+                else publication_times
+            ),
             warnings=relationship_warnings,
         )
         relationship.validate()
@@ -1174,6 +1825,194 @@ def build_d2_relationships(
                 relationship_warnings=("benchmark_text_is_not_index_identity",),
             )
 
+    holdings_by_code: Dict[str, Tuple[FundHolding, ...]] = {}
+    holdings_fact_by_code: Dict[str, BriefFact] = {}
+    holdings_included: set[str] = set()
+    holdings_omitted: set[str] = set(held_codes)
+    holdings_unknowns: set[str] = {f"holdings_industries_{code}" for code in held_codes}
+    holdings_evidence_ids: set[str] = set()
+    if portfolio_state in {"current", "dated"}:
+        for code in comparison_codes:
+            if code not in companies:
+                continue
+            records, fact, issue, issue_is_conflict = _validated_holdings_fact(
+                code,
+                facts.get(code, ()),
+                as_of,
+            )
+            if issue is not None:
+                (conflicts if issue_is_conflict else missing).add(issue)
+                continue
+            assert fact is not None
+            holdings_by_code[code] = records
+            holdings_fact_by_code[code] = fact
+            if code not in held_codes:
+                continue
+            support = ((code, fact),)
+            if (
+                not candidate_projection_fits(support)
+                or len(holdings_evidence_ids) >= MAX_TUPLE_ITEMS
+            ):
+                warnings.add("d2_fact_budget_reached")
+                continue
+            holdings_included.add(code)
+            holdings_omitted.discard(code)
+            holdings_unknowns.discard(f"holdings_industries_{code}")
+            holdings_evidence_ids.add(evidence_id(code, fact))
+
+        for candidate in sorted(code for code in held_codes if code != target_fund_code):
+            pair_codes = tuple(sorted((target_fund_code, candidate)))
+            left_code, right_code = pair_codes
+            if left_code not in holdings_by_code or right_code not in holdings_by_code:
+                continue
+            pair_unknown = f"holdings_pair_comparability_{left_code}_{right_code}"
+            try:
+                overlap = pairwise_overlap(
+                    left_code,
+                    right_code,
+                    holdings_by_code[left_code],
+                    holdings_by_code[right_code],
+                )
+            except ValueError as exc:
+                if "within one quarter" in str(exc):
+                    missing.add(f"holdings_report_period_unaligned_{left_code}_{right_code}")
+                else:
+                    conflicts.add(f"holdings_overlap_invalid_{left_code}_{right_code}")
+                holdings_unknowns.add(pair_unknown)
+                continue
+            left_selected = tuple(
+                item
+                for item in holdings_by_code[left_code]
+                if item.report_period == overlap.left_report_period
+            )
+            right_selected = tuple(
+                item
+                for item in holdings_by_code[right_code]
+                if item.report_period == overlap.right_report_period
+            )
+            left_scope = (
+                "top10"
+                if any(item.disclosure_scope == "top10" for item in left_selected)
+                else "complete"
+            )
+            right_scope = (
+                "top10"
+                if any(item.disclosure_scope == "top10" for item in right_selected)
+                else "complete"
+            )
+            added_overlap = add_relationship(
+                overlap.metric_name,
+                left_code,
+                right_code,
+                (
+                    (left_code, holdings_fact_by_code[left_code]),
+                    (right_code, holdings_fact_by_code[right_code]),
+                ),
+                _overlap_metrics(overlap, left_scope, right_scope),
+                force_partial=(overlap.metric_name == "top10_disclosed_overlap"),
+                relationship_warnings=_overlap_warnings(overlap),
+                report_periods=(
+                    overlap.left_report_period,
+                    overlap.right_report_period,
+                ),
+                publication_times=(
+                    _utc(overlap.left_published_at, "left holdings publication"),
+                    _utc(overlap.right_published_at, "right holdings publication"),
+                ),
+            )
+            if added_overlap is None:
+                holdings_unknowns.add(pair_unknown)
+
+    if adjusted_requested and portfolio_state in {"current", "dated"}:
+        adjusted_series: Dict[str, ValidatedAdjustedNavSeries] = {}
+        adjusted_facts: Dict[str, BriefFact] = {}
+        for code in comparison_codes:
+            if code not in companies:
+                continue
+            evidence = adjusted_series_by_fund.get(code)
+            if evidence is None:
+                missing.add(f"adjusted_return_series_missing_{code}")
+                continue
+            series, fact, issue, issue_is_conflict = _validated_adjusted_series(
+                code,
+                evidence,
+                as_of,
+                decision_audit_store,
+            )
+            if issue is not None:
+                (conflicts if issue_is_conflict else missing).add(issue)
+                continue
+            assert series is not None
+            adjusted_series[code] = series
+            adjusted_facts[code] = fact
+
+        for candidate in sorted(code for code in held_codes if code != target_fund_code):
+            if target_fund_code not in adjusted_series or candidate not in adjusted_series:
+                continue
+            left = adjusted_series[target_fund_code]
+            right = adjusted_series[candidate]
+            correlation = decimal_adjusted_return_correlation(
+                left,
+                right,
+                minimum_samples=MIN_CORRELATION_SAMPLES,
+            )
+            if correlation.status != "success":
+                if correlation.aligned_observations == 0 and correlation.insufficiency_codes == (
+                    "adjusted_return_samples_insufficient",
+                ):
+                    missing.add(
+                        "adjusted_return_common_end_mismatch_"
+                        f"{min(target_fund_code, candidate)}_"
+                        f"{max(target_fund_code, candidate)}"
+                    )
+                    continue
+                for issue in correlation.insufficiency_codes:
+                    mapped, issue_is_conflict = _correlation_insufficiency_code(
+                        issue,
+                        target_fund_code,
+                        candidate,
+                    )
+                    (conflicts if issue_is_conflict else missing).add(mapped)
+                continue
+            assert correlation.correlation is not None
+            assert correlation.effective_start is not None
+            assert correlation.effective_end is not None
+            full_alignment = (
+                correlation.aligned_observations
+                == correlation.left_observations
+                == correlation.right_observations
+            )
+            add_relationship(
+                "adjusted_return_correlation",
+                target_fund_code,
+                candidate,
+                (
+                    (target_fund_code, adjusted_facts[target_fund_code]),
+                    (candidate, adjusted_facts[candidate]),
+                ),
+                {
+                    "calculation_binding_mac": correlation.binding_mac,
+                    "calculation_version": correlation.calculation_version,
+                    "correlation": canonical_decimal(correlation.correlation),
+                    "left_fund_code": correlation.left_fund_code,
+                    "right_fund_code": correlation.right_fund_code,
+                    "left_series_binding_mac": correlation.left_series_binding_mac,
+                    "right_series_binding_mac": correlation.right_series_binding_mac,
+                    "left_source_attempt_id": str(correlation.left_source_attempt_id),
+                    "right_source_attempt_id": str(correlation.right_source_attempt_id),
+                    "samples": str(correlation.samples),
+                    "aligned_observations": str(correlation.aligned_observations),
+                    "left_observations": str(correlation.left_observations),
+                    "right_observations": str(correlation.right_observations),
+                    "start_date": correlation.effective_start.isoformat(),
+                    "end_date": correlation.effective_end.isoformat(),
+                    "common_end_date": correlation.effective_end.isoformat(),
+                    "coverage": (
+                        "full_input_alignment" if full_alignment else "minimum_aligned_window"
+                    ),
+                },
+            )
+
     position_present: Optional[bool] = None
     target_weight: Optional[str] = None
     economic_weight: Optional[str] = None
@@ -1246,6 +2085,34 @@ def build_d2_relationships(
         evidence_ids=tuple(sorted(coverage_fact_ids)),
     )
     coverage.validate()
+    holdings_facts = tuple(
+        projected[(code, holdings_fact_by_code[code].fact_id)] for code in sorted(holdings_included)
+    )
+    if not holdings_included:
+        holdings_coverage_state = BriefEvidenceState.INSUFFICIENT
+    elif (
+        holdings_omitted
+        or holdings_unknowns
+        or any(
+            fact.completeness is not EvidenceCompleteness.COMPLETE
+            or fact.freshness is not EvidenceFreshness.CURRENT
+            for fact in holdings_facts
+        )
+    ):
+        holdings_coverage_state = BriefEvidenceState.PARTIAL
+    else:
+        holdings_coverage_state = BriefEvidenceState.COMPLETE
+    holdings_coverage = BriefCoverage(
+        coverage_id="d2_disclosed_holdings_coverage",
+        scope="disclosed_holdings_overlap",
+        evidence_state=holdings_coverage_state,
+        included_fund_codes=tuple(sorted(holdings_included)),
+        omitted_fund_codes=tuple(sorted(holdings_omitted)),
+        known_percent=None,
+        unknown_fields=tuple(sorted(holdings_unknowns)),
+        evidence_ids=tuple(sorted(holdings_evidence_ids)),
+    )
+    holdings_coverage.validate()
     result = D2RelationshipSet(
         target_fund_code=target_fund_code,
         held_fund_codes=held_codes,
@@ -1255,6 +2122,7 @@ def build_d2_relationships(
         relationships=tuple(sorted(relationships, key=lambda item: item.relationship_id)),
         evidence_facts=tuple(sorted(projected.values(), key=lambda item: item.fact_id)),
         coverage=coverage,
+        holdings_coverage=holdings_coverage,
         target_portfolio_weight=target_weight,
         economic_exposure_weight=economic_weight,
         economic_exposure_hhi=economic_hhi,

@@ -1,26 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
 from kunjin.brief.d2 import (
+    AdjustedReturnSeriesEvidence,
     D2RelationshipSet,
     PortfolioEvidenceBinding,
     build_d2_relationships,
 )
 from kunjin.brief.facts import SourceLinkedFactSet
 from kunjin.brief.models import BriefEvidenceState, BriefFact
+from kunjin.brief.nav import _seal_validated_adjusted_nav_series
 from kunjin.brief.policy import MAX_FACTS
+from kunjin.decision.budget import RequestBudget
 from kunjin.decision.models import (
     EvidenceCompleteness,
     EvidenceFreshness,
     RequestMode,
+    SourceAttempt,
+    SourceAttemptOutcome,
     SourceTier,
 )
-from kunjin.models import StoredPosition
+from kunjin.decision.source_registry import SOURCE_REGISTRY_V1_CHECKSUM
+from kunjin.decision.store import DecisionAuditStore
+from kunjin.models import FundNavObservation, StoredPosition
+from kunjin.storage.repository import Repository
 
 NOW = datetime(2026, 7, 17, 8, 0, tzinfo=timezone.utc)
 REQUEST_ID = "1234567890abcdef1234567890abcdef"
@@ -168,7 +176,16 @@ def _build(
     snapshot_complete: bool = True,
     source_state: str = "same_request_success",
     observed_at: datetime | None = None,
+    adjusted_series_by_fund: object = None,
+    decision_audit_store: DecisionAuditStore | None = None,
 ) -> D2RelationshipSet:
+    optional = (
+        {}
+        if adjusted_series_by_fund is None
+        else {"adjusted_series_by_fund": adjusted_series_by_fund}
+    )
+    if decision_audit_store is not None:
+        optional["decision_audit_store"] = decision_audit_store
     return build_d2_relationships(
         target,
         _binding(
@@ -181,7 +198,194 @@ def _build(
         as_of,
         request_id=REQUEST_ID,
         request_mode=RequestMode.RAPID,
+        **optional,
     )
+
+
+def _holding_fact(
+    code: str,
+    *,
+    report_period: date = date(2026, 6, 30),
+    published_at: datetime = NOW - timedelta(days=2),
+    scope: str = "top10",
+    items: tuple[dict[str, object], ...],
+    freshness: EvidenceFreshness = EvidenceFreshness.CURRENT,
+    conflict_ids: tuple[str, ...] = (),
+    fact_id: str = "disclosed_holdings_1",
+) -> BriefFact:
+    fact = _fact(
+        code,
+        "holdings_industries",
+        {
+            "report_period": report_period.isoformat(),
+            "disclosure_scope": (scope,),
+            "items": items,
+        },
+        fact_id=fact_id,
+        conflict_ids=conflict_ids,
+    )
+    return replace(
+        fact,
+        data_as_of=datetime.combine(report_period, datetime.min.time(), tzinfo=timezone.utc),
+        published_at=published_at,
+        freshness=freshness,
+        completeness=(
+            EvidenceCompleteness.PARTIAL if scope == "top10" else EvidenceCompleteness.COMPLETE
+        ),
+    )
+
+
+def _holding_item(
+    security_code: str,
+    security_name: str,
+    disclosed_weight: str,
+    *,
+    rank: str = "1",
+    asset_class: str = "stock",
+) -> dict[str, object]:
+    return {
+        "rank": rank,
+        "security_code": security_code,
+        "security_name": security_name,
+        "asset_class": asset_class,
+        "disclosed_weight": disclosed_weight,
+    }
+
+
+def _adjusted_fact(code: str, observations: tuple[FundNavObservation, ...]) -> BriefFact:
+    fact = _fact(
+        code,
+        "adjusted_return_series",
+        {
+            "fund_code": code,
+            "sample_count": str(len(observations)),
+            "start_date": observations[0].nav_date.isoformat(),
+            "end_date": observations[-1].nav_date.isoformat(),
+            "corporate_action_state": "none",
+            "calculation_version": "1",
+            "source_attempt_id": str(observations[0].source_attempt_id),
+        },
+        fact_id="adjusted_return_series_1",
+    )
+    return replace(
+        fact,
+        source_id="eastmoney_nav",
+        canonical_url=f"https://fund.eastmoney.com/{code}.html",
+        completeness=EvidenceCompleteness.COMPLETE,
+        calculated=True,
+        data_as_of=datetime.combine(
+            observations[-1].nav_date,
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        ),
+        source_lineage_id=f"source_attempt_{observations[0].source_attempt_id}",
+    )
+
+
+def _adjusted_rows(
+    code: str,
+    *,
+    count: int = 61,
+    scale: str = "1",
+    accumulated: bool = True,
+    corporate_action_state: str = "none",
+    duplicate_last_date: bool = False,
+    flat: bool = False,
+    start_offset_days: int = 0,
+    source_attempt_id: int = 1,
+) -> tuple[FundNavObservation, ...]:
+    rows = []
+    factor = Decimal(scale)
+    previous_nav: Decimal | None = None
+    for index in range(count):
+        nav_date = date(2026, 1, 1) + timedelta(days=start_offset_days + index)
+        if duplicate_last_date and index == count - 1:
+            nav_date -= timedelta(days=1)
+        accumulated_nav = (
+            Decimal("1")
+            if flat
+            else factor * (Decimal("1") + Decimal(index * index) / Decimal("10000"))
+        )
+        daily_growth = (
+            Decimal("0")
+            if previous_nav is None
+            else (accumulated_nav / previous_nav - Decimal("1")) * Decimal("100")
+        )
+        rows.append(
+            FundNavObservation(
+                fund_code=code,
+                nav_date=nav_date,
+                unit_nav=accumulated_nav,
+                accumulated_nav=(accumulated_nav if accumulated else None),
+                daily_growth=daily_growth,
+                source="eastmoney",
+                retrieved_at=NOW,
+                corporate_action_state=corporate_action_state,
+                source_attempt_id=source_attempt_id,
+            )
+        )
+        previous_nav = accumulated_nav
+    return tuple(rows)
+
+
+def _series(code: str, rows: tuple[FundNavObservation, ...]):
+    return AdjustedReturnSeriesEvidence(
+        fund_code=code,
+        series=_seal_validated_adjusted_nav_series(
+            fund_code=code,
+            observations=rows,
+            source_attempt_id=rows[0].source_attempt_id or 0,
+            retrieved_at=rows[0].retrieved_at,
+            data_as_of=rows[-1].nav_date,
+        ),
+        evidence_fact=_adjusted_fact(code, rows),
+    )
+
+
+def _adjusted_audit_store(
+    tmp_path,
+    data_as_of_by_code: dict[str, date],
+    *,
+    finished_at: datetime = NOW,
+) -> tuple[DecisionAuditStore, dict[str, int]]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    repository = Repository(tmp_path / "d2-audit.db")
+    repository.migrate()
+    store = DecisionAuditStore(repository)
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id="a" * 32,
+        monotonic=lambda: 1.0,
+        wall_clock=lambda: NOW - timedelta(seconds=30),
+    )
+    request_run_id = store.begin_request(budget)
+    attempt_ids = {}
+    for code, data_as_of in sorted(data_as_of_by_code.items()):
+        attempt_ids[code] = store.record_source_attempt(
+            request_run_id,
+            SourceAttempt(
+                source_id="eastmoney_nav",
+                field_id="formal_nav",
+                subject_key=f"fund:{code}",
+                attempt_number=1,
+                outcome=SourceAttemptOutcome.SUCCESS,
+                started_at=NOW - timedelta(seconds=1),
+                finished_at=finished_at,
+                data_as_of=datetime.combine(
+                    data_as_of,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                ),
+                error_code=None,
+                cooldown_until=None,
+                force_actor=None,
+                force_reason=None,
+                registry_version="1",
+                registry_checksum=SOURCE_REGISTRY_V1_CHECKSUM,
+                response_bytes=1,
+            ),
+        )
+    return store, attempt_ids
 
 
 def test_position_multi_account_and_sibling_economic_aggregation_is_private_safe() -> None:
@@ -687,9 +891,7 @@ def test_supporting_fact_budget_preserves_snapshot_fact_bound() -> None:
 
     result = _build("100001", tuple(positions), fact_sets)
 
-    target_fact_ids = {item.fact_id for item in fact_sets["100001"]}
-    merged_ids = target_fact_ids | {item.fact_id for item in result.evidence_facts}
-    assert len(merged_ids) <= MAX_FACTS
+    assert len(result.evidence_facts) <= MAX_FACTS
     assert all(
         set(item.evidence_ids) <= {fact.fact_id for fact in result.evidence_facts}
         for item in result.relationships
@@ -697,7 +899,32 @@ def test_supporting_fact_budget_preserves_snapshot_fact_bound() -> None:
     assert "d2_fact_budget_reached" in result.warnings
 
 
-def test_fact_budget_cannot_change_economic_exposure_without_sibling_evidence() -> None:
+def test_irrelevant_target_facts_do_not_consume_projection_budget() -> None:
+    target_base = _facts("100001", company="甲", manager="甲", benchmark="基准甲")
+    irrelevant = tuple(
+        _fact(
+            "100001",
+            "irrelevant_public_fact",
+            {"label": f"value_{index}"},
+            fact_id=f"irrelevant_public_fact_{index}",
+        )
+        for index in range(MAX_FACTS - len(target_base))
+    )
+    result = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        {
+            "100001": target_base + irrelevant,
+            "200001": _facts("200001", company="乙", manager="乙", benchmark="基准乙"),
+        },
+    )
+
+    assert result.coverage.included_fund_codes == ("100001", "200001")
+    assert "d2_fact_budget_reached" not in result.warnings
+    assert len(result.evidence_facts) <= MAX_FACTS
+
+
+def test_fact_budget_uses_projected_sibling_evidence_for_economic_exposure() -> None:
     target_base = _facts(
         "100001",
         company="甲",
@@ -732,9 +959,9 @@ def test_fact_budget_cannot_change_economic_exposure_without_sibling_evidence() 
     )
 
     assert result.target_portfolio_weight == "0.5"
-    assert result.economic_exposure_weight == "0.5"
-    assert not any(item.relationship_type == "share_class_sibling" for item in result.relationships)
-    assert "d2_fact_budget_reached" in result.warnings
+    assert result.economic_exposure_weight == "1"
+    assert any(item.relationship_type == "share_class_sibling" for item in result.relationships)
+    assert "d2_fact_budget_reached" not in result.warnings
 
 
 def test_relationship_metrics_are_exact_per_type() -> None:
@@ -937,3 +1164,539 @@ def test_same_request_window_is_bounded_by_rapid_or_deep_policy() -> None:
             request_started_at=NOW - timedelta(hours=23),
             request_deadline_at=NOW + timedelta(minutes=1),
         ).validate()
+
+
+def test_holdings_overlap_preserves_top10_coverage_shared_min_and_scoped_evidence() -> None:
+    left_published = NOW - timedelta(days=2)
+    right_published = NOW - timedelta(days=1)
+    left_holding = _holding_fact(
+        "100001",
+        published_at=left_published,
+        items=(
+            _holding_item("600000", "浦发银行", "5"),
+            _holding_item("600519", "贵州茅台", "3", rank="2"),
+        ),
+    )
+    right_holding = _holding_fact(
+        "200001",
+        published_at=right_published,
+        items=(
+            _holding_item("600000", "浦发银行", "2"),
+            _holding_item("000001", "平安银行", "4", rank="2"),
+        ),
+    )
+    result = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        {
+            "100001": _facts("100001", company="甲", manager="甲", benchmark="甲")
+            + (left_holding,),
+            "200001": _facts("200001", company="乙", manager="乙", benchmark="乙")
+            + (right_holding,),
+        },
+    )
+
+    overlap = next(
+        item for item in result.relationships if item.relationship_type == "top10_disclosed_overlap"
+    )
+    assert overlap.evidence_state is BriefEvidenceState.PARTIAL
+    assert overlap.fund_codes == ("100001", "200001")
+    assert overlap.report_periods == (date(2026, 6, 30), date(2026, 6, 30))
+    assert overlap.publication_times == (left_published, right_published)
+    assert overlap.metrics == {
+        "calculation_version": "1",
+        "left_scope": "top10",
+        "right_scope": "top10",
+        "left_disclosed_percent": "8",
+        "right_disclosed_percent": "6",
+        "left_unknown_percent": "92",
+        "right_unknown_percent": "94",
+        "overlap_percent": "2",
+        "shared_exposures": (
+            {
+                "asset_class": "stock",
+                "security_code": "600000",
+                "security_name": "浦发银行",
+                "left_disclosed_percent": "5",
+                "right_disclosed_percent": "2",
+                "shared_percent": "2",
+            },
+        ),
+    }
+    assert "top10_scope_is_partial" in overlap.warnings
+    supporting = {item.fact_id: item for item in result.evidence_facts}
+    assert len(overlap.evidence_ids) == 2
+    assert all(supporting[item].field_id == "holdings_industries" for item in overlap.evidence_ids)
+    assert any(item.startswith("fund_200001_") for item in overlap.evidence_ids)
+    assert result.holdings_coverage.scope == "disclosed_holdings_overlap"
+    assert result.holdings_coverage.included_fund_codes == ("100001", "200001")
+    assert result.holdings_coverage.omitted_fund_codes == ()
+    assert result.holdings_coverage.known_percent is None
+    assert set(result.holdings_coverage.evidence_ids) == set(overlap.evidence_ids)
+    assert result.holdings_coverage is not result.coverage
+
+    tampered_metrics = dict(overlap.metrics)
+    tampered_metrics["left_unknown_percent"] = "0"
+    with pytest.raises(ValueError, match="overlap metrics"):
+        replace(
+            result,
+            relationships=(replace(overlap, metrics=tampered_metrics),),
+        ).validate()
+
+
+def test_holdings_overlap_adjacent_complete_period_warns_and_cross_quarter_is_unknown() -> None:
+    left = _holding_fact(
+        "100001",
+        scope="complete",
+        report_period=date(2026, 6, 30),
+        items=(_holding_item("600000", "浦发银行", "5"),),
+    )
+    adjacent = _holding_fact(
+        "200001",
+        scope="complete",
+        report_period=date(2026, 3, 31),
+        items=(_holding_item("600000", "浦发银行", "2"),),
+    )
+    facts = {
+        "100001": _facts("100001", company="甲", manager="甲", benchmark="甲") + (left,),
+        "200001": _facts("200001", company="乙", manager="乙", benchmark="乙") + (adjacent,),
+    }
+    result = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        facts,
+    )
+    overlap = next(
+        item for item in result.relationships if item.relationship_type == "disclosed_overlap"
+    )
+    assert overlap.report_periods == (date(2026, 6, 30), date(2026, 3, 31))
+    assert "report_period_mismatch" in overlap.warnings
+
+    too_old = replace(
+        adjacent,
+        value={
+            **dict(adjacent.value),
+            "report_period": "2025-09-30",
+        },
+        data_as_of=datetime(2025, 9, 30, tzinfo=timezone.utc),
+    )
+    unavailable = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        {**facts, "200001": facts["200001"][:-1] + (too_old,)},
+    )
+    assert not any(
+        item.relationship_type in {"top10_disclosed_overlap", "disclosed_overlap"}
+        for item in unavailable.relationships
+    )
+    assert "holdings_report_period_unaligned_100001_200001" in unavailable.missing_fields
+    assert unavailable.holdings_coverage.evidence_state is BriefEvidenceState.PARTIAL
+    assert (
+        "holdings_pair_comparability_100001_200001" in unavailable.holdings_coverage.unknown_fields
+    )
+
+
+def test_zero_top10_overlap_is_only_zero_inside_disclosed_scope() -> None:
+    result = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        {
+            "100001": _facts("100001", company="甲", manager="甲", benchmark="甲")
+            + (
+                _holding_fact(
+                    "100001",
+                    items=(_holding_item("600000", "浦发银行", "5"),),
+                ),
+            ),
+            "200001": _facts("200001", company="乙", manager="乙", benchmark="乙")
+            + (
+                _holding_fact(
+                    "200001",
+                    items=(_holding_item("000001", "平安银行", "4"),),
+                ),
+            ),
+        },
+    )
+    overlap = next(
+        item for item in result.relationships if item.relationship_type == "top10_disclosed_overlap"
+    )
+    assert overlap.metrics["overlap_percent"] == "0"
+    assert overlap.metrics["left_unknown_percent"] == "95"
+    assert overlap.metrics["right_unknown_percent"] == "96"
+    assert overlap.evidence_state is BriefEvidenceState.PARTIAL
+    assert "top10_scope_is_partial" in overlap.warnings
+
+
+def test_invalid_holdings_are_omitted_and_never_zero_filled() -> None:
+    valid = _holding_fact(
+        "100001",
+        items=(_holding_item("600000", "浦发银行", "5"),),
+    )
+    candidate_base = _facts("200001", company="乙", manager="乙", benchmark="乙")
+    variants = (
+        ((), "holdings_evidence_missing_200001"),
+        (
+            (
+                replace(
+                    _holding_fact(
+                        "200001",
+                        items=(_holding_item("600000", "浦发银行", "2"),),
+                    ),
+                    freshness=EvidenceFreshness.STALE,
+                ),
+            ),
+            "holdings_evidence_stale_200001",
+        ),
+        (
+            (
+                replace(
+                    _holding_fact(
+                        "200001",
+                        items=(_holding_item("600000", "浦发银行", "2"),),
+                    ),
+                    retrieved_at=NOW + timedelta(seconds=1),
+                ),
+            ),
+            "holdings_evidence_future_200001",
+        ),
+        (
+            (
+                _holding_fact(
+                    "200001",
+                    items=(_holding_item("600000", "浦发银行", "2"),),
+                    conflict_ids=("holding_conflict",),
+                ),
+            ),
+            "holdings_evidence_conflict_200001",
+        ),
+        (
+            (
+                _holding_fact(
+                    "200001",
+                    items=({"rank": "1", "security_code": "600000"},),
+                ),
+            ),
+            "holdings_evidence_malformed_200001",
+        ),
+        (
+            (
+                _holding_fact(
+                    "200001",
+                    items=(
+                        _holding_item("600000", "浦发银行", "2"),
+                        _holding_item("600000", "浦发银行", "1", rank="2"),
+                    ),
+                ),
+            ),
+            "holdings_duplicate_exposure_200001",
+        ),
+    )
+    for candidate_holdings, expected_code in variants:
+        result = _build(
+            "100001",
+            (_position("100001", "50"), _position("200001", "50")),
+            {
+                "100001": _facts("100001", company="甲", manager="甲", benchmark="甲") + (valid,),
+                "200001": candidate_base + candidate_holdings,
+            },
+        )
+        assert not any(
+            item.relationship_type in {"top10_disclosed_overlap", "disclosed_overlap"}
+            for item in result.relationships
+        )
+        assert expected_code in result.missing_fields + result.conflicts
+        assert "200001" in result.holdings_coverage.omitted_fund_codes
+        assert "holdings_industries_200001" in result.holdings_coverage.unknown_fields
+
+
+def test_identity_conflict_blocks_holdings_overlap_even_with_valid_disclosure() -> None:
+    target = _facts("100001", company="甲", manager="甲", benchmark="甲") + (
+        _holding_fact(
+            "100001",
+            items=(_holding_item("600000", "浦发银行", "5"),),
+        ),
+    )
+    candidate = _facts("200001", company="乙", manager="乙", benchmark="乙")
+    mismatched_identity = replace(
+        candidate[0],
+        value={"fund_code": "999999", "fund_company": "乙"},
+    )
+    result = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        {
+            "100001": target,
+            "200001": (mismatched_identity,)
+            + candidate[1:]
+            + (
+                _holding_fact(
+                    "200001",
+                    items=(_holding_item("600000", "浦发银行", "2"),),
+                ),
+            ),
+        },
+    )
+
+    assert "identity_subject_conflict_200001" in result.conflicts
+    assert not any(
+        item.relationship_type in {"top10_disclosed_overlap", "disclosed_overlap"}
+        for item in result.relationships
+    )
+    assert "200001" in result.holdings_coverage.omitted_fund_codes
+
+
+def test_validated_adjusted_return_series_builds_separate_correlation_relationship(
+    tmp_path,
+) -> None:
+    data_as_of = date(2026, 3, 2)
+    audit_store, attempt_ids = _adjusted_audit_store(
+        tmp_path,
+        {"100001": data_as_of, "200001": data_as_of},
+    )
+    left_rows = _adjusted_rows("100001", source_attempt_id=attempt_ids["100001"])
+    right_rows = _adjusted_rows("200001", scale="2", source_attempt_id=attempt_ids["200001"])
+    left_series = _series("100001", left_rows)
+    right_series = _series("200001", right_rows)
+    result = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        {
+            "100001": _facts("100001", company="甲", manager="甲", benchmark="甲"),
+            "200001": _facts("200001", company="乙", manager="乙", benchmark="乙"),
+        },
+        adjusted_series_by_fund={
+            "100001": left_series,
+            "200001": right_series,
+        },
+        decision_audit_store=audit_store,
+    )
+    correlation = next(
+        item
+        for item in result.relationships
+        if item.relationship_type == "adjusted_return_correlation"
+    )
+    assert correlation.evidence_state is BriefEvidenceState.COMPLETE
+    metrics = dict(correlation.metrics)
+    calculation_binding_mac = metrics.pop("calculation_binding_mac")
+    assert len(calculation_binding_mac) == 64
+    assert metrics == {
+        "aligned_observations": "61",
+        "calculation_version": "1",
+        "correlation": "1",
+        "coverage": "full_input_alignment",
+        "left_fund_code": "100001",
+        "left_observations": "61",
+        "left_series_binding_mac": left_series.series.binding_mac,
+        "left_source_attempt_id": str(attempt_ids["100001"]),
+        "right_fund_code": "200001",
+        "right_observations": "61",
+        "right_series_binding_mac": right_series.series.binding_mac,
+        "right_source_attempt_id": str(attempt_ids["200001"]),
+        "samples": "60",
+        "start_date": left_rows[0].nav_date.isoformat(),
+        "end_date": left_rows[-1].nav_date.isoformat(),
+        "common_end_date": left_rows[-1].nav_date.isoformat(),
+    }
+    assert correlation.report_periods == ()
+    assert len(correlation.evidence_ids) == 2
+    assert all(
+        next(item for item in result.evidence_facts if item.fact_id == evidence_id).field_id
+        == "adjusted_return_series"
+        for evidence_id in correlation.evidence_ids
+    )
+    assert not any(
+        item.relationship_type in {"top10_disclosed_overlap", "disclosed_overlap"}
+        for item in result.relationships
+    )
+    tampered_metrics = dict(correlation.metrics)
+    tampered_metrics["correlation"] = "0.5"
+    with pytest.raises(ValueError, match="semantics"):
+        replace(
+            result,
+            relationships=(replace(correlation, metrics=tampered_metrics),),
+        ).validate()
+
+
+def test_adjusted_series_fact_must_bind_subject_batch_and_window(tmp_path) -> None:
+    data_as_of = date(2026, 3, 2)
+    audit_store, attempt_ids = _adjusted_audit_store(
+        tmp_path,
+        {"100001": data_as_of, "200001": data_as_of},
+    )
+    left = _series(
+        "100001",
+        _adjusted_rows("100001", source_attempt_id=attempt_ids["100001"]),
+    )
+    right = _series(
+        "200001",
+        _adjusted_rows(
+            "200001",
+            scale="2",
+            source_attempt_id=attempt_ids["200001"],
+        ),
+    )
+    with pytest.raises(ValueError, match="requires an exact audit store"):
+        _build(
+            "100001",
+            (_position("100001", "50"), _position("200001", "50")),
+            {
+                "100001": _facts("100001", company="甲", manager="甲", benchmark="甲"),
+                "200001": _facts("200001", company="乙", manager="乙", benchmark="乙"),
+            },
+            adjusted_series_by_fund={"100001": left, "200001": right},
+        )
+    forged_fact = replace(
+        right.evidence_fact,
+        value={**dict(right.evidence_fact.value), "sample_count": "999"},
+    )
+    result = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        {
+            "100001": _facts("100001", company="甲", manager="甲", benchmark="甲"),
+            "200001": _facts("200001", company="乙", manager="乙", benchmark="乙"),
+        },
+        adjusted_series_by_fund={
+            "100001": left,
+            "200001": replace(right, evidence_fact=forged_fact),
+        },
+        decision_audit_store=audit_store,
+    )
+
+    assert not any(
+        item.relationship_type == "adjusted_return_correlation" for item in result.relationships
+    )
+    assert "adjusted_return_evidence_binding_invalid_200001" in result.conflicts
+
+    wrong_url = replace(
+        right.evidence_fact,
+        canonical_url="https://fund.eastmoney.com/100001.html",
+    )
+    wrong_url_result = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        {
+            "100001": _facts("100001", company="甲", manager="甲", benchmark="甲"),
+            "200001": _facts("200001", company="乙", manager="乙", benchmark="乙"),
+        },
+        adjusted_series_by_fund={
+            "100001": left,
+            "200001": replace(right, evidence_fact=wrong_url),
+        },
+        decision_audit_store=audit_store,
+    )
+    assert not any(
+        item.relationship_type == "adjusted_return_correlation"
+        for item in wrong_url_result.relationships
+    )
+    assert "adjusted_return_evidence_binding_invalid_200001" in wrong_url_result.conflicts
+
+    future_store, future_ids = _adjusted_audit_store(
+        tmp_path / "future_attempt",
+        {"100001": data_as_of, "200001": data_as_of},
+        finished_at=NOW + timedelta(seconds=30),
+    )
+    future_left = _series(
+        "100001",
+        _adjusted_rows(
+            "100001",
+            source_attempt_id=future_ids["100001"],
+        ),
+    )
+    future_right = _series(
+        "200001",
+        _adjusted_rows(
+            "200001",
+            scale="2",
+            source_attempt_id=future_ids["200001"],
+        ),
+    )
+    future_result = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        {
+            "100001": _facts("100001", company="甲", manager="甲", benchmark="甲"),
+            "200001": _facts("200001", company="乙", manager="乙", benchmark="乙"),
+        },
+        adjusted_series_by_fund={
+            "100001": future_left,
+            "200001": future_right,
+        },
+        decision_audit_store=future_store,
+    )
+    assert not any(
+        item.relationship_type == "adjusted_return_correlation"
+        for item in future_result.relationships
+    )
+    assert "adjusted_return_source_binding_invalid_100001" in future_result.conflicts
+
+
+def test_adjusted_return_correlation_insufficiency_is_explicit(tmp_path) -> None:
+    positions = (_position("100001", "50"), _position("200001", "50"))
+    facts = {
+        "100001": _facts("100001", company="甲", manager="甲", benchmark="甲"),
+        "200001": _facts("200001", company="乙", manager="乙", benchmark="乙"),
+    }
+    cases = (
+        (
+            {"count": 60},
+            "adjusted_return_samples_insufficient_200001",
+        ),
+        (
+            {"accumulated": False},
+            "adjusted_return_accumulated_nav_missing_200001",
+        ),
+        (
+            {"duplicate_last_date": True},
+            "adjusted_return_duplicate_date_200001",
+        ),
+        (
+            {"corporate_action_state": "unknown"},
+            "adjusted_return_discontinuity_200001",
+        ),
+        (
+            {"flat": True},
+            "adjusted_return_zero_variance_200001",
+        ),
+        (
+            {"start_offset_days": 1},
+            "adjusted_return_samples_insufficient_200001",
+        ),
+        (
+            {"start_offset_days": 61},
+            "adjusted_return_common_end_mismatch_100001_200001",
+        ),
+    )
+    for index, (right_kwargs, expected_code) in enumerate(cases):
+        preliminary_left = _adjusted_rows("100001")
+        preliminary_right = _adjusted_rows("200001", **right_kwargs)
+        audit_store, attempt_ids = _adjusted_audit_store(
+            tmp_path / f"case_{index}",
+            {
+                "100001": preliminary_left[-1].nav_date,
+                "200001": preliminary_right[-1].nav_date,
+            },
+        )
+        left = _adjusted_rows(
+            "100001",
+            source_attempt_id=attempt_ids["100001"],
+        )
+        right = _adjusted_rows(
+            "200001",
+            source_attempt_id=attempt_ids["200001"],
+            **right_kwargs,
+        )
+        result = _build(
+            "100001",
+            positions,
+            facts,
+            adjusted_series_by_fund={
+                "100001": _series("100001", left),
+                "200001": _series("200001", right),
+            },
+            decision_audit_store=audit_store,
+        )
+        assert not any(
+            item.relationship_type == "adjusted_return_correlation" for item in result.relationships
+        )
+        assert expected_code in result.missing_fields + result.conflicts

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
-from dataclasses import dataclass
+import secrets
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Callable, Optional, Tuple
@@ -19,7 +22,10 @@ from kunjin.decision.models import (
     SourceErrorCode,
     SourceFieldRef,
     SourceFieldState,
+    canonical_json_bytes,
     validate_aware_datetime,
+    validate_checksum,
+    validate_exact_dataclass_state,
 )
 from kunjin.decision.source_registry import SourceRegistryV1
 from kunjin.decision.worker import run_fund_nav_worker
@@ -41,6 +47,8 @@ _FORMAL_FIELD = "formal_nav"
 _ADJUSTED_FIELD = "adjusted_return_series"
 _FIELDS = (_FORMAL_FIELD, _ADJUSTED_FIELD)
 _MIN_ADJUSTED_SAMPLES = 60
+_MAX_ADJUSTED_SAMPLES = 1024
+_VALIDATED_SERIES_MAC_KEY = secrets.token_bytes(32)
 
 
 @dataclass(frozen=True)
@@ -52,6 +60,163 @@ class NavSyncResult:
     records: int
     latest_nav_date: Optional[str]
     omitted_work: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ValidatedAdjustedNavSeries:
+    fund_code: str
+    observations: Tuple[FundNavObservation, ...]
+    source_attempt_id: int
+    retrieved_at: datetime
+    data_as_of: date
+    binding_mac: str
+
+    def binding_bytes(self) -> bytes:
+        return canonical_json_bytes(
+            {
+                "data_as_of": self.data_as_of,
+                "fund_code": self.fund_code,
+                "observations": tuple(
+                    {
+                        "accumulated_nav": item.accumulated_nav,
+                        "corporate_action_state": item.corporate_action_state,
+                        "daily_growth": item.daily_growth,
+                        "fund_code": item.fund_code,
+                        "nav_date": item.nav_date,
+                        "retrieved_at": item.retrieved_at,
+                        "source": item.source,
+                        "source_attempt_id": item.source_attempt_id,
+                        "unit_nav": item.unit_nav,
+                    }
+                    for item in self.observations
+                ),
+                "retrieved_at": self.retrieved_at,
+                "source_attempt_id": self.source_attempt_id,
+            }
+        )
+
+    def validation_issue(self) -> Optional[str]:
+        try:
+            validate_checksum(self.binding_mac, "validated adjusted NAV series binding MAC")
+            authenticated = hmac.compare_digest(
+                self.binding_mac,
+                _validated_series_mac(self),
+            )
+        except (AttributeError, TypeError, ValueError):
+            authenticated = False
+        if not authenticated:
+            return "source_binding_invalid"
+        if (
+            type(self.observations) is not tuple
+            or not _MIN_ADJUSTED_SAMPLES <= len(self.observations) <= _MAX_ADJUSTED_SAMPLES
+        ):
+            return "samples_insufficient"
+        if type(self.source_attempt_id) is not int or self.source_attempt_id <= 0:
+            return "source_binding_invalid"
+        if (
+            type(self.retrieved_at) is not datetime
+            or self.retrieved_at.tzinfo is not timezone.utc
+            or type(self.data_as_of) is not date
+        ):
+            return "source_binding_invalid"
+
+        dates = []
+        for observation in self.observations:
+            if type(observation) is not FundNavObservation:
+                return "observation_invalid"
+            try:
+                observation.validate()
+            except (TypeError, ValueError):
+                return "observation_invalid"
+            if observation.fund_code != self.fund_code:
+                return "subject_mismatch"
+            if (
+                observation.source != "eastmoney"
+                or observation.source_attempt_id != self.source_attempt_id
+                or observation.retrieved_at != self.retrieved_at
+                or observation.retrieved_at.tzinfo is not timezone.utc
+            ):
+                return "source_binding_invalid"
+            if (
+                type(observation.nav_date) is not date
+                or type(observation.unit_nav) is not Decimal
+                or not observation.unit_nav.is_finite()
+                or observation.unit_nav <= 0
+            ):
+                return "observation_invalid"
+            dates.append(observation.nav_date)
+
+        if len(dates) != len(set(dates)):
+            return "duplicate_date"
+        if dates != sorted(dates):
+            return "date_order_invalid"
+        if self.data_as_of != dates[-1]:
+            return "source_binding_invalid"
+        if any(
+            type(item.accumulated_nav) is not Decimal
+            or not item.accumulated_nav.is_finite()
+            or item.accumulated_nav <= 0
+            for item in self.observations
+        ):
+            return "accumulated_nav_unavailable"
+        if any(item.corporate_action_state != "none" for item in self.observations):
+            return "corporate_action_unresolved"
+
+        first = self.observations[0]
+        if first.accumulated_nav is None:
+            return "accumulated_nav_unavailable"
+        distribution_spread = first.accumulated_nav - first.unit_nav
+        if any(
+            item.accumulated_nav is None
+            or item.accumulated_nav - item.unit_nav != distribution_spread
+            for item in self.observations
+        ):
+            return "discontinuity"
+        for older, newer in zip(self.observations, self.observations[1:]):
+            growth = newer.daily_growth
+            if type(growth) is not Decimal or not growth.is_finite():
+                return "discontinuity"
+            unit_change = newer.unit_nav - older.unit_nav
+            if (growth > 0 and unit_change < 0) or (growth < 0 and unit_change > 0):
+                return "discontinuity"
+        return None
+
+    def validate(self) -> None:
+        if type(self) is not ValidatedAdjustedNavSeries:
+            raise ValueError("validated adjusted NAV series subclasses are not accepted")
+        validate_exact_dataclass_state(self, "validated adjusted NAV series")
+        if type(self.fund_code) is not str or _FUND_CODE.fullmatch(self.fund_code) is None:
+            raise ValueError("validated adjusted NAV series fund code is invalid")
+        issue = self.validation_issue()
+        if issue is not None:
+            raise ValueError(f"validated adjusted NAV series is invalid: {issue}")
+
+
+def _validated_series_mac(value: ValidatedAdjustedNavSeries) -> str:
+    return hmac.new(
+        _VALIDATED_SERIES_MAC_KEY,
+        value.binding_bytes(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _seal_validated_adjusted_nav_series(
+    *,
+    fund_code: str,
+    observations: Tuple[FundNavObservation, ...],
+    source_attempt_id: int,
+    retrieved_at: datetime,
+    data_as_of: date,
+) -> ValidatedAdjustedNavSeries:
+    result = ValidatedAdjustedNavSeries(
+        fund_code=fund_code,
+        observations=observations,
+        source_attempt_id=source_attempt_id,
+        retrieved_at=retrieved_at,
+        data_as_of=data_as_of,
+        binding_mac="0" * 64,
+    )
+    return replace(result, binding_mac=_validated_series_mac(result))
 
 
 class BoundedNavService:
@@ -83,9 +248,7 @@ class BoundedNavService:
             raise ValueError("context must be an exact SourceRequestContext")
         if context.audit_store.repository.database.resolve() != self.repository.database.resolve():
             raise ValueError("NAV and audit stores must share one database")
-        latest_expected_data_as_of = self._normalized_expected_date(
-            latest_expected_data_as_of
-        )
+        latest_expected_data_as_of = self._normalized_expected_date(latest_expected_data_as_of)
         context.budget.require_publishable()
         subject_key = f"fund:{fund_code}"
         snapshot = self._source_snapshot(
@@ -130,10 +293,7 @@ class BoundedNavService:
                     and states[_FORMAL_FIELD] is SourceFieldState.DEGRADED
                 )
             )
-            and (
-                cached_formal_status == "success"
-                or latest_expected_data_as_of is None
-            )
+            and (cached_formal_status == "success" or latest_expected_data_as_of is None)
         ):
             return self._record_cache_hit(
                 fund_code,
@@ -156,9 +316,7 @@ class BoundedNavService:
         response = self.worker_runner(request, context.budget)
         context.budget.require_publishable()
         finished_at = self._trusted_response_time(context)
-        response_bytes = self._validate_worker_response(
-            request, response, context, finished_at
-        )
+        response_bytes = self._validate_worker_response(request, response, context, finished_at)
         if not response.ok:
             return self._record_worker_failure(
                 fund_code,
@@ -228,8 +386,7 @@ class BoundedNavService:
             ):
                 raise ValueError("NAV worker retrieval time is outside request lifetime")
             if any(
-                datetime.strptime(row.nav_date, "%Y-%m-%d").date()
-                > finished_at.date()
+                datetime.strptime(row.nav_date, "%Y-%m-%d").date() > finished_at.date()
                 for row in response.payload.rows
             ):
                 raise ValueError("NAV date is later than the trusted parent date")
@@ -345,9 +502,7 @@ class BoundedNavService:
                 accumulated_nav=(
                     None if row.accumulated_nav is None else Decimal(row.accumulated_nav)
                 ),
-                daily_growth=(
-                    None if row.daily_growth is None else Decimal(row.daily_growth)
-                ),
+                daily_growth=(None if row.daily_growth is None else Decimal(row.daily_growth)),
                 source="eastmoney",
                 retrieved_at=payload.retrieved_at,
                 corporate_action_state=row.corporate_action_state,
@@ -375,15 +530,15 @@ class BoundedNavService:
         for retrieved_at, attempt_id in candidates:
             if attempt_id is None:
                 continue
-            stored = context.audit_store.authenticated_source_attempt(attempt_id)
-            batch = tuple(
-                item
-                for item in observations
-                if item.retrieved_at == retrieved_at
-                and item.source_attempt_id == attempt_id
+            retrieval_batch = tuple(
+                item for item in observations if item.retrieved_at == retrieved_at
             )
-            if not batch:
+            if not retrieval_batch or any(
+                item.source_attempt_id != attempt_id for item in retrieval_batch
+            ):
                 continue
+            stored = context.audit_store.authenticated_source_attempt(attempt_id)
+            batch = retrieval_batch
             latest = max(batch, key=lambda item: item.nav_date)
             expected_data_as_of = datetime.combine(
                 latest.nav_date,
@@ -401,6 +556,58 @@ class BoundedNavService:
                 return tuple(sorted(batch, key=lambda item: item.nav_date))
         return ()
 
+    def validated_adjusted_series(
+        self,
+        fund_code: str,
+        context: SourceRequestContext,
+        *,
+        latest_expected_data_as_of: Optional[datetime] = None,
+    ) -> Optional[ValidatedAdjustedNavSeries]:
+        if type(fund_code) is not str or _FUND_CODE.fullmatch(fund_code) is None:
+            raise ValueError("fund code must be exactly six ASCII digits")
+        if type(context) is not SourceRequestContext:
+            raise ValueError("context must be an exact SourceRequestContext")
+        if context.audit_store.repository.database.resolve() != self.repository.database.resolve():
+            raise ValueError("NAV and audit stores must share one database")
+        latest_expected_data_as_of = self._normalized_expected_date(latest_expected_data_as_of)
+        context.budget.require_publishable()
+        subject_key = f"fund:{fund_code}"
+        cached = self._latest_cache_batch(
+            tuple(
+                item
+                for item in self.repository.fund_history(fund_code)
+                if item.source == "eastmoney"
+            ),
+            context,
+            subject_key,
+        )
+        if not cached:
+            return None
+        latest = cached[-1]
+        formal_status = self._formal_status(
+            latest.nav_date,
+            latest_expected_data_as_of,
+        )
+        if not self._adjusted_series_complete(cached, formal_status):
+            return None
+        attempt_ids = {item.source_attempt_id for item in cached}
+        retrieval_times = {item.retrieved_at for item in cached}
+        if len(attempt_ids) != 1 or None in attempt_ids or len(retrieval_times) != 1:
+            return None
+        source_attempt_id = next(iter(attempt_ids))
+        retrieved_at = next(iter(retrieval_times))
+        if type(source_attempt_id) is not int or type(retrieved_at) is not datetime:
+            return None
+        result = _seal_validated_adjusted_nav_series(
+            fund_code=fund_code,
+            observations=cached,
+            source_attempt_id=source_attempt_id,
+            retrieved_at=retrieved_at,
+            data_as_of=latest.nav_date,
+        )
+        result.validate()
+        return result
+
     @staticmethod
     def _adjusted_series_complete(
         observations: Tuple[FundNavObservation, ...],
@@ -408,9 +615,7 @@ class BoundedNavService:
     ) -> bool:
         if len(observations) < _MIN_ADJUSTED_SAMPLES or formal_status != "success":
             return False
-        ordered = tuple(
-            sorted(observations, key=lambda item: item.nav_date, reverse=True)
-        )
+        ordered = tuple(sorted(observations, key=lambda item: item.nav_date, reverse=True))
         if not all(
             item.accumulated_nav is not None
             and item.accumulated_nav.is_finite()
@@ -432,8 +637,10 @@ class BoundedNavService:
         for newer, older in zip(ordered, ordered[1:]):
             growth = newer.daily_growth
             unit_change = newer.unit_nav - older.unit_nav
-            if growth is None or (growth > 0 and unit_change < 0) or (
-                growth < 0 and unit_change > 0
+            if (
+                growth is None
+                or (growth > 0 and unit_change < 0)
+                or (growth < 0 and unit_change > 0)
             ):
                 return False
         return True
@@ -494,9 +701,7 @@ class BoundedNavService:
             context,
             finished_at=finished_at,
             data_as_of=data_as_of if adjusted_complete else None,
-            error_code=(
-                None if adjusted_complete else SourceErrorCode.VALIDATION_FAILURE
-            ),
+            error_code=(None if adjusted_complete else SourceErrorCode.VALIDATION_FAILURE),
             response_bytes=response_bytes,
             authorization=authorizations[_ADJUSTED_FIELD],
         )
@@ -533,11 +738,7 @@ class BoundedNavService:
                 raise
         return NavSyncResult(
             fund_code=fund_code,
-            status=(
-                "success"
-                if adjusted_complete and formal_status == "success"
-                else "partial"
-            ),
+            status=("success" if adjusted_complete and formal_status == "success" else "partial"),
             formal_nav_status=formal_status,
             adjusted_series_status="success" if adjusted_complete else "insufficient",
             records=len(observations),
@@ -651,9 +852,7 @@ class BoundedNavService:
             )
         )
         adjusted_complete = (
-            False
-            if latest is None
-            else self._adjusted_series_complete(cached, formal_status)
+            False if latest is None else self._adjusted_series_complete(cached, formal_status)
         )
         return NavSyncResult(
             fund_code,
@@ -703,11 +902,7 @@ class BoundedNavService:
                 context,
                 finished_at=context.budget.started_at,
                 data_as_of=data_as_of if adjusted_complete else None,
-                error_code=(
-                    None
-                    if adjusted_complete
-                    else SourceErrorCode.VALIDATION_FAILURE
-                ),
+                error_code=(None if adjusted_complete else SourceErrorCode.VALIDATION_FAILURE),
             ),
         )
         self._commit_attempts(context, attempts, {field: None for field in _FIELDS})

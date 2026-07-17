@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date, datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
+from kunjin.brief.nav import (
+    ValidatedAdjustedNavSeries,
+    _seal_validated_adjusted_nav_series,
+)
 from kunjin.funds.models import (
     AssetType,
     FundHolding,
@@ -19,6 +24,7 @@ from kunjin.funds.peers.analytics import (
     calculate_window_metric,
     common_end_date,
     current_manager_team_start,
+    decimal_adjusted_return_correlation,
     pairwise_industry_overlap,
     pairwise_overlap,
     portfolio_overlap,
@@ -39,6 +45,352 @@ def nav(day: date, value: str, fund_code: str = "519755") -> FundNavObservation:
         source="eastmoney",
         retrieved_at=NOW,
     )
+
+
+def adjusted_series(
+    fund_code: str,
+    returns: tuple[Decimal, ...],
+    *,
+    start: date = date(2026, 1, 1),
+    source_attempt_id: int = 1,
+    accumulated_offset: Decimal = Decimal("0"),
+) -> ValidatedAdjustedNavSeries:
+    value = Decimal("1")
+    observations = [
+        FundNavObservation(
+            fund_code=fund_code,
+            nav_date=start,
+            unit_nav=value,
+            accumulated_nav=value + accumulated_offset,
+            daily_growth=Decimal("0"),
+            source="eastmoney",
+            retrieved_at=NOW,
+            corporate_action_state="none",
+            source_attempt_id=source_attempt_id,
+        )
+    ]
+    for offset, daily_return in enumerate(returns, start=1):
+        value *= Decimal("1") + daily_return
+        observations.append(
+            FundNavObservation(
+                fund_code=fund_code,
+                nav_date=start + timedelta(days=offset),
+                unit_nav=value,
+                accumulated_nav=value + accumulated_offset,
+                daily_growth=daily_return * Decimal("100"),
+                source="eastmoney",
+                retrieved_at=NOW,
+                corporate_action_state="none",
+                source_attempt_id=source_attempt_id,
+            )
+        )
+    return _seal_validated_adjusted_nav_series(
+        fund_code=fund_code,
+        observations=tuple(observations),
+        source_attempt_id=source_attempt_id,
+        retrieved_at=NOW,
+        data_as_of=observations[-1].nav_date,
+    )
+
+
+def reseal_series(
+    series: ValidatedAdjustedNavSeries,
+    observations: tuple[FundNavObservation, ...],
+    *,
+    data_as_of: date | None = None,
+) -> ValidatedAdjustedNavSeries:
+    return _seal_validated_adjusted_nav_series(
+        fund_code=series.fund_code,
+        observations=observations,
+        source_attempt_id=series.source_attempt_id,
+        retrieved_at=series.retrieved_at,
+        data_as_of=observations[-1].nav_date if data_as_of is None else data_as_of,
+    )
+
+
+class AdjustedReturnCorrelationTest(unittest.TestCase):
+    def test_sixty_aligned_return_samples_are_decimal_and_preserve_common_window(self) -> None:
+        left_returns = tuple(
+            Decimal("0.001") if index % 2 == 0 else Decimal("0.003") for index in range(60)
+        )
+        left = adjusted_series("519755", left_returns)
+        right = adjusted_series("000001", left_returns, source_attempt_id=2)
+
+        result = decimal_adjusted_return_correlation(left, right, minimum_samples=60)
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.correlation, Decimal("1"))
+        self.assertEqual(result.samples, 60)
+        self.assertEqual(result.aligned_observations, 61)
+        self.assertEqual(result.left_observations, 61)
+        self.assertEqual(result.right_observations, 61)
+        self.assertEqual(result.effective_start, date(2026, 1, 1))
+        self.assertEqual(result.effective_end, date(2026, 3, 2))
+        self.assertEqual(result.calculation_version, "1")
+        self.assertEqual(result.insufficiency_codes, ())
+        self.assertIsInstance(result.correlation, Decimal)
+
+    def test_fifty_nine_returns_from_sixty_levels_are_insufficient(self) -> None:
+        returns = tuple(
+            Decimal("0.001") if index % 2 == 0 else Decimal("0.002") for index in range(59)
+        )
+        result = decimal_adjusted_return_correlation(
+            adjusted_series("519755", returns),
+            adjusted_series("000001", returns, source_attempt_id=2),
+            minimum_samples=60,
+        )
+
+        self.assertEqual(result.status, "insufficient_data")
+        self.assertIsNone(result.correlation)
+        self.assertEqual(result.samples, 59)
+        self.assertIn("adjusted_return_samples_insufficient", result.insufficiency_codes)
+
+    def test_perfect_negative_and_nontrivial_decimal_vectors(self) -> None:
+        left_returns = tuple(
+            Decimal("0.01") if index % 2 == 0 else Decimal("0.02") for index in range(60)
+        )
+        negative_returns = tuple(Decimal("0.03") - item for item in left_returns)
+        negative = decimal_adjusted_return_correlation(
+            adjusted_series("519755", left_returns),
+            adjusted_series("000001", negative_returns, source_attempt_id=2),
+            minimum_samples=60,
+        )
+        self.assertEqual(negative.status, "success")
+        self.assertEqual(negative.correlation, Decimal("-1"))
+
+        left_cycle = (Decimal("0.01"), Decimal("0.02"), Decimal("0.03")) * 20
+        right_cycle = (Decimal("0.03"), Decimal("0.01"), Decimal("0.02")) * 20
+        nontrivial = decimal_adjusted_return_correlation(
+            adjusted_series("519755", left_cycle),
+            adjusted_series("000001", right_cycle, source_attempt_id=2),
+            minimum_samples=60,
+        )
+        self.assertEqual(nontrivial.status, "success")
+        self.assertEqual(nontrivial.correlation, Decimal("-0.5"))
+
+    def test_constant_accumulated_nav_offset_does_not_distort_validated_unit_returns(self) -> None:
+        returns = tuple(
+            Decimal("0.001") if index % 2 == 0 else Decimal("0.003") for index in range(60)
+        )
+        result = decimal_adjusted_return_correlation(
+            adjusted_series("519755", returns),
+            adjusted_series(
+                "000001",
+                returns,
+                source_attempt_id=2,
+                accumulated_offset=Decimal("5"),
+            ),
+            minimum_samples=60,
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.correlation, Decimal("1"))
+
+    def test_unsealed_or_tampered_series_cannot_support_correlation(self) -> None:
+        returns = (Decimal("0.01"), Decimal("0.02")) * 30
+        valid_left = adjusted_series("519755", returns)
+        valid_right = adjusted_series("000001", returns, source_attempt_id=2)
+        tampered = replace(
+            valid_right,
+            observations=(
+                replace(valid_right.observations[0], unit_nav=Decimal("9")),
+                *valid_right.observations[1:],
+            ),
+        )
+
+        result = decimal_adjusted_return_correlation(
+            valid_left,
+            tampered,
+            minimum_samples=60,
+        )
+
+        self.assertEqual(result.status, "insufficient_data")
+        self.assertIn(
+            "adjusted_return_source_binding_invalid_right",
+            result.insufficiency_codes,
+        )
+
+    def test_correlation_result_rejects_hidden_state(self) -> None:
+        returns = (Decimal("0.01"), Decimal("0.02")) * 30
+        result = decimal_adjusted_return_correlation(
+            adjusted_series("519755", returns),
+            adjusted_series("000001", returns, source_attempt_id=2),
+            minimum_samples=60,
+        )
+        object.__setattr__(result, "hidden_override", "forged")
+
+        with self.assertRaisesRegex(ValueError, "unexpected instance state"):
+            result.validate()
+
+        clean = decimal_adjusted_return_correlation(
+            adjusted_series("519755", returns),
+            adjusted_series("000001", returns, source_attempt_id=2),
+            minimum_samples=60,
+        )
+        with self.assertRaisesRegex(ValueError, "binding MAC"):
+            replace(clean, correlation=Decimal("-1")).validate()
+
+    def test_alignment_uses_shared_levels_and_latest_common_end(self) -> None:
+        returns = tuple(
+            Decimal("0.001") if index % 2 == 0 else Decimal("0.003") for index in range(62)
+        )
+        left = adjusted_series("519755", returns)
+        right_full = adjusted_series("000001", returns, source_attempt_id=2)
+        right = reseal_series(
+            right_full,
+            tuple(
+                item for index, item in enumerate(right_full.observations) if index not in {10, 62}
+            ),
+            data_as_of=right_full.observations[-2].nav_date,
+        )
+
+        result = decimal_adjusted_return_correlation(left, right, minimum_samples=60)
+
+        self.assertEqual(result.status, "insufficient_data")
+        self.assertIn("adjusted_return_asymmetric_dates", result.insufficiency_codes)
+
+        bounded_right = reseal_series(
+            right_full,
+            right_full.observations[1:-1],
+        )
+        bounded = decimal_adjusted_return_correlation(
+            left,
+            bounded_right,
+            minimum_samples=60,
+        )
+        self.assertEqual(bounded.status, "success")
+        self.assertEqual(bounded.samples, 60)
+        self.assertEqual(bounded.aligned_observations, 61)
+        self.assertEqual(bounded.effective_start, date(2026, 1, 2))
+        self.assertEqual(bounded.effective_end, date(2026, 3, 3))
+
+    def test_duplicate_date_and_subject_mismatch_fail_closed(self) -> None:
+        returns = (Decimal("0.01"), Decimal("0.02")) * 30
+        valid_left = adjusted_series("519755", returns)
+        valid_right = adjusted_series("000001", returns, source_attempt_id=2)
+        duplicate = reseal_series(
+            valid_left,
+            valid_left.observations + (valid_left.observations[-1],),
+        )
+        duplicate_result = decimal_adjusted_return_correlation(
+            duplicate,
+            valid_right,
+            minimum_samples=60,
+        )
+        self.assertEqual(duplicate_result.status, "insufficient_data")
+        self.assertIn("adjusted_return_duplicate_date_left", duplicate_result.insufficiency_codes)
+
+        wrong_subject = reseal_series(
+            valid_left,
+            (
+                replace(valid_left.observations[0], fund_code="999999"),
+                *valid_left.observations[1:],
+            ),
+        )
+        subject_result = decimal_adjusted_return_correlation(
+            wrong_subject,
+            valid_right,
+            minimum_samples=60,
+        )
+        self.assertEqual(subject_result.status, "insufficient_data")
+        self.assertIn("adjusted_return_subject_mismatch_left", subject_result.insufficiency_codes)
+
+    def test_missing_accumulated_nav_or_corporate_action_fails_closed(self) -> None:
+        returns = (Decimal("0.01"), Decimal("0.02")) * 30
+        valid_left = adjusted_series("519755", returns)
+        valid_right = adjusted_series("000001", returns, source_attempt_id=2)
+        missing_accumulated = reseal_series(
+            valid_left,
+            (
+                *valid_left.observations[:30],
+                replace(valid_left.observations[30], accumulated_nav=None),
+                *valid_left.observations[31:],
+            ),
+        )
+        accumulated_result = decimal_adjusted_return_correlation(
+            missing_accumulated,
+            valid_right,
+            minimum_samples=60,
+        )
+        self.assertEqual(accumulated_result.status, "insufficient_data")
+        self.assertIn(
+            "adjusted_return_accumulated_nav_unavailable_left",
+            accumulated_result.insufficiency_codes,
+        )
+
+        for action_state in ("present", "unknown"):
+            with self.subTest(action_state=action_state):
+                action_series = reseal_series(
+                    valid_left,
+                    (
+                        *valid_left.observations[:30],
+                        replace(
+                            valid_left.observations[30],
+                            corporate_action_state=action_state,
+                        ),
+                        *valid_left.observations[31:],
+                    ),
+                )
+                action_result = decimal_adjusted_return_correlation(
+                    action_series,
+                    valid_right,
+                    minimum_samples=60,
+                )
+                self.assertEqual(action_result.status, "insufficient_data")
+                self.assertIn(
+                    "adjusted_return_corporate_action_unresolved_left",
+                    action_result.insufficiency_codes,
+                )
+
+    def test_accumulated_nav_breakpoint_or_growth_sign_conflict_fails_closed(self) -> None:
+        returns = (Decimal("0.01"), Decimal("0.02")) * 30
+        valid_left = adjusted_series("519755", returns)
+        valid_right = adjusted_series("000001", returns, source_attempt_id=2)
+        discontinuous_rows = (
+            (
+                *valid_left.observations[:30],
+                replace(
+                    valid_left.observations[30],
+                    accumulated_nav=valid_left.observations[30].accumulated_nav + Decimal("0.01"),
+                ),
+                *valid_left.observations[31:],
+            ),
+            (
+                *valid_left.observations[:30],
+                replace(valid_left.observations[30], daily_growth=Decimal("-1")),
+                *valid_left.observations[31:],
+            ),
+        )
+        for observations in discontinuous_rows:
+            with self.subTest(observations=observations[30]):
+                result = decimal_adjusted_return_correlation(
+                    reseal_series(valid_left, observations),
+                    valid_right,
+                    minimum_samples=60,
+                )
+                self.assertEqual(result.status, "insufficient_data")
+                self.assertIsNone(result.correlation)
+                self.assertIn(
+                    "adjusted_return_discontinuity_left",
+                    result.insufficiency_codes,
+                )
+
+    def test_zero_variance_on_either_side_is_insufficient(self) -> None:
+        variable = (Decimal("0.01"), Decimal("0.02")) * 30
+        constant = (Decimal("0.01"),) * 60
+        for left_returns, right_returns, expected_code in (
+            (constant, variable, "adjusted_return_zero_variance_left"),
+            (variable, constant, "adjusted_return_zero_variance_right"),
+        ):
+            with self.subTest(expected_code=expected_code):
+                result = decimal_adjusted_return_correlation(
+                    adjusted_series("519755", left_returns),
+                    adjusted_series("000001", right_returns, source_attempt_id=2),
+                    minimum_samples=60,
+                )
+                self.assertEqual(result.status, "insufficient_data")
+                self.assertIsNone(result.correlation)
+                self.assertIn(expected_code, result.insufficiency_codes)
 
 
 def size(day: date, value: Optional[str]) -> FundSizeObservation:
@@ -190,8 +542,7 @@ class AlignedNavMetricTest(unittest.TestCase):
         )
         mean = sum(daily_returns, Decimal("0")) / Decimal(len(daily_returns))
         expected_volatility = (
-            sum((item - mean) ** 2 for item in daily_returns)
-            / Decimal(len(daily_returns))
+            sum((item - mean) ** 2 for item in daily_returns) / Decimal(len(daily_returns))
         ).sqrt() * Decimal(252).sqrt()
         self.assertEqual(metric.annualized_volatility, expected_volatility)
         self.assertEqual(metric.max_drawdown, Decimal("0.25"))
@@ -359,20 +710,12 @@ class OverlapTest(unittest.TestCase):
 
     def test_one_quarter_mismatch_is_allowed_but_larger_gap_is_rejected(self) -> None:
         left = (holding("519755", "600000", "浦发银行", "5", report_period=date(2026, 3, 31)),)
-        adjacent = (
-            holding(
-                "000001", "600000", "浦发银行", "5", report_period=date(2025, 12, 31)
-            ),
-        )
+        adjacent = (holding("000001", "600000", "浦发银行", "5", report_period=date(2025, 12, 31)),)
         self.assertEqual(
             select_overlap_periods(left, adjacent),
             (date(2026, 3, 31), date(2025, 12, 31), ("report_period_mismatch",)),
         )
-        too_old = (
-            holding(
-                "000001", "600000", "浦发银行", "5", report_period=date(2025, 9, 30)
-            ),
-        )
+        too_old = (holding("000001", "600000", "浦发银行", "5", report_period=date(2025, 9, 30)),)
         with self.assertRaisesRegex(ValueError, "within one quarter"):
             select_overlap_periods(left, too_old)
 
