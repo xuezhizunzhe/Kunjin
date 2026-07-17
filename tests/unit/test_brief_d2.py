@@ -1166,6 +1166,16 @@ def test_same_request_window_is_bounded_by_rapid_or_deep_policy() -> None:
         ).validate()
 
 
+def test_portfolio_binding_repr_does_not_expose_private_position_values() -> None:
+    binding = _binding((_position("100001", "73129.17", account="private-account"),))
+
+    rendered = repr(binding)
+
+    assert "73129.17" not in rendered
+    assert "private-account" not in rendered
+    assert str(PRIVATE_PROFIT) not in rendered
+
+
 def test_holdings_overlap_preserves_top10_coverage_shared_min_and_scoped_evidence() -> None:
     left_published = NOW - timedelta(days=2)
     right_published = NOW - timedelta(days=1)

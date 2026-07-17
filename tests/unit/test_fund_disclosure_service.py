@@ -194,6 +194,71 @@ class FakeWorkerRunner:
 
 
 class FundDisclosureServiceTest(unittest.TestCase):
+    def test_bounded_brief_section_groups_lock_task11_order(self) -> None:
+        context = self._bounded_context("09" * 16)
+
+        identity = self.service.sync_sections(
+            "519755",
+            ("basic_profile",),
+            request_context=context,
+        )
+        manager_fee = self.service.sync_sections(
+            "519755",
+            ("manager_history", "fee_schedule"),
+            request_context=context,
+        )
+        announcements = self.service.sync_sections(
+            "519755",
+            ("announcements",),
+            request_context=context,
+        )
+
+        self.assertEqual(
+            tuple(identity.sections),
+            ("basic_profile",),
+        )
+        self.assertEqual(
+            tuple(manager_fee.sections),
+            ("manager_history", "fee_schedule"),
+        )
+        self.assertEqual(tuple(announcements.sections), ("announcements",))
+        self.assertEqual(
+            [request.field_id for request in self.worker.calls],
+            [
+                "basic_profile",
+                "manager_history",
+                "fee_schedule",
+                "announcement",
+            ],
+        )
+        self.assertEqual(self.client.requested_urls, [])
+
+    def test_bounded_brief_section_groups_reject_open_ended_scheduling(self) -> None:
+        context = self._bounded_context("0a" * 16)
+        invalid_groups = (
+            ["basic_profile"],
+            (),
+            ("basic_profile", "basic_profile"),
+            ("quarterly_holdings",),
+            ("size_history",),
+            ("basic_profile", "size_history"),
+            ("manager_history", "fee_schedule", "size_history"),
+            ("basic_profile", "announcements"),
+            ("size_history", "fee_schedule", "manager_history"),
+        )
+
+        for section_names in invalid_groups:
+            with self.subTest(section_names=section_names):
+                with self.assertRaises(ValueError):
+                    self.service.sync_sections(
+                        "519755",
+                        section_names,
+                        request_context=context,
+                    )
+
+        self.assertEqual(self.worker.calls, [])
+        self.assertEqual(self.client.requested_urls, [])
+
     def test_bounded_sections_bind_worker_and_registry_fields_explicitly(self) -> None:
         expected = {
             "basic_profile": ("basic_profile", "identity_active_status"),

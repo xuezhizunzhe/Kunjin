@@ -332,6 +332,15 @@ def test_bounded_portfolio_parent_commits_without_raw_snapshot_or_private_audit(
     assert result.position_present is True
     assert result.accounts == 1
     assert result.positions == 1
+    assert result.portfolio_binding.source_state == "same_request_success"
+    assert result.portfolio_binding.snapshot_complete is True
+    assert result.portfolio_binding.request_id == context.budget.request_id
+    assert result.portfolio_binding.request_mode is context.budget.mode
+    assert result.portfolio_binding.request_started_at == context.budget.started_at
+    assert result.portfolio_binding.request_deadline_at == context.budget.deadline_at
+    assert result.portfolio_binding.observed_at == NOW
+    assert result.portfolio_binding.positions[0].account_title == "学习账户"
+    assert result.portfolio_binding.positions[0].shares == Decimal(SHARES_SENTINEL)
     stored = repository.latest_positions()
     assert stored[0].shares == Decimal(SHARES_SENTINEL)
     assert repository.latest_raw_snapshot() is None
@@ -341,6 +350,10 @@ def test_bounded_portfolio_parent_commits_without_raw_snapshot_or_private_audit(
         "fund:123456",
     )
     assert attempts[0].attempt.outcome is SourceAttemptOutcome.SUCCESS
+    assert result.source_attempt_id == attempts[0].id
+    assert result.portfolio_binding.observation_version == f"source_attempt_{attempts[0].id}"
+    assert SHARES_SENTINEL not in repr(result)
+    assert SHARES_SENTINEL not in repr(result.portfolio_binding)
     with repository.connect() as connection:
         audit_text = " ".join(
             str(tuple(row))
@@ -376,6 +389,10 @@ def test_authentication_required_is_nonretryable_and_does_not_replace_portfolio(
 
     assert result.status == "unavailable"
     assert result.error_code == "authentication_required"
+    assert result.portfolio_binding.source_state == "unbound"
+    assert result.portfolio_binding.snapshot_complete is False
+    assert result.portfolio_binding.positions == ()
+    assert result.position_present is None
     assert repository.latest_positions() == []
     attempt = context.audit_store.source_attempt_history(
         "yangjibao_portfolio_observation",
@@ -385,6 +402,14 @@ def test_authentication_required_is_nonretryable_and_does_not_replace_portfolio(
     assert attempt.outcome is SourceAttemptOutcome.UNAVAILABLE
     assert attempt.error_code is SourceErrorCode.PAYWALL_OR_AUTH_REQUIRED
     assert attempt.cooldown_until is None
+    assert (
+        result.source_attempt_id
+        == context.audit_store.source_attempt_history(
+            "yangjibao_portfolio_observation",
+            "personal_position_observation",
+            "fund:123456",
+        )[0].id
+    )
 
 
 def test_cancelled_worker_result_never_writes_attempt_or_portfolio(tmp_path) -> None:
@@ -535,6 +560,10 @@ def test_rate_limit_cooldown_prevents_next_worker_call(tmp_path) -> None:
 
     assert worker_calls == []
     assert second.status == "skipped_cooldown"
+    assert second.portfolio_binding.source_state == "unbound"
+    assert second.portfolio_binding.snapshot_complete is False
+    assert second.portfolio_binding.positions == ()
+    assert second.position_present is None
     attempt = second_context.audit_store.source_attempt_history(
         "yangjibao_portfolio_observation",
         "personal_position_observation",
@@ -542,6 +571,33 @@ def test_rate_limit_cooldown_prevents_next_worker_call(tmp_path) -> None:
     )[0].attempt
     assert attempt.outcome is SourceAttemptOutcome.SKIPPED_COOLDOWN
     assert attempt.error_code is SourceErrorCode.COOLDOWN_ACTIVE
+    assert (
+        second.source_attempt_id
+        == second_context.audit_store.source_attempt_history(
+            "yangjibao_portfolio_observation",
+            "personal_position_observation",
+            "fund:123456",
+        )[0].id
+    )
+
+
+def test_success_binding_does_not_read_or_inherit_latest_repository_snapshot(tmp_path) -> None:
+    repository = Repository(tmp_path / "kunjin.db")
+    repository.migrate()
+    context, _ticks = _context(repository, "6" * 32)
+
+    with patch.object(
+        repository,
+        "latest_positions",
+        side_effect=AssertionError("must not reverse-load a concurrent portfolio snapshot"),
+    ):
+        result = BoundedPortfolioService(
+            repository,
+            worker_runner=lambda request, _budget: _response(request),
+        ).sync("123456", context)
+
+    assert tuple(item.fund_code for item in result.portfolio_binding.positions) == ("123456",)
+    assert result.portfolio_binding.positions[0].shares == Decimal(SHARES_SENTINEL)
 
 
 def test_portfolio_attempt_and_snapshot_roll_back_together(tmp_path) -> None:

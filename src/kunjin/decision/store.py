@@ -902,6 +902,51 @@ class DecisionAuditStore:
         except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError):
             raise DecisionAuditStoreError("source attempt authentication failed") from None
 
+    def authenticated_request_source_attempts(
+        self,
+        request_run_id: int,
+        budget: RequestBudget,
+        cutoff_at: datetime,
+    ) -> Tuple[StoredSourceAttempt, ...]:
+        _positive_id(request_run_id, "request run id")
+        if type(budget) is not RequestBudget:
+            raise ValueError("budget must be an exact RequestBudget")
+        validate_aware_datetime(cutoff_at, "source attempt cutoff")
+        cutoff_at = cutoff_at.astimezone(timezone.utc)
+        if not budget.started_at <= cutoff_at <= budget.deadline_at:
+            raise ValueError("source attempt cutoff is outside the request lifetime")
+        cutoff_text = _utc_text(cutoff_at, "source attempt cutoff")
+        budget.require_publishable()
+        try:
+            with self.repository.connect() as connection, connection:
+                connection.execute("BEGIN")
+                self._authenticate_budget_request(connection, request_run_id, budget)
+                rows = connection.execute(
+                    """
+                    SELECT source_attempts.*, request_runs.request_id AS request_id
+                    FROM source_attempts
+                    JOIN request_runs
+                      ON request_runs.id = source_attempts.request_run_id
+                    WHERE source_attempts.request_run_id = ?
+                      AND source_attempts.finished_at COLLATE BINARY
+                          <= ? COLLATE BINARY
+                    ORDER BY source_attempts.finished_at, source_attempts.id
+                    """,
+                    (request_run_id, cutoff_text),
+                ).fetchall()
+                attempts = tuple(_stored_attempt(row) for row in rows)
+                if any(
+                    item.request_run_id != request_run_id or item.request_id != budget.request_id
+                    for item in attempts
+                ):
+                    raise DecisionAuditStoreError("request source attempt binding failed")
+                budget.require_publishable()
+                return attempts
+        except (DecisionAuditStoreError, BudgetExpired):
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError):
+            raise DecisionAuditStoreError("request source attempt authentication failed") from None
+
     def authenticated_source_attempt_histories(
         self,
         request_run_id: int,

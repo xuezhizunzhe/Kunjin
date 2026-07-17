@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import re
 import secrets
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Mapping, Optional, Tuple
@@ -328,7 +328,7 @@ def _is_canonical_percent(value: object) -> bool:
 
 @dataclass(frozen=True)
 class PortfolioEvidenceBinding:
-    positions: Tuple[StoredPosition, ...]
+    positions: Tuple[StoredPosition, ...] = field(repr=False)
     snapshot_complete: bool
     observation_version: str
     observed_at: datetime
@@ -584,6 +584,59 @@ class AdjustedReturnSeriesEvidence:
         self.evidence_fact.validate()
         if self.evidence_fact.field_id != "adjusted_return_series":
             raise ValueError("adjusted return evidence fact has the wrong field")
+
+
+def _project_adjusted_return_series_fact(
+    series: ValidatedAdjustedNavSeries,
+) -> BriefFact:
+    observations = series.observations
+    fact = BriefFact(
+        fact_id=(f"adjusted_return_series_{series.fund_code}_{series.source_attempt_id}"),
+        field_id="adjusted_return_series",
+        value={
+            "fund_code": series.fund_code,
+            "sample_count": str(len(observations)),
+            "start_date": observations[0].nav_date.isoformat(),
+            "end_date": observations[-1].nav_date.isoformat(),
+            "corporate_action_state": "none",
+            "calculation_version": "1",
+            "source_attempt_id": str(series.source_attempt_id),
+        },
+        unit=None,
+        data_as_of=datetime.combine(
+            series.data_as_of,
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        ),
+        published_at=None,
+        retrieved_at=series.retrieved_at,
+        source_id="eastmoney_nav",
+        source_tier=SourceTier.TIER_2,
+        publisher="东方财富",
+        canonical_url=f"https://fund.eastmoney.com/{series.fund_code}.html",
+        freshness=EvidenceFreshness.CURRENT,
+        completeness=EvidenceCompleteness.COMPLETE,
+        conflict_ids=(),
+        calculated=True,
+        source_lineage_id=f"source_attempt_{series.source_attempt_id}",
+    )
+    fact.validate()
+    return fact
+
+
+def project_adjusted_return_series_evidence(
+    series: ValidatedAdjustedNavSeries,
+) -> AdjustedReturnSeriesEvidence:
+    if type(series) is not ValidatedAdjustedNavSeries:
+        raise ValueError("adjusted return projection requires an exact validated series")
+    series.validate()
+    result = AdjustedReturnSeriesEvidence(
+        fund_code=series.fund_code,
+        series=series,
+        evidence_fact=_project_adjusted_return_series_fact(series),
+    )
+    result.validate()
+    return result
 
 
 @dataclass(frozen=True)
@@ -1294,28 +1347,18 @@ def _validated_adjusted_series(
         or attempt.finished_at > as_of
     ):
         return None, fact, f"adjusted_return_source_binding_invalid_{fund_code}", True
-    value = fact.value
-    expected_lineage = f"source_attempt_{series.source_attempt_id}"
-    expected_value = {
-        "fund_code": fund_code,
-        "sample_count": str(len(observations)),
-        "start_date": observations[0].nav_date.isoformat(),
-        "end_date": observations[-1].nav_date.isoformat(),
-        "corporate_action_state": "none",
-        "calculation_version": "1",
-        "source_attempt_id": str(series.source_attempt_id),
-    }
+    expected_fact = _project_adjusted_return_series_fact(series)
     if (
-        not isinstance(value, Mapping)
-        or dict(value) != expected_value
-        or fact.source_id != "eastmoney_nav"
-        or fact.source_tier is not SourceTier.TIER_2
-        or fact.publisher != "东方财富"
-        or fact.canonical_url != f"https://fund.eastmoney.com/{fund_code}.html"
-        or not fact.calculated
-        or fact.retrieved_at != series.retrieved_at
-        or fact.data_as_of != expected_data_as_of
-        or fact.source_lineage_id != expected_lineage
+        not isinstance(fact.value, Mapping)
+        or dict(fact.value) != dict(expected_fact.value)
+        or fact.source_id != expected_fact.source_id
+        or fact.source_tier is not expected_fact.source_tier
+        or fact.publisher != expected_fact.publisher
+        or fact.canonical_url != expected_fact.canonical_url
+        or fact.calculated != expected_fact.calculated
+        or fact.retrieved_at != expected_fact.retrieved_at
+        or fact.data_as_of != expected_fact.data_as_of
+        or fact.source_lineage_id != expected_fact.source_lineage_id
     ):
         return None, fact, f"adjusted_return_evidence_binding_invalid_{fund_code}", True
     return series, fact, None, False

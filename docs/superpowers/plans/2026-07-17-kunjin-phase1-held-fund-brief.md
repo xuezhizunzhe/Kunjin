@@ -597,17 +597,17 @@ git commit -m "feat: project beginner held fund brief"
 - Create: tests/unit/test_brief_service.py
 - Modify: src/kunjin/brief/__init__.py
 
-- [ ] **Step 1: Write failing orchestration tests**
+- [x] **Step 1: Write failing orchestration tests**
 
 Prove one request ID/budget binds route, source work, facts, D2, state, snapshot, and output. Cover Rapid/Deep, priority, public partials, portfolio failure, cooldown, expiry at every boundary, cancellation, late result, final rollback, prior snapshot preservation, and no background work.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/unit/test_brief_service.py
 ~~~
 
-- [ ] **Step 3: Implement HeldFundBriefService.brief**
+- [x] **Step 3: Implement HeldFundBriefService.brief**
 
 ~~~text
 create RequestBudget
@@ -626,7 +626,7 @@ create RequestBudget
 
 Every exception finalizes failed/cancelled/expired with exact omitted work. Do not delete successful source/cache evidence.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/unit/test_brief_service.py \

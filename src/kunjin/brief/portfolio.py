@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable, Optional
 
+from kunjin.brief.d2 import PortfolioEvidenceBinding
 from kunjin.brief.portfolio_worker_protocol import (
     MAX_PORTFOLIO_RESPONSE_BYTES,
     SCHEMA_VERSION,
@@ -32,7 +33,7 @@ from kunjin.decision.worker import (
     _run_framed_worker,
 )
 from kunjin.funds.service import SourceRequestContext
-from kunjin.models import AccountObservation, PositionObservation
+from kunjin.models import AccountObservation, PositionObservation, StoredPosition
 from kunjin.services.sync import PortfolioSyncService
 from kunjin.storage.repository import Repository
 
@@ -48,6 +49,8 @@ class PortfolioObservationResult:
     positions: int
     position_present: Optional[bool]
     observed_at: Optional[str]
+    source_attempt_id: int
+    portfolio_binding: PortfolioEvidenceBinding = field(repr=False)
     error_code: Optional[str] = None
 
 
@@ -198,7 +201,7 @@ class BoundedPortfolioService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 context.budget.require_publishable()
-                context.audit_store.record_source_attempt(
+                source_attempt_id = context.audit_store.record_source_attempt(
                     context.request_run_id,
                     attempt,
                     connection=connection,
@@ -214,6 +217,33 @@ class BoundedPortfolioService:
             except BaseException:
                 connection.rollback()
                 raise
+        account_titles = {item.source_account_id: item.title for item in accounts}
+        bound_positions = tuple(
+            StoredPosition(
+                account_title=account_titles[item.source_account_id],
+                fund_code=item.fund_code,
+                fund_name=item.fund_name,
+                shares=item.shares,
+                observed_at=item.observed_at,
+                share_class=item.share_class,
+                formal_nav=item.formal_nav,
+                estimated_nav=item.estimated_nav,
+                observed_profit=item.observed_profit,
+            )
+            for item in positions
+        )
+        binding = PortfolioEvidenceBinding(
+            positions=bound_positions,
+            snapshot_complete=True,
+            observation_version=f"source_attempt_{source_attempt_id}",
+            observed_at=payload.retrieved_at,
+            source_state="same_request_success",
+            request_id=context.budget.request_id,
+            request_mode=context.budget.mode,
+            request_started_at=context.budget.started_at,
+            request_deadline_at=context.budget.deadline_at,
+        )
+        binding.validate()
         return PortfolioObservationResult(
             fund_code,
             "success",
@@ -221,6 +251,8 @@ class BoundedPortfolioService:
             len(positions),
             any(item.fund_code == fund_code and item.shares > 0 for item in positions),
             payload.retrieved_at.isoformat(),
+            source_attempt_id,
+            binding,
         )
 
     @staticmethod
@@ -315,7 +347,11 @@ class BoundedPortfolioService:
             response_bytes=0,
         )
         context.budget.require_publishable()
-        context.audit_store.record_source_attempt(context.request_run_id, attempt)
+        source_attempt_id = context.audit_store.record_source_attempt(
+            context.request_run_id,
+            attempt,
+        )
+        binding = self._unknown_binding(context, finished_at, source_attempt_id)
         return PortfolioObservationResult(
             fund_code,
             "skipped_cooldown",
@@ -323,6 +359,8 @@ class BoundedPortfolioService:
             0,
             None,
             None,
+            source_attempt_id,
+            binding,
             SourceErrorCode.COOLDOWN_ACTIVE.value,
         )
 
@@ -368,7 +406,11 @@ class BoundedPortfolioService:
             response_bytes=response_bytes,
         )
         context.budget.require_publishable()
-        context.audit_store.record_source_attempt(context.request_run_id, attempt)
+        source_attempt_id = context.audit_store.record_source_attempt(
+            context.request_run_id,
+            attempt,
+        )
+        binding = self._unknown_binding(context, finished_at, source_attempt_id)
         return PortfolioObservationResult(
             fund_code,
             "unavailable",
@@ -376,8 +418,30 @@ class BoundedPortfolioService:
             0,
             None,
             None,
+            source_attempt_id,
+            binding,
             public_reason,
         )
+
+    @staticmethod
+    def _unknown_binding(
+        context: SourceRequestContext,
+        finished_at: datetime,
+        source_attempt_id: int,
+    ) -> PortfolioEvidenceBinding:
+        binding = PortfolioEvidenceBinding(
+            positions=(),
+            snapshot_complete=False,
+            observation_version=f"unknown_source_attempt_{source_attempt_id}",
+            observed_at=finished_at,
+            source_state="unbound",
+            request_id=None,
+            request_mode=None,
+            request_started_at=None,
+            request_deadline_at=None,
+        )
+        binding.validate()
+        return binding
 
     @staticmethod
     def _attempt(

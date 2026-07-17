@@ -210,6 +210,19 @@ def _worker_error(reason_code: str, message: str) -> WorkerExecutionError:
     return WorkerExecutionError(reason_code, message)
 
 
+def _global_cancel_reason(error: BaseException) -> Optional[str]:
+    if not isinstance(error, WorkerExecutionError):
+        return "worker_aborted"
+    if error.reason_code in {
+        "request_cancelled",
+        "request_expired",
+        "worker_cleanup_failed",
+        "worker_timeout",
+    }:
+        return error.reason_code
+    return None
+
+
 def _remaining_worker_seconds(budget: RequestBudget) -> float:
     if budget.cancelled:
         raise _worker_error("request_cancelled", "request was cancelled")
@@ -460,12 +473,9 @@ def _run_framed_worker(
         if close_error is not None:
             budget.cancel("worker_aborted")
         elif primary_error is not None:
-            reason = (
-                primary_error.reason_code
-                if isinstance(primary_error, WorkerExecutionError)
-                else "worker_aborted"
-            )
-            budget.cancel(reason)
+            cancel_reason = _global_cancel_reason(primary_error)
+            if cancel_reason is not None:
+                budget.cancel(cancel_reason)
     except BaseException as exc:
         pending_error = exc
     finally:
@@ -474,7 +484,12 @@ def _run_framed_worker(
         except WorkerExecutionError as exc:
             cleanup_error = exc
     if cleanup_error is not None:
-        cause = pending_error or close_error or primary_error
+        cancel_error: Optional[BaseException] = None
+        try:
+            budget.cancel("worker_cleanup_failed")
+        except BaseException as exc:
+            cancel_error = exc
+        cause = pending_error or cancel_error or close_error or primary_error
         if cause is not None:
             raise cleanup_error from cause
         raise cleanup_error
@@ -485,6 +500,7 @@ def _run_framed_worker(
             raise close_error from primary_error
         raise close_error from None
     if return_code is None:
+        budget.cancel("worker_cleanup_failed")
         raise _worker_error(
             "worker_cleanup_failed",
             "public source worker finalization returned no status",
@@ -498,7 +514,6 @@ def _run_framed_worker(
         )
     ):
         primary_error = _worker_error("worker_nonzero_exit", "public source worker failed")
-        budget.cancel("worker_nonzero_exit")
     if primary_error is not None:
         raise primary_error
     try:
@@ -510,7 +525,6 @@ def _run_framed_worker(
             "request result is no longer publishable",
         ) from None
     if result is None:
-        budget.cancel("worker_protocol_error")
         raise _worker_error(
             "worker_protocol_error",
             "public source worker returned no result",

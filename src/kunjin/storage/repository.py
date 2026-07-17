@@ -1703,6 +1703,45 @@ class Repository:
         thesis.validate()
         return thesis
 
+    def latest_active_thesis(
+        self,
+        fund_code: str,
+    ) -> Optional[Tuple[int, InvestmentThesis]]:
+        if (
+            type(fund_code) is not str
+            or len(fund_code) != 6
+            or not fund_code.isascii()
+            or not fund_code.isdigit()
+        ):
+            raise ValueError("fund code must be exactly six ASCII digits")
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM investment_theses
+                WHERE fund_code = ? AND active = 1
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (fund_code,),
+            ).fetchone()
+        if row is None:
+            return None
+        thesis_id = int(row["id"])
+        if thesis_id <= 0:
+            raise ValueError("stored thesis id must be a positive integer")
+        thesis = InvestmentThesis(
+            fund_code=str(row["fund_code"]),
+            rationale=str(row["rationale"]),
+            horizon=str(row["horizon"]),
+            invalidation=str(row["invalidation"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            active=bool(row["active"]),
+        )
+        thesis.validate()
+        if thesis.fund_code != fund_code or not thesis.active:
+            raise ValueError("stored active thesis binding is invalid")
+        return thesis_id, thesis
+
     def list_theses(self, fund_code: Optional[str] = None) -> List[InvestmentThesis]:
         query = "SELECT * FROM investment_theses"
         parameters: Tuple[str, ...] = ()

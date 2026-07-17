@@ -724,11 +724,29 @@ def test_error_encoder_and_decoder_reject_noncanonical_messages(
     ),
 )
 def test_invalid_worker_results_fail_closed(mode: str, reason_code: str) -> None:
+    budget = _budget()
     with pytest.raises(WorkerExecutionError) as error:
-        _run_fixture(mode, _budget())
+        _run_fixture(mode, budget)
     assert error.value.reason_code == reason_code
     assert "Traceback" not in str(error.value)
     assert str(FIXTURE) not in str(error.value)
+    assert budget.cancelled is False
+    assert budget.cancel_reason is None
+
+
+@pytest.mark.parametrize("mode", ("malformed", "nonzero"))
+def test_source_local_worker_failure_allows_next_source_on_shared_budget(
+    mode: str,
+) -> None:
+    budget = _budget()
+    with pytest.raises(WorkerExecutionError):
+        _run_fixture(mode, budget)
+
+    result = _run_fixture("success", budget)
+
+    assert result.ok is True
+    assert budget.cancelled is False
+    assert budget.cancel_reason is None
 
 
 def test_response_decoder_rejects_trailing_or_oversized_bytes() -> None:
@@ -896,7 +914,7 @@ def test_fast_exited_leader_still_reaps_detached_stdout_grandchild(tmp_path: Pat
             process.wait(timeout=1)
 
 
-def test_oversized_output_cancels_kills_and_reaps_worker() -> None:
+def test_oversized_output_preserves_budget_but_kills_and_reaps_worker() -> None:
     processes: list[subprocess.Popen] = []
     real_popen = subprocess.Popen
 
@@ -905,6 +923,7 @@ def test_oversized_output_cancels_kills_and_reaps_worker() -> None:
         processes.append(process)
         return process
 
+    budget = _budget()
     with (
         patch("kunjin.decision.worker.subprocess.Popen", side_effect=capture),
         patch(
@@ -912,8 +931,10 @@ def test_oversized_output_cancels_kills_and_reaps_worker() -> None:
         ),
     ):
         with pytest.raises(WorkerExecutionError) as error:
-            run_public_worker(_request(), _budget())
+            run_public_worker(_request(), budget)
     assert error.value.reason_code == "worker_response_oversized"
+    assert budget.cancelled is False
+    assert budget.cancel_reason is None
     assert processes[0].poll() is not None
     assert not _pid_is_alive(processes[0].pid)
 
@@ -1285,9 +1306,49 @@ def test_internal_framed_runner_accepts_private_portfolio_target() -> None:
 
 def test_launch_rejects_invalid_phase0_run_identity(monkeypatch) -> None:
     monkeypatch.setenv("KUNJIN_PHASE0_RUN_ID", "A" * 32)
+    budget = _budget()
     with pytest.raises(WorkerExecutionError) as raised:
-        run_public_worker(_request(), _budget())
+        run_public_worker(_request(), budget)
     assert raised.value.reason_code == "worker_launch_failed"
+    assert budget.cancelled is False
+    assert budget.cancel_reason is None
+
+
+def test_cleanup_failure_cancels_shared_budget() -> None:
+    processes: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def capture(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    cleanup_error = WorkerExecutionError(
+        "worker_cleanup_failed",
+        "public source worker could not be reaped",
+    )
+    budget = _budget()
+    try:
+        with (
+            patch("kunjin.decision.worker.subprocess.Popen", side_effect=capture),
+            patch(
+                "kunjin.decision.worker._default_worker_argv",
+                return_value=_argv("success"),
+            ),
+            patch(
+                "kunjin.decision.worker._finalize_process_group",
+                side_effect=cleanup_error,
+            ),
+        ):
+            with pytest.raises(WorkerExecutionError) as raised:
+                run_public_worker(_request(), budget)
+        assert raised.value is cleanup_error
+        assert budget.cancelled is True
+        assert budget.cancel_reason == "worker_cleanup_failed"
+    finally:
+        for process in processes:
+            _kill_process_group(process.pid)
+            process.wait(timeout=1)
 
 
 def test_finalization_signals_group_before_the_only_wait() -> None:

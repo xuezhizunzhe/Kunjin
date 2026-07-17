@@ -166,6 +166,14 @@ PROFILE_SECTIONS = (
 )
 CLASSIFICATION_SECTIONS = ("basic_profile",)
 HOLDING_SECTIONS = ("quarterly_holdings", "industry_exposure")
+BRIEF_SECTION_GROUPS = (
+    ("basic_profile",),
+    ("manager_history", "fee_schedule"),
+    ("announcements",),
+)
+BRIEF_SECTION_ALLOWLIST = frozenset(
+    section for group in BRIEF_SECTION_GROUPS for section in group
+)
 AGE_LIMITS = {
     DocumentKind.BASIC_PROFILE: timedelta(days=30),
     DocumentKind.MANAGER_HISTORY: timedelta(days=7),
@@ -234,6 +242,36 @@ class FundDisclosureService:
         request_context: Optional[SourceRequestContext] = None,
     ) -> FundDisclosureSyncResult:
         return self._sync(fund_code, PROFILE_SECTIONS, request_context=request_context)
+
+    def sync_sections(
+        self,
+        fund_code: str,
+        section_names: Tuple[str, ...],
+        *,
+        request_context: SourceRequestContext,
+    ) -> FundDisclosureSyncResult:
+        if type(section_names) is not tuple:
+            raise ValueError("section names must be an exact tuple")
+        if any(type(section_name) is not str for section_name in section_names):
+            raise ValueError("section names must be exact strings")
+        if len(set(section_names)) != len(section_names):
+            raise ValueError("section names must not contain duplicates")
+        unsupported = tuple(
+            section_name
+            for section_name in section_names
+            if section_name not in BRIEF_SECTION_ALLOWLIST
+        )
+        if unsupported:
+            raise ValueError(f"unsupported brief disclosure section: {unsupported[0]}")
+        if section_names not in BRIEF_SECTION_GROUPS:
+            raise ValueError("unsupported brief disclosure section group")
+        if type(request_context) is not SourceRequestContext:
+            raise ValueError("request context must be an exact SourceRequestContext")
+        return self._sync(
+            fund_code,
+            section_names,
+            request_context=request_context,
+        )
 
     def sync_classification(
         self,
