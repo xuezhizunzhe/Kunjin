@@ -405,23 +405,23 @@ git commit -m "feat: bound private portfolio observation"
 - Create: src/kunjin/brief/facts.py
 - Create: tests/unit/test_brief_facts.py
 
-- [ ] **Step 1: Write failing selection/event tests**
+- [x] **Step 1: Write failing selection/event tests**
 
 Use Tier 1/Tier 2 conflicts, former/current managers, A/C fees, stale/top-ten holdings, missing redemption periods, and reprints. Every fact must resolve to a projected source and retain data/publication/retrieval dates.
 
 Tier 2 announcement indexes may remain attributed facts but cannot create mature official events. Only a validated Tier 1 manager-domain liquidation/termination source can trigger mature review.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/unit/test_brief_facts.py
 ~~~
 
-- [ ] **Step 3: Build facts and official events**
+- [x] **Step 3: Build facts and official events**
 
 Reuse build_disclosure_report selection semantics, then project bounded BriefFact records. Add latest formal NAV and current D1 classification with exact status/tags. Classify official events with anchored normalized-title patterns and source metadata. Preserve unmatched Tier 1 as other_official_product_notice and Tier 2 outside official_events. Never infer correction/retraction or independence from title similarity.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/unit/test_brief_facts.py
@@ -526,6 +526,11 @@ Cover blocked no_add; blocked plus liquidation retaining both states; identity-c
 - [ ] **Step 3: Implement HeldFundBriefEngine**
 
 Consume typed DecisionRoute, facts, events, D2, source resolutions, and confirmed theses. Produce separate sync_status and decision_evidence_status. Preserve simultaneous constraints, triggered reviews, and affected abstentions; primary state is presentation only. Do not parse free-form text here.
+
+`AuthenticatedAnnouncementContent` is an internal projection boundary, not an
+API input. Task 9 and later service layers must obtain it from an authenticated
+store/source-attempt binding and must not construct it directly from request
+fields, caller-supplied checksums, or caller-supplied integrity metadata.
 
 - [ ] **Step 4: Verify and commit**
 
