@@ -397,9 +397,24 @@ def test_normal_fractional_start_rounds_deadline_inside_policy_total() -> None:
     )
 
     represented_span = budget.monotonic_deadline - budget.monotonic_start
-    assert budget.monotonic_deadline == math.nextafter(
-        uncorrected_deadline, -math.inf
+    assert budget.monotonic_deadline == math.nextafter(uncorrected_deadline, -math.inf)
+    assert 0.0 < represented_span <= budget.total_seconds
+
+
+def test_later_fractional_start_rounds_deadline_inside_policy_total() -> None:
+    monotonic_start = 166.004
+    uncorrected_deadline = monotonic_start + 90.0
+    assert uncorrected_deadline - monotonic_start == 90.00000000000003
+
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id="d" * 32,
+        monotonic=lambda: monotonic_start,
+        wall_clock=lambda: UTC_START,
     )
+
+    represented_span = budget.monotonic_deadline - budget.monotonic_start
+    assert budget.monotonic_deadline == math.nextafter(uncorrected_deadline, -math.inf)
     assert 0.0 < represented_span <= budget.total_seconds
 
 

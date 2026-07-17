@@ -95,16 +95,15 @@ class RequestBudget:
             raise ValueError("monotonic deadline must be finite and after its start")
         represented_span = monotonic_deadline - monotonic_start
         if represented_span > total_seconds:
-            if represented_span - total_seconds > math.ulp(total_seconds):
-                raise ValueError(
-                    "represented monotonic deadline span exceeds total seconds"
-                )
+            deadline_resolution = math.ulp(monotonic_deadline)
+            if (
+                deadline_resolution >= cleanup_reserve_seconds
+                or represented_span - total_seconds > deadline_resolution
+            ):
+                raise ValueError("represented monotonic deadline span exceeds total seconds")
             monotonic_deadline = math.nextafter(monotonic_deadline, -math.inf)
             represented_span = monotonic_deadline - monotonic_start
-        if (
-            monotonic_deadline <= monotonic_start
-            or represented_span > total_seconds
-        ):
+        if monotonic_deadline <= monotonic_start or represented_span > total_seconds:
             raise ValueError("represented monotonic deadline span exceeds total seconds")
         try:
             deadline_at = started_at + timedelta(seconds=total_seconds)
