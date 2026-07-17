@@ -3697,19 +3697,43 @@ class CliIntegrationTest(unittest.TestCase):
 
     def test_ledger_reconcile_rejects_ambiguous_position_accounts(self) -> None:
         now = datetime.now(timezone.utc)
-        self.context.repository.replace_snapshot(
-            AccountObservation("yangjibao", "account-2", "另一个账户", now),
+        account_one = AccountObservation("yangjibao", "account-1", "学习账户", now)
+        account_two = AccountObservation("yangjibao", "account-2", "另一个账户", now)
+        sync_run_id = self.context.repository.begin_sync("yangjibao", "test")
+        self.context.repository.commit_sync(
+            sync_run_id,
+            [],
             [
-                PositionObservation(
-                    "account-2",
-                    "519755",
-                    "成长基金",
-                    Decimal("1"),
-                    now,
-                    formal_nav=Decimal("1.7467"),
-                    observed_profit=Decimal("0"),
-                )
+                (
+                    account_one,
+                    [
+                        PositionObservation(
+                            "account-1",
+                            "519755",
+                            "成长基金",
+                            Decimal("11.32"),
+                            now,
+                            formal_nav=Decimal("1.7467"),
+                            observed_profit=Decimal("-0.23"),
+                        )
+                    ],
+                ),
+                (
+                    account_two,
+                    [
+                        PositionObservation(
+                            "account-2",
+                            "519755",
+                            "成长基金",
+                            Decimal("1"),
+                            now,
+                            formal_nav=Decimal("1.7467"),
+                            observed_profit=Decimal("0"),
+                        )
+                    ],
+                ),
             ],
+            observed_at=now,
         )
 
         payload, exit_code, _ = run(

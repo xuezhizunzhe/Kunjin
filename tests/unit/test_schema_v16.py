@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from kunjin.models import AccountObservation, PositionObservation
 from kunjin.storage.repository import Repository, _execute_schema, _migrate_v12
 from kunjin.storage.schema import (
     SCHEMA_V1,
@@ -24,6 +27,7 @@ from kunjin.storage.schema import (
     SCHEMA_V15,
     SCHEMA_V16,
     SCHEMA_V17,
+    SCHEMA_V18,
     SCHEMA_VERSION,
 )
 
@@ -47,6 +51,7 @@ SCHEMAS = {
     15: SCHEMA_V15,
     16: SCHEMA_V16,
     17: SCHEMA_V17,
+    18: SCHEMA_V18,
 }
 
 
@@ -78,9 +83,7 @@ def test_v16_migration_is_additive_and_preserves_prior_bytes(
     repository = _create_version(tmp_path / f"v{starting_version}.db", starting_version)
     with repository.connect() as connection:
         before = bytes(
-            connection.execute(
-                "SELECT CAST(error_message AS BLOB) FROM sync_runs"
-            ).fetchone()[0]
+            connection.execute("SELECT CAST(error_message AS BLOB) FROM sync_runs").fetchone()[0]
         )
 
     repository.migrate()
@@ -88,17 +91,13 @@ def test_v16_migration_is_additive_and_preserves_prior_bytes(
     with repository.connect() as connection:
         versions = tuple(
             row["version"]
-            for row in connection.execute(
-                "SELECT version FROM schema_migrations ORDER BY version"
-            )
+            for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         )
         after = bytes(
-            connection.execute(
-                "SELECT CAST(error_message AS BLOB) FROM sync_runs"
-            ).fetchone()[0]
+            connection.execute("SELECT CAST(error_message AS BLOB) FROM sync_runs").fetchone()[0]
         )
-    assert SCHEMA_VERSION == 17
-    assert versions == tuple(range(1, 18))
+    assert SCHEMA_VERSION == 18
+    assert versions == tuple(range(1, 19))
     assert after == before
 
 
@@ -110,35 +109,25 @@ def test_v16_has_exact_brief_tables_columns_foreign_keys_and_immutability(
     with repository.connect() as connection:
         tables = {
             row["name"]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         policy_columns = tuple(
-            row["name"]
-            for row in connection.execute("PRAGMA table_info(brief_policy_versions)")
+            row["name"] for row in connection.execute("PRAGMA table_info(brief_policy_versions)")
         )
         snapshot_columns = tuple(
-            row["name"]
-            for row in connection.execute("PRAGMA table_info(fund_brief_snapshots)")
+            row["name"] for row in connection.execute("PRAGMA table_info(fund_brief_snapshots)")
         )
         foreign_keys = {
             (row["from"], row["table"], row["to"], row["on_delete"])
-            for row in connection.execute(
-                "PRAGMA foreign_key_list(fund_brief_snapshots)"
-            )
+            for row in connection.execute("PRAGMA foreign_key_list(fund_brief_snapshots)")
         }
         triggers = {
             row["name"]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
         }
         indexes = {
             row["name"]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
         }
     assert {"brief_policy_versions", "fund_brief_snapshots"} <= tables
     assert policy_columns == (
@@ -212,24 +201,19 @@ def test_v17_adds_bounded_corporate_action_state_and_preserves_nav_rows(
 
     with repository.connect() as connection:
         columns = tuple(
-            str(row["name"])
-            for row in connection.execute("PRAGMA table_info(fund_nav)")
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(fund_nav)")
         )
-        row = connection.execute(
-            "SELECT * FROM fund_nav WHERE fund_code = '123456'"
-        ).fetchone()
+        row = connection.execute("SELECT * FROM fund_nav WHERE fund_code = '123456'").fetchone()
         versions = tuple(
             int(item["version"])
-            for item in connection.execute(
-                "SELECT version FROM schema_migrations ORDER BY version"
-            )
+            for item in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         )
         assert row is not None
         assert row["corporate_action_state"] == "unknown"
         assert row["source_attempt_id"] is None
         assert "corporate_action_state" in columns
         assert "source_attempt_id" in columns
-        assert versions == tuple(range(1, 18))
+        assert versions == tuple(range(1, 19))
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """
@@ -252,6 +236,265 @@ def test_v17_adds_bounded_corporate_action_state_and_preserves_nav_rows(
             )
 
 
+def test_v18_preserves_legacy_positions_until_first_complete_snapshot(
+    tmp_path: Path,
+) -> None:
+    repository = _create_version(tmp_path / "v17-portfolio.db", 17)
+    with repository.connect() as connection, connection:
+        account_id = connection.execute(
+            """
+            INSERT INTO accounts(source, source_account_id, title, observed_at)
+            VALUES ('yangjibao', 'legacy-account', '旧账户', ?)
+            """,
+            (UTC,),
+        ).lastrowid
+        connection.execute(
+            """
+            INSERT INTO positions(
+                account_id, fund_code, fund_name, shares, formal_nav, observed_at
+            ) VALUES (?, '123456', '旧基金', '10', '1.2', ?)
+            """,
+            (account_id, UTC),
+        )
+
+    repository.migrate()
+
+    assert [item.fund_code for item in repository.latest_positions()] == ["123456"]
+    observed_at = datetime(2026, 7, 17, tzinfo=timezone.utc)
+    with repository.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        sync_run_id = repository.begin_sync(
+            "yangjibao",
+            "fund_brief",
+            connection=connection,
+            started_at=observed_at,
+        )
+        repository.commit_sync(
+            sync_run_id,
+            (),
+            (),
+            connection=connection,
+            observed_at=observed_at,
+        )
+        connection.commit()
+
+    assert repository.latest_positions() == []
+    with repository.connect() as connection:
+        columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(positions)")}
+        snapshot = connection.execute("SELECT * FROM portfolio_observation_snapshots").fetchone()
+        assert "sync_run_id" in columns
+        assert snapshot["account_count"] == 0
+        assert snapshot["position_count"] == 0
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute("UPDATE portfolio_observation_snapshots SET account_count = 1")
+
+        invalid_run_id = connection.execute(
+            """
+            INSERT INTO sync_runs(source, trigger, started_at, status)
+            VALUES ('yangjibao', 'test', ?, 'running')
+            """,
+            (UTC,),
+        ).lastrowid
+        with pytest.raises(sqlite3.IntegrityError, match="account count mismatch"):
+            connection.execute(
+                """
+                INSERT INTO portfolio_observation_snapshots(
+                    sync_run_id, observed_at, account_count, position_count
+                ) VALUES (?, ?, 1, 0)
+                """,
+                (invalid_run_id, UTC),
+            )
+
+
+def test_v18_latest_positions_uses_observation_time_not_commit_order(
+    tmp_path: Path,
+) -> None:
+    repository = Repository(tmp_path / "out-of-order-portfolio.db")
+    repository.migrate()
+    older_at = datetime(2026, 7, 17, 11, 0, tzinfo=timezone.utc)
+    newer_at = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    new_account = AccountObservation("yangjibao", "account-1", "\u65b0\u8d26\u6237", newer_at)
+    old_account = AccountObservation("yangjibao", "account-1", "\u65e7\u8d26\u6237", older_at)
+    old_position = PositionObservation(
+        "account-1",
+        "123456",
+        "\u65e7\u57fa\u91d1",
+        Decimal("1"),
+        older_at,
+    )
+
+    with repository.connect() as connection, connection:
+        newer_run = repository.begin_sync(
+            "yangjibao", "test", connection=connection, started_at=newer_at
+        )
+        repository.commit_sync(
+            newer_run,
+            (),
+            ((new_account, ()),),
+            connection=connection,
+            observed_at=newer_at,
+        )
+
+    with repository.connect() as connection, connection:
+        older_run = repository.begin_sync(
+            "yangjibao", "test", connection=connection, started_at=older_at
+        )
+        repository.commit_sync(
+            older_run,
+            (),
+            ((old_account, (old_position,)),),
+            connection=connection,
+            observed_at=older_at,
+        )
+
+    assert repository.latest_positions() == []
+    with repository.connect() as connection:
+        account = connection.execute(
+            """
+            SELECT title, observed_at FROM accounts
+            WHERE source = 'yangjibao' AND source_account_id = 'account-1'
+            """
+        ).fetchone()
+        assert account["title"] == "\u65b0\u8d26\u6237"
+        assert account["observed_at"] == newer_at.isoformat()
+        account_id = int(
+            connection.execute(
+                """
+                SELECT id FROM accounts
+                WHERE source = 'yangjibao' AND source_account_id = 'account-1'
+                """
+            ).fetchone()["id"]
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="account set is closed"):
+            connection.execute(
+                """
+                INSERT INTO portfolio_observation_accounts(
+                    sync_run_id, account_id, account_title, observed_at
+                ) VALUES (?, ?, 'late account', ?)
+                """,
+                (newer_run, account_id, newer_at.isoformat()),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="position set is closed"):
+            connection.execute(
+                """
+                INSERT INTO positions(
+                    account_id, fund_code, fund_name, shares, observed_at, sync_run_id
+                ) VALUES (?, '654321', 'late fund', '1', ?, ?)
+                """,
+                (account_id, newer_at.isoformat(), newer_run),
+            )
+        legacy_position_id = connection.execute(
+            """
+            INSERT INTO positions(
+                account_id, fund_code, fund_name, shares, observed_at
+            ) VALUES (?, '654321', 'legacy fund', '1', ?)
+            """,
+            (account_id, newer_at.isoformat()),
+        ).lastrowid
+        with pytest.raises(sqlite3.IntegrityError, match="positions are immutable"):
+            connection.execute(
+                "UPDATE positions SET sync_run_id = ? WHERE id = ?",
+                (newer_run, legacy_position_id),
+            )
+
+
+def test_v18_snapshot_guards_reject_wrong_source_and_time_bypasses(
+    tmp_path: Path,
+) -> None:
+    repository = Repository(tmp_path / "portfolio-guard-bypasses.db")
+    repository.migrate()
+    observed_at = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    older_at = datetime(2026, 7, 17, 11, 0, tzinfo=timezone.utc)
+
+    with repository.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        wrong_account_id = connection.execute(
+            """
+            INSERT INTO accounts(source, source_account_id, title, observed_at)
+            VALUES ('eastmoney', 'wrong-account', 'wrong', ?)
+            """,
+            (observed_at.isoformat(),),
+        ).lastrowid
+        run_id = repository.begin_sync(
+            "yangjibao", "test", connection=connection, started_at=observed_at
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="account set is closed"):
+            connection.execute(
+                """
+                INSERT INTO portfolio_observation_accounts(
+                    sync_run_id, account_id, account_title, observed_at
+                ) VALUES (?, ?, 'wrong', ?)
+                """,
+                (run_id, wrong_account_id, observed_at.isoformat()),
+            )
+
+        account_id = connection.execute(
+            """
+            INSERT INTO accounts(source, source_account_id, title, observed_at)
+            VALUES ('yangjibao', 'account-1', 'current', ?)
+            """,
+            (observed_at.isoformat(),),
+        ).lastrowid
+        connection.execute(
+            """
+            INSERT INTO portfolio_observation_accounts(
+                sync_run_id, account_id, account_title, observed_at
+            ) VALUES (?, ?, 'current', ?)
+            """,
+            (run_id, account_id, observed_at.isoformat()),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="position set is closed"):
+            connection.execute(
+                """
+                INSERT INTO positions(
+                    account_id, fund_code, fund_name, shares, observed_at, sync_run_id
+                ) VALUES (?, '123456', 'mismatched', '1', ?, ?)
+                """,
+                (account_id, older_at.isoformat(), run_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="follows snapshot"):
+            connection.execute(
+                """
+                INSERT INTO portfolio_observation_snapshots(
+                    sync_run_id, observed_at, account_count, position_count
+                ) VALUES (?, ?, 1, 0)
+                """,
+                (run_id, older_at.isoformat()),
+            )
+        connection.rollback()
+
+
+def test_commit_sync_rejects_wrong_or_nonrunning_sync_run(tmp_path: Path) -> None:
+    repository = Repository(tmp_path / "wrong-run.db")
+    repository.migrate()
+    observed_at = datetime(2026, 7, 17, tzinfo=timezone.utc)
+    account = AccountObservation("yangjibao", "account-1", "学习账户", observed_at)
+    position = PositionObservation(
+        "account-1",
+        "123456",
+        "测试基金",
+        Decimal("1"),
+        observed_at,
+    )
+    with repository.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        wrong_source = repository.begin_sync(
+            "eastmoney",
+            "test",
+            connection=connection,
+            started_at=observed_at,
+        )
+        with pytest.raises(ValueError, match="yangjibao"):
+            repository.commit_sync(
+                wrong_source,
+                (),
+                ((account, (position,)),),
+                connection=connection,
+                observed_at=observed_at,
+            )
+        connection.rollback()
+
+
 def test_failed_v16_migration_rolls_back_objects_marker_and_prior_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -264,15 +507,11 @@ def test_failed_v16_migration_rolls_back_objects_marker_and_prior_bytes(
     with repository.connect() as connection:
         versions = tuple(
             row["version"]
-            for row in connection.execute(
-                "SELECT version FROM schema_migrations ORDER BY version"
-            )
+            for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         )
         tables = {
             row["name"]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         value = connection.execute("SELECT error_message FROM sync_runs").fetchone()[0]
     assert versions == tuple(range(1, 16))
@@ -315,9 +554,7 @@ def test_v16_rejects_unexpected_virtual_schema_objects(tmp_path: Path) -> None:
     repository.migrate()
     with repository.connect() as connection, connection:
         try:
-            connection.execute(
-                "CREATE VIRTUAL TABLE unrelated_brief_fts USING fts5(value)"
-            )
+            connection.execute("CREATE VIRTUAL TABLE unrelated_brief_fts USING fts5(value)")
         except sqlite3.OperationalError as exc:
             if "no such module: fts5" in str(exc).casefold():
                 pytest.skip("SQLite build does not expose FTS5")

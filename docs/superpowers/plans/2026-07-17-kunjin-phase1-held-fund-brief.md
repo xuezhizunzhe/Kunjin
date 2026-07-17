@@ -339,27 +339,29 @@ git commit -m "feat: bound formal nav synchronization"
 
 **Files:**
 
-- Modify: src/kunjin/decision/models.py
+- Modify: src/kunjin/adapters/yangjibao.py
 - Create: src/kunjin/brief/portfolio_worker_protocol.py
 - Create: src/kunjin/brief/portfolio_worker_main.py
 - Create: src/kunjin/brief/portfolio.py
 - Modify: src/kunjin/services/sync.py
+- Modify: src/kunjin/storage/repository.py
+- Modify: src/kunjin/storage/schema.py
 - Create: tests/unit/test_brief_portfolio_worker.py
-- Modify: tests/unit/test_sync.py
-- Modify: tests/unit/test_decision_health.py
+- Modify: tests/unit/test_yangjibao.py
+- Modify: tests/unit/test_schema_v4.py through tests/unit/test_schema_v16.py
 
-- [ ] **Step 1: Write failing credential/lifecycle tests**
+- [x] **Step 1: Write failing credential/lifecycle tests**
 
 With token and numeric sentinels, prove the token is absent from argv, environment, temp files, request frame, response frame, stderr, logs, exceptions, and audit rows. Cover missing/expired auth, rate limit, malformed records, size, timeout, ignored termination, child process, late output, parent-only writes, and no external mutation.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/unit/test_brief_portfolio_worker.py \
-  tests/unit/test_sync.py tests/unit/test_decision_health.py
+  tests/integration/test_sync.py tests/unit/test_decision_health.py
 ~~~
 
-- [ ] **Step 3: Define the no-secret request**
+- [x] **Step 3: Define the no-secret request**
 
 ~~~json
 {
@@ -371,24 +373,26 @@ With token and numeric sentinels, prove the token is absent from argv, environme
 
 The child loads KeychainTokenStore itself, calls only list_accounts/list_holdings, validates records, and returns typed observations without token, signing secret, headers, signature, or raw API bodies. Add stable authentication_required as an unavailable, non-transient source error without changing EvidencePolicy/SourceRegistry checksums.
 
-- [ ] **Step 4: Implement parent validation and commit**
+- [x] **Step 4: Implement parent validation and commit**
 
 BoundedPortfolioService uses the private environment, validates all observations again, records one yangjibao_portfolio_observation/personal_position_observation attempt, checks budget, then calls parent-only PortfolioSyncService.commit_observations(). Raw snapshots are omitted on this path.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/unit/test_brief_portfolio_worker.py \
-  tests/unit/test_sync.py tests/unit/test_decision_health.py \
-  tests/unit/test_decision_worker.py
+  tests/unit/test_yangjibao.py tests/integration/test_sync.py \
+  tests/unit/test_decision_health.py tests/unit/test_decision_worker.py \
+  tests/unit/test_schema_v16.py
 .venv/bin/ruff check src/kunjin/brief src/kunjin/services/sync.py \
-  src/kunjin/decision/models.py tests/unit/test_brief_portfolio_worker.py \
-  tests/unit/test_sync.py
-git add src/kunjin/decision/models.py \
+  src/kunjin/adapters/yangjibao.py src/kunjin/storage \
+  tests/unit/test_brief_portfolio_worker.py tests/unit/test_yangjibao.py
+git add src/kunjin/adapters/yangjibao.py \
   src/kunjin/brief/portfolio_worker_protocol.py \
   src/kunjin/brief/portfolio_worker_main.py src/kunjin/brief/portfolio.py \
-  src/kunjin/services/sync.py tests/unit/test_brief_portfolio_worker.py \
-  tests/unit/test_sync.py tests/unit/test_decision_health.py
+  src/kunjin/services/sync.py src/kunjin/storage/repository.py \
+  src/kunjin/storage/schema.py tests/unit/test_brief_portfolio_worker.py \
+  tests/unit/test_yangjibao.py tests/unit/test_schema_v*.py
 git commit -m "feat: bound private portfolio observation"
 ~~~
 

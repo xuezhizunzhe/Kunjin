@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -3311,4 +3311,170 @@ REFERENCES source_attempts(id) ON DELETE RESTRICT;
 
 CREATE INDEX fund_nav_source_attempt
 ON fund_nav(source_attempt_id, retrieved_at);
+"""
+
+SCHEMA_V18 = """
+ALTER TABLE positions
+ADD COLUMN sync_run_id INTEGER
+REFERENCES sync_runs(id) ON DELETE RESTRICT;
+
+CREATE INDEX positions_sync_run
+ON positions(sync_run_id, account_id, fund_code);
+
+CREATE TABLE portfolio_observation_accounts (
+    sync_run_id INTEGER NOT NULL
+        REFERENCES sync_runs(id) ON DELETE RESTRICT,
+    account_id INTEGER NOT NULL
+        REFERENCES accounts(id) ON DELETE RESTRICT,
+    account_title TEXT NOT NULL CHECK(
+        typeof(account_title) = 'text'
+        AND instr(account_title, char(0)) = 0
+        AND length(account_title) BETWEEN 1 AND 256
+    ),
+    observed_at TEXT NOT NULL CHECK(
+        typeof(observed_at) = 'text'
+        AND julianday(observed_at) IS NOT NULL
+        AND substr(observed_at, -6) = '+00:00'
+        AND substr(observed_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', observed_at) = substr(observed_at, 1, 19)
+        AND (
+            length(observed_at) = 25 OR (
+                length(observed_at) = 32
+                AND substr(observed_at, 20, 1) = '.'
+                AND substr(observed_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(observed_at, 21, 6) != '000000'
+            )
+        )
+    ),
+    PRIMARY KEY(sync_run_id, account_id)
+);
+
+CREATE INDEX portfolio_observation_accounts_account
+ON portfolio_observation_accounts(account_id, sync_run_id);
+
+CREATE TRIGGER portfolio_observation_account_insert_guard
+BEFORE INSERT ON portfolio_observation_accounts
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM sync_runs
+        WHERE id = NEW.sync_run_id
+          AND source = 'yangjibao'
+          AND status = 'running'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM accounts
+        WHERE id = NEW.account_id AND source = 'yangjibao'
+    ) OR EXISTS (
+        SELECT 1 FROM portfolio_observation_snapshots
+        WHERE sync_run_id = NEW.sync_run_id
+    ) THEN RAISE(ABORT, 'portfolio snapshot account set is closed') END;
+END;
+
+CREATE TRIGGER portfolio_position_snapshot_insert_guard
+BEFORE INSERT ON positions
+WHEN NEW.sync_run_id IS NOT NULL
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM sync_runs
+        WHERE id = NEW.sync_run_id
+          AND source = 'yangjibao'
+          AND status = 'running'
+    ) OR EXISTS (
+        SELECT 1 FROM portfolio_observation_snapshots
+        WHERE sync_run_id = NEW.sync_run_id
+    ) OR NOT EXISTS (
+        SELECT 1 FROM portfolio_observation_accounts
+        WHERE sync_run_id = NEW.sync_run_id
+          AND account_id = NEW.account_id
+          AND observed_at = NEW.observed_at
+    ) THEN RAISE(ABORT, 'portfolio snapshot position set is closed') END;
+END;
+
+CREATE TRIGGER portfolio_position_snapshot_no_update
+BEFORE UPDATE ON positions
+WHEN OLD.sync_run_id IS NOT NULL OR NEW.sync_run_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'portfolio snapshot positions are immutable');
+END;
+
+CREATE TRIGGER portfolio_position_snapshot_no_delete
+BEFORE DELETE ON positions
+WHEN OLD.sync_run_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'portfolio snapshot positions are immutable');
+END;
+
+CREATE TABLE portfolio_observation_snapshots (
+    sync_run_id INTEGER PRIMARY KEY
+        REFERENCES sync_runs(id) ON DELETE RESTRICT,
+    observed_at TEXT NOT NULL CHECK(
+        typeof(observed_at) = 'text'
+        AND julianday(observed_at) IS NOT NULL
+        AND substr(observed_at, -6) = '+00:00'
+        AND substr(observed_at, 11, 1) = 'T'
+        AND strftime('%Y-%m-%dT%H:%M:%S', observed_at) = substr(observed_at, 1, 19)
+        AND (
+            length(observed_at) = 25 OR (
+                length(observed_at) = 32
+                AND substr(observed_at, 20, 1) = '.'
+                AND substr(observed_at, 21, 6) NOT GLOB '*[^0-9]*'
+                AND substr(observed_at, 21, 6) != '000000'
+            )
+        )
+    ),
+    account_count INTEGER NOT NULL CHECK(
+        typeof(account_count) = 'integer' AND account_count >= 0
+    ),
+    position_count INTEGER NOT NULL CHECK(
+        typeof(position_count) = 'integer' AND position_count >= 0
+    )
+);
+
+CREATE TRIGGER portfolio_observation_snapshot_insert_guard
+BEFORE INSERT ON portfolio_observation_snapshots
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM sync_runs
+        WHERE id = NEW.sync_run_id
+          AND source = 'yangjibao'
+          AND status = 'running'
+    ) THEN RAISE(ABORT, 'portfolio snapshot requires a running yangjibao sync') END;
+    SELECT CASE WHEN (
+        SELECT count(*) FROM positions WHERE sync_run_id = NEW.sync_run_id
+    ) != NEW.position_count
+    THEN RAISE(ABORT, 'portfolio snapshot position count mismatch') END;
+    SELECT CASE WHEN (
+        SELECT count(*) FROM portfolio_observation_accounts
+        WHERE sync_run_id = NEW.sync_run_id
+    ) != NEW.account_count
+    THEN RAISE(ABORT, 'portfolio snapshot account count mismatch') END;
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM portfolio_observation_accounts
+        WHERE sync_run_id = NEW.sync_run_id
+          AND observed_at > NEW.observed_at
+    ) THEN RAISE(ABORT, 'portfolio account observation follows snapshot') END;
+END;
+
+CREATE TRIGGER portfolio_observation_account_no_update
+BEFORE UPDATE ON portfolio_observation_accounts
+BEGIN
+    SELECT RAISE(ABORT, 'portfolio observation accounts are immutable');
+END;
+
+CREATE TRIGGER portfolio_observation_account_no_delete
+BEFORE DELETE ON portfolio_observation_accounts
+BEGIN
+    SELECT RAISE(ABORT, 'portfolio observation accounts are immutable');
+END;
+
+CREATE TRIGGER portfolio_observation_snapshot_no_update
+BEFORE UPDATE ON portfolio_observation_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'portfolio observation snapshots are immutable');
+END;
+
+CREATE TRIGGER portfolio_observation_snapshot_no_delete
+BEFORE DELETE ON portfolio_observation_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'portfolio observation snapshots are immutable');
+END;
 """

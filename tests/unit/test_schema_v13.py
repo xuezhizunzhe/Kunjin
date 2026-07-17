@@ -117,8 +117,8 @@ class SchemaV13Test(unittest.TestCase):
                         ).fetchone()
                         after = (row["id"], bytes(row["input_manifest_json"], "utf-8"))
 
-                self.assertEqual(SCHEMA_VERSION, 17)
-                self.assertEqual(versions, tuple(range(1, 18)))
+                self.assertEqual(SCHEMA_VERSION, 18)
+                self.assertEqual(versions, tuple(range(1, 19)))
                 self.assertEqual(
                     columns,
                     (

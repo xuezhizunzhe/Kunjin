@@ -43,6 +43,7 @@ from kunjin.storage.schema import (
     SCHEMA_V15,
     SCHEMA_V16,
     SCHEMA_V17,
+    SCHEMA_V18,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -173,6 +174,7 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (15, SCHEMA_V15),
         (16, SCHEMA_V16),
         (17, SCHEMA_V17),
+        (18, SCHEMA_V18),
     )
 
 
@@ -278,8 +280,7 @@ def _trigger_probe_statements(
     for alias in ("rowid", "_rowid_", "oid"):
         quoted_alias = _quote_sqlite_identifier(alias)
         statements.append(
-            f"EXPLAIN UPDATE {quoted_target} "
-            f"SET {quoted_alias} = {quoted_alias} WHERE 0"
+            f"EXPLAIN UPDATE {quoted_target} SET {quoted_alias} = {quoted_alias} WHERE 0"
         )
     statements.append(f"EXPLAIN DELETE FROM {quoted_target} WHERE 0")
     return tuple(statements)
@@ -293,9 +294,7 @@ def _reject_unexpected_schema_dependencies(
     protected_tables: set,
     error_message: str,
 ) -> None:
-    normalized_protected_tables = {
-        _ascii_identifier(table) for table in protected_tables
-    }
+    normalized_protected_tables = {_ascii_identifier(table) for table in protected_tables}
     extras = {name: value for name, value in actual.items() if name not in expected}
     if not extras:
         return
@@ -328,9 +327,7 @@ def _reject_unexpected_schema_dependencies(
         if value[0] == "trigger"
     }
     extra_views = {
-        _ascii_identifier(name): str(name)
-        for name, value in extras.items()
-        if value[0] == "view"
+        _ascii_identifier(name): str(name) for name, value in extras.items() if value[0] == "view"
     }
 
     monitored_sources = set(extra_triggers) | set(extra_views)
@@ -365,9 +362,7 @@ def _reject_unexpected_schema_dependencies(
             if value[0] != "table":
                 continue
             quoted_name = _quote_sqlite_identifier(str(name))
-            foreign_keys = probe.execute(
-                f"PRAGMA foreign_key_list({quoted_name})"
-            ).fetchall()
+            foreign_keys = probe.execute(f"PRAGMA foreign_key_list({quoted_name})").fetchall()
             if any(
                 _ascii_identifier(str(row["table"])) in normalized_protected_tables
                 for row in foreign_keys
@@ -1165,21 +1160,45 @@ class Repository:
             ).fetchall()
         return {str(row["name"]) for row in rows}
 
-    def begin_sync(self, source: str, trigger: str) -> int:
-        with self.connect() as connection, connection:
-            cursor = connection.execute(
+    def begin_sync(
+        self,
+        source: str,
+        trigger: str,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+        started_at: Optional[datetime] = None,
+    ) -> int:
+        if connection is not None and type(connection) is not sqlite3.Connection:
+            raise ValueError("connection must be an exact sqlite3.Connection or None")
+        timestamp = (started_at or _utc_now()).astimezone(timezone.utc).isoformat()
+
+        def write(active_connection: sqlite3.Connection) -> int:
+            cursor = active_connection.execute(
                 "INSERT INTO sync_runs(source, trigger, started_at, status) "
                 "VALUES (?, ?, ?, 'running')",
-                (source, trigger, _utc_now().isoformat()),
+                (source, trigger, timestamp),
             )
             return int(cursor.lastrowid)
+
+        if connection is not None:
+            return write(connection)
+        with self.connect() as owned_connection, owned_connection:
+            return write(owned_connection)
 
     def commit_sync(
         self,
         sync_run_id: int,
         raw_snapshots: Sequence[Tuple[str, str, str, datetime]],
         observations: Sequence[Tuple[AccountObservation, Sequence[PositionObservation]]],
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+        observed_at: Optional[datetime] = None,
     ) -> None:
+        if connection is not None and type(connection) is not sqlite3.Connection:
+            raise ValueError("connection must be an exact sqlite3.Connection or None")
+        account_ids = tuple(account.source_account_id for account, _positions in observations)
+        if len(account_ids) != len(set(account_ids)):
+            raise ValueError("portfolio snapshot contains duplicate accounts")
         for account, positions in observations:
             account.validate()
             for position in positions:
@@ -1187,10 +1206,28 @@ class Repository:
                 if position.source_account_id != account.source_account_id:
                     raise ValueError("position account id does not match account")
 
+        snapshot_time = observed_at or max(
+            (account.observed_at for account, _positions in observations),
+            default=_utc_now(),
+        )
+        if snapshot_time.tzinfo is None or snapshot_time.utcoffset() is None:
+            raise ValueError("portfolio snapshot time must be aware")
+        snapshot_time = snapshot_time.astimezone(timezone.utc)
         finished_at = _utc_now().isoformat()
-        with self.connect() as connection, connection:
+
+        def write(active_connection: sqlite3.Connection) -> None:
+            sync_run = active_connection.execute(
+                "SELECT source, status FROM sync_runs WHERE id = ?",
+                (sync_run_id,),
+            ).fetchone()
+            if sync_run is None:
+                raise ValueError("portfolio sync run does not exist")
+            if str(sync_run["source"]) != "yangjibao":
+                raise ValueError("portfolio sync run source must be yangjibao")
+            if str(sync_run["status"]) != "running":
+                raise ValueError("portfolio sync run must be running")
             for endpoint, payload_json, checksum, retrieved_at in raw_snapshots:
-                connection.execute(
+                active_connection.execute(
                     """
                     INSERT INTO raw_snapshots(
                         sync_run_id, endpoint, retrieved_at, payload_json, payload_sha256
@@ -1199,14 +1236,20 @@ class Repository:
                     (sync_run_id, endpoint, retrieved_at.isoformat(), payload_json, checksum),
                 )
 
+            position_count = 0
             for account, positions in observations:
-                connection.execute(
+                if account.source != "yangjibao":
+                    raise ValueError("portfolio account source must be yangjibao")
+                if account.observed_at > snapshot_time:
+                    raise ValueError("account observation follows portfolio snapshot")
+                active_connection.execute(
                     """
                     INSERT INTO accounts(source, source_account_id, title, observed_at)
                     VALUES (?, ?, ?, ?)
                     ON CONFLICT(source, source_account_id) DO UPDATE SET
                         title = excluded.title,
                         observed_at = excluded.observed_at
+                    WHERE excluded.observed_at >= accounts.observed_at
                     """,
                     (
                         account.source,
@@ -1215,18 +1258,34 @@ class Repository:
                         account.observed_at.isoformat(),
                     ),
                 )
-                account_row = connection.execute(
+                account_row = active_connection.execute(
                     "SELECT id FROM accounts WHERE source = ? AND source_account_id = ?",
                     (account.source, account.source_account_id),
                 ).fetchone()
                 account_id = int(account_row["id"])
+                active_connection.execute(
+                    """
+                    INSERT INTO portfolio_observation_accounts(
+                        sync_run_id, account_id, account_title, observed_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        sync_run_id,
+                        account_id,
+                        account.title,
+                        account.observed_at.astimezone(timezone.utc).isoformat(),
+                    ),
+                )
                 for position in positions:
-                    connection.execute(
+                    if position.observed_at != account.observed_at:
+                        raise ValueError("position observation time does not match account")
+                    active_connection.execute(
                         """
                         INSERT INTO positions(
                             account_id, fund_code, fund_name, share_class, shares,
-                            formal_nav, estimated_nav, observed_profit, observed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            formal_nav, estimated_nav, observed_profit, observed_at,
+                            sync_run_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             account_id,
@@ -1238,10 +1297,20 @@ class Repository:
                             _as_text(position.estimated_nav),
                             _as_text(position.observed_profit),
                             position.observed_at.isoformat(),
+                            sync_run_id,
                         ),
                     )
+                    position_count += 1
 
-            connection.execute(
+            active_connection.execute(
+                """
+                INSERT INTO portfolio_observation_snapshots(
+                    sync_run_id, observed_at, account_count, position_count
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (sync_run_id, snapshot_time.isoformat(), len(observations), position_count),
+            )
+            updated = active_connection.execute(
                 """
                 UPDATE sync_runs
                 SET status = 'success', finished_at = ?, error_code = NULL, error_message = NULL
@@ -1249,6 +1318,14 @@ class Repository:
                 """,
                 (finished_at, sync_run_id),
             )
+            if updated.rowcount != 1:
+                raise ValueError("portfolio sync run could not be completed")
+
+        if connection is not None:
+            write(connection)
+            return
+        with self.connect() as owned_connection, owned_connection:
+            write(owned_connection)
 
     def fail_sync(self, sync_run_id: int, error_code: str, error_message: str) -> None:
         with self.connect() as connection, connection:
@@ -1263,17 +1340,42 @@ class Repository:
 
     def latest_positions(self) -> List[StoredPosition]:
         with self.connect() as connection:
-            rows = connection.execute(
+            snapshot = connection.execute(
                 """
-                SELECT a.title AS account_title, p.*
-                FROM positions p
-                JOIN accounts a ON a.id = p.account_id
-                WHERE p.observed_at = (
-                    SELECT MAX(p2.observed_at) FROM positions p2 WHERE p2.account_id = p.account_id
-                )
-                ORDER BY a.title, p.fund_code
+                SELECT snapshots.sync_run_id
+                FROM portfolio_observation_snapshots snapshots
+                JOIN sync_runs ON sync_runs.id = snapshots.sync_run_id
+                WHERE sync_runs.source = 'yangjibao' AND sync_runs.status = 'success'
+                ORDER BY snapshots.observed_at DESC, snapshots.sync_run_id DESC
+                LIMIT 1
                 """
-            ).fetchall()
+            ).fetchone()
+            if snapshot is None:
+                rows = connection.execute(
+                    """
+                    SELECT a.title AS account_title, p.*
+                    FROM positions p
+                    JOIN accounts a ON a.id = p.account_id
+                    WHERE p.observed_at = (
+                        SELECT MAX(p2.observed_at)
+                        FROM positions p2 WHERE p2.account_id = p.account_id
+                    )
+                    ORDER BY a.title, p.fund_code
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT snapshot_accounts.account_title AS account_title, p.*
+                    FROM positions p
+                    JOIN portfolio_observation_accounts snapshot_accounts
+                      ON snapshot_accounts.sync_run_id = p.sync_run_id
+                     AND snapshot_accounts.account_id = p.account_id
+                    WHERE p.sync_run_id = ?
+                    ORDER BY snapshot_accounts.account_title, p.fund_code
+                    """,
+                    (int(snapshot["sync_run_id"]),),
+                ).fetchall()
         return [
             StoredPosition(
                 account_title=str(row["account_title"]),
@@ -1497,9 +1599,7 @@ class Repository:
                 retrieved_at=datetime.fromisoformat(str(row["retrieved_at"])),
                 corporate_action_state=str(row["corporate_action_state"]),
                 source_attempt_id=(
-                    None
-                    if row["source_attempt_id"] is None
-                    else int(row["source_attempt_id"])
+                    None if row["source_attempt_id"] is None else int(row["source_attempt_id"])
                 ),
             )
             for row in rows

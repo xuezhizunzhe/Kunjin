@@ -16,6 +16,7 @@ from kunjin.models import AccountObservation, PositionObservation
 from kunjin.security.keychain import KeychainTokenStore
 
 DEFAULT_BASE_URL = "https://browser-plug-api.yangjibao.com"
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 YANGJIBAO_BROWSER_PLUGIN_SIGNING_SECRET = "YxmKSrQR4uoJ5lOoWIhcbd7SlUEh9OOc"
 EXACT_GET_PATHS = {
     "/qr_code",
@@ -53,6 +54,12 @@ class RemoteResponseError(YangjibaoError):
     code = "remote_response_error"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
 @dataclass(frozen=True)
 class QrLoginChallenge:
     challenge_id: str
@@ -88,12 +95,27 @@ class YangjibaoClient:
         timeout_seconds: int = 20,
     ) -> None:
         parsed = urllib.parse.urlparse(base_url)
-        if parsed.scheme != "https":
-            raise InsecureTransportError("Yangjibao requires HTTPS")
+        try:
+            port = parsed.port
+        except ValueError:
+            raise InsecureTransportError("Yangjibao requires its official HTTPS origin") from None
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "browser-plug-api.yangjibao.com"
+            or port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise InsecureTransportError("Yangjibao requires its official HTTPS origin")
         self.token_store = token_store
         self.base_url = base_url.rstrip("/")
         self.signing_secret = signing_secret
         self.timeout_seconds = timeout_seconds
+        self._opener = urllib.request.build_opener(_NoRedirectHandler())
 
     def _validate_path(self, path: str) -> None:
         path_only = path.split("?", 1)[0]
@@ -131,13 +153,18 @@ class YangjibaoClient:
             method="GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            with self._opener.open(request, timeout=self.timeout_seconds) as response:
+                body = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise RemoteResponseError("Yangjibao response exceeded its limit")
+                payload = json.loads(body.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
                 raise AuthenticationRequiredError("Yangjibao authorization expired") from exc
             if exc.code == 429:
                 raise RateLimitedError("Yangjibao request rate limited") from exc
+            if 300 <= exc.code <= 399:
+                raise RemoteResponseError("Yangjibao redirect was rejected") from exc
             raise RemoteResponseError(f"Yangjibao HTTP error: {exc.code}") from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             raise RemoteResponseError("Yangjibao network request failed") from exc
@@ -161,9 +188,7 @@ class YangjibaoClient:
             raise RemoteResponseError("invalid QR challenge id")
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            data = self._request_json(
-                f"/qr_code_state/{challenge_id}", token_required=False
-            )
+            data = self._request_json(f"/qr_code_state/{challenge_id}", token_required=False)
             if isinstance(data, dict) and str(data.get("state")) == "2":
                 token = str(data.get("token") or "")
                 if not token:
@@ -184,23 +209,28 @@ class YangjibaoClient:
         qr.print_ascii(invert=True)
         return True
 
-
     def list_accounts(self) -> Tuple[Any, List[AccountObservation]]:
         data = self._request_json("/user_account")
-        items = data.get("list", []) if isinstance(data, dict) else []
+        if not isinstance(data, dict):
+            raise RemoteResponseError("Yangjibao account response is malformed")
+        if "list" not in data:
+            raise RemoteResponseError("Yangjibao account list is missing")
+        items = data["list"]
         if not isinstance(items, list):
             raise RemoteResponseError("Yangjibao account list is malformed")
         observed_at = datetime.now(timezone.utc)
-        accounts = [
-            AccountObservation(
-                source="yangjibao",
-                source_account_id=str(item.get("id") or ""),
-                title=str(item.get("title") or "未命名账户"),
-                observed_at=observed_at,
+        accounts = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise RemoteResponseError("Yangjibao account record is malformed")
+            accounts.append(
+                AccountObservation(
+                    source="yangjibao",
+                    source_account_id=str(item.get("id") or ""),
+                    title=str(item.get("title") or "未命名账户"),
+                    observed_at=observed_at,
+                )
             )
-            for item in items
-            if isinstance(item, dict)
-        ]
         for account in accounts:
             account.validate()
         return data, accounts
@@ -217,18 +247,22 @@ class YangjibaoClient:
         positions: List[PositionObservation] = []
         for item in data:
             if not isinstance(item, dict):
-                continue
-            nav_info = item.get("nv_info") if isinstance(item.get("nv_info"), dict) else {}
+                raise RemoteResponseError("Yangjibao holding record is malformed")
+            raw_nav_info = item.get("nv_info")
+            if raw_nav_info is not None and not isinstance(raw_nav_info, dict):
+                raise RemoteResponseError("Yangjibao holding NAV record is malformed")
+            nav_info = raw_nav_info or {}
             name = str(item.get("short_name") or item.get("name") or "")
-            estimated_nav = (
-                nav_info.get("gsz") or nav_info.get("vgsz") or nav_info.get("zsgz")
-            )
+            estimated_nav = nav_info.get("gsz") or nav_info.get("vgsz") or nav_info.get("zsgz")
+            shares = _decimal(item.get("hold_share"))
+            if shares is None:
+                raise RemoteResponseError("Yangjibao holding shares are missing")
             position = PositionObservation(
                 source_account_id=account_id,
                 fund_code=str(item.get("code") or ""),
                 fund_name=name,
                 share_class=_share_class(name),
-                shares=_decimal(item.get("hold_share")) or Decimal("0"),
+                shares=shares,
                 formal_nav=_decimal(item.get("last_net")),
                 estimated_nav=_decimal(estimated_nav),
                 observed_profit=_decimal(item.get("hold_earn")),

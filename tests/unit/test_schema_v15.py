@@ -278,14 +278,16 @@ class SchemaV15Test(unittest.TestCase):
                 "FROM request_runs"
             ).fetchone()
 
-        self.assertEqual(SCHEMA_VERSION, 17)
-        self.assertEqual(versions, tuple(range(1, 18)))
+        self.assertEqual(SCHEMA_VERSION, 18)
+        self.assertEqual(versions, tuple(range(1, 19)))
         self.assertEqual(
             tables_after - tables_before,
             {
                 "source_work_authorizations",
                 "brief_policy_versions",
                 "fund_brief_snapshots",
+                "portfolio_observation_snapshots",
+                "portfolio_observation_accounts",
             },
         )
         self.assertEqual(tuple(before), tuple(after))
