@@ -3755,6 +3755,24 @@ class CliIntegrationTest(unittest.TestCase):
         explicit_calls = [call for call in store.saved if call[0][0] == "explicit"]
         self.assertEqual(explicit_calls[0][0][5], explicit_calls[1][0][5])
 
+    def test_portfolio_diagnose_cli_is_additive_and_non_authorizing(self) -> None:
+        parsed = build_parser().parse_args(
+            ["--json", "portfolio", "diagnose", "--candidate", "000001"]
+        )
+        self.assertEqual(parsed.portfolio_command, "diagnose")
+        self.assertEqual(parsed.candidate, "000001")
+
+        payload, exit_code, _ = run(
+            ["--json", "portfolio", "diagnose"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "portfolio.diagnose")
+        self.assertFalse(payload["data"]["action_boundary"]["action_authorized"])
+        self.assertFalse(payload["data"]["action_boundary"]["exact_amount_available"])
+        self.assertEqual(payload["errors"][0]["code"], "insufficient_data")
+
     def test_peer_sync_partial_success_keeps_member_errors_in_data(self) -> None:
         result = PeerSyncResult(
             "519755",

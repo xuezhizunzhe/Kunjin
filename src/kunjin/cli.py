@@ -69,6 +69,8 @@ from kunjin.decision.policy import EvidencePolicyV1
 from kunjin.decision.service import DecisionRoutingService
 from kunjin.decision.source_registry import SourceRegistryV1
 from kunjin.decision.store import DecisionAuditStore
+from kunjin.diagnosis.research import public_diagnosis_payload
+from kunjin.diagnosis.service import DiagnosisService
 from kunjin.funds.peers.analytics import PEER_CALCULATION_VERSION
 from kunjin.funds.peers.research import (
     build_explicit_compare_report,
@@ -318,6 +320,7 @@ class ApplicationContext:
     source_health_service: Optional[SourceHealthService] = None
     brief_service: Optional["HeldFundBriefService"] = None
     intelligence_service: Optional["IntelligenceService"] = None
+    diagnosis_service: Optional[DiagnosisService] = None
 
 
 def build_context(*, public_acceptance_subject: Optional[str] = None) -> ApplicationContext:
@@ -461,6 +464,7 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
             source_health_service,
             fund_disclosure_store,
         ),
+        diagnosis_service=DiagnosisService(repository, fund_disclosure_store),
     )
 
 
@@ -606,6 +610,8 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_subparsers.add_parser("show")
     portfolio_subparsers.add_parser("analyze")
     portfolio_subparsers.add_parser("overlap")
+    portfolio_diagnose = portfolio_subparsers.add_parser("diagnose")
+    portfolio_diagnose.add_argument("--candidate")
 
     fund = subparsers.add_parser("fund")
     fund_subparsers = fund.add_subparsers(dest="fund_command", required=True)
@@ -3189,6 +3195,28 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                 }
             )
         return envelope("portfolio.overlap", data, errors=errors)
+
+    if args.command == "portfolio" and args.portfolio_command == "diagnose":
+        diagnosis_service = context.diagnosis_service
+        if diagnosis_service is None:
+            disclosure_store = context.fund_disclosure_store or FundDisclosureStore(
+                context.repository
+            )
+            diagnosis_service = DiagnosisService(context.repository, disclosure_store)
+        result = diagnosis_service.diagnose(args.candidate)
+        data = public_diagnosis_payload(result)
+        errors = []
+        if (
+            result.relationship_coverage.evidence_state == "insufficient_data"
+            or result.holdings_coverage.evidence_state == "insufficient_data"
+        ):
+            errors.append(
+                {
+                    "code": "insufficient_data",
+                    "message": "Portfolio diagnosis has insufficient authenticated coverage",
+                }
+            )
+        return envelope("portfolio.diagnose", data, errors=errors)
 
     if args.command == "fund" and args.fund_command == "research":
         _validate_fund_code(args.fund_code)
