@@ -56,6 +56,7 @@ def _source_attempt(
     source_id: str,
     *,
     outcome: str = "success",
+    finished_offset: int = 3,
 ) -> int:
     return int(
         connection.execute(
@@ -73,7 +74,7 @@ def _source_attempt(
                 source_id,
                 outcome,
                 NOW.isoformat(),
-                (NOW + timedelta(seconds=1)).isoformat(),
+                (NOW + timedelta(seconds=finished_offset)).isoformat(),
                 NOW.isoformat(),
                 CHECKSUM,
             ),
@@ -196,11 +197,21 @@ def _snapshot(request_run_id: int, request_id: str) -> IntelligenceSnapshot:
     )
 
 
-def _seed_request_and_evidence(repository: Repository, store: IntelligenceStore):
+def _seed_request_and_evidence(
+    repository: Repository,
+    store: IntelligenceStore,
+    *,
+    attempt_finished_offset: int = 3,
+):
     budget = _budget()
     request_run_id = DecisionAuditStore(repository).begin_request(budget)
     with repository.connect() as connection, connection:
-        attempt_id = _source_attempt(connection, request_run_id, "gov_cn_policy")
+        attempt_id = _source_attempt(
+            connection,
+            request_run_id,
+            "gov_cn_policy",
+            finished_offset=attempt_finished_offset,
+        )
         items = (_item("item_one", attempt_id), _item("item_two", attempt_id, offset=1))
         item_ids = store.save_items(items, connection)
         edge = LineageEdge(
@@ -520,7 +531,9 @@ def test_integrity_transitions_are_append_only_authenticated_and_derive_current_
     store: IntelligenceStore,
 ) -> None:
     _budget_value, run_id, attempt_id, item_ids, _items = _seed_request_and_evidence(
-        repository, store
+        repository,
+        store,
+        attempt_finished_offset=6,
     )
     with repository.connect() as connection, connection:
         correction_id = store.save_items(
