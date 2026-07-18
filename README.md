@@ -90,6 +90,70 @@ Broad financial-media ingestion, complete D2 portfolio construction, D3
 candidate selection and pre-purchase checks, and Phase E mature monitoring and
 sell timing are not implemented.
 
+## Pragmatic News And Market Intelligence MVP
+
+Use the three bounded, JSON-only public-intelligence commands after a current
+`fact_research` route:
+
+```bash
+.venv/bin/kunjin --json news recent --window recent --mode rapid
+.venv/bin/kunjin --json market overview --window recent --mode rapid
+.venv/bin/kunjin --json fund intelligence 519755 --window recent --mode rapid
+```
+
+Rapid owns one 90-second request budget; explicit Deep owns 480 seconds. The
+result preserves each source attempt's outcome, reason, retryability, cooldown,
+manual supplementation, source tier, publication date, retrieval date, and
+coverage gaps. `items` are attributed source `fact` records. `events` are
+`reasoned_inference`; their `lineage` identifies reprint relationships, so a
+reprint never becomes independent confirmation. Partial success remains useful,
+while a total source failure returns `insufficient_data` without invented facts.
+Caps and deadline omissions are terminal results, not instructions to retry in a
+loop or develop an adapter during the request.
+
+Market rows currently have HTTP retrieval time but no authenticated exchange
+session time. Treat that as `market_session=unknown`; the safe interpretation is
+`direction=insufficient_data`, not a same-day timing or buy/sell signal. Sector
+rank observations remain `experimental_shadow`, freshness is unknown, and source
+accuracy is not prediction accuracy.
+
+`fund intelligence` supplies `disclosed_context`: when available disclosed
+identity terms, benchmark terms, and disclosed top-ten security names may
+explain a relevance link, but they do not prove current exposure or
+whole-portfolio composition. Use
+`fund brief`, `fund profile`, `fund fees`, and `fund research` for held-position,
+identity, manager, fee, formal-NAV, and risk facts. Use `portfolio analyze` and
+`portfolio overlap` for current weights, concentration, and
+`top10_disclosed_overlap`; the intelligence command does not replace them.
+
+A thesis result of `possible_invalidation_match` or `no_matching_evidence`
+always requires manual semantic review. A string match cannot understand
+negation or context and cannot trigger a sale. Every intelligence response stays
+`action_maturity=evidence_only`, `action_authorized=false`, and
+`exact_amount_available=false`; it never authorizes an order, exact amount, or
+automatic trade.
+
+The personal MVP routes its five common questions as follows:
+
+- latest news: `decision route --action fact_research`, then `news recent`;
+- market context or a direction-to-buy question: route `fact_research` and `buy_or_add` when purchase intent exists, then `market overview`; current missing dimensions can require a direction abstention;
+- named candidate: route `fact_research` and `buy_or_add`, then combine `fund intelligence`, fund fact commands, and returned gates; while complete D2 or D3 is missing this is candidate research, not a suitability approval;
+- held-fund daily review: first distinguish partial reduction from full exit, use the matching `fund brief` action, then `fund intelligence` and thesis review; this cannot time a sale;
+- portfolio diagnosis: `status`, current `sync portfolio`, `portfolio analyze`, refresh each stale/missing/due held-fund disclosure, then `portfolio overlap`.
+
+Read-only browsing may be added as visibly separate transient
+`external_context`. It must retain its own URLs and dates and cannot strengthen
+KunJin's persisted evidence state, source tier, conflict state, or action
+authorization. Complete cross-source opposition detection is not implemented;
+an empty conflict list means only that no conflict was found inside the bounded
+authenticated sources.
+
+Deferred from this personal MVP are full valuation/fundamental analysis,
+complete D2 look-through/correlation/stress testing, D3 exact amount and mature
+channel authorization, mature Phase E automatic monitoring/sell timing, and
+broad official adapters. Privacy, read-only operation, no automatic trading,
+and fail-closed `insufficient_data` remain mandatory.
+
 ## Requirements
 
 - macOS
@@ -149,6 +213,11 @@ When PyPI access is available, install terminal QR rendering with:
 .venv/bin/kunjin --json portfolio analyze
 .venv/bin/kunjin --json portfolio overlap
 .venv/bin/kunjin --json fund brief 519755 --action continue_holding --mode rapid
+.venv/bin/kunjin --json decision route --mode rapid --action fact_research
+.venv/bin/kunjin --json decision route --mode rapid --action fact_research --action buy_or_add
+.venv/bin/kunjin --json news recent --window recent --mode rapid
+.venv/bin/kunjin --json market overview --window recent --mode rapid
+.venv/bin/kunjin --json fund intelligence 519755 --window recent --mode rapid
 .venv/bin/kunjin --json sync fund 017811
 .venv/bin/kunjin --json fund research 017811
 .venv/bin/kunjin --json sync fund-profile 017811
@@ -570,8 +639,8 @@ The installer creates the plist but does not load it automatically.
 - Exact subscription lots, fund transaction confirmations, dividends, and
   redemption fees remain unavailable unless the imported evidence actually
   contains those fields or a future authoritative source provides them.
-- Full valuation and earnings research, persistent capital flows, and automatic
-  news persistence are not implemented.
+- Full valuation and earnings research, persistent capital flows, and continuous
+  full-history news crawling are not implemented.
 - Broad financial-media ingestion, complete D2 construction, D3 selection, and
   Phase E mature monitoring or sell timing are not implemented.
 - Peer reports do not provide a universal composite score or automatic trade;

@@ -1,4 +1,4 @@
 interface:
-  display_name: "KunJin Held-Fund Research"
-  short_description: "Explain one held fund with bounded conditional evidence"
-  default_prompt: "Use $kunjin-fund to route each fund subquestion by action, run a bounded held-fund brief when applicable, return evidence-backed research_only or conditional guidance, preserve classification evidence and conditional evidence, and never trade automatically."
+  display_name: "KunJin Personal Fund Research"
+  short_description: "Research funds with bounded evidence and safety gates"
+  default_prompt: "Use $kunjin-fund to route each fund subquestion by action across news, market, named-fund, portfolio, and daily-review workflows, run a bounded held-fund brief when applicable, return evidence-backed research_only or conditional guidance, preserve classification evidence and conditional evidence, and never trade automatically."

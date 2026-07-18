@@ -438,16 +438,32 @@ special exception:
 - "Use yesterday's successful assessment after the profile changed." Rerun
   `--json suitability assess`; never promote stale history to a current result.
 
-## Latest News Workflow
+## Pragmatic Intelligence Workflows
+Route the five personal MVP scenarios without implying unavailable decisions:
 
-When the user asks why a fund or sector moved, first use KunJin for the dated
-portfolio/NAV/sector facts. Then use available read-only browsing or search tools
-for official fund-company announcements, exchange notices, regulator releases,
-and dated company disclosures. Use established financial media only as secondary
-context. Cite the source and publication time, separate reported events from
-market commentary, and label any causal link as `reasoned_inference` unless the
-evidence directly establishes it. Do not persist news in KunJin until the audited
-news adapter exists.
+- latest news: route `fact_research`, then run `kunjin --json news recent --window recent --mode rapid`;
+- market context or a direction-to-buy question: route `fact_research` and also `buy_or_add` when purchase intent exists, then run `market overview`; expect `direction=insufficient_data` until its missing dimensions are authenticated;
+- named candidate: route `fact_research` and `buy_or_add`, run `fund intelligence` plus the fact commands and returned gates, and label the result candidate facts plus mandatory purchase abstention while complete D2 or D3 is missing;
+- held-fund daily review: clarify partial reduction versus full exit, use the corresponding `fund brief` action, then `fund intelligence` and `thesis review`; this reviews evidence and does not time a sale; and
+- portfolio diagnosis: run `status`, current `sync portfolio`, `portfolio analyze`, inspect held-fund holdings, refresh each stale/missing/due holding disclosure, then run `portfolio overlap`.
+
+Preserve source outcome, date, source tier, publication date, `fact` versus
+`reasoned_inference`, lineage, reprint, conflict, partial, cooldown, cap, and
+manual supplementation fields. A reprint is not independent confirmation. At
+`market_session=unknown`, state `direction=insufficient_data`; never turn HTTP
+retrieval time or `experimental_shadow` into market timing. Source accuracy is
+not prediction accuracy.
+
+Treat fund relevance as `disclosed_context`, not current or complete exposure.
+Use `fund profile`, `fund fees`, and `fund research` for identity, manager, fee,
+formal-NAV, and risk facts. A thesis `possible_invalidation_match` or
+`no_matching_evidence` requires manual semantic review and cannot trigger a
+sale. Preserve `action_maturity=evidence_only`, `action_authorized=false`, and
+`exact_amount_available=false`.
+
+Use read-only browsing only as visibly separate transient `external_context`
+with its own sources and dates. It cannot strengthen KunJin's persisted evidence
+state, and empty conflicts do not prove complete cross-source agreement.
 
 ## Safety Boundaries
 
@@ -475,15 +491,9 @@ news adapter exists.
 - Never expose a managed screenshot path. `ledger document delete` removes only KunJin's private managed copy, not the user's original image or the immutable confirmed transaction.
 - Never add automatic trading instructions.
 
-## Unsupported Requests
-
-Valuation, earnings, persistent capital flows, and automated news ingestion are
-not implemented yet. Fund research covers formal-NAV performance and risk plus
-sourced identity, manager, fee, size, benchmark, quarterly holding, raw
-industry-source records, announcement, peer-comparison, and disclosed-overlap
-evidence. Authenticated current industry observations are not currently
-available because the production controlled-taxonomy registry is empty. Market
-research currently covers sector strength and breadth. Peer comparison has no
-universal score or automatic trade path. Weekly reports explicitly mark missing
-news and causal evidence. Identify missing evidence and do not substitute
+## Deferred Requests
+Defer valuation/fundamentals, complete D2, D3 exact amount and mature channel
+authorization, mature Phase E monitoring/sell timing, broad official adapters,
+and continuous full-history news crawling. Keep the existing minimum D2 and
+`top10_disclosed_overlap`; identify missing evidence without substituting
 guesses, platform rankings, or unverified snippets.

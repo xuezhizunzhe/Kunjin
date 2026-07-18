@@ -3313,6 +3313,137 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         ):
             self.assertIn(phrase, skill)
 
+    def test_pragmatic_mvp_acceptance_declares_bounded_modes_and_core_cases(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts/run_pragmatic_mvp_acceptance.sh").read_text(
+            encoding="utf-8"
+        )
+
+        for mode in ("local", "fault", "live", "owner"):
+            self.assertIn(mode, script)
+        for case in (
+            "official_policy",
+            "media_reprint",
+            "partial_market",
+            "malformed_payload",
+            "unsafe_redirect",
+            "source_timeout",
+            "source_cooldown",
+            "source_cap_reached",
+            "manual_supplement_required",
+            "named_fund_public",
+            "decision_routing",
+            "held_fund_review",
+            "thesis_review",
+            "portfolio_diagnosis",
+            "candidate_gate_abstention",
+            "anonymous_owner",
+            "no_process_residue",
+        ):
+            self.assertIn(case, script)
+        for command in (
+            "news recent --window recent --mode rapid",
+            "market overview --window recent --mode rapid",
+            "fund intelligence",
+        ):
+            self.assertIn(command, script)
+        for source in ("gov_cn_policy", "stcn_fund_news", "eastmoney_market"):
+            self.assertIn(source, script)
+
+        self.assertIn("KUNJIN_PRAGMATIC_LIVE_APPROVED", script)
+        self.assertIn("KUNJIN_PRAGMATIC_OWNER_APPROVED", script)
+        self.assertIn("explicit_public_read_only", script)
+        self.assertIn("explicit_private_read_only", script)
+        owner_body = script.split("run_owner() {", 1)[1].split('case "${MODE}"', 1)[0]
+        self.assertIn(
+            'KUNJIN_PRAGMATIC_LIVE_APPROVED:-}" != "explicit_public_read_only"',
+            owner_body,
+        )
+        self.assertIn("KUNJIN_PRAGMATIC_OWNER_APPROVED", owner_body)
+        for owner_command in (
+            '["status"]',
+            '["portfolio", "analyze"]',
+            '["portfolio", "overlap"]',
+            '["fund", "brief"',
+            '["fund", "intelligence"',
+            '["thesis", "review"',
+        ):
+            self.assertIn(owner_command, owner_body)
+        self.assertIn("source.backup(target)", owner_body)
+        self.assertIn("public intelligence leaked a forbidden private field", owner_body)
+        self.assertIn("never places trades", script)
+        self.assertIn('source["outcome"]', script)
+        self.assertIn('source["source_tier"]', script)
+        self.assertNotIn('source["status"]', script)
+
+    def test_pragmatic_mvp_readme_and_skill_preserve_useful_evidence_boundaries(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        agent = (root / "integrations/codex/kunjin-fund/agents/openai.yaml").read_text(
+            encoding="utf-8"
+        )
+        combined = " ".join((readme + "\n" + skill).split())
+
+        for command in (
+            "kunjin --json news recent --window recent --mode rapid",
+            "kunjin --json market overview --window recent --mode rapid",
+            "kunjin --json fund intelligence 519755 --window recent --mode rapid",
+        ):
+            self.assertIn(command, combined)
+        for phrase in (
+            "source tier",
+            "publication date",
+            "fact",
+            "reasoned_inference",
+            "lineage",
+            "reprint",
+            "partial",
+            "cooldown",
+            "manual supplementation",
+            "market_session=unknown",
+            "direction=insufficient_data",
+            "disclosed_context",
+            "possible_invalidation_match",
+            "no_matching_evidence",
+            "manual semantic review",
+            "action_maturity=evidence_only",
+            "action_authorized=false",
+            "exact_amount_available=false",
+            "external_context",
+            "cannot strengthen KunJin's persisted evidence state",
+            "complete D2",
+            "D3 exact amount",
+            "mature Phase E",
+            "broad official adapters",
+        ):
+            self.assertIn(phrase, combined)
+
+        for route in (
+            "latest news",
+            "market context or a direction-to-buy question",
+            "named candidate",
+            "held-fund daily review",
+            "portfolio diagnosis",
+        ):
+            self.assertIn(route, skill)
+        for existing_command in (
+            "fund brief",
+            "fund profile",
+            "fund fees",
+            "fund research",
+            "portfolio analyze",
+            "portfolio overlap",
+        ):
+            self.assertIn(existing_command, skill)
+
+        self.assertIn("$kunjin-fund", agent)
+        self.assertIn("news, market, named-fund, portfolio, and daily-review", agent)
+        self.assertNotIn("Do not persist news in KunJin until", skill)
+        self.assertNotIn("automated news ingestion are not implemented", skill)
+
 
 if __name__ == "__main__":
     unittest.main()
