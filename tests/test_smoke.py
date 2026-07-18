@@ -101,7 +101,10 @@ class SmokeTest(unittest.TestCase):
             "Research for `reduce_to_cash` and `full_exit` may continue",
             "position, fee, and settlement facts",
             "Split `switch_funds` into its reduction leg and purchase leg",
-            "Phase B, Phase C, D1, D2, D3, and post-trade",
+            (
+                "Phase B, Phase C, D1, complete D2 (the Phase 1 minimum subset "
+                "never satisfies this gate), D3, and post-trade"
+            ),
             "Do not give a mature buy or add recommendation",
             "Rapid is the default and has a 90-second terminal budget",
             "Deep is explicit and has a 480-second terminal budget",
@@ -139,6 +142,65 @@ class SmokeTest(unittest.TestCase):
         ):
             self.assertIn(phrase, agent)
         self.assertNotIn("before any directional or position-size discussion", agent)
+
+    def test_kunjin_skill_uses_phase1_held_fund_brief_contract(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        agent = (root / "integrations/codex/kunjin-fund/agents/openai.yaml").read_text(
+            encoding="utf-8"
+        )
+        normalized_readme = " ".join(readme.split())
+        normalized_skill = " ".join(skill.split())
+
+        shared_contract = (
+            "one currently held fund",
+            "--json fund brief 519755 --action continue_holding --mode rapid",
+            (
+                "when the request includes `continue_holding`, `reduce_to_cash`, "
+                "`full_exit`, or `switch_funds`"
+            ),
+            "`fact_research` is always added internally",
+            "Fact-only questions stay on the standalone `fact_research` route",
+            (
+                "Any buy or add request, including an already-held fund, stays on "
+                "standalone `buy_or_add`"
+            ),
+            "never satisfies the complete D2 gate",
+            "`terminal_status=complete`",
+            "no scheduled work was omitted",
+            "not a financial conclusion",
+            "`sync_status`",
+            "`decision_evidence_status`",
+            "Tier 2",
+            "data date",
+            "minimum D2 subset",
+            "`minimum_relationship_coverage`",
+            "`disclosed_holdings_coverage`",
+            "`exact_amount_available=false`",
+            "conditional",
+            "Broad financial-media ingestion",
+            "complete D2",
+            "D3",
+            "Phase E",
+            "not implemented",
+        )
+        for phrase in shared_contract:
+            self.assertIn(phrase, normalized_readme)
+            self.assertIn(phrase, normalized_skill)
+
+        self.assertIn("`fund brief` owns the 90/480-second budget", normalized_skill)
+        self.assertIn("Never orchestrate legacy commands in its place", normalized_skill)
+        self.assertIn("unknown relationships as unknown", normalized_skill)
+        self.assertNotIn(
+            "D2 portfolio correlation and overlap controls and D3 product-selection",
+            normalized_skill,
+        )
+        self.assertIn("$kunjin-fund", agent)
+        self.assertIn("held-fund brief", agent)
+        self.assertIn("conditional evidence", agent)
 
     def test_phase0_commands_are_top_level_json_contracts(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -2393,8 +2455,8 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             ),
             "unsupported is not missing evidence",
             "Non-`verified` D1 evidence may still support dated, attributed facts",
-            "D2 portfolio correlation and overlap controls",
-            "D3 product-selection and pre-purchase checks",
+            "minimum D2 subset",
+            "complete D2 and D3 product-selection and pre-purchase checks",
         ):
             self.assertIn(phrase, normalized_skill)
 

@@ -751,21 +751,21 @@ git commit -m "test: add held fund brief acceptance"
 - Modify after validation/approval: /Users/yanzihao/.codex/skills/kunjin-fund/
 - Modify: tests/test_smoke.py
 
-- [ ] **Step 1: Write failing contract tests**
+- [x] **Step 1: Write failing contract tests**
 
 Require fund brief for one held-fund question, combined fact/action routing, split sync/decision evidence, Tier 2/date labels, D2 coverage, official-event limits, exact false, and conditional wording. Require explicit statements that broad news, complete D2, D3, and Phase E remain absent.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/test_smoke.py -k kunjin_skill
 ~~~
 
-- [ ] **Step 3: Update repository docs/Skill**
+- [x] **Step 3: Update repository docs/Skill**
 
 Add command, state/evidence explanation, limitations, privacy, Rapid/Deep, no background work, and supplementation. Replace only the obsolete claim that D2 is entirely absent with the precise minimum-subset boundary.
 
-- [ ] **Step 4: Validate and sync installed Skill**
+- [x] **Step 4: Validate and sync installed Skill**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/test_smoke.py -k kunjin_skill
@@ -778,7 +778,8 @@ After explicit external-write approval, copy the validated repository directory,
 
 ~~~bash
 git add README.md integrations/codex/kunjin-fund/SKILL.md \
-  integrations/codex/kunjin-fund/agents/openai.yaml tests/test_smoke.py
+  integrations/codex/kunjin-fund/agents/openai.yaml tests/test_smoke.py \
+  docs/superpowers/plans/2026-07-17-kunjin-phase1-held-fund-brief.md
 git commit -m "docs: use held fund brief workflow"
 ~~~
 

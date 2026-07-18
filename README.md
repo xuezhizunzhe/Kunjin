@@ -9,7 +9,8 @@ stores redacted snapshots in SQLite, and calculates reproducible portfolio total
 and concentration metrics. The current build also supports formal-NAV fund risk
 research, sourced fund identity and disclosure research, A-share sector
 strength/breadth, deterministic peer comparison and disclosed-holdings overlap,
-investment theses, weekly reports, and a weekday post-close synchronization job.
+one-held-fund conditional briefs, investment theses, weekly reports, and a
+weekday post-close synchronization job.
 
 KunJin does not log in to or operate Alipay, modify Yangjibao data, place fund
 orders, or produce automatic trading instructions.
@@ -45,6 +46,49 @@ can modify the code, process environment, or output directory. The acceptance
 does not read the personal profile or database, synchronize Yangjibao, use
 Docker, poll a failed source, or authorize a mature purchase or exact amount.
 The output directory must not already exist.
+
+## Held Fund Brief (Phase 1)
+
+For one currently held fund question, use the bounded aggregate command only
+when the request includes `continue_holding`, `reduce_to_cash`, `full_exit`, or
+`switch_funds`, instead of assembling that action answer from separate legacy
+commands:
+
+```bash
+.venv/bin/kunjin --json fund brief 519755 --action continue_holding --mode rapid
+```
+
+The supported owner actions are `continue_holding`, `reduce_to_cash`,
+`full_exit`, and `switch_funds`; `fact_research` is always added internally.
+Fact-only questions stay on the standalone `fact_research` route. Any buy or add
+request, including an already-held fund, stays on standalone `buy_or_add`; the
+brief may supply separate facts but never replaces the risk-increasing gate.
+Rapid is the default with one 90-second terminal budget. Deep is explicit with
+one 480-second terminal budget. A cooldown or failed source produces a useful
+partial result and exact manual-supplementation requirements rather than
+background retries or interactive adapter work.
+
+The result keeps `terminal_status`, `sync_status`, and
+`decision_evidence_status` separate. `terminal_status=complete` means no
+scheduled work was omitted; it is not a financial conclusion, proof of complete
+evidence, or action authorization. Likewise, a usable public fact does not imply
+that the requested action is sufficiently supported. Each fact retains its
+source tier, data date, publication time, and conflicts. A Tier 2 fact remains
+visibly Tier 2 and cannot authorize a mature personal action.
+
+Phase 1 implements a minimum D2 subset for position presence, authenticated
+relationships, and disclosed-holdings overlap. Read
+`minimum_relationship_coverage` and `disclosed_holdings_coverage` separately;
+missing or stale evidence keeps unknown relationships unknown rather than zero.
+This minimum subset never satisfies the complete D2 gate required for buy/add or
+the purchase leg of a switch.
+Official-event coverage is limited to audited fund, product, and manager
+announcements. Every action remains conditional, automatic trading is absent,
+and the public result preserves `exact_amount_available=false`.
+
+Broad financial-media ingestion, complete D2 portfolio construction, D3
+candidate selection and pre-purchase checks, and Phase E mature monitoring and
+sell timing are not implemented.
 
 ## Requirements
 
@@ -104,6 +148,7 @@ When PyPI access is available, install terminal QR rendering with:
 .venv/bin/kunjin --json portfolio show
 .venv/bin/kunjin --json portfolio analyze
 .venv/bin/kunjin --json portfolio overlap
+.venv/bin/kunjin --json fund brief 519755 --action continue_holding --mode rapid
 .venv/bin/kunjin --json sync fund 017811
 .venv/bin/kunjin --json fund research 017811
 .venv/bin/kunjin --json sync fund-profile 017811
@@ -330,11 +375,12 @@ from its name, platform label, historical volatility, or a D1 label alone.
 
 A D1 `verified` result is not suitability, not an allocation, not a buy signal,
 and not a 90% beginner-help claim. It does not evaluate the owner's portfolio or
-authorize buy, hold, add, reduce, sell, rebalance, or position-size output. D2
-portfolio correlation, overlap, and construction controls are not implemented;
-D3 product-selection and pre-purchase checks are also not implemented. Phase E
-continuous monitoring is not implemented. Every result remains `research_only`,
-with no direction or amount authorized.
+authorize buy, hold, add, reduce, sell, rebalance, or position-size output. The
+separate Phase 1 `fund brief` implements only the minimum D2 subset described
+above; complete D2 portfolio construction, D3 product-selection and
+pre-purchase checks, and Phase E continuous monitoring are not implemented.
+Every D1 classification result remains `research_only`, with no direction or
+amount authorized.
 
 The official-domain coverage is audited and finite. A missing manager/index-provider
 adapter can leave an otherwise common supported fund `partial` or `unclassified`;
@@ -376,8 +422,9 @@ script and inspect only safe readiness metadata:
 Conversion success is not financial evidence. Converted HTML must still pass
 the normal official identity, document-kind, report-period, active-content,
 ambiguity, and fact checks. D1.1-C now applies bounded current-report selection,
-Manifest V3 authentication, and parser v4 fact extraction; D2, D3, and Phase E
-remain unimplemented, and the result remains `research_only`.
+Manifest V3 authentication, and parser v4 fact extraction; it does not by itself
+implement the Phase 1 minimum D2 subset, complete D2, D3, or Phase E, and the
+classification result remains `research_only`.
 
 ## Personal Transaction Ledger
 
@@ -525,6 +572,8 @@ The installer creates the plist but does not load it automatically.
   contains those fields or a future authoritative source provides them.
 - Full valuation and earnings research, persistent capital flows, and automatic
   news persistence are not implemented.
+- Broad financial-media ingestion, complete D2 construction, D3 selection, and
+  Phase E mature monitoring or sell timing are not implemented.
 - Peer reports do not provide a universal composite score or automatic trade;
   their metric-specific orderings require the user to choose a horizon and weigh
   opposing evidence.
