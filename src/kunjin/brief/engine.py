@@ -69,6 +69,22 @@ _TRANSACTION_ACTION_IDS = {
     "switch_reduce",
     "switch_buy",
 }
+_RESERVED_GATE_FIELDS = {
+    "d1",
+    "d2",
+    "d3",
+    "exit_reason",
+    "fees",
+    "personal_position",
+    "phase_b",
+    "phase_b_context",
+    "phase_c",
+    "phase_e_policy",
+    "position",
+    "post_trade",
+    "settlement",
+    "use_of_proceeds",
+}
 _THESIS_BINDING_KEY = secrets.token_bytes(32)
 _SOURCE_RESOLUTION_BINDING_KEY = secrets.token_bytes(32)
 
@@ -185,8 +201,11 @@ class BriefSourceResolution:
         if (
             self.resolution is RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED
             and not self.manual_supplementation_codes
+            and not self.acceptable_alternative_ids
         ):
-            raise ValueError("manual source resolution requires supplementation codes")
+            raise ValueError(
+                "manual source resolution requires supplementation codes or alternatives"
+            )
         if self.resolution is RequestFieldResolution.USABLE and not any(
             item is SourceFieldState.HEALTHY for item in self.source_states
         ):
@@ -284,6 +303,7 @@ def load_brief_source_resolution(
     evidence_ids: Tuple[str, ...] = (),
     acceptable_alternative_ids: Tuple[str, ...] = (),
     manual_supplementation_codes: Tuple[str, ...] = (),
+    manual_supplement_ready: bool = True,
 ) -> BriefSourceResolution:
     if type(audit_store) is not DecisionAuditStore:
         raise ValueError("source resolution loader requires an exact DecisionAuditStore")
@@ -300,8 +320,13 @@ def load_brief_source_resolution(
     if field_id == "official_events" and attempt.source_id != "fund_manager_official_documents":
         raise ValueError("official event resolution requires an authenticated official source")
     resolution_state, source_states = source_attempt_resolution(attempt)
+    if type(manual_supplement_ready) is not bool:
+        raise ValueError("manual supplement readiness must be an exact boolean")
+    if not manual_supplement_ready and manual_supplementation_codes:
+        raise ValueError("unexhausted alternatives cannot carry manual supplement codes")
     if (
         resolution_state is RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED
+        and manual_supplement_ready
         and not manual_supplementation_codes
     ):
         manual_supplementation_codes = (f"{field_id}_manual_supplement_required",)
@@ -687,7 +712,7 @@ class HeldFundBriefEngine:
             blocking_codes=all_blocking_codes,
             missing_fields=missing_fields,
             conflicts=conflicts,
-            resolution_lineage_ids=tuple(
+            resolution_lineage_ids=_unique(
                 f"source_attempt_{item.source_attempt_id}" for item in source_resolutions
             ),
             resolution_bindings=tuple(item.to_snapshot_binding() for item in source_resolutions),
@@ -867,14 +892,13 @@ class HeldFundBriefEngine:
             fact.field_id
             for fact in fact_set.facts
             if fact.field_id not in explicit_missing
+            and fact.field_id not in _RESERVED_GATE_FIELDS
             and fact.freshness is EvidenceFreshness.CURRENT
-            and fact.completeness is not EvidenceCompleteness.INSUFFICIENT
+            and fact.completeness is EvidenceCompleteness.COMPLETE
             and not fact.conflict_ids
         }
         if d2.position_present is not None and d2.portfolio_evidence_state != "unknown":
             shared.add("personal_position")
-        if d2.coverage.evidence_state is not BriefEvidenceState.INSUFFICIENT:
-            shared.add("d2")
         available = {route.action_id: set(shared) for route in action_routes}
         for route in action_routes:
             if "financial_safety_not_current" not in route.blocking_codes:
@@ -884,7 +908,11 @@ class HeldFundBriefEngine:
             if "redemption_terms" in shared:
                 available[route.action_id].update(("fees", "settlement"))
         for item in source_resolutions:
-            if item.action_id in available and item.resolution is RequestFieldResolution.USABLE:
+            if (
+                item.action_id in available
+                and item.resolution is RequestFieldResolution.USABLE
+                and (item.field_id == "official_events" or item.field_id in shared)
+            ):
                 available[item.action_id].add(item.field_id)
         return available
 
@@ -934,6 +962,9 @@ class HeldFundBriefEngine:
             for field in self._required_fields(action_route.action_id)
             if field not in available_fields
         )
+        required_gate_missing = tuple(
+            field for field in action_route.required_gates if field not in available_fields
+        )
         blocking.extend(f"{field}_missing" for field in critical_missing)
         if not action_route.research_available:
             blocking.append("research_unavailable")
@@ -965,12 +996,15 @@ class HeldFundBriefEngine:
             elif not action_route.research_available:
                 state = BriefState.ABSTAIN
                 maturity = ActionMaturity.EXPERIMENTAL_SHADOW
-            elif hard_events:
-                state = BriefState.REDUCE_OR_EXIT_REVIEW
-                maturity = ActionMaturity.MATURE
             elif identity_conflicts or inactive_action_events or critical_missing:
                 state = BriefState.ABSTAIN
                 maturity = ActionMaturity.EXPERIMENTAL_SHADOW
+            elif hard_events and required_gate_missing:
+                state = BriefState.ABSTAIN
+                maturity = ActionMaturity.EXPERIMENTAL_SHADOW
+            elif hard_events:
+                state = BriefState.REDUCE_OR_EXIT_REVIEW
+                maturity = ActionMaturity.MATURE
             elif watch_events:
                 state = BriefState.WATCH
                 maturity = ActionMaturity.EXPERIMENTAL_SHADOW
@@ -1000,9 +1034,6 @@ class HeldFundBriefEngine:
             if not action_route.research_available:
                 state = BriefState.ABSTAIN
                 maturity = ActionMaturity.EXPERIMENTAL_SHADOW
-            elif hard_events:
-                state = BriefState.REDUCE_OR_EXIT_REVIEW
-                maturity = ActionMaturity.MATURE
             elif (
                 identity_conflicts
                 or inactive_action_events
@@ -1014,6 +1045,12 @@ class HeldFundBriefEngine:
                 maturity = ActionMaturity.EXPERIMENTAL_SHADOW
                 if "redemption_terms" not in available_fields:
                     blocking.append("redemption_terms_missing")
+            elif hard_events and required_gate_missing:
+                state = BriefState.ABSTAIN
+                maturity = ActionMaturity.EXPERIMENTAL_SHADOW
+            elif hard_events:
+                state = BriefState.REDUCE_OR_EXIT_REVIEW
+                maturity = ActionMaturity.MATURE
             else:
                 state = BriefState.REDUCE_OR_EXIT_REVIEW
                 maturity = ActionMaturity.EXPERIMENTAL_SHADOW
@@ -1061,7 +1098,11 @@ class HeldFundBriefEngine:
             missing_fields=tuple(
                 dict.fromkeys(
                     [
-                        *(item for item in missing_fields if item in action_missing_fields),
+                        *(
+                            item
+                            for item in missing_fields
+                            if item in action_missing_fields and item not in available_fields
+                        ),
                         *critical_missing,
                     ]
                 )

@@ -4,17 +4,17 @@ set -euo pipefail
 umask 077
 
 usage() {
-    printf 'Usage: %s HEALTHY_PUBLIC_CODE UNSUPPORTED_PUBLIC_CODE OUTPUT_DIR\n' "$0" >&2
+    printf 'Usage: %s USEFUL_PARTIAL_CODE UNSUPPORTED_PUBLIC_CODE OUTPUT_DIR\n' "$0" >&2
     printf '       %s --owner OUTPUT_DIR\n' "$0" >&2
 }
 
 MODE=""
-HEALTHY_CODE=""
+USEFUL_PARTIAL_CODE=""
 UNSUPPORTED_CODE=""
 OWNER_CODE_FILE=""
 if [[ "$#" -eq 3 && "$1" != "--owner" ]]; then
     MODE="public"
-    HEALTHY_CODE="$1"
+    USEFUL_PARTIAL_CODE="$1"
     UNSUPPORTED_CODE="$2"
     OUTPUT_DIR="$3"
 elif [[ "$#" -eq 2 && "$1" == "--owner" ]]; then
@@ -30,9 +30,9 @@ if [[ "${OUTPUT_DIR}" != /* ]]; then
     exit 65
 fi
 if [[ "${MODE}" == "public" ]]; then
-    if [[ ! "${HEALTHY_CODE}" =~ ^[0-9]{6}$ ]] \
+    if [[ ! "${USEFUL_PARTIAL_CODE}" =~ ^[0-9]{6}$ ]] \
         || [[ ! "${UNSUPPORTED_CODE}" =~ ^[0-9]{6}$ ]] \
-        || [[ "${HEALTHY_CODE}" == "${UNSUPPORTED_CODE}" ]]; then
+        || [[ "${USEFUL_PARTIAL_CODE}" == "${UNSUPPORTED_CODE}" ]]; then
         printf 'public fund codes must be distinct six-digit ASCII codes\n' >&2
         exit 65
     fi
@@ -100,7 +100,7 @@ if [[ "${MODE}" == "owner" ]]; then
 fi
 
 set +e
-/usr/bin/python3 - "${MODE}" "${HEALTHY_CODE}" "${UNSUPPORTED_CODE}" \
+/usr/bin/python3 - "${MODE}" "${USEFUL_PARTIAL_CODE}" "${UNSUPPORTED_CODE}" \
     "${OUTPUT_PARENT}" "${OUTPUT_BASENAME}" "${CLI}" "${RUNTIME_DIR}" \
     "${ACCEPTANCE_TIMEOUT_SECONDS}" "${OWNER_CODE_FILE}" <<'PY'
 import ctypes
@@ -123,7 +123,7 @@ from urllib.parse import unquote, urlparse
 
 
 mode = sys.argv[1]
-healthy_code = sys.argv[2]
+useful_partial_code = sys.argv[2]
 unsupported_code = sys.argv[3]
 output_parent_path = sys.argv[4]
 output_basename = sys.argv[5]
@@ -210,6 +210,15 @@ BEGINNER_SECTION_KEYS = {
     "evidence_gaps": {"items", "text"},
     "change_conditions": {"items", "text"},
 }
+BEGINNER_GAP_KEYS = {
+    "affected_action_ids", "condition", "field_id", "label_zh", "scope",
+    "source_resolution", "supplementation", "next_step",
+}
+BEGINNER_NEXT_STEP_KEYS = {"action", "status"}
+BEGINNER_SOURCE_RESOLUTION_KEYS = {
+    "acceptable_alternative_ids", "primary_source_id", "resolution",
+    "source_field_id", "source_states",
+}
 SOURCE_DATA_KEYS = {
     "fund_code", "mode", "policy_checksum", "policy_version", "registry_checksum",
     "registry_version", "request_field_resolutions", "request_id", "snapshot_at",
@@ -269,6 +278,7 @@ FACT_VALUE_KEYS = {
     "fund_manager_product_announcement": {
         "category", "record_published_at", "record_publisher", "record_url", "title",
     },
+    "redemption_terms": {"fee_condition", "settlement_condition"},
 }
 HOLDING_ITEM_KEYS = {
     "asset_class", "disclosed_weight", "rank", "security_code", "security_name",
@@ -1190,28 +1200,35 @@ def project_source_status(path, expected_code):
             raise AcceptanceFailure("source fields contain a duplicate identity")
         fields_by_identity[identity] = projected
         projected_fields.append(projected)
-    manual_identities = set()
+    supplementation_identities = set()
     for resolution in resolutions.values():
-        if resolution["resolution"] != "manual_supplement_required":
+        if resolution["resolution"] not in {"manual_supplement_required", "partial"}:
             continue
         identity = (resolution["primary_source_id"], resolution["field_id"])
         source = fields_by_identity.get(identity)
+        allowed_states = (
+            {"unsupported", "unavailable"}
+            if resolution["resolution"] == "manual_supplement_required"
+            else {"not_checked", "degraded", "cooldown", "unsupported", "unavailable"}
+        )
+        if source is None:
+            raise AcceptanceFailure("source resolution primary identity is missing")
+        if source["source_tier"] != "tier_1":
+            continue
         if (
-            source is None
-            or source["source_tier"] != "tier_1"
-            or source["state"] not in {"unsupported", "unavailable"}
+            source["state"] not in allowed_states
             or source["supplementation"] is None
         ):
-            raise AcceptanceFailure("manual supplementation is not bound to its Tier 1 source")
-        expected_missing_item = SUPPLEMENT_MISSING_ITEM.get(
+            raise AcceptanceFailure("supplementation is not bound to its unresolved Tier 1 source")
+        if source["supplementation"]["missing_item"] != resolution["field_id"]:
+            raise AcceptanceFailure("manual supplementation missing item is not controlled")
+        source["supplementation"]["missing_item"] = SUPPLEMENT_MISSING_ITEM.get(
             resolution["field_id"],
             resolution["field_id"],
         )
-        if source["supplementation"]["missing_item"] != expected_missing_item:
-            raise AcceptanceFailure("manual supplementation missing item is not controlled")
-        manual_identities.add(identity)
+        supplementation_identities.add(identity)
     for source in projected_fields:
-        if (source["source_id"], source["field_id"]) not in manual_identities:
+        if (source["source_id"], source["field_id"]) not in supplementation_identities:
             source["supplementation"] = None
     return {
         "fund_code": expected_code,
@@ -1613,11 +1630,137 @@ def project_brief(path, expected_code, expected_action):
             "scope": identifier(gap["scope"], "gap scope"),
         })
     beginner = exact_dict(data["beginner_explanation_zh"], BEGINNER_KEYS, "beginner output")
+    projected_beginner = {}
     for section_name, section_keys in BEGINNER_SECTION_KEYS.items():
         section = exact_dict(beginner[section_name], section_keys, section_name)
         scan_public_tree(section, section_name)
+        projected_beginner[section_name] = section
+    beginner_gaps = []
+    for value in exact_list(beginner["evidence_gaps"]["items"], "beginner gaps"):
+        item = exact_dict(value, BEGINNER_GAP_KEYS, "beginner gap")
+        projected_item = {
+            "affected_action_ids": identifier_list(
+                item["affected_action_ids"], "beginner gap affected actions"
+            ),
+            "condition": identifier(item["condition"], "beginner gap condition"),
+            "field_id": identifier(item["field_id"], "beginner gap field"),
+            "label_zh": public_text(item["label_zh"], "beginner gap label"),
+            "scope": identifier(item["scope"], "beginner gap scope"),
+            "source_resolution": None,
+            "supplementation": None,
+            "next_step": None,
+        }
+        next_step = exact_dict(
+            item["next_step"], BEGINNER_NEXT_STEP_KEYS, "beginner gap next step"
+        )
+        projected_item["next_step"] = {
+            "action": public_text(next_step["action"], "beginner gap next action"),
+            "status": identifier(next_step["status"], "beginner gap next status"),
+        }
+        resolution = item["source_resolution"]
+        if resolution is not None:
+            resolution = exact_dict(
+                resolution,
+                BEGINNER_SOURCE_RESOLUTION_KEYS,
+                "beginner source resolution",
+            )
+            projected_resolution = {
+                "acceptable_alternative_ids": identifier_list(
+                    resolution["acceptable_alternative_ids"],
+                    "beginner acceptable alternatives",
+                ),
+                "primary_source_id": identifier(
+                    resolution["primary_source_id"], "beginner primary source"
+                ),
+                "resolution": identifier(
+                    resolution["resolution"], "beginner resolution"
+                ),
+                "source_field_id": identifier(
+                    resolution["source_field_id"], "beginner source field"
+                ),
+                "source_states": identifier_list(
+                    resolution["source_states"], "beginner source states"
+                ),
+            }
+            if projected_item["field_id"] == "official_events" and (
+                projected_resolution["source_field_id"]
+                != "fund_manager_product_announcement"
+            ):
+                raise AcceptanceFailure("official event gap uses an invalid source field")
+            projected_item["source_resolution"] = projected_resolution
+        supplementation = item["supplementation"]
+        if supplementation is not None:
+            supplementation = exact_dict(
+                supplementation,
+                SUPPLEMENTATION_KEYS,
+                "beginner supplementation",
+            )
+            projected_supplementation = {
+                "accepted_input": [
+                    public_text(entry, "beginner accepted input")
+                    for entry in exact_list(
+                        supplementation["accepted_input"], "beginner accepted input"
+                    )
+                ],
+                "freshness_requirement": public_text(
+                    supplementation["freshness_requirement"],
+                    "beginner supplement freshness",
+                ),
+                "impact_if_missing": public_text(
+                    supplementation["impact_if_missing"], "beginner supplement impact"
+                ),
+                "missing_item": identifier(
+                    supplementation["missing_item"], "beginner supplement missing item"
+                ),
+                "suggested_location": public_text(
+                    supplementation["suggested_location"], "beginner supplement location"
+                ),
+                "supported_without_it": public_text(
+                    supplementation["supported_without_it"], "beginner supported scope"
+                ),
+                "unsupported_without_it": public_text(
+                    supplementation["unsupported_without_it"],
+                    "beginner unsupported scope",
+                ),
+                "why_required": public_text(
+                    supplementation["why_required"], "beginner supplement rationale"
+                ),
+            }
+            projected_item["supplementation"] = projected_supplementation
+        resolution = projected_item["source_resolution"]
+        if resolution is None and projected_item["supplementation"] is not None:
+            raise AcceptanceFailure("beginner supplementation lacks a source resolution")
+        if resolution is not None:
+            manual = resolution["resolution"] == "manual_supplement_required"
+            if resolution["resolution"] == "usable":
+                raise AcceptanceFailure("beginner evidence gap cannot be labeled usable")
+            if manual != (projected_item["supplementation"] is not None):
+                raise AcceptanceFailure("beginner manual resolution and supplementation conflict")
+            if manual and projected_item["next_step"]["status"] != resolution["resolution"]:
+                raise AcceptanceFailure("beginner manual gap has a conflicting next step")
+            if projected_item["supplementation"] is not None and (
+                projected_item["supplementation"]["missing_item"]
+                != resolution["source_field_id"]
+            ):
+                raise AcceptanceFailure("beginner supplementation is spliced from another field")
+        beginner_gaps.append(projected_item)
+    if [
+        {
+            "affected_action_ids": item["affected_action_ids"],
+            "condition": item["condition"],
+            "field_id": item["field_id"],
+            "scope": item["scope"],
+        }
+        for item in beginner_gaps
+    ] != gaps:
+        raise AcceptanceFailure("beginner gaps do not exactly preserve top-level gaps")
+    projected_beginner["evidence_gaps"] = {
+        **projected_beginner["evidence_gaps"],
+        "items": beginner_gaps,
+    }
     headline = exact_dict(beginner["headline"], HEADLINE_KEYS, "headline")
     scan_public_tree(headline, "headline")
+    projected_beginner["headline"] = headline
     triggered_reviews = identifier_list(action["triggered_reviews"], "triggered reviews")
     headline_text = conditional_financial_text(
         headline["text"],
@@ -1693,6 +1836,7 @@ def project_brief(path, expected_code, expected_action):
         },
         "decision_evidence_status": decision_status,
         "facts": facts,
+        "beginner_explanation_zh": projected_beginner,
         "headline": headline_text,
         "maturity_explanation": maturity_text,
         "missing_evidence": gaps,
@@ -1722,7 +1866,7 @@ def project_brief(path, expected_code, expected_action):
     }, subject
 
 
-def require_healthy(projected):
+def require_useful_partial(projected):
     facts_by_field = {}
     for item in projected["facts"]:
         facts_by_field.setdefault(item["field_id"], []).append(item)
@@ -1732,26 +1876,168 @@ def require_healthy(projected):
         {"current_manager_team"},
         {"formal_nav"},
     )
+    limited_required_fields = set()
     for group in required_groups:
         matches = [item for field in group for item in facts_by_field.get(field, ())]
         if not matches:
-            raise AcceptanceFailure("healthy brief lacks a required useful sourced fact")
+            raise AcceptanceFailure("useful partial lacks a required sourced fact")
         for item in matches:
-            if (
-                item["freshness"] in {"stale", "unknown"}
-                or item["completeness"] != "complete"
-                or item["conflict_ids"]
+            if item["freshness"] in {"stale", "unknown"} or item["conflict_ids"]:
+                raise AcceptanceFailure("useful partial has stale, unknown, or conflicted facts")
+            if item["source_tier"] == "tier_1" and (
+                item["freshness"] != "current" or item["completeness"] != "complete"
             ):
-                raise AcceptanceFailure("healthy brief has stale, incomplete, or conflicted facts")
-            if item["field_id"] != "formal_nav" and item["source_tier"] != "tier_1":
-                raise AcceptanceFailure("healthy official identity or manager fact is not Tier 1")
+                raise AcceptanceFailure("useful partial Tier 1 fact is not current and complete")
+            if item["source_tier"] == "tier_2" and (
+                item["freshness"] not in {"current", "dated_history"}
+                or item["completeness"] not in {"partial", "complete"}
+            ):
+                raise AcceptanceFailure("useful partial Tier 2 fact is not explicitly labeled")
+            if item["source_tier"] == "tier_2" and (
+                item["freshness"] != "current" or item["completeness"] != "complete"
+            ):
+                limited_required_fields.add(item["field_id"])
     gaps = {item["field_id"] for item in projected["missing_evidence"]}
-    for fact_field, gap_field in (
-        ("fees_share_class_relationship", "fees_share_class_relationship"),
-        ("holdings_industries", "holdings_industries"),
+    if limited_required_fields:
+        if (
+            projected["sync_status"]["state"] == "complete"
+            or projected["decision_evidence_status"]["state"] == "complete"
+        ):
+            raise AcceptanceFailure("labeled partial facts are inconsistent with complete status")
+        action = projected["action_interpretation"]
+        if action["primary_state"] != "abstain" or any(
+            item["state"] != "abstain" for item in action["interpretations"]
+        ):
+            raise AcceptanceFailure("action-critical labeled partial facts did not abstain")
+        if limited_required_fields.intersection(
+            {"identity_active_status", "share_class_identity"}
+        ) and gaps.isdisjoint({"identity_active_status", "share_class_identity"}):
+            raise AcceptanceFailure("labeled partial identity lacks an explicit action gap")
+    beginner = projected["beginner_explanation_zh"]
+    identity_text = beginner["fund_identity"]["text"]
+    why_text = beginner["why_this_state"]["text"]
+    relationship_text = beginner["portfolio_relationship"]["text"]
+    if "Tier " not in identity_text:
+        raise AcceptanceFailure("useful partial identity omits its source tier")
+    if (
+        re.search(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}", identity_text) is None
+        and gaps.isdisjoint({"identity_active_status", "share_class_identity"})
     ):
-        if fact_field not in fields and gap_field not in gaps:
-            raise AcceptanceFailure("healthy brief silently omitted a required fact or gap")
+        raise AcceptanceFailure("undated identity lacks an explicit identity gap")
+    if any(value not in why_text for value in ("当前经理", "正式净值", "费用")):
+        raise AcceptanceFailure("useful partial omits key beginner fact explanations")
+    if any(value not in relationship_text for value in ("覆盖", "未知", "不是完整 D2")):
+        raise AcceptanceFailure("useful partial relationship explanation is not explicit")
+
+    def fact_marker(item):
+        data_date = item["data_as_of"] or item["published_at"] or "日期未知"
+        tier = item["source_tier"].replace("tier_", "Tier ")
+        return data_date, tier
+
+    fund_code = projected["subject"]["fund_code"]
+    identity_candidates = facts_by_field.get("identity_active_status") or []
+    identity = next(
+        (
+            item
+            for item in identity_candidates
+            if isinstance(item["value"], dict)
+            and item["value"].get("fund_code") == fund_code
+        ),
+        None,
+    )
+    share_candidates = facts_by_field.get("share_class_identity") or []
+    share_class = next(
+        (
+            item
+            for item in share_candidates
+            if isinstance(item["value"], dict)
+            and item["value"].get("related_fund_code") == fund_code
+        ),
+        None,
+    )
+    identity_tokens = []
+    if share_class is not None:
+        identity_tokens.extend(
+            value
+            for value in (
+                share_class["value"].get("fund_name"),
+                share_class["value"].get("share_class"),
+                *fact_marker(share_class),
+            )
+            if value
+        )
+    if identity is not None:
+        identity_tokens.extend(fact_marker(identity))
+        for key in ("fund_name", "status"):
+            value = identity["value"].get(key)
+            if value:
+                identity_tokens.append(value)
+    if any(str(value) not in identity_text for value in identity_tokens):
+        raise AcceptanceFailure("beginner identity text conflicts with structured facts")
+    identity_evidence_ids = set(beginner["fund_identity"]["evidence_ids"])
+    facts_by_id = {item["fact_id"]: item for item in projected["facts"]}
+    for evidence_id in identity_evidence_ids:
+        evidence = facts_by_id.get(evidence_id)
+        if evidence is None:
+            raise AcceptanceFailure("beginner identity evidence id is unresolved")
+        value = evidence["value"]
+        if evidence["field_id"] == "share_class_identity" and (
+            not isinstance(value, dict) or value.get("related_fund_code") != fund_code
+        ):
+            raise AcceptanceFailure("beginner identity evidence includes a non-target share")
+        if evidence["field_id"] == "identity_active_status" and (
+            not isinstance(value, dict) or value.get("fund_code") != fund_code
+        ):
+            raise AcceptanceFailure("beginner identity evidence includes a non-target identity")
+    for sibling in share_candidates:
+        if sibling is share_class or not isinstance(sibling["value"], dict):
+            continue
+        sibling_name = sibling["value"].get("fund_name")
+        if sibling_name and sibling_name in identity_text:
+            raise AcceptanceFailure("beginner identity selected a non-target sibling share")
+
+    managers = facts_by_field.get("current_manager_team") or []
+    nav = (facts_by_field.get("formal_nav") or [None])[0]
+    fee = (facts_by_field.get("fees_share_class_relationship") or [None])[0]
+    holdings = (facts_by_field.get("holdings_industries") or [None])[0]
+    why_tokens = []
+    for manager in managers:
+        why_tokens.extend((manager["value"]["manager_name"], *fact_marker(manager)))
+    if nav is not None:
+        why_tokens.extend((nav["value"], *fact_marker(nav)))
+    if fee is not None:
+        why_tokens.extend(fact_marker(fee))
+    if holdings is not None:
+        why_tokens.extend((holdings["value"]["report_period"], *fact_marker(holdings)))
+    if any(str(value) not in why_text for value in why_tokens):
+        raise AcceptanceFailure("beginner key-fact text conflicts with structured facts")
+
+    risk_reducing_ids = {"reduce_to_cash", "full_exit", "switch_reduce"}
+    redemption_facts = facts_by_field.get("redemption_terms", ())
+    redemption_current = bool(redemption_facts) and all(
+        item["freshness"] == "current"
+        and item["completeness"] == "complete"
+        and not item["conflict_ids"]
+        for item in redemption_facts
+    )
+    for interpretation in projected["action_interpretation"]["interpretations"]:
+        if interpretation["action_id"] not in risk_reducing_ids:
+            continue
+        if redemption_current:
+            continue
+        if "redemption_terms" not in gaps or interpretation["state"] != "abstain":
+            raise AcceptanceFailure(
+                "risk-reducing action lacks current redemption terms or explicit abstention"
+            )
+    for fact_field, accepted_gaps in (
+        ("fees_share_class_relationship", {"fees_share_class_relationship"}),
+        (
+            "holdings_industries",
+            {"holdings_industries", f"holdings_industries_{fund_code}"},
+        ),
+    ):
+        if fact_field not in fields and accepted_gaps.isdisjoint(gaps):
+            raise AcceptanceFailure("useful partial silently omitted a required fact or gap")
     announcement_obtained = "official_events" in projected["sync_status"]["obtained_fields"]
     if not (
         "fund_manager_product_announcement" in fields
@@ -1759,25 +2045,28 @@ def require_healthy(projected):
         or announcement_obtained
         or "official_events" in gaps
     ):
-        raise AcceptanceFailure("healthy brief silently omitted its announcement scope")
+        raise AcceptanceFailure("useful partial silently omitted its announcement scope")
     if projected["subject"]["position_present"] is None:
-        raise AcceptanceFailure("healthy brief lacks position presence")
+        raise AcceptanceFailure("useful partial lacks position presence")
     if not projected["portfolio_relationship"]["relationships"]:
-        raise AcceptanceFailure("healthy brief lacks a deterministic relationship")
+        raise AcceptanceFailure("useful partial lacks a deterministic relationship")
     if not any(
         item["relationship_type"] == "duplicate_holding_identity"
         and item["metrics"] == {"multiple_observations": True}
         for item in projected["portfolio_relationship"]["relationships"]
     ):
-        raise AcceptanceFailure("healthy brief lacks its synthetic duplicate binding")
+        raise AcceptanceFailure("useful partial lacks its synthetic duplicate binding")
     if any(
         item["evidence_state"] == "insufficient"
         for item in projected["portfolio_relationship"]["relationships"]
     ):
-        raise AcceptanceFailure("healthy brief relationship evidence is insufficient")
+        raise AcceptanceFailure("useful partial relationship evidence is insufficient")
     for key in ("minimum_relationship_coverage", "disclosed_holdings_coverage"):
-        if projected["portfolio_relationship"][key]["evidence_state"] == "insufficient":
-            raise AcceptanceFailure("healthy brief D2 coverage is insufficient")
+        coverage = projected["portfolio_relationship"][key]
+        if coverage["evidence_state"] == "insufficient" and not coverage["unknown_fields"]:
+            raise AcceptanceFailure("useful partial concealed insufficient D2 coverage")
+        if coverage["evidence_state"] == "insufficient" and "覆盖不足" not in relationship_text:
+            raise AcceptanceFailure("useful partial softened insufficient D2 in Chinese")
 
 
 def require_unsupported(projected, source_status):
@@ -1786,28 +2075,59 @@ def require_unsupported(projected, source_status):
         raise AcceptanceFailure("unsupported brief is not a useful partial")
     if not status["acceptable_alternative_ids"]:
         raise AcceptanceFailure("unsupported brief lacks an acceptable alternative")
-    if not status["manual_supplementation_codes"]:
-        raise AcceptanceFailure("unsupported brief lacks a supplementation path")
-    supplementations = [
-        item["supplementation"]
+    manual_suffix = "_manual_supplement_required"
+    manual_code_fields = {
+        code[: -len(manual_suffix)]
+        for code in status["manual_supplementation_codes"]
+        if code.endswith(manual_suffix)
+    }
+    if len(manual_code_fields) != len(status["manual_supplementation_codes"]):
+        raise AcceptanceFailure("brief manual supplementation code is not canonical")
+    beginner_manual_fields = set()
+    for item in projected["beginner_explanation_zh"]["evidence_gaps"]["items"]:
+        if not item["next_step"]["action"] or not item["next_step"]["status"]:
+            raise AcceptanceFailure("brief gap lacks a controlled next step")
+        resolution = item["source_resolution"]
+        if resolution is None or resolution["resolution"] != "manual_supplement_required":
+            continue
+        if item["supplementation"] is None or not resolution["acceptable_alternative_ids"]:
+            raise AcceptanceFailure("brief manual gap lacks its bound supplementation path")
+        source_field = resolution["source_field_id"]
+        beginner_manual_fields.add(
+            "official_events"
+            if source_field == "fund_manager_product_announcement"
+            else source_field
+        )
+    if beginner_manual_fields != manual_code_fields:
+        raise AcceptanceFailure("brief manual codes and field-bound gaps do not match")
+    gap_fields = {item["field_id"] for item in projected["missing_evidence"]}
+    supplemented_sources = [
+        item
         for item in source_status["source_fields"]
         if item["supplementation"] is not None
+        and item["supplementation"]["missing_item"] in gap_fields
     ]
-    if not supplementations or any(
-        not item["accepted_input"]
-        or not item["suggested_location"]
-        or not item["impact_if_missing"]
-        for item in supplementations
+    if not supplemented_sources or any(
+        not item["supplementation"]["accepted_input"]
+        or not item["supplementation"]["suggested_location"]
+        or not item["supplementation"]["impact_if_missing"]
+        for item in supplemented_sources
     ):
         raise AcceptanceFailure("source status lacks a concrete supplementation path")
-    if not any(
-        item["resolution"] == "manual_supplement_required"
+    resolutions = {
+        (item["primary_source_id"], item["field_id"]): item["resolution"]
         for item in source_status["request_field_resolutions"]
+    }
+    if any(
+        resolutions.get((item["source_id"], item["field_id"]))
+        not in {"manual_supplement_required", "partial"}
+        for item in supplemented_sources
     ):
-        raise AcceptanceFailure("source status lacks a manual supplementation resolution")
-    gap_fields = {item["field_id"] for item in projected["missing_evidence"]}
-    supplemented_items = {item["missing_item"] for item in supplementations}
-    if len(supplemented_items) != len(supplementations):
+        raise AcceptanceFailure("source supplementation is not bound to an unresolved field")
+    supplemented_items = {
+        item["supplementation"]["missing_item"] for item in supplemented_sources
+    }
+    if len(supplemented_items) != len(supplemented_sources):
         raise AcceptanceFailure("source supplementation paths are ambiguous")
     if not supplemented_items.issubset(gap_fields):
         raise AcceptanceFailure("brief gaps are not bound to source supplementation")
@@ -2003,15 +2323,21 @@ try:
     if mode == "public":
         cases = (
             (
-                "healthy-continue_holding", healthy_code, "continue_holding",
-                "healthy-continue_holding",
+                "useful-partial-continue_holding", useful_partial_code, "continue_holding",
+                "useful-partial-continue_holding",
             ),
             (
-                "healthy-reduce_to_cash", healthy_code, "reduce_to_cash",
-                "healthy-reduce_to_cash",
+                "useful-partial-reduce_to_cash", useful_partial_code, "reduce_to_cash",
+                "useful-partial-reduce_to_cash",
             ),
-            ("healthy-full_exit", healthy_code, "full_exit", "healthy-full_exit"),
-            ("healthy-switch_funds", healthy_code, "switch_funds", "healthy-switch_funds"),
+            (
+                "useful-partial-full_exit", useful_partial_code, "full_exit",
+                "useful-partial-full_exit",
+            ),
+            (
+                "useful-partial-switch_funds", useful_partial_code, "switch_funds",
+                "useful-partial-switch_funds",
+            ),
             ("unsupported-continue_holding", unsupported_code, "continue_holding", "unsupported"),
         )
         files = {}
@@ -2030,10 +2356,10 @@ try:
             projections[name] = projected
             files[name + ".json"] = projected
         for name in (
-            "healthy-continue_holding", "healthy-reduce_to_cash",
-            "healthy-full_exit", "healthy-switch_funds",
+            "useful-partial-continue_holding", "useful-partial-reduce_to_cash",
+            "useful-partial-full_exit", "useful-partial-switch_funds",
         ):
-            require_healthy(projections[name])
+            require_useful_partial(projections[name])
         source_path = run_command(
             "unsupported-source-status",
             ["--json", "source", "status", "--fund-code", unsupported_code],
@@ -2047,25 +2373,25 @@ try:
             "acceptance_scope": "technical_safety_not_financial_sufficiency",
             "fund_fact_scope": "live_public_sources",
             "global_deadline_seconds": timeout_seconds,
-            "healthy": {
-                "code": healthy_code,
-                "decision_evidence_state": projections["healthy-continue_holding"][
+            "useful_partial": {
+                "code": useful_partial_code,
+                "decision_evidence_state": projections["useful-partial-continue_holding"][
                     "decision_evidence_status"
                 ]["state"],
                 "relationship_types": sorted({
                     item["relationship_type"]
-                    for item in projections["healthy-continue_holding"][
+                    for item in projections["useful-partial-continue_holding"][
                         "portfolio_relationship"
                     ]["relationships"]
                 }),
                 "useful_fact_fields": [
                     item["field_id"]
-                    for item in projections["healthy-continue_holding"]["facts"]
+                    for item in projections["useful-partial-continue_holding"]["facts"]
                 ],
-                "sync_state": projections["healthy-continue_holding"]["sync_status"][
+                "sync_state": projections["useful-partial-continue_holding"]["sync_status"][
                     "state"
                 ],
-                "terminal_status": projections["healthy-continue_holding"]["request"][
+                "terminal_status": projections["useful-partial-continue_holding"]["request"][
                     "terminal_status"
                 ],
             },

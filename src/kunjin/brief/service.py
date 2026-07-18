@@ -36,6 +36,7 @@ from kunjin.decision.models import (
     RequestMode,
     RequestTerminalStatus,
     SourceAttemptOutcome,
+    SourceFieldRef,
     validate_aware_datetime,
     validate_identifier,
 )
@@ -746,38 +747,84 @@ class HeldFundBriefService:
         if not callable(loader):
             return ()
         stored_attempts = loader(request_run_id, budget, as_of)
-        fact_by_field: Dict[str, list[str]] = {}
-        for fact in (*fact_set.facts, *d2.evidence_facts):
-            fact_by_field.setdefault(fact.field_id, []).append(fact.fact_id)
+        subject_key = f"fund:{fact_set.fund_code}"
+        all_facts = (*fact_set.facts, *d2.evidence_facts)
+
+        def evidence_ids_for(stored, projected_field: str) -> Tuple[str, ...]:
+            lineage = f"source_attempt_{stored.id}"
+            if projected_field == "official_events":
+                return tuple(
+                    item.event_id
+                    for item in fact_set.official_events
+                    if lineage in {item.original_source_id, item.quoted_source_id}
+                )
+            return tuple(
+                fact.fact_id
+                for fact in all_facts
+                if fact.field_id == projected_field and fact.source_lineage_id == lineage
+            )
+
+        def related_source_refs(source_id: str, field_id: str) -> set[SourceFieldRef]:
+            return {
+                SourceFieldRef(source_id, field_id),
+                *self._registry_alternative_refs(source_id, field_id),
+            }
+
+        def manual_supplement_ready(source_id: str, field_id: str) -> bool:
+            expected_refs = related_source_refs(source_id, field_id)
+            latest_by_ref = {}
+            for candidate in reversed(stored_attempts):
+                candidate_attempt = candidate.attempt
+                candidate_ref = SourceFieldRef(
+                    candidate_attempt.source_id,
+                    candidate_attempt.field_id,
+                )
+                if (
+                    candidate_attempt.subject_key == subject_key
+                    and candidate_ref in expected_refs
+                    and candidate_ref not in latest_by_ref
+                ):
+                    latest_by_ref[candidate_ref] = candidate_attempt
+            exhausted = {
+                SourceAttemptOutcome.UNAVAILABLE,
+                SourceAttemptOutcome.UNSUPPORTED,
+            }
+            return expected_refs == set(latest_by_ref) and all(
+                attempt.outcome in exhausted for attempt in latest_by_ref.values()
+            )
+
         requirements = dict(self._brief_policy.fact_requirements)
         resolutions = []
         seen = set()
         for stored in reversed(stored_attempts):
             attempt = stored.attempt
-            if attempt.subject_key != f"fund:{fact_set.fund_code}":
+            if attempt.subject_key != subject_key:
                 continue
             field_id = attempt.field_id
             projected_field = (
                 "official_events" if field_id == "fund_manager_product_announcement" else field_id
             )
-            lineage = f"source_attempt_{stored.id}"
-            evidence_ids = tuple(
-                fact_id
-                for fact_id in fact_by_field.get(projected_field, ())
-                if next(
-                    item
-                    for item in (*fact_set.facts, *d2.evidence_facts)
-                    if item.fact_id == fact_id
-                ).source_lineage_id
-                == lineage
-            )
+            evidence_ids = evidence_ids_for(stored, projected_field)
             if projected_field == "official_events":
-                evidence_ids = tuple(
-                    item.event_id
-                    for item in fact_set.official_events
-                    if lineage in {item.original_source_id, item.quoted_source_id}
-                )
                 if attempt.source_id != "fund_manager_official_documents":
+                    continue
+            elif attempt.outcome not in {
+                SourceAttemptOutcome.SUCCESS,
+                SourceAttemptOutcome.CACHE_HIT,
+            }:
+                alternatives = related_source_refs(attempt.source_id, attempt.field_id)
+                if any(
+                    candidate.attempt.subject_key == subject_key
+                    and SourceFieldRef(
+                        candidate.attempt.source_id,
+                        candidate.attempt.field_id,
+                    )
+                    in alternatives
+                    and candidate.attempt.outcome
+                    in {SourceAttemptOutcome.SUCCESS, SourceAttemptOutcome.CACHE_HIT}
+                    and evidence_ids_for(candidate, projected_field)
+                    for candidate in stored_attempts
+                ):
                     continue
             for action_route in route.actions:
                 action_id = action_route.action_id
@@ -794,6 +841,22 @@ class HeldFundBriefService:
                     and not evidence_ids
                 ):
                     continue
+                acceptable_alternative_ids: Tuple[str, ...] = ()
+                if attempt.outcome in {
+                    SourceAttemptOutcome.UNAVAILABLE,
+                    SourceAttemptOutcome.UNSUPPORTED,
+                }:
+                    acceptable_alternative_ids = tuple(
+                        sorted(
+                            {
+                                reference.source_id
+                                for reference in self._registry_alternative_refs(
+                                    attempt.source_id,
+                                    attempt.field_id,
+                                )
+                            }
+                        )
+                    )
                 try:
                     resolution = load_brief_source_resolution(
                         self._audit_store,
@@ -801,12 +864,30 @@ class HeldFundBriefService:
                         action_id=action_id,
                         field_id=projected_field,
                         evidence_ids=evidence_ids,
+                        acceptable_alternative_ids=acceptable_alternative_ids,
+                        manual_supplement_ready=manual_supplement_ready(
+                            attempt.source_id,
+                            attempt.field_id,
+                        ),
                     )
                 except ValueError:
                     continue
                 resolutions.append(resolution)
                 seen.add((action_id, projected_field))
         return tuple(resolutions)
+
+    def _registry_alternative_refs(
+        self,
+        source_id: str,
+        field_id: str,
+    ) -> Tuple[SourceFieldRef, ...]:
+        for source in self._source_registry.sources:
+            if source.source_id != source_id:
+                continue
+            for field in source.fields:
+                if field.field_id == field_id:
+                    return field.acceptable_alternatives
+        return ()
 
     @staticmethod
     def _budget_terminal_status(budget: RequestBudget) -> RequestTerminalStatus:

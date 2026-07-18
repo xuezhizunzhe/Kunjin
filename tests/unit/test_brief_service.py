@@ -809,6 +809,203 @@ def test_source_resolution_uses_final_retry_not_first_transient(
     assert loaded == [12]
 
 
+def test_unavailable_source_resolution_preserves_registry_alternatives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repository_value, audit, _script, service = _service(tmp_path)
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id="1234567890abcdef1234567890abcdef",
+        monotonic=lambda: 1.0,
+        wall_clock=lambda: NOW,
+    )
+    request_run_id = audit.begin_request(budget)
+    attempts = (
+        SimpleNamespace(
+            id=11,
+            attempt=SimpleNamespace(
+                source_id="eastmoney_nav",
+                field_id="formal_nav",
+                subject_key=f"fund:{FUND_CODE}",
+                outcome=SourceAttemptOutcome.UNAVAILABLE,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        audit,
+        "authenticated_request_source_attempts",
+        lambda *_args: attempts,
+    )
+    captured: list[tuple[str, ...]] = []
+
+    def resolution_loader(_store, source_attempt_id, **kwargs):
+        captured.append(
+            (
+                kwargs["acceptable_alternative_ids"],
+                kwargs["manual_supplement_ready"],
+            )
+        )
+        return source_attempt_id
+
+    monkeypatch.setattr(
+        "kunjin.brief.service.load_brief_source_resolution",
+        resolution_loader,
+    )
+    route = SimpleNamespace(actions=(SimpleNamespace(action_id="fact_research"),))
+    fact_set = SimpleNamespace(fund_code=FUND_CODE, facts=(), official_events=())
+    d2 = SimpleNamespace(evidence_facts=())
+
+    resolutions = service._source_resolutions(
+        request_run_id,
+        budget,
+        route,
+        fact_set,
+        d2,
+        NOW,
+    )
+
+    assert resolutions == (11,)
+    assert captured == [(('fund_manager_official_documents',), False)]
+
+
+def test_successful_alternative_wins_over_later_unavailable_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repository_value, audit, _script, service = _service(tmp_path)
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id="1234567890abcdef1234567890abcdef",
+        monotonic=lambda: 1.0,
+        wall_clock=lambda: NOW,
+    )
+    request_run_id = audit.begin_request(budget)
+    attempts = (
+        SimpleNamespace(
+            id=11,
+            attempt=SimpleNamespace(
+                source_id="eastmoney_nav",
+                field_id="formal_nav",
+                subject_key=f"fund:{FUND_CODE}",
+                outcome=SourceAttemptOutcome.SUCCESS,
+            ),
+        ),
+        SimpleNamespace(
+            id=12,
+            attempt=SimpleNamespace(
+                source_id="fund_manager_official_documents",
+                field_id="formal_nav",
+                subject_key=f"fund:{FUND_CODE}",
+                outcome=SourceAttemptOutcome.UNAVAILABLE,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        audit,
+        "authenticated_request_source_attempts",
+        lambda *_args: attempts,
+    )
+    loaded: list[int] = []
+
+    def resolution_loader(_store, source_attempt_id, **_kwargs):
+        loaded.append(source_attempt_id)
+        return source_attempt_id
+
+    monkeypatch.setattr(
+        "kunjin.brief.service.load_brief_source_resolution",
+        resolution_loader,
+    )
+    fact = SimpleNamespace(
+        fact_id="formal_nav_fact",
+        field_id="formal_nav",
+        source_lineage_id="source_attempt_11",
+    )
+    route = SimpleNamespace(actions=(SimpleNamespace(action_id="fact_research"),))
+    fact_set = SimpleNamespace(
+        fund_code=FUND_CODE,
+        facts=(fact,),
+        official_events=(),
+    )
+    d2 = SimpleNamespace(evidence_facts=())
+
+    resolutions = service._source_resolutions(
+        request_run_id,
+        budget,
+        route,
+        fact_set,
+        d2,
+        NOW,
+    )
+
+    assert resolutions == (11,)
+    assert loaded == [11]
+
+
+def test_cross_field_alternatives_are_counted_when_deciding_manual_supplementation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repository_value, audit, _script, service = _service(tmp_path)
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id="1234567890abcdef1234567890abcdef",
+        monotonic=lambda: 1.0,
+        wall_clock=lambda: NOW,
+    )
+    request_run_id = audit.begin_request(budget)
+    attempts = (
+        SimpleNamespace(
+            id=11,
+            attempt=SimpleNamespace(
+                source_id="fund_manager_official_documents",
+                field_id="transaction_availability_limits_cutoff",
+                subject_key=f"fund:{FUND_CODE}",
+                outcome=SourceAttemptOutcome.UNAVAILABLE,
+            ),
+        ),
+        SimpleNamespace(
+            id=12,
+            attempt=SimpleNamespace(
+                source_id="yangjibao_portfolio_observation",
+                field_id="transaction_channel_observation",
+                subject_key=f"fund:{FUND_CODE}",
+                outcome=SourceAttemptOutcome.UNSUPPORTED,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        audit,
+        "authenticated_request_source_attempts",
+        lambda *_args: attempts,
+    )
+    captured: list[bool] = []
+
+    def resolution_loader(_store, source_attempt_id, **kwargs):
+        if source_attempt_id == 11:
+            captured.append(kwargs["manual_supplement_ready"])
+        return source_attempt_id
+
+    monkeypatch.setattr(
+        "kunjin.brief.service.load_brief_source_resolution",
+        resolution_loader,
+    )
+    route = SimpleNamespace(actions=(SimpleNamespace(action_id="fact_research"),))
+    fact_set = SimpleNamespace(fund_code=FUND_CODE, facts=(), official_events=())
+    d2 = SimpleNamespace(evidence_facts=())
+
+    service._source_resolutions(
+        request_run_id,
+        budget,
+        route,
+        fact_set,
+        d2,
+        NOW,
+    )
+
+    assert captured == [True]
+
+
 def test_constructor_rejects_disclosure_store_from_another_database(
     tmp_path: Path,
 ) -> None:

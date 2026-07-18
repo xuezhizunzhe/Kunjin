@@ -981,11 +981,18 @@ class BriefSnapshot:
                     interpretation.state is BriefState.NO_ADD
                     and "phase_b_blocked" in interpretation.blocking_codes
                 )
-                if not phase_b_no_add and not (
+                evidence_gap_abstain = (
+                    interpretation.state is BriefState.ABSTAIN
+                    and interpretation.action_id in self.affected_action_abstentions
+                )
+                mature_review = (
                     interpretation.state is BriefState.REDUCE_OR_EXIT_REVIEW
                     and interpretation.action_maturity is ActionMaturity.MATURE
-                ):
-                    raise ValueError("active hard official event requires exit review or no-add")
+                )
+                if not (phase_b_no_add or evidence_gap_abstain or mature_review):
+                    raise ValueError(
+                        "active hard official event requires review, no-add, or gap abstention"
+                    )
                 if not {event.event_id for event in hard_events}.issubset(
                     interpretation.supporting_evidence_ids
                 ):

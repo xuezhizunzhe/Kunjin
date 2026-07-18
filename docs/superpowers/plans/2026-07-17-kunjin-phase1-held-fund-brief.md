@@ -695,7 +695,7 @@ git commit -m "feat: expose held fund brief command"
 
 - [x] **Step 1: Write failing offline acceptance tests**
 
-Use fake CLI healthy/unsupported/owner projections and all action routes. Cover timeout, interrupt, ignored TERM, detached descendants, oversized output, unknown fields, output conflict/inode replacement, and private sentinel rejection.
+Use fake CLI useful-partial/unsupported/owner projections and all action routes. Cover timeout, interrupt, ignored TERM, detached descendants, oversized output, unknown fields, output conflict/inode replacement, and private sentinel rejection.
 
 Exact public interface:
 
@@ -792,7 +792,7 @@ git commit -m "docs: use held fund brief workflow"
 - Create after evidence: docs/audits/2026-07-17-kunjin-phase1-independent-review.md
 - Modify only for verified P0/P1 defects: Task 1-14 owned files.
 
-- [ ] **Step 1: Run complete local matrix**
+- [x] **Step 1: Run complete local matrix**
 
 ~~~bash
 .venv/bin/python -m pytest -q
@@ -803,29 +803,29 @@ git commit -m "docs: use held fund brief workflow"
 git diff --check
 ~~~
 
-- [ ] **Step 2: Run exact failure nodes**
+- [x] **Step 2: Run exact failure nodes**
 
 Run worker, NAV, private portfolio, store rollback, cooldown, late-write, subprocess, and acceptance cases by exact node ID. Confirm all fixture PIDs/groups are gone and only authenticated parent writes exist.
 
-- [ ] **Step 3: Run approved public live acceptance**
+- [x] **Step 3: Run approved public live acceptance**
 
-Predeclare healthy and unsupported public codes, use a fresh /private/tmp output, and verify 90-second termination, useful facts, dates/tiers, concrete supplementation, all action boundaries, no Docker/adapter work, and no worker residue.
+Predeclare useful-partial and unsupported public codes, use a fresh /private/tmp output, and verify 90-second termination, useful facts, dates/tiers, concrete supplementation, all action boundaries, no Docker/adapter work, and no worker residue. The useful-partial case must not be described as healthy or decision-sufficient.
 
-- [ ] **Step 4: Run private owner acceptance**
+- [x] **Step 4: Run private owner acceptance**
 
 Use existing read-only auth. Do not print or retain the held code or private values. Ask the owner only to confirm privately that position presence and relationship interpretation match.
 
-- [ ] **Step 5: Dispatch two fresh read-only reviewers**
+- [x] **Step 5: Dispatch two fresh read-only reviewers**
 
 Financial review: B bypass, no-add, known/unknown D2, events, no inferred hold, reduce/exit, switch independence, no timing/amount.
 
 Product review: 90/480 boundaries, useful partial, Chinese clarity, source/cooldown, cleanup, privacy, atomic current snapshot, no interactive infrastructure.
 
-- [ ] **Step 6: Fix all P0/P1 and bind retained P2**
+- [x] **Step 6: Fix all P0/P1 and bind retained P2**
 
 For each defect: reproduce, add failing test, apply one root-cause fix, run focused tests, obtain independent spec/quality review, and rerun full matrix. Do not increase score for code/test/docs/latency alone.
 
-- [ ] **Step 7: Write and commit audit**
+- [x] **Step 7: Write and commit audit**
 
 Record evidence, P2, product reliability, fresh beginner score, and explicit 90-percent conclusion.
 
@@ -834,7 +834,7 @@ git add docs/audits/2026-07-17-kunjin-phase1-independent-review.md
 git commit -m "docs: review held fund brief usability"
 ~~~
 
-- [ ] **Step 8: Stop at Phase 2 owner gate**
+- [x] **Step 8: Stop at Phase 2 owner gate**
 
 Report commits, evidence directories, tests, scores, and limits. Do not design or execute Phase 2 before confirmation.
 

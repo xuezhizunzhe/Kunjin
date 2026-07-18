@@ -22,6 +22,7 @@ from kunjin.brief.models import (
     canonical_event_affected_actions,
 )
 from kunjin.brief.research import (
+    _beginner_gap_items,
     _canonical_relationship,
     _merge_facts,
     build_owner_report,
@@ -39,6 +40,7 @@ from kunjin.decision.models import (
     RequestTerminalStatus,
     SourceAttempt,
     SourceAttemptOutcome,
+    SourceErrorCode,
     SourceTier,
 )
 from kunjin.decision.routing import ActionRouter
@@ -236,6 +238,7 @@ def _official_resolution(
     action_id: str,
     *,
     evidence_ids: tuple[str, ...] = (),
+    outcome: SourceAttemptOutcome = SourceAttemptOutcome.SUCCESS,
 ):
     repository = Repository(tmp_path / f"resolution-{action_id}.db")
     repository.migrate()
@@ -255,17 +258,33 @@ def _official_resolution(
             field_id="fund_manager_product_announcement",
             subject_key=f"fund:{FUND_CODE}",
             attempt_number=1,
-            outcome=SourceAttemptOutcome.SUCCESS,
+            outcome=outcome,
             started_at=NOW - timedelta(seconds=5),
             finished_at=NOW - timedelta(seconds=4),
-            data_as_of=NOW - timedelta(seconds=5),
-            error_code=None,
-            cooldown_until=None,
+            data_as_of=(
+                NOW - timedelta(seconds=5)
+                if outcome is SourceAttemptOutcome.SUCCESS
+                else None
+            ),
+            error_code=(
+                None
+                if outcome is SourceAttemptOutcome.SUCCESS
+                else (
+                    SourceErrorCode.NETWORK_TIMEOUT
+                    if outcome is SourceAttemptOutcome.TRANSIENT_FAILURE
+                    else SourceErrorCode.FIELD_UNSUPPORTED
+                )
+            ),
+            cooldown_until=(
+                NOW + timedelta(minutes=5)
+                if outcome is SourceAttemptOutcome.TRANSIENT_FAILURE
+                else None
+            ),
             force_actor=None,
             force_reason=None,
             registry_version=registry.version,
             registry_checksum=registry.checksum(),
-            response_bytes=10,
+            response_bytes=10 if outcome is SourceAttemptOutcome.SUCCESS else 0,
         ),
     )
     return load_brief_source_resolution(
@@ -287,6 +306,7 @@ def _bundle(
     positions: tuple[StoredPosition, ...] | None = None,
     snapshot_complete: bool = True,
     observation_version: str = "synthetic_portfolio_v1",
+    resolution_outcome: SourceAttemptOutcome = SourceAttemptOutcome.SUCCESS,
 ):
     fact_set = _fact_set() if fact_set is None else fact_set
     d2 = _d2(
@@ -307,6 +327,7 @@ def _bundle(
         tmp_path,
         resolution_action,
         evidence_ids=tuple(item.event_id for item in fact_set.official_events),
+        outcome=resolution_outcome,
     )
     evaluation = HeldFundBriefEngine().evaluate(
         route=route,
@@ -353,6 +374,200 @@ def test_owner_weight_is_ephemeral_and_payload_has_exact_sections(tmp_path) -> N
     assert payload["decision_evidence_status"] == (
         snapshot.decision_evidence_status.to_canonical_dict()
     )
+
+
+def test_beginner_explanation_translates_key_facts_dates_tiers_and_coverage(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    beginner = public_payload(build_owner_report(snapshot, d2))["beginner_explanation_zh"]
+
+    identity_text = beginner["fund_identity"]["text"]
+    why_text = beginner["why_this_state"]["text"]
+    relationship_text = beginner["portfolio_relationship"]["text"]
+    assert "测试基金A" in identity_text
+    assert "A" in identity_text
+    assert "Tier 2" in identity_text
+    assert "2026-07-16" in identity_text
+    assert "测试经理" in why_text
+    assert "1.2345" in why_text
+    assert "费用" in why_text
+    assert "Tier 2" in why_text
+    assert "覆盖" in relationship_text
+    assert "未知" in relationship_text
+    assert "不是完整 D2" in relationship_text
+
+
+def test_beginner_identity_selects_target_share_and_lists_full_manager_team(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    sibling_share = replace(
+        _fact(
+            "share_class_identity",
+            {
+                "related_fund_code": "000001",
+                "share_class": "C",
+                "fund_name": "其他基金C",
+            },
+        ),
+        fact_id="sibling_share_class_identity",
+        source_lineage_id="document_sibling_share_class_identity",
+    )
+    second_manager = replace(
+        _fact(
+            "current_manager_team",
+            {"manager_name": "第二位经理", "tenure_start": "2025-01-01"},
+        ),
+        fact_id="current_manager_team_second",
+        source_lineage_id="document_current_manager_team_second",
+    )
+    updated = replace(
+        snapshot,
+        facts=(sibling_share, second_manager, *snapshot.facts),
+        source_lineage_ids=(
+            sibling_share.source_lineage_id,
+            second_manager.source_lineage_id,
+            *snapshot.source_lineage_ids,
+        ),
+    )
+    updated.validate()
+
+    beginner = public_payload(build_owner_report(updated, d2))["beginner_explanation_zh"]
+    identity_text = beginner["fund_identity"]["text"]
+    why_text = beginner["why_this_state"]["text"]
+
+    assert "测试基金A" in identity_text
+    assert "其他基金C" not in identity_text
+    assert sibling_share.fact_id not in beginner["fund_identity"]["evidence_ids"]
+    assert "测试经理" in why_text
+    assert "第二位经理" in why_text
+
+
+def test_beginner_identity_rejects_single_non_target_share(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    wrong_share = replace(
+        next(item for item in snapshot.facts if item.field_id == "share_class_identity"),
+        value={
+            "related_fund_code": "000001",
+            "share_class": "C",
+            "fund_name": "其他基金C",
+        },
+    )
+    updated = replace(
+        snapshot,
+        facts=tuple(
+            wrong_share if item.field_id == "share_class_identity" else item
+            for item in snapshot.facts
+        ),
+    )
+    updated.validate()
+
+    identity = public_payload(build_owner_report(updated, d2))["beginner_explanation_zh"][
+        "fund_identity"
+    ]
+    identity_text = identity["text"]
+
+    assert "其他基金C" not in identity_text
+    assert "份额类别未取得" in identity_text
+    assert wrong_share.fact_id not in identity["evidence_ids"]
+
+
+def test_beginner_manual_gap_binds_source_alternative_and_supplementation(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(
+        tmp_path,
+        resolution_outcome=SourceAttemptOutcome.UNSUPPORTED,
+    )
+    payload = public_payload(build_owner_report(snapshot, d2))
+    top_gap = next(
+        item for item in payload["missing_evidence"] if item["field_id"] == "official_events"
+    )
+    beginner_gap = next(
+        item
+        for item in payload["beginner_explanation_zh"]["evidence_gaps"]["items"]
+        if item["field_id"] == "official_events"
+    )
+
+    assert set(top_gap) == {"affected_action_ids", "condition", "field_id", "scope"}
+    assert beginner_gap["label_zh"] == "基金正式公告事件"
+    resolution = beginner_gap["source_resolution"]
+    assert resolution["primary_source_id"] == "fund_manager_official_documents"
+    assert resolution["source_field_id"] == "fund_manager_product_announcement"
+    assert resolution["resolution"] == "manual_supplement_required"
+    assert resolution["source_states"] == ["unsupported"]
+    assert resolution["acceptable_alternative_ids"] == ["eastmoney_f10"]
+    supplementation = beginner_gap["supplementation"]
+    assert supplementation["accepted_input"] == ["URL", "PDF", "screenshot", "field"]
+    assert supplementation["suggested_location"]
+    assert supplementation["impact_if_missing"]
+    assert supplementation["freshness_requirement"]
+
+
+def test_beginner_cooldown_gap_has_bound_state_without_manual_supplementation(
+    tmp_path,
+) -> None:
+    _, _, d2, _, snapshot = _bundle(
+        tmp_path,
+        resolution_outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+    )
+    gaps = public_payload(build_owner_report(snapshot, d2))["beginner_explanation_zh"][
+        "evidence_gaps"
+    ]["items"]
+    gap = next(item for item in gaps if item["field_id"] == "official_events")
+
+    assert gap["source_resolution"]["resolution"] == "partial"
+    assert gap["source_resolution"]["source_states"] == ["cooldown"]
+    assert gap["supplementation"] is None
+
+
+def test_every_beginner_gap_has_a_controlled_next_step(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    gaps = public_payload(build_owner_report(snapshot, d2))["beginner_explanation_zh"][
+        "evidence_gaps"
+    ]["items"]
+
+    assert gaps
+    assert all(
+        set(item["next_step"]) == {"action", "status"}
+        and item["next_step"]["action"]
+        and item["next_step"]["status"]
+        for item in gaps
+    )
+
+
+def test_beginner_gap_downgrades_usable_attempt_and_maps_unchecked_official_source(
+    tmp_path,
+) -> None:
+    _, _, _d2_value, _, snapshot = _bundle(tmp_path)
+    gap = {
+        "affected_action_ids": ["continue_holding"],
+        "condition": "missing",
+        "field_id": "official_events",
+        "scope": "decision_evidence_status",
+    }
+
+    bound = _beginner_gap_items(snapshot, [gap])[0]
+    unbound = _beginner_gap_items(replace(snapshot, resolution_bindings=()), [gap])[0]
+
+    assert bound["source_resolution"]["resolution"] == "partial"
+    assert bound["source_resolution"]["source_states"] == ["healthy"]
+    assert unbound["source_resolution"]["resolution"] == "partial"
+    assert unbound["source_resolution"]["source_field_id"] == (
+        "fund_manager_product_announcement"
+    )
+    assert unbound["source_resolution"]["primary_source_id"] == (
+        "fund_manager_official_documents"
+    )
+    assert unbound["source_resolution"]["source_states"] == ["not_checked"]
+
+
+def test_owner_weight_never_enters_beginner_explanation(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    report = build_owner_report(snapshot, d2)
+    weighted = replace(
+        report,
+        owner_overlay={**report.owner_overlay, "portfolio_weight": "0.7312917"},
+    )
+    weighted.validate()
+
+    beginner = public_payload(weighted)["beginner_explanation_zh"]
+    assert "0.7312917" not in json.dumps(beginner, ensure_ascii=False)
 
 
 @pytest.mark.parametrize(

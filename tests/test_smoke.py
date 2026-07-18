@@ -1272,7 +1272,7 @@ if argv[:3] == ["--json", "source", "status"]:
                     "accepted_input": ["公开官方公告 URL", "带日期的官方公告截图"],
                     "freshness_requirement": "当前有效版本",
                     "impact_if_missing": "不能排除影响持有或退出判断的正式公告",
-                    "missing_item": "official_events",
+                    "missing_item": "fund_manager_product_announcement",
                     "suggested_location": "基金管理人官网产品公告页",
                     "supported_without_it": "仍可展示已取得的基金事实",
                     "unsupported_without_it": "不能形成公告驱动的行动判断",
@@ -1300,6 +1300,34 @@ if argv[:3] == ["--json", "source", "status"]:
             fee_resolution,
             announcement_resolution,
         ]
+    if scenario == "partial_supplementation":
+        payload["data"]["request_field_resolutions"][0]["resolution"] = "partial"
+        source_field = payload["data"]["source_fields"][0]
+        source_field["consecutive_failures"] = 0
+        source_field["last_failure_at"] = None
+        source_field["last_failure_reason"] = None
+        source_field["state"] = "not_checked"
+        market_field = json.loads(json.dumps(source_field))
+        market_field["field_id"] = "market_context"
+        market_field["source_id"] = "eastmoney_market"
+        market_field["source_tier"] = "tier_2"
+        market_field["supplementation"]["missing_item"] = "market_context"
+        market_resolution = json.loads(
+            json.dumps(payload["data"]["request_field_resolutions"][0])
+        )
+        market_resolution["field_id"] = "market_context"
+        market_resolution["primary_source_id"] = "eastmoney_market"
+        payload["data"]["source_fields"].append(market_field)
+        payload["data"]["request_field_resolutions"].append(market_resolution)
+        manager_field = json.loads(json.dumps(source_field))
+        manager_field["field_id"] = "current_manager_team"
+        manager_field["supplementation"]["missing_item"] = "current_manager_team"
+        manager_resolution = json.loads(
+            json.dumps(payload["data"]["request_field_resolutions"][0])
+        )
+        manager_resolution["field_id"] = "current_manager_team"
+        payload["data"]["source_fields"].append(manager_field)
+        payload["data"]["request_field_resolutions"].append(manager_resolution)
     json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
     raise SystemExit(0)
 
@@ -1374,7 +1402,7 @@ def fact(index, field_id, value):
 fact_fields = (
     ("share_class_identity", {
         "fund_name": "公开验收基金A",
-        "related_fund_code": "000004",
+        "related_fund_code": code,
         "share_class": "A",
     }),
     ("current_manager_team", {
@@ -1413,6 +1441,10 @@ fact_fields = (
         "record_publisher": "公开验收来源",
         "record_url": f"https://example.invalid/{code}/announcement",
         "title": "公开验收公告",
+    }),
+    ("redemption_terms", {
+        "fee_condition": "holding_period_required",
+        "settlement_condition": "published_rule_available",
     }),
 )
 facts = [fact(index, field_id, value) for index, (field_id, value) in enumerate(fact_fields)]
@@ -1523,7 +1555,9 @@ status = {
     "acceptable_alternative_ids": (["user_official_document"] if unsupported else []),
     "conflicted_fields": [],
     "cooldown_fields": [],
-    "manual_supplementation_codes": (["provide_official_document"] if unsupported else []),
+    "manual_supplementation_codes": (
+        ["official_events_manual_supplement_required"] if unsupported else []
+    ),
     "missing_fields": (["official_events"] if unsupported else []),
     "obtained_fields": [item[0] for item in fact_fields],
     "required_fields": [item[0] for item in fact_fields],
@@ -1684,6 +1718,203 @@ if scenario == "owner_coverage_unknown" and action == "continue_holding":
     payload["data"]["decision_evidence_status"]["missing_fields"] = [
         "manager_evidence_missing_000999"
     ]
+if scenario in {"labeled_partial", "inconsistent_labeled_partial"} and code == "000001":
+    payload["data"]["facts"] = [
+        fact_item
+        for fact_item in payload["data"]["facts"]
+        if fact_item["field_id"] != "holdings_industries"
+    ]
+    payload["data"]["missing_evidence"].append({
+        "affected_action_ids": owner_actions,
+        "condition": "missing",
+        "field_id": f"holdings_industries_{code}",
+        "scope": "disclosed_holdings_coverage",
+    })
+    for fact_item in payload["data"]["facts"]:
+        if fact_item["field_id"] in {
+            "share_class_identity",
+            "current_manager_team",
+            "formal_nav",
+        }:
+            fact_item["source_tier"] = "tier_2"
+            fact_item["freshness"] = "dated_history"
+            fact_item["completeness"] = "partial"
+    disclosed = payload["data"]["portfolio_relationship"][
+        "disclosed_holdings_coverage"
+    ]
+    disclosed["evidence_state"] = "insufficient"
+    disclosed["included_fund_codes"] = []
+    disclosed["omitted_fund_codes"] = [code]
+    disclosed["unknown_fields"] = [f"holdings_industries_{code}"]
+    disclosed["evidence_ids"] = []
+if scenario == "labeled_partial" and code == "000001":
+    sync_status = payload["data"]["sync_status"]
+    sync_status["state"] = "partial"
+    sync_status["missing_fields"] = ["identity_active_status"]
+    sync_status["obtained_fields"] = [
+        field_id
+        for field_id in sync_status["obtained_fields"]
+        if field_id != "holdings_industries"
+    ]
+    decision_status = json.loads(json.dumps(sync_status))
+    decision_status["state"] = "insufficient"
+    decision_status["obtained_fields"] = ["formal_nav"]
+    decision_status["supported_interpretations"] = []
+    decision_status["unsupported_interpretations"] = owner_actions
+    payload["data"]["decision_evidence_status"] = decision_status
+    payload["data"]["missing_evidence"].append({
+        "affected_action_ids": owner_actions,
+        "condition": "missing",
+        "field_id": "identity_active_status",
+        "scope": "decision_evidence_status",
+    })
+    for item in payload["data"]["action_interpretation"]["interpretations"]:
+        item["state"] = "abstain"
+        if "identity_active_status_missing" not in item["blocking_codes"]:
+            item["blocking_codes"].append("identity_active_status_missing")
+            item["blocking_codes"].sort()
+        if "identity_active_status" not in item["missing_fields"]:
+            item["missing_fields"].append("identity_active_status")
+            item["missing_fields"].sort()
+    action = payload["data"]["action_interpretation"]
+    action["primary_state"] = "abstain"
+    action["affected_action_abstentions"] = owner_actions
+    action["blocking_codes"] = sorted({
+        code
+        for item in action["interpretations"]
+        for code in item["blocking_codes"]
+    })
+    headline = payload["data"]["beginner_explanation_zh"]["headline"]
+    headline["primary_state"] = "abstain"
+    headline["text"] = state_text("abstain")
+    for headline_item, item in zip(headline["items"], action["interpretations"]):
+        headline_item["state"] = "abstain"
+        headline_item["text"] = headline_item_text(item)
+if scenario == "inconsistent_redemption_terms" and code == "000001":
+    for fact_item in payload["data"]["facts"]:
+        if fact_item["field_id"] == "redemption_terms":
+            fact_item["source_tier"] = "tier_2"
+            fact_item["freshness"] = "dated_history"
+            fact_item["completeness"] = "partial"
+beginner = payload["data"]["beginner_explanation_zh"]
+facts_by_field = {
+    field_id: next(
+        (item for item in payload["data"]["facts"] if item["field_id"] == field_id),
+        None,
+    )
+    for field_id in {
+        "share_class_identity", "identity_active_status", "current_manager_team",
+        "formal_nav", "fees_share_class_relationship", "holdings_industries",
+    }
+}
+
+def evidence_marker(item):
+    data_date = item["data_as_of"] or item["published_at"] or "日期未知"
+    return f"{data_date}，{item['source_tier'].replace('tier_', 'Tier ')}"
+
+identity = facts_by_field["share_class_identity"] or facts_by_field["identity_active_status"]
+if identity is None:
+    beginner["fund_identity"]["text"] = "基金身份与份额类别未取得。"
+else:
+    identity_value = identity["value"]
+    beginner["fund_identity"]["text"] = (
+        f"基金：{identity_value.get('fund_name', '名称未取得')}；"
+        f"份额类别：{identity_value.get('share_class', '未取得')}。"
+        f"身份依据：{evidence_marker(identity)}。"
+    )
+manager = facts_by_field["current_manager_team"]
+nav = facts_by_field["formal_nav"]
+fee = facts_by_field["fees_share_class_relationship"]
+holdings = facts_by_field["holdings_industries"]
+beginner["why_this_state"]["text"] = (
+    (
+        "当前经理未取得"
+        if manager is None
+        else f"当前经理：{manager['value']['manager_name']}（{evidence_marker(manager)}）"
+    )
+    + "；"
+    + (
+        "正式净值未取得"
+        if nav is None
+        else f"正式净值：{nav['value']}（{evidence_marker(nav)}）"
+    )
+    + "；"
+    + (
+        "费用与份额规则未取得"
+        if fee is None
+        else f"费用与份额规则：已取得（{evidence_marker(fee)}）"
+    )
+    + "；"
+    + (
+        "披露持仓及报告期未取得"
+        if holdings is None
+        else (
+            f"披露持仓：已取得，报告期：{holdings['value']['report_period']}"
+            f"（{evidence_marker(holdings)}）"
+        )
+    )
+    + "。"
+)
+beginner["portfolio_relationship"]["text"] = (
+    "已知关系：同一基金存在多条持仓观察；组合覆盖明确列示；"
+    "这里只是最小关系子集，不是完整 D2；"
+    "未知持仓不按零重叠处理，也不表示分散充分。"
+)
+if payload["data"]["portfolio_relationship"]["disclosed_holdings_coverage"][
+    "evidence_state"
+] == "insufficient":
+    beginner["portfolio_relationship"]["text"] = (
+        "已知关系：同一基金存在多条持仓观察；披露持仓覆盖不足；"
+        "这里只是最小关系子集，不是完整 D2；"
+        "未知持仓不按零重叠处理，也不表示分散充分。"
+    )
+labels = {
+    "holdings_industries_000001": "披露持仓",
+    "identity_active_status": "基金身份",
+    "official_events": "基金正式公告事件",
+}
+beginner_gaps = []
+for gap in payload["data"]["missing_evidence"]:
+    manual = gap["field_id"] == "official_events" and unsupported
+    beginner_gaps.append({
+        **gap,
+        "label_zh": labels.get(gap["field_id"], "待补充证据"),
+        "source_resolution": ({
+            "acceptable_alternative_ids": ["eastmoney_f10"],
+            "primary_source_id": "fund_manager_official_documents",
+            "resolution": "manual_supplement_required",
+            "source_field_id": "fund_manager_product_announcement",
+            "source_states": ["unsupported"],
+        } if manual else None),
+        "supplementation": ({
+            "accepted_input": ["URL", "PDF", "screenshot", "field"],
+            "freshness_requirement": "current applicable version",
+            "impact_if_missing": "action gates remain blocked",
+            "missing_item": "fund_manager_product_announcement",
+            "suggested_location": "official fund manager announcements",
+            "supported_without_it": "other independently evidenced facts",
+            "unsupported_without_it": "announcement-driven action conclusion",
+            "why_required": "official events may change action availability",
+        } if manual else None),
+        "next_step": ({
+            "action": "按同一缺口列出的受控补证要求提供材料；补证前保持相关动作 abstain。",
+            "status": "manual_supplement_required",
+        } if manual else {
+            "action": "后续新请求按登记来源进行一次有边界检查，本次保持相关动作 abstain。",
+            "status": "not_checked",
+        }),
+    })
+beginner["evidence_gaps"]["items"] = beginner_gaps
+if scenario == "brief_manual_unbound" and code == "000002":
+    for item in beginner["evidence_gaps"]["items"]:
+        if item["field_id"] == "official_events":
+            item["source_resolution"] = None
+            item["supplementation"] = None
+if scenario == "wrong_beginner_fact" and code == "000001":
+    beginner["why_this_state"]["text"] = beginner["why_this_state"]["text"].replace(
+        "公开基金经理",
+        "错误基金经理",
+    )
 fixture_fd_text = os.environ.get("KUNJIN_PHASE1_PUBLIC_FIXTURE_FD")
 marker_fd_text = os.environ.get("KUNJIN_PHASE1_PUBLIC_MARKER_FD")
 if fixture_fd_text is not None or marker_fd_text is not None:
@@ -1727,7 +1958,7 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         for phrase in (
             "set -euo pipefail",
             '^[0-9]{6}$',
-            "HEALTHY_PUBLIC_CODE UNSUPPORTED_PUBLIC_CODE OUTPUT_DIR",
+            "USEFUL_PARTIAL_CODE UNSUPPORTED_PUBLIC_CODE OUTPUT_DIR",
             "--owner OUTPUT_DIR",
             "KUNJIN_PHASE1_RUN_ID",
             "start_new_session=True",
@@ -1778,35 +2009,37 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             self.assertEqual(summary["status"], "passed")
             self.assertEqual(summary["portfolio_fixture"], "synthetic_non_personal")
             self.assertEqual(summary["fund_fact_scope"], "live_public_sources")
-            self.assertEqual(summary["healthy"]["useful_fact_fields"][:3], [
+            self.assertEqual(summary["useful_partial"]["useful_fact_fields"][:3], [
                 "share_class_identity",
                 "current_manager_team",
                 "formal_nav",
             ])
-            healthy_brief = json.loads(
-                (public_output / "healthy-continue_holding.json").read_text(
+            useful_partial_brief = json.loads(
+                (public_output / "useful-partial-continue_holding.json").read_text(
                     encoding="utf-8"
                 )
             )
             formal_nav = next(
-                item for item in healthy_brief["facts"] if item["field_id"] == "formal_nav"
+                item
+                for item in useful_partial_brief["facts"]
+                if item["field_id"] == "formal_nav"
             )
             self.assertEqual(formal_nav["source_tier"], "tier_2")
             self.assertEqual(
-                healthy_brief["subject"]["portfolio_fixture"],
+                useful_partial_brief["subject"]["portfolio_fixture"],
                 "synthetic_non_personal",
             )
             projected_files = sorted(path.name for path in public_output.iterdir())
             self.assertEqual(
                 projected_files,
                 [
-                    "healthy-continue_holding.json",
-                    "healthy-full_exit.json",
-                    "healthy-reduce_to_cash.json",
-                    "healthy-switch_funds.json",
                     "summary.json",
                     "unsupported-continue_holding.json",
                     "unsupported-source-status.json",
+                    "useful-partial-continue_holding.json",
+                    "useful-partial-full_exit.json",
+                    "useful-partial-reduce_to_cash.json",
+                    "useful-partial-switch_funds.json",
                 ],
             )
             rendered = "".join(
@@ -1911,6 +2144,10 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
                 "switch_buy_permission",
                 "switch_primary_mismatch",
                 "private_metric",
+                "wrong_beginner_fact",
+                "inconsistent_redemption_terms",
+                "inconsistent_labeled_partial",
+                "brief_manual_unbound",
                 "unbound_supplementation",
                 "spliced_supplementation",
                 "detached",
@@ -1967,6 +2204,79 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
                         with self.assertRaises(ProcessLookupError):
                             os.kill(spawned_pid, 0)
 
+    def test_phase1_acceptance_accepts_labeled_partial_and_unknown_holdings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            acceptance, _cli = self._install_phase1_acceptance_fixture(temporary_root)
+            output = temporary_root / "labeled-partial-output"
+            result = subprocess.run(
+                [str(acceptance), "000001", "000002", str(output)],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "FAKE_KUNJIN_LOG": str(temporary_root / "calls.log"),
+                    "FAKE_KUNJIN_SCENARIO": "labeled_partial",
+                    "KUNJIN_PHASE1_PUBLIC_FIXTURE_ATTESTATION": "synthetic_non_personal",
+                },
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            useful_partial = json.loads(
+                (output / "useful-partial-continue_holding.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            identity = next(
+                item
+                for item in useful_partial["facts"]
+                if item["field_id"] == "share_class_identity"
+            )
+            self.assertEqual(identity["source_tier"], "tier_2")
+            self.assertEqual(identity["freshness"], "dated_history")
+            self.assertEqual(identity["completeness"], "partial")
+            holdings = useful_partial["portfolio_relationship"][
+                "disclosed_holdings_coverage"
+            ]
+            self.assertEqual(holdings["evidence_state"], "insufficient")
+            self.assertEqual(holdings["unknown_fields"], ["holdings_industries_000001"])
+            self.assertNotIn("included_fund_codes", holdings)
+            self.assertNotIn("omitted_fund_codes", holdings)
+
+    def test_phase1_acceptance_accepts_controlled_rapid_partial_supplementation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            acceptance, _cli = self._install_phase1_acceptance_fixture(temporary_root)
+            output = temporary_root / "partial-supplementation-output"
+            result = subprocess.run(
+                [str(acceptance), "000001", "000002", str(output)],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "FAKE_KUNJIN_LOG": str(temporary_root / "calls.log"),
+                    "FAKE_KUNJIN_SCENARIO": "partial_supplementation",
+                    "KUNJIN_PHASE1_PUBLIC_FIXTURE_ATTESTATION": "synthetic_non_personal",
+                },
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            unsupported = json.loads(
+                (output / "unsupported-source-status.json").read_text(encoding="utf-8")
+            )
+            resolution = unsupported["request_field_resolutions"][0]
+            self.assertEqual(resolution["resolution"], "partial")
+            supplementation = unsupported["source_fields"][0]["supplementation"]
+            self.assertTrue(supplementation["accepted_input"])
+            self.assertTrue(supplementation["suggested_location"])
+            self.assertTrue(supplementation["impact_if_missing"])
+
     def test_phase1_acceptance_interrupt_cleans_ignored_term_child(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temporary_root = Path(directory)
@@ -1989,10 +2299,15 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
                 start_new_session=True,
             )
             deadline = time.monotonic() + 3
-            while not pid_file.exists() and time.monotonic() < deadline:
+            child_pid_text = ""
+            while time.monotonic() < deadline:
+                if pid_file.exists():
+                    child_pid_text = pid_file.read_text(encoding="ascii")
+                    if child_pid_text.isascii() and child_pid_text.isdigit():
+                        break
                 time.sleep(0.01)
-            self.assertTrue(pid_file.exists())
-            child_pid = int(pid_file.read_text(encoding="ascii"))
+            self.assertTrue(child_pid_text.isascii() and child_pid_text.isdigit())
+            child_pid = int(child_pid_text)
             os.killpg(process.pid, signal.SIGINT)
             _stdout, stderr = process.communicate(timeout=5)
             self.assertNotEqual(process.returncode, 0, stderr.decode())

@@ -41,6 +41,7 @@ from kunjin.decision.models import (
     RequestMode,
     SourceAttempt,
     SourceAttemptOutcome,
+    SourceErrorCode,
     SourceFieldState,
     SourceTier,
     canonical_json_bytes,
@@ -239,11 +240,18 @@ def _d2(fact_set: SourceLinkedFactSet):
 def _official_resolution(
     action_id: str,
     *,
+    field_id: str = "official_events",
     evidence_ids: tuple[str, ...] = (),
     outcome: SourceAttemptOutcome = SourceAttemptOutcome.SUCCESS,
     data_as_of: datetime | None = None,
+    manual_supplement_ready: bool = True,
+    acceptable_alternative_ids: tuple[str, ...] = (),
 ) -> BriefSourceResolution:
     with TemporaryDirectory() as directory:
+        successful = {
+            SourceAttemptOutcome.SUCCESS,
+            SourceAttemptOutcome.CACHE_HIT,
+        }
         repository = Repository(Path(directory) / "resolution.db")
         repository.migrate()
         store = DecisionAuditStore(repository)
@@ -259,28 +267,42 @@ def _official_resolution(
             request_run_id,
             SourceAttempt(
                 source_id="fund_manager_official_documents",
-                field_id="fund_manager_product_announcement",
+                field_id=(
+                    "fund_manager_product_announcement"
+                    if field_id == "official_events"
+                    else field_id
+                ),
                 subject_key=f"fund:{FUND_CODE}",
                 attempt_number=1,
                 outcome=outcome,
                 started_at=NOW - timedelta(seconds=5),
                 finished_at=NOW - timedelta(seconds=4),
-                data_as_of=(NOW - timedelta(seconds=5) if data_as_of is None else data_as_of),
-                error_code=None,
+                data_as_of=(
+                    (NOW - timedelta(seconds=5) if data_as_of is None else data_as_of)
+                    if outcome in successful
+                    else None
+                ),
+                error_code=(
+                    None
+                    if outcome in successful
+                    else SourceErrorCode.SOURCE_UNAVAILABLE
+                ),
                 cooldown_until=None,
                 force_actor=None,
                 force_reason=None,
                 registry_version=registry.version,
                 registry_checksum=registry.checksum(),
-                response_bytes=100,
+                response_bytes=100 if outcome in successful else 0,
             ),
         )
         return load_brief_source_resolution(
             store,
             attempt_id,
             action_id=action_id,
-            field_id="official_events",
+            field_id=field_id,
             evidence_ids=evidence_ids,
+            manual_supplement_ready=manual_supplement_ready,
+            acceptable_alternative_ids=acceptable_alternative_ids,
         )
 
 
@@ -350,6 +372,40 @@ def _interpretation(result: HeldFundBriefEvaluation, action_id: str):
     return next(item for item in result.interpretations if item.action_id == action_id)
 
 
+def test_multiple_field_resolutions_from_one_attempt_share_one_lineage() -> None:
+    resolutions = (
+        _official_resolution("continue_holding"),
+        _official_resolution(
+            "continue_holding",
+            field_id="formal_nav",
+            data_as_of=NOW - timedelta(days=30),
+        ),
+    )
+
+    result = _evaluate(
+        ActionKind.CONTINUE_HOLDING,
+        source_resolutions=resolutions,
+    )
+
+    assert result.resolution_lineage_ids == ("source_attempt_1",)
+    assert tuple(binding.lineage_id for binding in result.resolution_bindings) == (
+        "source_attempt_1",
+        "source_attempt_1",
+    )
+
+
+def test_unchecked_alternative_suppresses_aggregate_manual_code() -> None:
+    resolution = _official_resolution(
+        "continue_holding",
+        outcome=SourceAttemptOutcome.UNAVAILABLE,
+        manual_supplement_ready=False,
+        acceptable_alternative_ids=("eastmoney_f10",),
+    )
+
+    assert resolution.resolution is RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED
+    assert resolution.manual_supplementation_codes == ()
+
+
 def test_phase_b_block_is_mature_no_add_without_suppressing_research() -> None:
     result = _evaluate(ActionKind.CONTINUE_HOLDING, blocked=True)
     interpretation = _interpretation(result, "continue_holding")
@@ -403,8 +459,8 @@ def test_liquidation_and_termination_reviews_coexist_without_trade_instruction()
     )
     interpretation = _interpretation(result, "continue_holding")
 
-    assert result.primary_state is BriefState.REDUCE_OR_EXIT_REVIEW
-    assert result.action_maturity is ActionMaturity.MATURE
+    assert result.primary_state is BriefState.ABSTAIN
+    assert result.action_maturity is ActionMaturity.EXPERIMENTAL_SHADOW
     assert result.triggered_reviews == (
         OfficialEventCode.FUND_LIQUIDATION_NOTICE.value,
         OfficialEventCode.FUND_TERMINATION_NOTICE.value,
@@ -412,6 +468,7 @@ def test_liquidation_and_termination_reviews_coexist_without_trade_instruction()
     assert {liquidation.event_id, termination.event_id}.issubset(
         interpretation.supporting_evidence_ids
     )
+    assert "continue_holding" in result.affected_action_abstentions
     assert "immediate_sale" in interpretation.unavailable_actions
 
 
@@ -771,6 +828,8 @@ def test_switch_reduce_and_buy_legs_remain_independent() -> None:
         "d3_missing",
         "post_trade_missing",
     }.issubset(buy_leg.blocking_codes)
+    assert "d2" not in result.decision_evidence_status.obtained_fields
+    assert "d2" in result.decision_evidence_status.missing_fields
     assert "switch_buy" in result.affected_action_abstentions
 
 
@@ -955,8 +1014,8 @@ def test_liquidation_review_preserves_redemption_restriction_abstention() -> Non
     )
     interpretation = _interpretation(result, "full_exit")
 
-    assert interpretation.state is BriefState.REDUCE_OR_EXIT_REVIEW
-    assert interpretation.action_maturity is ActionMaturity.MATURE
+    assert interpretation.state is BriefState.ABSTAIN
+    assert interpretation.action_maturity is ActionMaturity.EXPERIMENTAL_SHADOW
     assert OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE.value in (interpretation.blocking_codes)
     assert "executable_redemption" in interpretation.unavailable_actions
     assert "full_exit" in result.affected_action_abstentions
@@ -973,6 +1032,101 @@ def test_transaction_research_without_redemption_terms_abstains(action) -> None:
     assert "redemption_terms_missing" in interpretation.blocking_codes
     assert "exact_fee" in interpretation.unavailable_actions
     assert "executable_redemption" in interpretation.unavailable_actions
+
+
+def test_partial_formal_nav_cannot_support_continue_holding() -> None:
+    facts = _fact_set().facts
+    partial_nav = replace(
+        next(item for item in facts if item.field_id == "formal_nav"),
+        completeness=EvidenceCompleteness.PARTIAL,
+    )
+    fact_set = replace(
+        _fact_set(),
+        facts=tuple(
+            partial_nav if item.field_id == "formal_nav" else item for item in facts
+        ),
+    )
+
+    result = _evaluate(ActionKind.CONTINUE_HOLDING, fact_set=fact_set)
+    interpretation = _interpretation(result, "continue_holding")
+
+    assert interpretation.state is BriefState.ABSTAIN
+    assert "formal_nav" in interpretation.missing_fields
+    assert "continue_holding" in result.affected_action_abstentions
+
+
+@pytest.mark.parametrize("action", (ActionKind.REDUCE_TO_CASH, ActionKind.FULL_EXIT))
+def test_partial_redemption_terms_cannot_support_transaction_research(action) -> None:
+    partial_terms = replace(
+        _fact(
+            "redemption_terms",
+            {"fee_condition": "published", "settlement_condition": "published"},
+        ),
+        completeness=EvidenceCompleteness.PARTIAL,
+    )
+
+    result = _evaluate(action, fact_set=_fact_set(extra_facts=(partial_terms,)))
+    interpretation = _interpretation(result, action.value)
+
+    assert interpretation.state is BriefState.ABSTAIN
+    assert "redemption_terms" in interpretation.missing_fields
+    assert "redemption_terms_missing" in interpretation.blocking_codes
+
+
+@pytest.mark.parametrize(
+    "event_code",
+    (OfficialEventCode.FUND_LIQUIDATION_NOTICE, OfficialEventCode.FUND_TERMINATION_NOTICE),
+)
+def test_hard_event_without_redemption_terms_triggers_review_but_abstains(event_code) -> None:
+    event = _event(event_code, "full_exit")
+
+    result = _evaluate(
+        ActionKind.FULL_EXIT,
+        fact_set=_fact_set(events=(event,)),
+    )
+    interpretation = _interpretation(result, "full_exit")
+
+    assert event_code.value in result.triggered_reviews
+    assert event.event_id in interpretation.supporting_evidence_ids
+    assert interpretation.state is BriefState.ABSTAIN
+    assert interpretation.action_maturity is ActionMaturity.EXPERIMENTAL_SHADOW
+    assert "redemption_terms_missing" in interpretation.blocking_codes
+    assert "immediate_sale" in interpretation.unavailable_actions
+
+
+def test_hard_event_with_terms_still_requires_every_route_gate() -> None:
+    liquidation = _event(OfficialEventCode.FUND_LIQUIDATION_NOTICE, "full_exit")
+    terms = _fact(
+        "redemption_terms",
+        {"fee_condition": "published", "settlement_condition": "published"},
+    )
+
+    result = _evaluate(
+        ActionKind.FULL_EXIT,
+        fact_set=_fact_set(events=(liquidation,), extra_facts=(terms,)),
+    )
+    interpretation = _interpretation(result, "full_exit")
+
+    assert interpretation.state is BriefState.ABSTAIN
+    assert interpretation.action_maturity is ActionMaturity.EXPERIMENTAL_SHADOW
+    assert {"exit_reason", "use_of_proceeds"}.issubset(interpretation.missing_fields)
+    assert set(result.decision_evidence_status.obtained_fields).isdisjoint(
+        result.decision_evidence_status.missing_fields
+    )
+
+
+def test_plain_fact_cannot_satisfy_reserved_complete_d2_gate() -> None:
+    forged_d2 = _fact("d2", {"evidence_state": "complete"})
+
+    result = _evaluate(
+        ActionKind.SWITCH_FUNDS,
+        fact_set=_fact_set(extra_facts=(forged_d2,)),
+    )
+    switch_buy = _interpretation(result, "switch_buy")
+
+    assert switch_buy.state is BriefState.ABSTAIN
+    assert "d2" in switch_buy.missing_fields
+    assert "d2" not in result.decision_evidence_status.obtained_fields
 
 
 def test_transaction_leg_with_terms_but_no_announcement_check_abstains() -> None:

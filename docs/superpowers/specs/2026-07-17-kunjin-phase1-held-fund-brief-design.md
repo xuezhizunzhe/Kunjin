@@ -316,7 +316,15 @@ Decision evidence additionally lists:
 - supported interpretations;
 - unsupported interpretations;
 - acceptable alternative sources; and
-- a concrete manual-supplementation path.
+- a controlled next step for every gap; and
+- a concrete manual-supplementation path only after every registered source
+  alternative is exhausted.
+
+An authenticated attempt distinguishes `not_checked`, transient/cooldown,
+usable, and exhausted-source states. Unchecked or transient alternatives never
+masquerade as a manual-supplementation requirement. Alternative exhaustion is
+calculated from the complete registered `(source_id, field_id)` reference, so a
+cross-field alternative is not silently ignored.
 
 For example, missing fee details may leave a watch interpretation available
 while blocking exact fee, executable redemption, and every exact amount. It
@@ -336,15 +344,16 @@ Every state includes `action_maturity`, supporting evidence, opposing evidence,
 blocking codes, missing fields, invalidation conditions, unavailable actions,
 and `exact_amount_available=false`.
 
-The Phase 1 precedence is:
+The Phase 1 presentation precedence is:
 
 1. a current Phase B hard block makes the primary state `no_add` and preserves
    the exact hard-block codes;
-2. an authenticated liquidation or termination notice adds a mandatory
-   `reduce_or_exit_review` entry to `triggered_reviews` even when `no_add` is
-   primary;
+2. an authenticated liquidation or termination notice adds a mandatory review
+   entry to `triggered_reviews` without itself authorizing a transaction;
 3. an identity conflict or action-critical evidence gap produces `abstain` for
-   the affected interpretation;
+   the affected interpretation; a hard event produces a mature
+   `reduce_or_exit_review` state only when the affected action's critical facts
+   and every routed required gate are current, complete, and conflict-free;
 4. a supported risk event that does not authorize exit produces `watch`;
 5. an owner-confirmed thesis whose invalidation has not triggered may produce
    `hold`, but only as `experimental_shadow`; and
@@ -360,7 +369,9 @@ Maturity rules:
 
 - deterministic Phase B `no_add` may be `mature` as a safety constraint;
 - an authenticated liquidation or termination notice may maturely trigger an
-  exit review, never an immediate sale;
+  exit review only after action-critical evidence passes; otherwise the event
+  remains visible while the affected action is `abstain`, never an immediate
+  sale;
 - `hold`, ordinary `watch`, and non-policy reduce/exit interpretations remain
   `experimental_shadow` in Phase 1;
 - one-day price movement, short-term ranking, or one media claim cannot by
@@ -400,6 +411,17 @@ exact top-level sections:
 5. `why_this_state`: supporting and opposing evidence separately;
 6. `evidence_gaps`: what is missing and which conclusion it affects; and
 7. `change_conditions`: evidence or invalidation events that require review.
+
+The identity projection binds the displayed share class, evidence IDs, and
+evidence dates to the requested fund code instead of selecting or citing an
+arbitrary sibling share. The manager projection lists the complete current
+manager team rather than only the first record. The
+portfolio relationship text states explicitly that the Phase 1 minimum subset
+is not complete D2. Every evidence-gap item includes a controlled next step:
+registered but unchecked sources stay `not_checked`, transient/cooldown work is
+not retried inside the response, and only fully exhausted alternatives expose a
+manual supplementation request. A healthy source attempt attached to an
+incomplete projected fact is still shown as a `partial` gap, never `usable`.
 
 The Chinese projection cannot rename stable codes, omit partial/conflicted/
 stale state, translate `mature` as a mature financial judgment, infer an
@@ -528,30 +550,39 @@ operates Alipay or mutates an external account.
 
 ## 15. Real Acceptance
 
-### 15.1 Public Cold Healthy Case
+### 15.1 Public Cold Useful-Partial Case
 
 A declared public fund code runs against a fresh queried-fund database. A
 synthetic, non-personal portfolio-side fixture may be prewarmed, but its exact
-starting state is recorded. Within 90 seconds the result must include:
+starting state is recorded. This case proves a bounded useful partial, not a
+financially healthy or decision-sufficient result. Within 90 seconds it must
+include:
 
-- identity/share class;
-- current manager/team;
-- latest formal NAV and date;
+- dated identity/share-class evidence or an explicit identity gap;
+- dated manager/team evidence with its source tier;
+- formal NAV with date and source tier;
 - current fee overview or explicit fee gap;
-- latest available disclosed holdings and report date;
+- disclosed holdings and report period, or explicit insufficient coverage with
+  non-empty unknown fields;
 - applicable official announcements;
 - position presence/absence; and
 - at least one real deterministic portfolio relationship.
 
-A bare SLA marker, record count, or `abstain` does not pass.
+Tier 2 dated or partial action-critical facts require partial or insufficient
+evidence status, an explicit gap, and `abstain`; they never become current Tier
+1 evidence. A bare SLA marker, record count, or unexplained `abstain` does not
+pass. Complete holdings coverage and a current report period remain complete-D2
+requirements and are not claimed by this case.
 
 ### 15.2 Public Unsupported-Source Case
 
 A different, predeclared public fund code whose source family is unsupported
 runs in a fresh isolated runtime. Within 90 seconds it must return all obtained
-facts plus each missing field's action impact, acceptable alternative, and
-concrete supplementation path. It must not retry indefinitely or create an
-adapter.
+facts plus each missing field's action impact and controlled next step. A source
+gap lists its registered primary and acceptable alternatives. A concrete manual
+supplementation path appears only after all registered alternatives are
+exhausted; otherwise the same brief says the field was not checked or remains
+partial. It must not retry indefinitely or create an adapter.
 
 ### 15.3 Real Owner Held-Fund Case
 

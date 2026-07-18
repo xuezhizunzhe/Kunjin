@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import replace
 from decimal import Decimal
-from typing import Tuple
+from typing import Optional, Tuple
 
 from kunjin.brief.d2 import D2RelationshipSet
 from kunjin.brief.engine import HeldFundBriefEvaluation
@@ -22,10 +23,12 @@ from kunjin.brief.models import (
 )
 from kunjin.decision.models import (
     DecisionRoute,
+    RequestFieldResolution,
     canonical_decimal,
     canonical_json_bytes,
     canonical_value,
 )
+from kunjin.decision.source_registry import SourceRegistryV1
 
 _TOP_LEVEL_KEYS = (
     "request",
@@ -67,6 +70,25 @@ _GAP_FIELDS = (
     ("cooldown", "cooldown_fields"),
 )
 _MAX_BEGINNER_EXPLANATION_BYTES = 64 * 1024
+_FACT_LABELS_ZH = {
+    "identity_active_status": "基金身份",
+    "share_class_identity": "份额类别",
+    "current_manager_team": "当前经理",
+    "formal_nav": "正式净值",
+    "fees_share_class_relationship": "费用与份额规则",
+    "holdings_industries": "披露持仓",
+    "official_events": "基金正式公告事件",
+}
+_RELATIONSHIP_LABELS_ZH = {
+    "adjusted_return_correlation": "经校正收益相关性",
+    "disclosed_overlap": "披露持仓重叠",
+    "duplicate_holding_identity": "同一基金存在多条持仓观察",
+    "same_company": "同一基金公司",
+    "same_current_benchmark": "同一当前业绩基准",
+    "same_manager": "同一当前基金经理",
+    "share_class_sibling": "同一基金的不同份额类别",
+    "top10_disclosed_overlap": "前十大披露持仓重叠",
+}
 
 
 def _sorted_unique(values) -> Tuple[str, ...]:
@@ -523,6 +545,317 @@ def _maturity_text(mode: str) -> str:
     return "experimental_shadow 是实验性影子状态，仅供观察，不授权交易。"
 
 
+def _fact_value(fact: BriefFact, key: str):
+    return fact.value.get(key) if isinstance(fact.value, Mapping) else None
+
+
+def _fact_marker(fact: BriefFact) -> str:
+    value = fact.data_as_of or fact.published_at
+    data_date = "日期未知" if value is None else canonical_value(value)
+    tier = fact.source_tier.value.replace("tier_", "Tier ")
+    return f"{data_date}，{tier}"
+
+
+def _first_fact(snapshot: BriefSnapshot, field_id: str) -> Optional[BriefFact]:
+    return next((fact for fact in snapshot.facts if fact.field_id == field_id), None)
+
+
+def _target_fact(
+    snapshot: BriefSnapshot,
+    field_id: str,
+    code_key: str,
+) -> Optional[BriefFact]:
+    candidates = tuple(fact for fact in snapshot.facts if fact.field_id == field_id)
+    return next(
+        (
+            fact
+            for fact in candidates
+            if _fact_value(fact, code_key) == snapshot.fund_code
+        ),
+        None,
+    )
+
+
+def _target_identity_facts(snapshot: BriefSnapshot) -> Tuple[BriefFact, ...]:
+    return tuple(
+        fact
+        for fact in (
+            _target_fact(snapshot, "identity_active_status", "fund_code"),
+            _target_fact(snapshot, "share_class_identity", "related_fund_code"),
+        )
+        if fact is not None
+    )
+
+
+def _identity_text(snapshot: BriefSnapshot) -> str:
+    facts = _target_identity_facts(snapshot)
+    identity = next((fact for fact in facts if fact.field_id == "identity_active_status"), None)
+    share_class = next((fact for fact in facts if fact.field_id == "share_class_identity"), None)
+    if not facts:
+        return "基金身份与份额类别未取得；不能把基金代码自行解释为已确认身份。"
+    name = (
+        _fact_value(share_class, "fund_name") if share_class is not None else None
+    ) or (_fact_value(identity, "fund_name") if identity is not None else None)
+    share = _fact_value(share_class, "share_class") if share_class is not None else None
+    status = _fact_value(identity, "status") if identity is not None else None
+    details = [f"基金：{name}" if name else "基金名称未取得"]
+    details.append(f"份额类别：{share}" if share else "份额类别未取得")
+    if status:
+        details.append(f"状态：{status}")
+    evidence = "；".join(_fact_marker(fact) for fact in facts)
+    return "；".join(details) + f"。身份依据：{evidence}。"
+
+
+def _why_state_fact_text(snapshot: BriefSnapshot) -> str:
+    parts = []
+    managers = tuple(
+        fact for fact in snapshot.facts if fact.field_id == "current_manager_team"
+    )
+    if not managers:
+        parts.append("当前经理未取得")
+    else:
+        manager_items = tuple(
+            dict.fromkeys(
+                f"{_fact_value(manager, 'manager_name') or '姓名未取得'}"
+                f"（{_fact_marker(manager)}）"
+                for manager in managers
+            )
+        )
+        parts.append(f"当前经理团队：{'、'.join(manager_items)}")
+    nav = _first_fact(snapshot, "formal_nav")
+    if nav is None:
+        parts.append("正式净值未取得")
+    else:
+        nav_value = _fact_value(nav, "nav")
+        if nav_value is None and not isinstance(nav.value, Mapping):
+            nav_value = nav.value
+        parts.append(f"正式净值：{nav_value or '数值未取得'}（{_fact_marker(nav)}）")
+    fee = _first_fact(snapshot, "fees_share_class_relationship")
+    parts.append(
+        "费用与份额规则未取得"
+        if fee is None
+        else f"费用与份额规则：已取得（{_fact_marker(fee)}）"
+    )
+    holdings = _first_fact(snapshot, "holdings_industries")
+    if holdings is None:
+        parts.append("披露持仓及报告期未取得")
+    else:
+        period = _fact_value(holdings, "report_period")
+        parts.append(
+            f"披露持仓：已取得，报告期：{period or '未标明'}（{_fact_marker(holdings)}）"
+        )
+    return "；".join(parts) + "。这些事实只解释当前规则状态，不构成买卖指令。"
+
+
+def _relationship_text(snapshot: BriefSnapshot) -> str:
+    known = [
+        _RELATIONSHIP_LABELS_ZH.get(item.relationship_type, item.relationship_type)
+        for item in snapshot.relationships
+    ]
+    minimum_state = snapshot.coverage.evidence_state.value
+    holdings_state = snapshot.holdings_coverage.evidence_state.value
+    unknown_count = len(
+        set(snapshot.coverage.unknown_fields + snapshot.holdings_coverage.unknown_fields)
+    )
+    known_text = "、".join(known) if known else "未取得可验证组合关系"
+    if holdings_state == "insufficient":
+        coverage_text = "披露持仓覆盖不足"
+    else:
+        coverage_text = f"披露持仓覆盖为 {holdings_state}"
+    return (
+        f"已知关系：{known_text}；最小关系覆盖为 {minimum_state}；{coverage_text}；"
+        f"仍有 {unknown_count} 个未知字段。这里仅是 Phase 1 最小关系子集，不是完整 D2 "
+        "组合体检；未知持仓不按零重叠处理，也不表示分散充分。"
+    )
+
+
+def _gap_binding_field(snapshot: BriefSnapshot, field_id: str) -> str:
+    if field_id == "official_events":
+        return "official_events"
+    if field_id == "share_class_identity":
+        return "identity_active_status"
+    if field_id in {"redemption_fee_rules", "fees"}:
+        return "fees_share_class_relationship"
+    if field_id in {"redemption_terms", "settlement"}:
+        return "transaction_availability_limits_cutoff"
+    if field_id == f"holdings_industries_{snapshot.fund_code}":
+        return "holdings_industries"
+    return field_id
+
+
+def _registry_field(source_id: str, field_id: str):
+    registry = SourceRegistryV1()
+    registry.validate()
+    for source in registry.sources:
+        if source.source_id != source_id:
+            continue
+        for field in source.fields:
+            if field.field_id == field_id:
+                return field
+    return None
+
+
+def _first_registry_field(field_id: str):
+    registry_field_id = (
+        "fund_manager_product_announcement" if field_id == "official_events" else field_id
+    )
+    registry = SourceRegistryV1()
+    registry.validate()
+    matches = tuple(
+        (source.source_id, field)
+        for source in registry.sources
+        for field in source.fields
+        if field.field_id == registry_field_id
+    )
+    if field_id == "official_events":
+        return next(
+            (
+                match
+                for match in matches
+                if match[0] == "fund_manager_official_documents"
+            ),
+            None,
+        )
+    if matches:
+        return matches[0]
+    return None
+
+
+def _internal_gap_next_step(field_id: str) -> dict[str, str]:
+    stage = (
+        "适当性与财务安全评估"
+        if field_id.startswith("phase_b")
+        else "资产配置区间评估"
+        if field_id.startswith("phase_c")
+        else "完整 D2 组合体检"
+        if field_id == "d2"
+        else "D3 候选基金购买前检查"
+        if field_id == "d3"
+        else "Phase E 持有与卖出监控"
+        if field_id.startswith("phase_e")
+        else "D1 官方产品身份与分类核验"
+        if field_id == "d1_classification" or field_id.startswith("authenticated_index_identity")
+        else "最新官方定期报告与披露持仓同步"
+        if field_id.startswith("holdings_evidence_missing")
+        or field_id in {"industry_exposure", "quarterly_holdings"}
+        else "基金规模与基础资料同步"
+        if field_id == "size_history"
+        else "对应的受控数据同步或阶段评估"
+    )
+    return {
+        "action": f"先完成{stage}；在此之前保持相关动作 abstain。",
+        "status": "stage_required",
+    }
+
+
+def _beginner_gap_items(
+    snapshot: BriefSnapshot,
+    missing_evidence: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    manual_codes = set(snapshot.sync_status.manual_supplementation_codes) | set(
+        snapshot.decision_evidence_status.manual_supplementation_codes
+    )
+    items = []
+    for gap in missing_evidence:
+        field_id = str(gap["field_id"])
+        binding_field = _gap_binding_field(snapshot, field_id)
+        bindings = sorted(
+            (
+                binding
+                for binding in snapshot.resolution_bindings
+                if binding.field_id == binding_field
+            ),
+            key=lambda item: (
+                item.resolution is not RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED,
+                item.action_id,
+                item.source_id,
+                item.source_attempt_id,
+            ),
+        )
+        binding = bindings[0] if bindings else None
+        source_resolution = None
+        supplementation = None
+        next_step = _internal_gap_next_step(binding_field)
+        if binding is not None:
+            policy = _registry_field(binding.source_id, binding.source_field_id)
+            if policy is None:
+                raise ValueError("beginner gap resolution is absent from the source registry")
+            manual_code = f"{binding.field_id}_manual_supplement_required"
+            aggregate_manual = (
+                binding.resolution is RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED
+                and manual_code in manual_codes
+            )
+            effective_resolution = (
+                RequestFieldResolution.PARTIAL
+                if (
+                    binding.resolution is RequestFieldResolution.USABLE
+                    or (
+                        binding.resolution
+                        is RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED
+                        and not aggregate_manual
+                    )
+                )
+                else binding.resolution
+            )
+            source_resolution = {
+                "acceptable_alternative_ids": sorted(
+                    {reference.source_id for reference in policy.acceptable_alternatives}
+                ),
+                "primary_source_id": binding.source_id,
+                "resolution": effective_resolution.value,
+                "source_field_id": binding.source_field_id,
+                "source_states": [state.value for state in binding.source_states],
+            }
+            if aggregate_manual:
+                if policy.supplementation is None:
+                    raise ValueError(
+                        "manual gap resolution lacks a controlled supplementation path"
+                    )
+                supplementation = policy.supplementation.to_canonical_dict()
+                next_step = {
+                    "action": "按同一缺口列出的受控补证要求提供材料；补证前保持相关动作 abstain。",
+                    "status": RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED.value,
+                }
+            else:
+                next_step = {
+                    "action": (
+                        "本次不循环重试；后续新请求按登记的主来源和替代来源继续检查，"
+                        "在取得完整证据前保持相关动作 abstain。"
+                    ),
+                    "status": effective_resolution.value,
+                }
+        else:
+            registry_entry = _first_registry_field(binding_field)
+            if registry_entry is not None:
+                source_id, policy = registry_entry
+                source_resolution = {
+                    "acceptable_alternative_ids": sorted(
+                        {reference.source_id for reference in policy.acceptable_alternatives}
+                    ),
+                    "primary_source_id": source_id,
+                    "resolution": RequestFieldResolution.PARTIAL.value,
+                    "source_field_id": policy.field_id,
+                    "source_states": ["not_checked"],
+                }
+                next_step = {
+                    "action": (
+                        "当前请求没有该字段的认证来源尝试；后续新请求按登记来源进行一次"
+                        "有边界检查，本次保持相关动作 abstain。"
+                    ),
+                    "status": "not_checked",
+                }
+        items.append(
+            {
+                **gap,
+                "label_zh": _FACT_LABELS_ZH.get(binding_field, "待补充证据"),
+                "source_resolution": source_resolution,
+                "supplementation": supplementation,
+                "next_step": next_step,
+            }
+        )
+    return items
+
+
 def _beginner_explanation(snapshot: BriefSnapshot, missing_evidence) -> dict[str, object]:
     headline_items = []
     for interpretation in snapshot.interpretations:
@@ -588,11 +921,7 @@ def _beginner_explanation(snapshot: BriefSnapshot, missing_evidence) -> dict[str
             " 顶层成熟度仅描述主状态；转入腿仍以自己的 experimental_shadow 和 abstain 为准，"
             "不得继承转出腿许可。"
         )
-    identity_facts = tuple(
-        fact
-        for fact in snapshot.facts
-        if fact.field_id in {"identity_active_status", "share_class_identity"}
-    )
+    identity_facts = _target_identity_facts(snapshot)
     identity_ids = [fact.fact_id for fact in identity_facts]
     identity_dates = sorted(
         {
@@ -645,7 +974,7 @@ def _beginner_explanation(snapshot: BriefSnapshot, missing_evidence) -> dict[str
         "fund_identity": {
             "data_dates": identity_dates,
             "evidence_ids": identity_ids,
-            "text": "基金身份、份额类别、日期和来源等级以所列结构化证据为准。",
+            "text": _identity_text(snapshot),
         },
         "portfolio_relationship": {
             "coverage_ids": [
@@ -657,7 +986,7 @@ def _beginner_explanation(snapshot: BriefSnapshot, missing_evidence) -> dict[str
                 "disclosed_holdings_coverage": list(snapshot.holdings_coverage.unknown_fields),
                 "minimum_relationship_coverage": list(snapshot.coverage.unknown_fields),
             },
-            "text": ("这里只展示已验证的组合关系与覆盖缺口；未知持仓不按零重叠处理。"),
+            "text": _relationship_text(snapshot),
         },
         "recent_official_events": {
             "event_ids": active_event_ids,
@@ -676,7 +1005,8 @@ def _beginner_explanation(snapshot: BriefSnapshot, missing_evidence) -> dict[str
                 for item in snapshot.interpretations
             ],
             "text": (
-                "每个动作的支持证据、反方证据和阻断码分别列示；"
+                _why_state_fact_text(snapshot)
+                + " 每个动作的支持证据、反方证据和阻断码分别列示；"
                 "一个动作的证据不能授权另一个动作，没有反方记录也不等于没有风险。"
             ),
         },
@@ -716,6 +1046,7 @@ def public_payload(report: HeldFundBriefReport) -> dict[str, object]:
     if overlay is None:
         raise ValueError("owner-local payload requires an owner overlay")
     missing = _missing_evidence(snapshot)
+    beginner_missing = _beginner_gap_items(snapshot, missing)
     payload = {
         "request": {
             "action_ids": list(snapshot.action_ids),
@@ -756,7 +1087,7 @@ def public_payload(report: HeldFundBriefReport) -> dict[str, object]:
             "triggered_reviews": list(snapshot.triggered_reviews),
         },
         "missing_evidence": missing,
-        "beginner_explanation_zh": _beginner_explanation(snapshot, missing),
+        "beginner_explanation_zh": _beginner_explanation(snapshot, beginner_missing),
     }
     if tuple(payload) != _TOP_LEVEL_KEYS:
         raise ValueError("owner payload schema drifted")
