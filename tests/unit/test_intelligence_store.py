@@ -247,6 +247,29 @@ def test_save_is_append_only_and_reloads_exact_bytes(
         )
 
 
+def test_authenticated_cache_query_rechecks_items_and_expiry(
+    repository: Repository,
+    store: IntelligenceStore,
+) -> None:
+    _budget_value, _run_id, _attempt_id, _item_ids, items = _seed_request_and_evidence(
+        repository, store
+    )
+
+    cached = store.authenticated_cached_items(
+        "gov_cn_policy",
+        NOW,
+        NOW + timedelta(minutes=1),
+    )
+
+    assert cached == tuple(reversed(items))
+    assert store.authenticated_items_by_keys(("item_one", "item_two")) == items
+    assert store.authenticated_cached_items(
+        "gov_cn_policy",
+        NOW + timedelta(hours=1),
+        NOW + timedelta(hours=2),
+    ) == ()
+
+
 def test_lineage_and_events_reuse_identical_canonical_rows_and_reject_key_drift(
     repository: Repository,
     store: IntelligenceStore,

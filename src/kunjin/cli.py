@@ -141,6 +141,7 @@ from kunjin.suitability.store import (
 
 if TYPE_CHECKING:
     from kunjin.brief.service import HeldFundBriefService
+    from kunjin.intelligence.service import IntelligenceService
 
 _FUND_CODE = re.compile(r"^[0-9]{6}$")
 _COMMAND_PART = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -151,6 +152,7 @@ _TOP_LEVEL_COMMANDS = {
     "fund",
     "ledger",
     "market",
+    "news",
     "portfolio",
     "profile",
     "report",
@@ -315,6 +317,7 @@ class ApplicationContext:
     decision_service: Optional[DecisionRoutingService] = None
     source_health_service: Optional[SourceHealthService] = None
     brief_service: Optional["HeldFundBriefService"] = None
+    intelligence_service: Optional["IntelligenceService"] = None
 
 
 def build_context(*, public_acceptance_subject: Optional[str] = None) -> ApplicationContext:
@@ -325,6 +328,8 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
         load_public_acceptance_capability,
     )
     from kunjin.brief.service import HeldFundBriefService
+    from kunjin.intelligence.service import IntelligenceService
+    from kunjin.intelligence.store import IntelligenceStore
 
     paths = RuntimePaths.from_environment()
     public_acceptance = load_public_acceptance_capability(
@@ -449,6 +454,13 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
         ),
         source_health_service=source_health_service,
         brief_service=brief_service,
+        intelligence_service=IntelligenceService(
+            repository,
+            decision_audit_store,
+            IntelligenceStore(repository, decision_audit_store),
+            source_health_service,
+            fund_disclosure_store,
+        ),
     )
 
 
@@ -639,10 +651,20 @@ def build_parser() -> argparse.ArgumentParser:
     fund_classification_evidence.add_argument("fund_code")
     fund_subparsers.add_parser("classification-policy")
     fund_subparsers.add_parser("converter-status")
+    fund_intelligence = fund_subparsers.add_parser("intelligence")
+    fund_intelligence.add_argument("fund_code")
+    _add_intelligence_arguments(fund_intelligence)
 
     market = subparsers.add_parser("market")
     market_subparsers = market.add_subparsers(dest="market_command", required=True)
     market_subparsers.add_parser("sectors")
+    market_overview = market_subparsers.add_parser("overview")
+    _add_intelligence_arguments(market_overview)
+
+    news = subparsers.add_parser("news")
+    news_subparsers = news.add_subparsers(dest="news_command", required=True)
+    news_recent = news_subparsers.add_parser("recent")
+    _add_intelligence_arguments(news_recent)
 
     thesis = subparsers.add_parser("thesis")
     thesis_subparsers = thesis.add_subparsers(dest="thesis_command", required=True)
@@ -690,6 +712,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_intelligence_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--window",
+        choices=["today", "recent", "near_term"],
+    )
+    parser.add_argument("--start")
+    parser.add_argument("--end")
+    parser.add_argument(
+        "--mode",
+        choices=[item.value for item in RequestMode],
+        default=RequestMode.RAPID.value,
+    )
+
+
 def _positions_payload(context: ApplicationContext) -> List[Dict[str, Any]]:
     return [serialize(position) for position in context.repository.latest_positions()]
 
@@ -697,6 +733,61 @@ def _positions_payload(context: ApplicationContext) -> List[Dict[str, Any]]:
 def _validate_fund_code(fund_code: str) -> None:
     if not _FUND_CODE.fullmatch(fund_code):
         raise InvalidFundCodeError("fund code must contain six digits")
+
+
+def _intelligence_interval_arguments(
+    args: argparse.Namespace,
+) -> Tuple[str, Optional[date], Optional[date]]:
+    if (args.start is None) != (args.end is None):
+        raise CliUsageError("intelligence interval requires both --start and --end")
+    if args.start is not None and args.window is not None:
+        raise CliUsageError("--window cannot be combined with --start and --end")
+    if args.start is None:
+        return args.window or "recent", None, None
+    try:
+        start = date.fromisoformat(args.start)
+        end = date.fromisoformat(args.end)
+    except (TypeError, ValueError):
+        raise CliUsageError("intelligence interval dates must use YYYY-MM-DD") from None
+    if start.isoformat() != args.start or end.isoformat() != args.end or end < start:
+        raise CliUsageError("intelligence interval dates are invalid")
+    return "recent", start, end
+
+
+def _intelligence_response(
+    context: ApplicationContext,
+    args: argparse.Namespace,
+) -> Dict[str, object]:
+    if context.intelligence_service is None:
+        raise CliUsageError("intelligence service is unavailable")
+    window, start, end = _intelligence_interval_arguments(args)
+    mode = args.mode
+    if args.command == "news":
+        result = context.intelligence_service.news_recent(
+            window=window,
+            mode=mode,
+            start=start,
+            end=end,
+        )
+    elif args.command == "market":
+        result = context.intelligence_service.market_overview(
+            window=window,
+            mode=mode,
+            start=start,
+            end=end,
+        )
+    else:
+        _validate_fund_code(args.fund_code)
+        result = context.intelligence_service.fund_intelligence(
+            args.fund_code,
+            window=window,
+            mode=mode,
+            start=start,
+            end=end,
+        )
+    from kunjin.intelligence.research import public_intelligence_payload
+
+    return public_intelligence_payload(result)
 
 
 def _fund_brief_response(
@@ -2622,6 +2713,16 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             ),
         )
 
+    if (
+        (args.command == "news" and args.news_command == "recent")
+        or (args.command == "market" and args.market_command == "overview")
+        or (args.command == "fund" and args.fund_command == "intelligence")
+    ):
+        if not args.json_output:
+            raise CliUsageError("intelligence research commands require JSON mode")
+        nested = getattr(args, f"{args.command}_command")
+        return envelope(f"{args.command}.{nested}", _intelligence_response(context, args))
+
     if args.command == "profile":
         if args.profile_command == "edit" and args.json_output:
             raise CliUsageError("profile edit is interactive and does not support JSON mode")
@@ -3390,6 +3491,7 @@ def _command_name_from_argv(argv: Sequence[str]) -> str:
         "fund",
         "ledger",
         "market",
+        "news",
         "portfolio",
         "profile",
         "report",

@@ -28,6 +28,7 @@ from kunjin.cli import (
     _validate_decision_route_data,
     _validate_source_status_data,
     build_context,
+    build_parser,
     run,
 )
 from kunjin.decision.budget import RequestBudget
@@ -77,6 +78,13 @@ from kunjin.funds.service import (
     SectionSyncResult,
 )
 from kunjin.funds.store import FundDisclosureStore
+from kunjin.intelligence.models import IntelligenceWorkflow, QueryInterval
+from kunjin.intelligence.service import (
+    IntelligenceRequestSubject,
+    IntelligenceServiceError,
+    PragmaticIntelligenceResult,
+)
+from kunjin.intelligence.store import AuthenticatedTerminalRequest
 from kunjin.ledger.alipay import AlipayPaymentParser
 from kunjin.ledger.models import OcrBlock
 from kunjin.ledger.service import LedgerService
@@ -562,6 +570,143 @@ class CliIntegrationTest(unittest.TestCase):
             set(payload),
             {"schema_version", "command", "as_of", "data", "warnings", "errors"},
         )
+
+    def test_pragmatic_intelligence_parser_and_thin_json_dispatch(self) -> None:
+        self.assertEqual(
+            build_parser().parse_args(["--json", "news", "recent"]).news_command,
+            "recent",
+        )
+        self.assertEqual(
+            build_parser().parse_args(["--json", "market", "overview"]).market_command,
+            "overview",
+        )
+        parsed = build_parser().parse_args(
+            ["--json", "fund", "intelligence", "519755"]
+        )
+        self.assertEqual(parsed.fund_command, "intelligence")
+        self.assertEqual(parsed.fund_code, "519755")
+
+        terminal = AuthenticatedTerminalRequest(
+            id=1,
+            request_id="a" * 32,
+            mode=RequestMode.RAPID,
+            status=RequestTerminalStatus.PARTIAL,
+            started_at=self.suitability_now,
+            deadline_at=self.suitability_now + timedelta(seconds=90),
+            finished_at=self.suitability_now + timedelta(seconds=1),
+            omitted_work=("source_unavailable",),
+        )
+        class FakeIntelligenceService:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def _result(self, workflow, fund_code=None):
+                return PragmaticIntelligenceResult(
+                    report=None,
+                    terminal_request=terminal,
+                    subject=IntelligenceRequestSubject(
+                        workflow=workflow,
+                        interval=QueryInterval(
+                            self_now - timedelta(hours=72),
+                            self_now,
+                            "Asia/Shanghai",
+                        ),
+                        subject_scope=(
+                            "global_public"
+                            if fund_code is None
+                            else "named_public_fund"
+                        ),
+                        fund_code=fund_code,
+                    ),
+                    items=(),
+                    item_uses=(),
+                    lineage_edges=(),
+                    events=(),
+                    source_summaries=(),
+                    sector_labels=(),
+                    fund_context=None,
+                    thesis_review=None,
+                )
+
+            def news_recent(self, **kwargs):
+                self.calls.append(("news", kwargs))
+                return self._result(IntelligenceWorkflow.NEWS_RECENT)
+
+            def market_overview(self, **kwargs):
+                self.calls.append(("market", kwargs))
+                return self._result(IntelligenceWorkflow.MARKET_OVERVIEW)
+
+            def fund_intelligence(self, fund_code, **kwargs):
+                self.calls.append(("fund", fund_code, kwargs))
+                return self._result(IntelligenceWorkflow.FUND_INTELLIGENCE, fund_code)
+
+        self_now = self.suitability_now
+        service = FakeIntelligenceService()
+        self.context.intelligence_service = service
+        cases = (
+            (["--json", "news", "recent"], "news.recent"),
+            (["--json", "market", "overview", "--mode", "deep"], "market.overview"),
+            (
+                ["--json", "fund", "intelligence", "519755"],
+                "fund.intelligence",
+            ),
+        )
+        for argv, command in cases:
+            with self.subTest(command=command):
+                payload, exit_code, json_output = run(argv, self.context)
+                self.assertEqual(exit_code, 0)
+                self.assertTrue(json_output)
+                self.assert_envelope(payload, command)
+                self.assertFalse(payload["data"]["exact_amount_available"])
+                self.assertNotIn("fund:000000", json.dumps(payload, ensure_ascii=False))
+
+        self.assertEqual(service.calls[0][1]["window"], "recent")
+        self.assertEqual(service.calls[1][1]["mode"], "deep")
+        self.assertEqual(service.calls[2][1], "519755")
+
+    def test_pragmatic_intelligence_service_error_is_stable_and_sanitized(self) -> None:
+        class FailingIntelligenceService:
+            def news_recent(self, **_kwargs):
+                raise IntelligenceServiceError(7)
+
+        self.context.intelligence_service = FailingIntelligenceService()
+        payload, exit_code, json_output = run(
+            ["--json", "news", "recent"], self.context
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "news.recent")
+        self.assertEqual(
+            payload["errors"],
+            [
+                {
+                    "code": "intelligence_service_failed",
+                    "message": "intelligence service failed",
+                }
+            ],
+        )
+
+    def test_pragmatic_intelligence_rejects_mixed_window_and_explicit_dates(self) -> None:
+        payload, exit_code, json_output = run(
+            [
+                "--json",
+                "news",
+                "recent",
+                "--window",
+                "recent",
+                "--start",
+                "2026-07-01",
+                "--end",
+                "2026-07-02",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "news.recent")
+        self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
 
     def test_phase0_decision_route_parser_and_json_contract(self) -> None:
         payload, exit_code, json_output = run(

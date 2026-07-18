@@ -13,10 +13,14 @@ from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.models import (
     EvidenceCompleteness,
     EvidenceFreshness,
+    RequestMode,
     RequestTerminalStatus,
     SourceTier,
+    StoredSourceAttempt,
     canonical_json_bytes,
+    validate_identifier,
     validate_identifier_tuple,
+    validate_request_id,
 )
 from kunjin.decision.store import DecisionAuditStore, DecisionAuditStoreError
 from kunjin.intelligence.models import (
@@ -70,6 +74,55 @@ class StoredIntegrityTransition:
     current_state: IntegrityState
     occurred_at: datetime
     event_checksum: str
+
+
+@dataclass(frozen=True)
+class AuthenticatedTerminalRequest:
+    id: int
+    request_id: str
+    mode: RequestMode
+    status: RequestTerminalStatus
+    started_at: datetime
+    deadline_at: datetime
+    finished_at: datetime
+    omitted_work: Tuple[str, ...]
+
+    def validate(self) -> None:
+        _positive_id(self.id, "terminal request id")
+        validate_request_id(self.request_id)
+        if type(self.mode) is not RequestMode:
+            raise ValueError("terminal request mode must be exact")
+        if self.status not in {
+            RequestTerminalStatus.COMPLETE,
+            RequestTerminalStatus.PARTIAL,
+        }:
+            raise ValueError("terminal request status must be complete or partial")
+        for value, name in (
+            (self.started_at, "terminal request start"),
+            (self.deadline_at, "terminal request deadline"),
+            (self.finished_at, "terminal request finish"),
+        ):
+            try:
+                _utc_text(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} must be UTC") from None
+        validate_identifier_tuple(self.omitted_work, "terminal request omitted work")
+        if not self.started_at <= self.finished_at <= self.deadline_at:
+            raise ValueError("terminal request times are invalid")
+        if (self.status is RequestTerminalStatus.COMPLETE and self.omitted_work) or (
+            self.status is RequestTerminalStatus.PARTIAL and not self.omitted_work
+        ):
+            raise ValueError("terminal request status and omitted work are inconsistent")
+
+
+@dataclass(frozen=True)
+class AuthenticatedSnapshotItemUse:
+    item_id: str
+    source_attempt_id: int
+
+    def validate(self) -> None:
+        validate_identifier(self.item_id, "snapshot item use item id")
+        _positive_id(self.source_attempt_id, "snapshot item use source attempt id")
 
 
 class IntelligenceStore:
@@ -576,6 +629,184 @@ class IntelligenceStore:
         except (sqlite3.DatabaseError, TypeError, ValueError, UnicodeError):
             raise IntelligenceStoreError("intelligence item authentication failed") from None
 
+    def authenticated_items_by_keys(
+        self,
+        item_keys: Tuple[str, ...],
+    ) -> Tuple[NewsItem, ...]:
+        validate_identifier_tuple(item_keys, "intelligence item keys")
+        if len(set(item_keys)) != len(item_keys):
+            raise ValueError("intelligence item keys must be unique")
+        if not item_keys:
+            return ()
+        try:
+            with self.repository.connect() as connection:
+                rows = connection.execute(
+                    "SELECT id, item_key FROM intelligence_news_items "
+                    f"WHERE item_key IN ({','.join('?' for _ in item_keys)})",
+                    item_keys,
+                ).fetchall()
+                row_by_key = {str(row["item_key"]): int(row["id"]) for row in rows}
+                return tuple(
+                    self._authenticated_item(connection, row_by_key[item_key])
+                    for item_key in item_keys
+                    if item_key in row_by_key
+                )
+        except IntelligenceStoreError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, UnicodeError):
+            raise IntelligenceStoreError("intelligence item authentication failed") from None
+
+    def authenticated_cached_items(
+        self,
+        source_id: str,
+        retrieved_not_before: datetime,
+        as_of: datetime,
+    ) -> Tuple[NewsItem, ...]:
+        validate_identifier(source_id, "intelligence cache source id")
+        lower = _utc_text(retrieved_not_before)
+        upper = _utc_text(as_of)
+        if as_of < retrieved_not_before:
+            raise ValueError("intelligence cache interval is invalid")
+        try:
+            with self.repository.connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT item.id
+                    FROM intelligence_news_items AS item
+                    JOIN source_attempts AS attempt ON attempt.id=item.source_attempt_id
+                    JOIN intelligence_news_excerpts AS excerpt ON excerpt.item_id=item.id
+                    WHERE item.source_id=?
+                      AND item.retrieved_at>=? AND item.retrieved_at<=?
+                      AND excerpt.expires_at>?
+                      AND attempt.source_id=item.source_id
+                      AND attempt.outcome IN ('success','cache_hit')
+                    ORDER BY item.published_at DESC, item.id DESC
+                    """,
+                    (source_id, lower, upper, upper),
+                ).fetchall()
+                items = tuple(
+                    self._authenticated_item(connection, int(row["id"])) for row in rows
+                )
+                return tuple(
+                    item for item in items if item.integrity_state is IntegrityState.ACTIVE
+                )
+        except IntelligenceStoreError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, UnicodeError):
+            raise IntelligenceStoreError("intelligence cache authentication failed") from None
+
+    def authenticated_terminal_request(
+        self,
+        request_run_id: int,
+    ) -> AuthenticatedTerminalRequest:
+        _positive_id(request_run_id, "request run id")
+        try:
+            with self.repository.connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM request_runs WHERE id=?",
+                    (request_run_id,),
+                ).fetchone()
+            if row is None or row["finished_at"] is None:
+                raise IntelligenceStoreError("intelligence request authentication failed")
+            status = RequestTerminalStatus(str(row["status"]))
+            if status not in {RequestTerminalStatus.COMPLETE, RequestTerminalStatus.PARTIAL}:
+                raise IntelligenceStoreError("intelligence request authentication failed")
+            omitted = tuple(
+                _json_array(
+                    _ascii_bytes(row["omitted_work_json"], "request omitted work"),
+                    "request omitted work",
+                )
+            )
+            validate_identifier_tuple(omitted, "request omitted work")
+            result = AuthenticatedTerminalRequest(
+                id=int(row["id"]),
+                request_id=str(row["request_id"]),
+                mode=RequestMode(str(row["mode"])),
+                status=status,
+                started_at=_stored_utc(row["started_at"]),
+                deadline_at=_stored_utc(row["deadline_at"]),
+                finished_at=_stored_utc(row["finished_at"]),
+                omitted_work=omitted,
+            )
+            result.validate()
+            return result
+        except IntelligenceStoreError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, UnicodeError, KeyError):
+            raise IntelligenceStoreError("intelligence request authentication failed") from None
+
+    def authenticated_terminal_source_attempts(
+        self,
+        request_run_id: int,
+    ) -> Tuple[StoredSourceAttempt, ...]:
+        terminal = self.authenticated_terminal_request(request_run_id)
+        try:
+            with self.repository.connect() as connection:
+                rows = connection.execute(
+                    "SELECT id FROM source_attempts WHERE request_run_id=? ORDER BY id",
+                    (request_run_id,),
+                ).fetchall()
+            attempts = tuple(
+                self.decision_store.authenticated_source_attempt(int(row["id"]))
+                for row in rows
+            )
+            if any(
+                item.request_run_id != terminal.id
+                or item.request_id != terminal.request_id
+                for item in attempts
+            ):
+                raise IntelligenceStoreError("intelligence source coverage failed")
+            return attempts
+        except IntelligenceStoreError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, KeyError):
+            raise IntelligenceStoreError("intelligence source coverage failed") from None
+
+    def authenticated_snapshot_item_uses(
+        self,
+        snapshot_id: int,
+    ) -> Tuple[AuthenticatedSnapshotItemUse, ...]:
+        stored = self.authenticated_snapshot(snapshot_id)
+        try:
+            with self.repository.connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT item.item_key, item.source_id, item_use.source_attempt_id
+                    FROM intelligence_snapshot_item_uses AS item_use
+                    JOIN intelligence_news_items AS item ON item.id=item_use.item_id
+                    WHERE item_use.request_run_id=?
+                    ORDER BY item.item_key
+                    """,
+                    (stored.snapshot.request_run_id,),
+                ).fetchall()
+            values = tuple(
+                AuthenticatedSnapshotItemUse(
+                    item_id=str(row["item_key"]),
+                    source_attempt_id=int(row["source_attempt_id"]),
+                )
+                for row in rows
+            )
+            for value, row in zip(values, rows):
+                value.validate()
+                attempt = self.decision_store.authenticated_source_attempt(
+                    value.source_attempt_id
+                )
+                if (
+                    attempt.request_run_id != stored.snapshot.request_run_id
+                    or attempt.attempt.source_id != row["source_id"]
+                    or attempt.attempt.outcome.value not in {"success", "cache_hit"}
+                ):
+                    raise IntelligenceStoreError("intelligence item use authentication failed")
+            if tuple(value.item_id for value in values) != tuple(
+                sorted(stored.snapshot.item_ids)
+            ):
+                raise IntelligenceStoreError("intelligence item use authentication failed")
+            return values
+        except IntelligenceStoreError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, KeyError):
+            raise IntelligenceStoreError("intelligence item use authentication failed") from None
+
     def lineage_for_item(self, item_id: int) -> Tuple[LineageEdge, ...]:
         _positive_id(item_id, "item id")
         try:
@@ -874,15 +1105,24 @@ class IntelligenceStore:
                 or hashlib.sha256(canonical).hexdigest() != row["link_checksum"]
             ):
                 raise IntelligenceStoreError("intelligence snapshot authentication failed")
+
     @staticmethod
     def _authenticate_item_attempt(connection: sqlite3.Connection, item: NewsItem) -> None:
         row = connection.execute(
-            "SELECT * FROM source_attempts WHERE id=?", (item.source_attempt_id,)
+            """
+            SELECT attempt.*, run.deadline_at AS request_deadline_at
+            FROM source_attempts AS attempt
+            JOIN request_runs AS run ON run.id=attempt.request_run_id
+            WHERE attempt.id=?
+            """,
+            (item.source_attempt_id,),
         ).fetchone()
         if row is None or (
             row["source_id"] != item.source_id
             or row["outcome"] not in {"success", "cache_hit"}
-            or _stored_utc(row["finished_at"]) > item.retrieved_at
+            or item.retrieved_at < _stored_utc(row["started_at"]) - timedelta(seconds=1)
+            or item.retrieved_at
+            > _stored_utc(row["request_deadline_at"]) + timedelta(seconds=1)
         ):
             raise IntelligenceStoreError("intelligence item source attempt binding failed")
 
