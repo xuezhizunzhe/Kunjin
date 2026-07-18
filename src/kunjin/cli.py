@@ -10,7 +10,7 @@ import urllib.parse
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from kunjin import __version__
@@ -139,7 +139,10 @@ from kunjin.suitability.store import (
     SuitabilityPolicyStore,
 )
 
-_FUND_CODE = re.compile(r"^\d{6}$")
+if TYPE_CHECKING:
+    from kunjin.brief.service import HeldFundBriefService
+
+_FUND_CODE = re.compile(r"^[0-9]{6}$")
 _COMMAND_PART = re.compile(r"^[a-z][a-z0-9_-]*$")
 _TOP_LEVEL_COMMANDS = {
     "allocation",
@@ -278,6 +281,10 @@ class SourceStatusCliError(ValueError):
     code = "source_status_failed"
 
 
+class FundBriefCliError(ValueError):
+    code = "fund_brief_failed"
+
+
 class KunjinArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise CliUsageError(message)
@@ -307,9 +314,14 @@ class ApplicationContext:
     fund_risk_service: Optional[FundRiskService] = None
     decision_service: Optional[DecisionRoutingService] = None
     source_health_service: Optional[SourceHealthService] = None
+    brief_service: Optional["HeldFundBriefService"] = None
 
 
 def build_context() -> ApplicationContext:
+    from kunjin.brief.nav import BoundedNavService
+    from kunjin.brief.portfolio import BoundedPortfolioService
+    from kunjin.brief.service import HeldFundBriefService
+
     paths = RuntimePaths.from_environment().ensure()
     repository = Repository(paths.database)
     repository.migrate()
@@ -347,12 +359,33 @@ def build_context() -> ApplicationContext:
     decision_audit_store = DecisionAuditStore(repository)
     evidence_policy = EvidencePolicyV1()
     source_registry = SourceRegistryV1()
+    sync_service = PortfolioSyncService(client, repository)
+    source_health_service = SourceHealthService(
+        decision_audit_store,
+        registry=source_registry,
+        policy=evidence_policy,
+    )
+    brief_service = HeldFundBriefService(
+        repository=repository,
+        suitability_service=suitability_service,
+        disclosure_service=fund_disclosure_service,
+        portfolio_service=BoundedPortfolioService(
+            repository,
+            sync_service=sync_service,
+        ),
+        nav_service=BoundedNavService(repository),
+        audit_store=decision_audit_store,
+        health_service=source_health_service,
+        evidence_policy=evidence_policy,
+        source_registry=source_registry,
+        risk_store=fund_risk_store,
+    )
     return ApplicationContext(
         paths=paths,
         repository=repository,
         token_store=token_store,
         client=client,
-        sync_service=PortfolioSyncService(client, repository),
+        sync_service=sync_service,
         research_service=research_service,
         ledger_service=LedgerService(
             paths=paths,
@@ -396,11 +429,8 @@ def build_context() -> ApplicationContext:
             policy=evidence_policy,
             registry=source_registry,
         ),
-        source_health_service=SourceHealthService(
-            decision_audit_store,
-            registry=source_registry,
-            policy=evidence_policy,
-        ),
+        source_health_service=source_health_service,
+        brief_service=brief_service,
     )
 
 
@@ -549,6 +579,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     fund = subparsers.add_parser("fund")
     fund_subparsers = fund.add_subparsers(dest="fund_command", required=True)
+    fund_brief = fund_subparsers.add_parser("brief")
+    fund_brief.add_argument("fund_code")
+    fund_brief.add_argument(
+        "--action",
+        choices=[
+            ActionKind.CONTINUE_HOLDING.value,
+            ActionKind.REDUCE_TO_CASH.value,
+            ActionKind.FULL_EXIT.value,
+            ActionKind.SWITCH_FUNDS.value,
+        ],
+        required=True,
+    )
+    fund_brief.add_argument(
+        "--mode",
+        choices=[item.value for item in RequestMode],
+        default=RequestMode.RAPID.value,
+    )
     fund_research = fund_subparsers.add_parser("research")
     fund_research.add_argument("fund_code")
     fund_profile = fund_subparsers.add_parser("profile")
@@ -632,6 +679,32 @@ def _positions_payload(context: ApplicationContext) -> List[Dict[str, Any]]:
 def _validate_fund_code(fund_code: str) -> None:
     if not _FUND_CODE.fullmatch(fund_code):
         raise InvalidFundCodeError("fund code must contain six digits")
+
+
+def _fund_brief_response(
+    context: ApplicationContext,
+    fund_code: str,
+    action: ActionKind,
+    mode: RequestMode,
+) -> Dict[str, Any]:
+    from kunjin.brief.research import public_outcome_payload
+
+    _validate_fund_code(fund_code)
+    if context.brief_service is None:
+        raise CliUsageError("held fund brief service is unavailable")
+    try:
+        outcome = context.brief_service.brief_outcome(
+            fund_code,
+            action=action,
+            mode=mode,
+        )
+        return public_outcome_payload(outcome)
+    except KeyboardInterrupt:
+        raise
+    except SystemExit:
+        raise FundBriefCliError("held fund brief failed") from None
+    except Exception:
+        raise FundBriefCliError("held fund brief failed") from None
 
 
 def _validate_compare_codes(fund_codes: Sequence[str]) -> Tuple[str, ...]:
@@ -2518,6 +2591,19 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             _source_status_response(context, args.fund_code),
         )
 
+    if args.command == "fund" and args.fund_command == "brief":
+        if not args.json_output:
+            raise CliUsageError("fund brief requires JSON mode")
+        return envelope(
+            "fund.brief",
+            _fund_brief_response(
+                context,
+                args.fund_code,
+                ActionKind(args.action),
+                RequestMode(args.mode),
+            ),
+        )
+
     if args.command == "profile":
         if args.profile_command == "edit" and args.json_output:
             raise CliUsageError("profile edit is interactive and does not support JSON mode")
@@ -3208,6 +3294,11 @@ def run(
     ) as exc:
         code = getattr(exc, "code", "operation_failed")
         message = redact_secrets(str(exc))
+        command_name = (
+            _command_name(args) if args is not None else _command_name_from_argv(raw_argv)
+        )
+        if isinstance(exc, CliUsageError) and args is None and command_name == "fund.brief":
+            message = "invalid fund brief arguments"
         if isinstance(
             exc,
             (
@@ -3239,7 +3330,7 @@ def run(
             else None
         )
         payload = envelope(
-            (_command_name(args) if args is not None else _command_name_from_argv(raw_argv)),
+            command_name,
             error_data,
             errors=[{"code": str(code), "message": message}],
         )

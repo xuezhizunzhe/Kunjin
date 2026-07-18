@@ -648,7 +648,7 @@ git commit -m "feat: orchestrate held fund brief"
 - Modify: tests/integration/test_cli.py
 - Modify: tests/test_smoke.py
 
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 Cover exact invocation, missing JSON, invalid code/action/mode, current holding, auth missing, blocked B, partial profile, unsupported holdings, liquidation, no thesis, thesis, reduce, exit, switch, exact schema, and privacy.
 
@@ -658,18 +658,18 @@ kunjin --json fund brief 519755 --action continue_holding --mode rapid
 
 No amount/shares/date/URL/adapter/background/Docker option exists.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/integration/test_cli.py \
   tests/test_smoke.py -k "fund_brief or phase0"
 ~~~
 
-- [ ] **Step 3: Wire thin context and dispatch**
+- [x] **Step 3: Wire thin context and dispatch**
 
 Instantiate brief dependencies once, validate arguments/JSON, call service, and envelope strict output. Keep business rules out of cli.py. Expected partial/insufficient outcomes exit zero; invalid usage or inability to produce a valid terminal envelope exits nonzero.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/integration/test_cli.py \

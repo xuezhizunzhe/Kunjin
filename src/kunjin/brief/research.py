@@ -15,6 +15,7 @@ from kunjin.brief.models import (
     BriefFact,
     BriefSnapshot,
     BriefState,
+    HeldFundBriefOutcome,
     HeldFundBriefReport,
     OfficialEventCode,
     RelationshipEvidence,
@@ -37,6 +38,17 @@ _TOP_LEVEL_KEYS = (
     "action_interpretation",
     "missing_evidence",
     "beginner_explanation_zh",
+)
+_OUTCOME_REQUEST_KEYS = (
+    "action_ids",
+    "created_at",
+    "decision_snapshot_id",
+    "evidence_fingerprint",
+    "mode",
+    "request_run_id",
+    "result_checksum",
+    "terminal_status",
+    "omitted_work",
 )
 _BEGINNER_KEYS = (
     "headline",
@@ -748,4 +760,23 @@ def public_payload(report: HeldFundBriefReport) -> dict[str, object]:
     }
     if tuple(payload) != _TOP_LEVEL_KEYS:
         raise ValueError("owner payload schema drifted")
+    return payload
+
+
+def public_outcome_payload(outcome: HeldFundBriefOutcome) -> dict[str, object]:
+    """Project an authenticated terminal outcome into the owner-local payload."""
+
+    if type(outcome) is not HeldFundBriefOutcome:
+        raise ValueError("public outcome payload requires an exact HeldFundBriefOutcome")
+    outcome.validate()
+    payload = public_payload(outcome.report)
+    payload["request"] = {
+        **payload["request"],
+        "terminal_status": outcome.terminal_status.value,
+        "omitted_work": list(outcome.omitted_work),
+    }
+    if tuple(payload["request"]) != _OUTCOME_REQUEST_KEYS:
+        raise ValueError("owner outcome request schema drifted")
+    if tuple(payload) != _TOP_LEVEL_KEYS:
+        raise ValueError("owner outcome payload schema drifted")
     return payload

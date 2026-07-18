@@ -20,7 +20,7 @@ from kunjin.brief.facts import (
     SourceLinkedFactSet,
     build_source_linked_facts,
 )
-from kunjin.brief.models import HeldFundBriefReport
+from kunjin.brief.models import HeldFundBriefOutcome, HeldFundBriefReport
 from kunjin.brief.policy import HeldFundBriefPolicyV1
 from kunjin.brief.portfolio import PortfolioObservationResult
 from kunjin.brief.research import build_owner_report, build_snapshot
@@ -252,6 +252,21 @@ class HeldFundBriefService:
         mode: RequestMode = RequestMode.RAPID,
         latest_expected_data_as_of: Optional[datetime] = None,
     ) -> HeldFundBriefReport:
+        return self.brief_outcome(
+            fund_code,
+            action=action,
+            mode=mode,
+            latest_expected_data_as_of=latest_expected_data_as_of,
+        ).report
+
+    def brief_outcome(
+        self,
+        fund_code: str,
+        *,
+        action: ActionKind,
+        mode: RequestMode = RequestMode.RAPID,
+        latest_expected_data_as_of: Optional[datetime] = None,
+    ) -> HeldFundBriefOutcome:
         self._validate_request(fund_code, action, mode, latest_expected_data_as_of)
         budget = RequestBudget.create(
             mode,
@@ -411,7 +426,7 @@ class HeldFundBriefService:
                 else RequestTerminalStatus.COMPLETE
             )
             finished_at = self._current_time(budget, not_before=as_of)
-            owner_report: list[HeldFundBriefReport] = []
+            outcomes: list[HeldFundBriefOutcome] = []
 
             def snapshot_factory(run_id: int, decision_id: int):
                 snapshot = build_snapshot(
@@ -422,7 +437,13 @@ class HeldFundBriefService:
                     d2=d2,
                     evaluation=evaluation,
                 )
-                owner_report.append(build_owner_report(snapshot, d2))
+                outcome = HeldFundBriefOutcome(
+                    build_owner_report(snapshot, d2),
+                    terminal_status,
+                    terminal_omitted,
+                )
+                outcome.validate()
+                outcomes.append(outcome)
                 return snapshot
 
             self._brief_store.publish(
@@ -439,9 +460,9 @@ class HeldFundBriefService:
                 budget=budget,
             )
             completed.add("brief_publication")
-            if len(owner_report) != 1:
-                raise HeldFundBriefServiceError("owner report publication binding failed")
-            return owner_report[0]
+            if len(outcomes) != 1 or type(outcomes[0]) is not HeldFundBriefOutcome:
+                raise HeldFundBriefServiceError("brief outcome publication binding failed")
+            return outcomes[0]
         except BudgetExpired:
             status = self._budget_terminal_status(budget)
             self._finalize_unpublished(

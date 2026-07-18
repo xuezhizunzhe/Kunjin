@@ -33,6 +33,7 @@ from kunjin.cli import (
 from kunjin.decision.budget import RequestBudget
 from kunjin.decision.health import SourceHealthService
 from kunjin.decision.models import (
+    ActionKind,
     ForceReasonCode,
     RequestFieldResolution,
     RequestMode,
@@ -1615,6 +1616,32 @@ class CliIntegrationTest(unittest.TestCase):
             context.decision_service._registry,
             context.source_health_service.registry,
         )
+        self.assertIsNotNone(context.brief_service)
+        self.assertIs(context.brief_service._repository, context.repository)
+        self.assertIs(context.brief_service._suitability_service, context.suitability_service)
+        self.assertIs(
+            context.brief_service._disclosure_service,
+            context.fund_disclosure_service,
+        )
+        self.assertIs(
+            context.brief_service._portfolio_service.sync_service,
+            context.sync_service,
+        )
+        self.assertIs(
+            context.brief_service._portfolio_service.repository,
+            context.repository,
+        )
+        self.assertIs(context.brief_service._nav_service.repository, context.repository)
+        self.assertIs(
+            context.brief_service._audit_store,
+            context.source_health_service.audit_store,
+        )
+        self.assertIs(
+            context.brief_service._health_service,
+            context.source_health_service,
+        )
+        self.assertIs(context.brief_service._risk_store, context.fund_risk_store)
+        self.assertIsNone(context.brief_service._announcement_content_loader)
         for forbidden_dependency in (
             "_profile_service",
             "_suitability_service",
@@ -1934,6 +1961,508 @@ class CliIntegrationTest(unittest.TestCase):
                     self.assertNotIn(sentinel, rendered)
                     self.assertNotIn("918273645001", rendered)
                     self.assertNotIn("secret-traceback", rendered)
+
+    def test_fund_brief_exact_json_invocation_is_thin_and_amount_free(self) -> None:
+        report = object()
+
+        class BriefService:
+            def __init__(inner_self) -> None:
+                inner_self.calls = []
+
+            def brief_outcome(inner_self, fund_code, *, action, mode):
+                inner_self.calls.append((fund_code, action, mode))
+                return report
+
+        service = BriefService()
+        self.context.brief_service = service
+        projected = {
+            "request": {
+                "action_ids": ["fact_research", "continue_holding"],
+                "omitted_work": ["official_announcements"],
+                "terminal_status": "partial",
+            },
+            "subject": {"fund_code": "519755"},
+            "sync_status": {"state": "partial"},
+            "decision_evidence_status": {"state": "insufficient"},
+        }
+
+        with patch(
+            "kunjin.brief.research.public_outcome_payload",
+            return_value=projected,
+        ) as projector:
+            payload, exit_code, json_output = run(
+                [
+                    "--json",
+                    "fund",
+                    "brief",
+                    "519755",
+                    "--action",
+                    "continue_holding",
+                    "--mode",
+                    "rapid",
+                ],
+                self.context,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "fund.brief")
+        self.assertEqual(payload["data"], projected)
+        self.assertEqual(payload["data"]["request"]["terminal_status"], "partial")
+        self.assertEqual(
+            payload["data"]["request"]["omitted_work"],
+            ["official_announcements"],
+        )
+        self.assertEqual(payload["data"]["sync_status"]["state"], "partial")
+        self.assertEqual(
+            payload["data"]["decision_evidence_status"]["state"],
+            "insufficient",
+        )
+        self.assertEqual(
+            service.calls,
+            [("519755", ActionKind.CONTINUE_HOLDING, RequestMode.RAPID)],
+        )
+        projector.assert_called_once_with(report)
+
+    def test_fund_brief_supports_all_owner_actions_and_switch(self) -> None:
+        class BriefService:
+            def __init__(inner_self) -> None:
+                inner_self.calls = []
+
+            def brief_outcome(inner_self, fund_code, *, action, mode):
+                inner_self.calls.append((fund_code, action, mode))
+                return object()
+
+        service = BriefService()
+        self.context.brief_service = service
+        expected_actions = {
+            "continue_holding": ["fact_research", "continue_holding"],
+            "reduce_to_cash": ["fact_research", "reduce_to_cash"],
+            "full_exit": ["fact_research", "full_exit"],
+            "switch_funds": ["fact_research", "switch_reduce", "switch_buy"],
+        }
+        for action, action_ids in expected_actions.items():
+            with (
+                self.subTest(action=action),
+                patch(
+                    "kunjin.brief.research.public_outcome_payload",
+                    return_value={
+                        "request": {
+                            "action_ids": action_ids,
+                            "omitted_work": [],
+                            "terminal_status": "complete",
+                        }
+                    },
+                ),
+            ):
+                payload, exit_code, _ = run(
+                    ["--json", "fund", "brief", "519755", "--action", action],
+                    self.context,
+                )
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(payload["data"]["request"]["action_ids"], action_ids)
+
+        self.assertEqual(
+            [item[1] for item in service.calls],
+            [
+                ActionKind.CONTINUE_HOLDING,
+                ActionKind.REDUCE_TO_CASH,
+                ActionKind.FULL_EXIT,
+                ActionKind.SWITCH_FUNDS,
+            ],
+        )
+
+    def test_fund_brief_deep_mode_is_explicitly_forwarded(self) -> None:
+        class BriefService:
+            def __init__(inner_self) -> None:
+                inner_self.calls = []
+
+            def brief_outcome(inner_self, fund_code, *, action, mode):
+                inner_self.calls.append((fund_code, action, mode))
+                return object()
+
+        service = BriefService()
+        self.context.brief_service = service
+        with patch(
+            "kunjin.brief.research.public_outcome_payload",
+            return_value={
+                "request": {
+                    "action_ids": ["fact_research", "full_exit"],
+                    "mode": "deep",
+                    "omitted_work": [],
+                    "terminal_status": "complete",
+                }
+            },
+        ):
+            payload, exit_code, _ = run(
+                [
+                    "--json",
+                    "fund",
+                    "brief",
+                    "519755",
+                    "--action",
+                    "full_exit",
+                    "--mode",
+                    "deep",
+                ],
+                self.context,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["request"]["mode"], "deep")
+        self.assertEqual(
+            service.calls,
+            [("519755", ActionKind.FULL_EXIT, RequestMode.DEEP)],
+        )
+
+    def test_fund_brief_rejects_non_json_invalid_code_action_and_mode(self) -> None:
+        self.context.brief_service = SimpleNamespace(
+            brief_outcome=lambda *_args, **_kwargs: object()
+        )
+        cases = (
+            (
+                ["fund", "brief", "519755", "--action", "continue_holding"],
+                "invalid_arguments",
+            ),
+            (
+                ["--json", "fund", "brief", "51975", "--action", "continue_holding"],
+                "invalid_fund_code",
+            ),
+            (
+                [
+                    "--json",
+                    "fund",
+                    "brief",
+                    "\uff11\uff12\uff13\uff14\uff15\uff16",
+                    "--action",
+                    "continue_holding",
+                ],
+                "invalid_fund_code",
+            ),
+            (
+                ["--json", "fund", "brief", "519755", "--action", "buy_or_add"],
+                "invalid_arguments",
+            ),
+            (
+                [
+                    "--json",
+                    "fund",
+                    "brief",
+                    "519755",
+                    "--action",
+                    "continue_holding",
+                    "--mode",
+                    "overnight",
+                ],
+                "invalid_arguments",
+            ),
+        )
+        for argv, expected_code in cases:
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, "fund.brief")
+                self.assertEqual(payload["errors"][0]["code"], expected_code)
+
+    def test_fund_brief_technical_failure_is_nonzero_and_sanitized(self) -> None:
+        private = (
+            "access_token=never-print-this amount=918273645001 "
+            f"managed_path={self.context.paths.database}"
+        )
+
+        class FailingBriefService:
+            def brief_outcome(inner_self, *_args, **_kwargs):
+                raise RuntimeError(private)
+
+        self.context.brief_service = FailingBriefService()
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "fund",
+                "brief",
+                "519755",
+                "--action",
+                "continue_holding",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "fund.brief")
+        self.assertEqual(
+            payload["errors"],
+            [
+                {
+                    "code": "fund_brief_failed",
+                    "message": "held fund brief failed",
+                }
+            ],
+        )
+        rendered = json.dumps(payload)
+        for value in ("never-print-this", "918273645001", str(self.context.paths.database)):
+            self.assertNotIn(value, rendered)
+
+        self.context.brief_service = SimpleNamespace(
+            brief_outcome=lambda *_args, **_kwargs: object()
+        )
+        with patch(
+            "kunjin.brief.research.public_outcome_payload",
+            side_effect=ValueError(private),
+        ):
+            projection, projection_exit, _ = run(
+                [
+                    "--json",
+                    "fund",
+                    "brief",
+                    "519755",
+                    "--action",
+                    "continue_holding",
+                ],
+                self.context,
+            )
+        self.assertEqual(projection_exit, 1)
+        self.assertEqual(projection["errors"], payload["errors"])
+        self.assertNotIn(private, json.dumps(projection))
+
+    def test_fund_brief_system_exit_is_nonzero_json_and_sanitized(self) -> None:
+        private = "access_token=never-print-this managed_path=/private/tmp/secret"
+        for exit_value in (0, 2, private):
+            with self.subTest(exit_value=exit_value):
+
+                class ExitingBriefService:
+                    def brief_outcome(inner_self, *_args, **_kwargs):
+                        raise SystemExit(exit_value)
+
+                self.context.brief_service = ExitingBriefService()
+                payload, exit_code, json_output = run(
+                    [
+                        "--json",
+                        "fund",
+                        "brief",
+                        "519755",
+                        "--action",
+                        "continue_holding",
+                    ],
+                    self.context,
+                )
+
+                self.assertTrue(json_output)
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, "fund.brief")
+                self.assertEqual(
+                    payload["errors"],
+                    [
+                        {
+                            "code": "fund_brief_failed",
+                            "message": "held fund brief failed",
+                        }
+                    ],
+                )
+                self.assertNotIn("never-print-this", json.dumps(payload))
+                self.assertNotIn("/private/tmp/secret", json.dumps(payload))
+
+    def test_fund_brief_keyboard_interrupt_is_not_disguised_as_json(self) -> None:
+        class InterruptedBriefService:
+            def brief_outcome(inner_self, *_args, **_kwargs):
+                raise KeyboardInterrupt
+
+        self.context.brief_service = InterruptedBriefService()
+        with self.assertRaises(KeyboardInterrupt):
+            run(
+                [
+                    "--json",
+                    "fund",
+                    "brief",
+                    "519755",
+                    "--action",
+                    "continue_holding",
+                ],
+                self.context,
+            )
+
+    def test_fund_brief_has_no_private_or_expansive_options(self) -> None:
+        self.context.brief_service = SimpleNamespace(
+            brief_outcome=lambda *_args, **_kwargs: object()
+        )
+        forbidden = (
+            "--amount",
+            "--shares",
+            "--date",
+            "--url",
+            "--path",
+            "--token",
+            "--adapter",
+            "--docker",
+            "--background",
+        )
+        for option in forbidden:
+            private = "never-print-this"
+            with self.subTest(option=option):
+                payload, exit_code, _ = run(
+                    [
+                        "--json",
+                        "fund",
+                        "brief",
+                        "519755",
+                        "--action",
+                        "continue_holding",
+                        option,
+                        private,
+                    ],
+                    self.context,
+                )
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, "fund.brief")
+                self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+                self.assertNotIn(private, json.dumps(payload))
+
+    def test_fund_brief_valid_business_states_remain_successful(self) -> None:
+        cases = (
+            ("current_holding", "continue_holding", "complete", (), "complete", "partial", "watch"),
+            (
+                "auth_missing",
+                "continue_holding",
+                "partial",
+                ("personal_position_observation",),
+                "partial",
+                "insufficient",
+                "abstain",
+            ),
+            (
+                "phase_b_blocked",
+                "continue_holding",
+                "complete",
+                (),
+                "complete",
+                "partial",
+                "no_add",
+            ),
+            (
+                "partial_profile",
+                "continue_holding",
+                "partial",
+                ("identity_profile",),
+                "partial",
+                "insufficient",
+                "abstain",
+            ),
+            (
+                "unsupported_holdings",
+                "continue_holding",
+                "partial",
+                ("holdings_industries",),
+                "partial",
+                "insufficient",
+                "watch",
+            ),
+            (
+                "liquidation",
+                "continue_holding",
+                "complete",
+                (),
+                "complete",
+                "partial",
+                "reduce_or_exit_review",
+            ),
+            ("no_thesis", "continue_holding", "complete", (), "complete", "partial", "watch"),
+            (
+                "active_thesis_fail_closed",
+                "continue_holding",
+                "partial",
+                ("thesis_review",),
+                "complete",
+                "insufficient",
+                "watch",
+            ),
+            (
+                "reduce",
+                "reduce_to_cash",
+                "complete",
+                (),
+                "complete",
+                "partial",
+                "reduce_or_exit_review",
+            ),
+            (
+                "exit",
+                "full_exit",
+                "complete",
+                (),
+                "complete",
+                "partial",
+                "reduce_or_exit_review",
+            ),
+            (
+                "switch",
+                "switch_funds",
+                "partial",
+                ("switch_buy_evidence",),
+                "partial",
+                "insufficient",
+                "abstain",
+            ),
+        )
+        for (
+            scenario,
+            action,
+            terminal_status,
+            omitted_work,
+            sync_state,
+            decision_state,
+            primary_state,
+        ) in cases:
+            with self.subTest(scenario=scenario):
+                self.context.brief_service = SimpleNamespace(
+                    brief_outcome=lambda *_args, **_kwargs: object()
+                )
+                projected = {
+                    "request": {
+                        "terminal_status": terminal_status,
+                        "omitted_work": list(omitted_work),
+                    },
+                    "sync_status": {"state": sync_state},
+                    "decision_evidence_status": {"state": decision_state},
+                    "action_interpretation": {"primary_state": primary_state},
+                }
+                with patch(
+                    "kunjin.brief.research.public_outcome_payload",
+                    return_value=projected,
+                ):
+                    payload, exit_code, _ = run(
+                        ["--json", "fund", "brief", "519755", "--action", action],
+                        self.context,
+                    )
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(payload["errors"], [])
+                self.assertEqual(payload["data"], projected)
+
+    def test_fund_brief_missing_service_is_a_fixed_usage_error(self) -> None:
+        self.context.brief_service = None
+
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "fund",
+                "brief",
+                "519755",
+                "--action",
+                "continue_holding",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "fund.brief")
+        self.assertEqual(
+            payload["errors"],
+            [
+                {
+                    "code": "invalid_arguments",
+                    "message": "held fund brief service is unavailable",
+                }
+            ],
+        )
 
     def test_allocation_amount_free_boundary_rejects_malicious_service_values(self) -> None:
         sentinel = "private-goal-918273645001"

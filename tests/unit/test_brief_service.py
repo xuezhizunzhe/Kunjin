@@ -9,12 +9,14 @@ from types import SimpleNamespace
 import pytest
 
 from kunjin.brief.d2 import PortfolioEvidenceBinding
+from kunjin.brief.models import HeldFundBriefOutcome
 from kunjin.brief.nav import NavSyncResult
 from kunjin.brief.portfolio import PortfolioObservationResult
 from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.models import (
     ActionKind,
     RequestMode,
+    RequestTerminalStatus,
     SourceAttempt,
     SourceAttemptOutcome,
 )
@@ -408,6 +410,61 @@ def test_complete_requires_empty_omitted_work(tmp_path: Path) -> None:
     assert run["omitted_work_json"] == "[]"
 
 
+def test_brief_outcome_returns_authenticated_complete_terminal_contract(tmp_path: Path) -> None:
+    _repository_value, _audit, script, service = _service(
+        tmp_path,
+        all_sources_complete=True,
+    )
+
+    outcome = service.brief_outcome(
+        FUND_CODE,
+        action=ActionKind.CONTINUE_HOLDING,
+        mode=RequestMode.RAPID,
+    )
+
+    outcome.validate()
+    assert outcome.terminal_status is RequestTerminalStatus.COMPLETE
+    assert outcome.omitted_work == ()
+    assert len(script.calls) == 6
+
+
+def test_brief_outcome_returns_authenticated_partial_terminal_contract(tmp_path: Path) -> None:
+    _repository_value, _audit, script, service = _service(tmp_path)
+
+    outcome = service.brief_outcome(
+        FUND_CODE,
+        action=ActionKind.CONTINUE_HOLDING,
+        mode=RequestMode.RAPID,
+    )
+
+    outcome.validate()
+    assert outcome.terminal_status is RequestTerminalStatus.PARTIAL
+    assert outcome.omitted_work
+    assert len(script.calls) == 6
+
+
+def test_compatible_brief_executes_once_and_returns_outcome_report(tmp_path: Path) -> None:
+    _repository_value, _audit, script, service = _service(tmp_path)
+    original = service.brief_outcome
+    outcomes = []
+
+    def counted(*args, **kwargs):
+        outcome = original(*args, **kwargs)
+        outcomes.append(outcome)
+        return outcome
+
+    service.brief_outcome = counted
+    report = service.brief(
+        FUND_CODE,
+        action=ActionKind.CONTINUE_HOLDING,
+        mode=RequestMode.RAPID,
+    )
+
+    assert len(outcomes) == 1
+    assert report is outcomes[0].report
+    assert len(script.calls) == 6
+
+
 def test_budget_cancellation_stops_after_current_source(tmp_path: Path) -> None:
     repository, _audit, script, service = _service(
         tmp_path,
@@ -603,6 +660,40 @@ def test_final_publish_failure_rolls_back_and_preserves_prior_snapshot(
     history = service._brief_store.history(FUND_CODE)
     assert len(history) == 1
     assert history[0].snapshot == first.snapshot
+    with repository.connect() as connection:
+        runs = connection.execute("SELECT status FROM request_runs ORDER BY id").fetchall()
+        decisions = connection.execute("SELECT COUNT(*) FROM decision_snapshots").fetchone()[0]
+        briefs = connection.execute("SELECT COUNT(*) FROM fund_brief_snapshots").fetchone()[0]
+    assert [row["status"] for row in runs] == ["partial", "failed"]
+    assert decisions == 1
+    assert briefs == 1
+
+
+def test_outcome_validation_failure_rolls_back_and_preserves_prior_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, _audit, _script, service = _service(tmp_path)
+    first = service.brief_outcome(
+        FUND_CODE,
+        action=ActionKind.CONTINUE_HOLDING,
+        mode=RequestMode.RAPID,
+    )
+
+    def reject_outcome(_outcome) -> None:
+        raise ValueError("scripted outcome validation failure")
+
+    monkeypatch.setattr(HeldFundBriefOutcome, "validate", reject_outcome)
+    with pytest.raises(Exception, match="held fund brief failed"):
+        service.brief_outcome(
+            FUND_CODE,
+            action=ActionKind.CONTINUE_HOLDING,
+            mode=RequestMode.RAPID,
+        )
+
+    history = service._brief_store.history(FUND_CODE)
+    assert len(history) == 1
+    assert history[0].snapshot == first.report.snapshot
     with repository.connect() as connection:
         runs = connection.execute("SELECT status FROM request_runs ORDER BY id").fetchall()
         decisions = connection.execute("SELECT COUNT(*) FROM decision_snapshots").fetchone()[0]

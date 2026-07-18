@@ -16,6 +16,7 @@ from kunjin.brief.models import (
     BriefResolutionBinding,
     BriefSnapshot,
     BriefState,
+    HeldFundBriefOutcome,
     HeldFundBriefReport,
     OfficialEvent,
     OfficialEventCode,
@@ -37,6 +38,7 @@ from kunjin.decision.models import (
     EvidenceFreshness,
     RequestFieldResolution,
     RequestMode,
+    RequestTerminalStatus,
     SourceFieldState,
     SourceTier,
 )
@@ -594,6 +596,64 @@ def test_snapshot_is_canonical_ascii_and_owner_overlay_is_ephemeral() -> None:
     report.validate()
     assert report.to_canonical_dict()["owner_overlay"]["portfolio_weight"] == "0.125"
     assert report.persisted_checksum() == snapshot.checksum()
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "omitted_work"),
+    (
+        (RequestTerminalStatus.COMPLETE, ()),
+        (RequestTerminalStatus.PARTIAL, ("formal_nav",)),
+    ),
+)
+def test_held_fund_brief_outcome_accepts_exact_terminal_contract(
+    terminal_status: RequestTerminalStatus,
+    omitted_work: tuple[str, ...],
+) -> None:
+    report = HeldFundBriefReport(snapshot=_snapshot())
+    outcome = HeldFundBriefOutcome(report, terminal_status, omitted_work)
+
+    outcome.validate()
+    assert outcome.report is report
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "omitted_work", "message"),
+    (
+        (RequestTerminalStatus.COMPLETE, ("formal_nav",), "inconsistent"),
+        (RequestTerminalStatus.PARTIAL, (), "inconsistent"),
+        (RequestTerminalStatus.FAILED, ("formal_nav",), "complete or partial"),
+        (RequestTerminalStatus.PARTIAL, ["formal_nav"], "exact tuple"),
+        (RequestTerminalStatus.PARTIAL, ("formal_nav", "formal_nav"), "duplicates"),
+        (RequestTerminalStatus.PARTIAL, ("shares",), "private"),
+    ),
+)
+def test_held_fund_brief_outcome_rejects_invalid_or_private_omissions(
+    terminal_status: RequestTerminalStatus,
+    omitted_work: object,
+    message: str,
+) -> None:
+    outcome = HeldFundBriefOutcome(
+        HeldFundBriefReport(snapshot=_snapshot()),
+        terminal_status,
+        omitted_work,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        outcome.validate()
+
+
+def test_held_fund_brief_outcome_requires_exact_record_types() -> None:
+    class OutcomeSubclass(HeldFundBriefOutcome):
+        pass
+
+    report = HeldFundBriefReport(snapshot=_snapshot())
+    with pytest.raises(ValueError, match="exact HeldFundBriefOutcome"):
+        OutcomeSubclass(report, RequestTerminalStatus.COMPLETE, ()).validate()
+
+    outcome = HeldFundBriefOutcome(report, RequestTerminalStatus.COMPLETE, ())
+    object.__setattr__(outcome, "report", object())
+    with pytest.raises(ValueError, match="exact HeldFundBriefReport"):
+        outcome.validate()
 
 
 def test_nested_public_maps_are_defensively_frozen() -> None:

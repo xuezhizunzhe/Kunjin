@@ -152,6 +152,40 @@ class SmokeTest(unittest.TestCase):
         self.assertNotIn("sync daily completes within 90 seconds", cli)
         self.assertNotIn("fund peers completes within 480 seconds", cli)
 
+    def test_fund_brief_cli_surface_is_json_only_and_bounded(self) -> None:
+        parser = build_parser()
+        parsed = parser.parse_args(
+            [
+                "--json",
+                "fund",
+                "brief",
+                "519755",
+                "--action",
+                "continue_holding",
+                "--mode",
+                "rapid",
+            ]
+        )
+
+        self.assertTrue(parsed.json_output)
+        self.assertEqual(parsed.command, "fund")
+        self.assertEqual(parsed.fund_command, "brief")
+        self.assertEqual(parsed.fund_code, "519755")
+        self.assertEqual(parsed.action, "continue_holding")
+        self.assertEqual(parsed.mode, "rapid")
+        for forbidden in (
+            "amount",
+            "shares",
+            "date",
+            "url",
+            "path",
+            "token",
+            "adapter",
+            "docker",
+            "background",
+        ):
+            self.assertFalse(hasattr(parsed, forbidden))
+
     def test_phase0_acceptance_script_has_bounded_amount_free_contract(self) -> None:
         root = Path(__file__).resolve().parents[1]
         script_path = root / "scripts" / "run_phase0_acceptance.sh"

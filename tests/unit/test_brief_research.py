@@ -14,6 +14,7 @@ from kunjin.brief.models import (
     BriefEvidenceState,
     BriefFact,
     BriefState,
+    HeldFundBriefOutcome,
     HeldFundBriefReport,
     OfficialEvent,
     OfficialEventCode,
@@ -25,6 +26,7 @@ from kunjin.brief.research import (
     _merge_facts,
     build_owner_report,
     build_snapshot,
+    public_outcome_payload,
     public_payload,
 )
 from kunjin.decision.budget import RequestBudget
@@ -34,6 +36,7 @@ from kunjin.decision.models import (
     EvidenceCompleteness,
     EvidenceFreshness,
     RequestMode,
+    RequestTerminalStatus,
     SourceAttempt,
     SourceAttemptOutcome,
     SourceTier,
@@ -350,6 +353,58 @@ def test_owner_weight_is_ephemeral_and_payload_has_exact_sections(tmp_path) -> N
     assert payload["decision_evidence_status"] == (
         snapshot.decision_evidence_status.to_canonical_dict()
     )
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "omitted_work"),
+    (
+        (RequestTerminalStatus.COMPLETE, ()),
+        (RequestTerminalStatus.PARTIAL, ("formal_nav", "official_announcements")),
+    ),
+)
+def test_public_outcome_payload_adds_exact_terminal_request_schema(
+    tmp_path,
+    terminal_status,
+    omitted_work,
+) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    report = build_owner_report(snapshot, d2)
+    legacy_payload = public_payload(report)
+    payload = public_outcome_payload(HeldFundBriefOutcome(report, terminal_status, omitted_work))
+
+    assert tuple(payload) == TOP_LEVEL_KEYS
+    assert tuple(payload["request"]) == (
+        "action_ids",
+        "created_at",
+        "decision_snapshot_id",
+        "evidence_fingerprint",
+        "mode",
+        "request_run_id",
+        "result_checksum",
+        "terminal_status",
+        "omitted_work",
+    )
+    assert payload["request"]["terminal_status"] == terminal_status.value
+    assert payload["request"]["omitted_work"] == list(omitted_work)
+    assert "terminal_status" not in payload["sync_status"]
+    assert "terminal_status" not in payload["decision_evidence_status"]
+    assert {key: payload[key] for key in payload if key != "request"} == {
+        key: legacy_payload[key] for key in legacy_payload if key != "request"
+    }
+
+
+def test_public_outcome_payload_requires_an_exact_valid_outcome(tmp_path) -> None:
+    _, _, d2, _, snapshot = _bundle(tmp_path)
+    outcome = HeldFundBriefOutcome(
+        build_owner_report(snapshot, d2),
+        RequestTerminalStatus.PARTIAL,
+        ("shares",),
+    )
+
+    with pytest.raises(ValueError, match="private"):
+        public_outcome_payload(outcome)
+    with pytest.raises(ValueError, match="exact HeldFundBriefOutcome"):
+        public_outcome_payload(object())
 
 
 def test_watch_headline_is_conditional_and_not_a_trade_instruction(tmp_path) -> None:

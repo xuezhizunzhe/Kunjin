@@ -18,6 +18,7 @@ from kunjin.decision.models import (
     EvidenceFreshness,
     RequestFieldResolution,
     RequestMode,
+    RequestTerminalStatus,
     SourceFieldState,
     SourceTier,
     canonical_decimal,
@@ -1306,3 +1307,28 @@ class HeldFundBriefReport:
     def persisted_checksum(self) -> str:
         self.validate()
         return self.snapshot.checksum()
+
+
+@dataclass(frozen=True)
+class HeldFundBriefOutcome:
+    report: HeldFundBriefReport
+    terminal_status: RequestTerminalStatus
+    omitted_work: Tuple[str, ...]
+
+    def validate(self) -> None:
+        _validate_exact_record(self, HeldFundBriefOutcome, "held fund brief outcome")
+        if type(self.report) is not HeldFundBriefReport:
+            raise ValueError("outcome report must be an exact HeldFundBriefReport")
+        self.report.validate()
+        if type(self.terminal_status) is not RequestTerminalStatus or self.terminal_status not in {
+            RequestTerminalStatus.COMPLETE,
+            RequestTerminalStatus.PARTIAL,
+        }:
+            raise ValueError("outcome terminal status must be complete or partial")
+        validate_identifier_tuple(self.omitted_work, "outcome omitted work")
+        if any(_is_private_path(item) for item in self.omitted_work):
+            raise ValueError("outcome omitted work contains a private path")
+        if (self.terminal_status is RequestTerminalStatus.COMPLETE and self.omitted_work) or (
+            self.terminal_status is RequestTerminalStatus.PARTIAL and not self.omitted_work
+        ):
+            raise ValueError("outcome terminal status and omitted work are inconsistent")
