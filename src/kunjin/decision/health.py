@@ -64,6 +64,10 @@ _REGISTRY_POLICY_REQUIREMENT_V1 = {
     "holdings_industries": "holdings_industries",
     "identity_active_status": "identity_active_status",
     "market_context": "news_media_context",
+    "market_dimensions": "news_media_context",
+    "policy_events": "news_media_context",
+    "fund_media_events": "news_media_context",
+    "fund_official_events": "fund_manager_product_announcement",
     "personal_position_observation": "personal_position",
     "transaction_availability_limits_cutoff": (
         "transaction_availability_limits_cutoff"

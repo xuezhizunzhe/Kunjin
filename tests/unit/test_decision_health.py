@@ -455,6 +455,10 @@ def test_every_registry_field_has_an_explicit_policy_requirement_binding(tmp_pat
         "holdings_industries": "holdings_industries",
         "identity_active_status": "identity_active_status",
         "market_context": "news_media_context",
+        "market_dimensions": "news_media_context",
+        "policy_events": "news_media_context",
+        "fund_media_events": "news_media_context",
+        "fund_official_events": "fund_manager_product_announcement",
         "personal_position_observation": "personal_position",
         "transaction_availability_limits_cutoff": (
             "transaction_availability_limits_cutoff"
@@ -479,6 +483,27 @@ def test_tier2_market_context_cannot_independently_authorize_an_action(tmp_path)
     freshness = {
         "query_window_start": NOW - timedelta(hours=1),
         "query_window_end": NOW,
+    }
+    assert harness.resolve(identity, **freshness) is RequestFieldResolution.USABLE
+    assert harness.resolve(
+        identity,
+        action=ActionKind.CONTINUE_HOLDING,
+        risk_effect=RiskEffect.RISK_MAINTAINING,
+        **freshness,
+    ) is RequestFieldResolution.PARTIAL
+
+
+def test_tier2_fund_media_cannot_independently_authorize_an_action(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+    identity = ("stcn_fund_news", "fund_media_events")
+    harness.record(identity=identity, finished_at=NOW, data_as_of=NOW)
+
+    freshness = {
+        "query_window_start": NOW - timedelta(hours=1),
+        "query_window_end": NOW,
+        "correction_retraction_check_complete": True,
+        "correction_retraction_found": False,
+        "correction_retraction_checked_at": NOW,
     }
     assert harness.resolve(identity, **freshness) is RequestFieldResolution.USABLE
     assert harness.resolve(

@@ -16,7 +16,7 @@ EVIDENCE_POLICY_V1_GOLDEN_CHECKSUM = (
     "6be880169a65dbaecfd75ba21250afea247320df033e37694feb4168505dd3fe"
 )
 SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM = (
-    "1893c53c2f8211d429f5a3b87ac579c7800e6a47b58470a952f7ad91c070db7e"
+    "c876085a132026afab288a0a7022b7b29389fe36de4bcf9dba85a204c986953e"
 )
 
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -126,6 +126,8 @@ class SourceErrorCode(str, Enum):
     NETWORK_TIMEOUT = "network_timeout"
     SOURCE_UNAVAILABLE = "source_unavailable"
     HTTP_4XX = "http_4xx"
+    HTTP_RATE_LIMITED = "http_rate_limited"
+    HTTP_5XX = "http_5xx"
     UNSAFE_URL = "unsafe_url"
     UNSAFE_REDIRECT = "unsafe_redirect"
     OVERSIZED_RESPONSE = "oversized_response"
@@ -148,6 +150,8 @@ TRANSIENT_SOURCE_ERRORS = frozenset(
         SourceErrorCode.DNS_FAILURE,
         SourceErrorCode.TRANSIENT_NETWORK_FAILURE,
         SourceErrorCode.NETWORK_TIMEOUT,
+        SourceErrorCode.HTTP_RATE_LIMITED,
+        SourceErrorCode.HTTP_5XX,
     )
 )
 UNAVAILABLE_SOURCE_ERRORS = frozenset(
@@ -220,6 +224,8 @@ V1_SOURCE_TIERS = (
     ("eastmoney_nav", SourceTier.TIER_2),
     ("eastmoney_market", SourceTier.TIER_2),
     ("fund_manager_official_documents", SourceTier.TIER_1),
+    ("gov_cn_policy", SourceTier.TIER_1),
+    ("stcn_fund_news", SourceTier.TIER_2),
     ("yangjibao_portfolio_observation", SourceTier.PRIVATE_OBSERVATION),
 )
 V1_SOURCE_FIELD_IDENTITIES = frozenset(
@@ -232,6 +238,7 @@ V1_SOURCE_FIELD_IDENTITIES = frozenset(
         ("eastmoney_nav", "formal_nav"),
         ("eastmoney_nav", "adjusted_return_series"),
         ("eastmoney_market", "market_context"),
+        ("eastmoney_market", "market_dimensions"),
         ("fund_manager_official_documents", "identity_active_status"),
         ("fund_manager_official_documents", "current_manager_team"),
         ("fund_manager_official_documents", "fees_share_class_relationship"),
@@ -243,6 +250,9 @@ V1_SOURCE_FIELD_IDENTITIES = frozenset(
         ),
         ("fund_manager_official_documents", "formal_nav"),
         ("fund_manager_official_documents", "adjusted_return_series"),
+        ("fund_manager_official_documents", "fund_official_events"),
+        ("gov_cn_policy", "policy_events"),
+        ("stcn_fund_news", "fund_media_events"),
         ("yangjibao_portfolio_observation", "personal_position_observation"),
         ("yangjibao_portfolio_observation", "transaction_channel_observation"),
     )

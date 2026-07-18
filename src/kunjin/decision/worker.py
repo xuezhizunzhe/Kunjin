@@ -41,10 +41,12 @@ _PHASE0_RUN_ID_ENV = "KUNJIN_PHASE0_RUN_ID"
 PUBLIC_WORKER_ENV = "public"
 PRIVATE_KEYCHAIN_WORKER_ENV = "private_keychain"
 _PUBLIC_WORKER_MODULE = "kunjin.decision.worker_main"
+_INTELLIGENCE_PUBLIC_WORKER_MODULE = "kunjin.intelligence.worker_main"
 _PRIVATE_KEYCHAIN_WORKER_MODULE = "kunjin.brief.portfolio_worker_main"
 _WORKER_TARGETS = frozenset(
     {
         (_PUBLIC_WORKER_MODULE, PUBLIC_WORKER_ENV),
+        (_INTELLIGENCE_PUBLIC_WORKER_MODULE, PUBLIC_WORKER_ENV),
         (_PRIVATE_KEYCHAIN_WORKER_MODULE, PRIVATE_KEYCHAIN_WORKER_ENV),
     }
 )
@@ -112,6 +114,7 @@ class WorkerExecutionError(RuntimeError):
 def _validate_worker_module(value: str) -> str:
     if type(value) is not str or value not in {
         _PUBLIC_WORKER_MODULE,
+        _INTELLIGENCE_PUBLIC_WORKER_MODULE,
         _PRIVATE_KEYCHAIN_WORKER_MODULE,
     }:
         raise ValueError("worker module is invalid")

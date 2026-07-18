@@ -24,6 +24,8 @@ SOURCE_IDS = (
     "eastmoney_nav",
     "eastmoney_market",
     "fund_manager_official_documents",
+    "gov_cn_policy",
+    "stcn_fund_news",
     "yangjibao_portfolio_observation",
 )
 
@@ -235,6 +237,24 @@ def _build_sources() -> Tuple[SourcePolicy, ...]:
                         unsupported="current market interpretation",
                     ),
                 ),
+                SourceFieldPolicy(
+                    "market_dimensions",
+                    SourceTier.TIER_2,
+                    FreshnessRule(
+                        FreshnessKind.QUERY_WINDOW,
+                        maximum_age_seconds=2 * 60 * 60,
+                        dated_history_fallback_seconds=365 * _DAY,
+                    ),
+                    "dated market and sector trend, breadth, flow, and crowding dimensions",
+                    (),
+                    _supplementation(
+                        "market_dimensions",
+                        location="dated exchange, index-provider, or market-data page",
+                        freshness="inside query window and within 2 hours for current",
+                        supported="fund facts and portfolio structure analysis",
+                        unsupported="current market or sector direction",
+                    ),
+                ),
             ),
         ),
         SourcePolicy(
@@ -358,6 +378,62 @@ def _build_sources() -> Tuple[SourcePolicy, ...]:
                         unsupported="current timing conclusion or adjusted-return correlation",
                     ),
                 ),
+                SourceFieldPolicy(
+                    "fund_official_events",
+                    SourceTier.TIER_1,
+                    _announcement(),
+                    "official fund event with correction and retraction status",
+                    (),
+                    _supplementation(
+                        "fund_official_events",
+                        location="official fund manager announcements or regulator disclosure",
+                        freshness="inside query window with correction and retraction check",
+                        supported="other independently evidenced fund facts",
+                        unsupported="conclusion affected by the unresolved official event gap",
+                    ),
+                ),
+            ),
+        ),
+        SourcePolicy(
+            source_id="gov_cn_policy",
+            source_kind="official_public_tier_1",
+            scope="current central-government policy events",
+            fields=(
+                SourceFieldPolicy(
+                    "policy_events",
+                    SourceTier.TIER_1,
+                    _announcement(),
+                    "official policy events with correction and retraction status",
+                    (),
+                    _supplementation(
+                        "policy_events",
+                        location="current China government policy page or official document",
+                        freshness="inside query window with correction and retraction check",
+                        supported="other independently evidenced market facts",
+                        unsupported="policy catalyst direction for the unresolved entity",
+                    ),
+                ),
+            ),
+        ),
+        SourcePolicy(
+            source_id="stcn_fund_news",
+            source_kind="attributed_public_tier_2",
+            scope="attributed public-fund media events and context",
+            fields=(
+                SourceFieldPolicy(
+                    "fund_media_events",
+                    SourceTier.TIER_2,
+                    _announcement(),
+                    "attributed fund-media events with original-source lineage",
+                    (),
+                    _supplementation(
+                        "fund_media_events",
+                        location="dated public financial-media URL or official original source",
+                        freshness="inside query window with correction and retraction check",
+                        supported="official facts and other independently evidenced context",
+                        unsupported="media-only action authorization or official fact promotion",
+                    ),
+                ),
             ),
         ),
         SourcePolicy(
@@ -416,6 +492,24 @@ def _build_sources() -> Tuple[SourcePolicy, ...]:
 class SourceRegistryV1:
     version: str = "1"
     sources: Tuple[SourcePolicy, ...] = field(default_factory=_build_sources)
+
+    @property
+    def source_ids(self) -> Tuple[str, ...]:
+        self.validate()
+        return tuple(source.source_id for source in self.sources)
+
+    def field(self, source_id: str, field_id: str) -> SourceFieldPolicy:
+        self.validate()
+        matches = tuple(
+            source_field
+            for source in self.sources
+            if source.source_id == source_id
+            for source_field in source.fields
+            if source_field.field_id == field_id
+        )
+        if len(matches) != 1:
+            raise ValueError("source registry field identity is not declared")
+        return matches[0]
 
     def validate(self) -> None:
         validate_exact_dataclass_state(self, "source registry V1")

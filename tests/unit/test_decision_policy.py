@@ -193,6 +193,8 @@ def test_phase0_enums_are_exact() -> None:
         "network_timeout",
         "source_unavailable",
         "http_4xx",
+        "http_rate_limited",
+        "http_5xx",
         "unsafe_url",
         "unsafe_redirect",
         "oversized_response",
@@ -247,7 +249,7 @@ def test_policy_and_registry_have_pinned_canonical_bytes() -> None:
     policy = EvidencePolicyV1()
     registry = SourceRegistryV1()
     assert policy.checksum() == "6be880169a65dbaecfd75ba21250afea247320df033e37694feb4168505dd3fe"
-    assert registry.checksum() == "1893c53c2f8211d429f5a3b87ac579c7800e6a47b58470a952f7ad91c070db7e"
+    assert registry.checksum() == "c876085a132026afab288a0a7022b7b29389fe36de4bcf9dba85a204c986953e"
     for item in (policy, registry):
         canonical = item.canonical_json()
         assert (
@@ -298,6 +300,62 @@ def test_source_registry_references_are_finite_resolvable_and_complete() -> None
     ).acceptable_alternatives == (
         SourceFieldRef("yangjibao_portfolio_observation", "transaction_channel_observation"),
     )
+
+
+def test_phase2_registry_enables_only_preflighted_sources() -> None:
+    registry = SourceRegistryV1()
+
+    assert registry.field("gov_cn_policy", "policy_events").source_tier is (
+        SourceTier.TIER_1
+    )
+    assert registry.field("stcn_fund_news", "fund_media_events").source_tier is (
+        SourceTier.TIER_2
+    )
+    assert registry.field("eastmoney_market", "market_dimensions").source_tier is (
+        SourceTier.TIER_2
+    )
+    assert registry.field(
+        "fund_manager_official_documents", "fund_official_events"
+    ).source_tier is SourceTier.TIER_1
+    assert "cs_com_cn" not in registry.source_ids
+    assert "csrc_public_news" not in registry.source_ids
+
+
+def test_phase2_event_freshness_requires_recent_integrity_check() -> None:
+    registry = SourceRegistryV1()
+    context = FreshnessContext(
+        now=UTC_NOW,
+        query_window_start=UTC_NOW - timedelta(days=3),
+        query_window_end=UTC_NOW,
+        correction_retraction_check_complete=True,
+        correction_retraction_found=False,
+        correction_retraction_checked_at=UTC_NOW,
+    )
+    for source_id, field_id in (
+        ("gov_cn_policy", "policy_events"),
+        ("stcn_fund_news", "fund_media_events"),
+        ("fund_manager_official_documents", "fund_official_events"),
+    ):
+        field = registry.field(source_id, field_id)
+        assert field.is_current(UTC_NOW - timedelta(hours=1), context)
+        assert not field.is_current(
+            UTC_NOW - timedelta(hours=1),
+            replace(
+                context,
+                correction_retraction_checked_at=UTC_NOW - timedelta(hours=3),
+            ),
+        )
+
+
+def test_tier2_media_is_not_an_alternative_for_missing_tier1_policy_fact() -> None:
+    registry = SourceRegistryV1()
+    policy = registry.field("gov_cn_policy", "policy_events")
+    media = registry.field("stcn_fund_news", "fund_media_events")
+
+    assert SourceFieldRef("stcn_fund_news", "fund_media_events") not in (
+        policy.acceptable_alternatives
+    )
+    assert media.acceptable_alternatives == ()
 
 
 def test_runtime_source_identity_and_tier_are_bound_to_canonical_v1() -> None:
