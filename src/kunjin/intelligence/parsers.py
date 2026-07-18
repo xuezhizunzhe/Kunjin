@@ -20,6 +20,7 @@ _MAX_PAYLOAD_BYTES = 5 * 1024 * 1024
 _MAX_JSON_DEPTH = 12
 _MAX_JSON_COLLECTION_ITEMS = 512
 _MAX_JSON_MAPPING_ITEMS = 128
+_MAX_GOV_POLICY_ROWS = 2_048
 _MAX_TEXT_CHARS = 4_096
 _MAX_BREADTH_TOTAL = 10_000
 _EXCERPT_MAX_BYTES = 2_048
@@ -27,12 +28,35 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _UTC = timezone.utc
 _GOV_POLICY_URL = re.compile(
     r"https://www\.gov\.cn/zhengce/"
-    r"(?:content/\d{6}/content_\d+\.htm|zhengceku/\d{6}/content_\d+\.htm)"
+    r"(?:"
+    r"(?:content/)?\d{6}/content_\d+\.htm"
+    r"|zhengceku/\d{6}/content_\d+\.htm"
+    r"|(?:content/)?\d{4}-\d{2}/\d{2}/content_\d+\.htm"
+    r")"
 )
 _STCN_DETAIL_PATH = re.compile(r"/article/detail/(\d+)\.html")
 _SECTOR_CODE = re.compile(r"[A-Za-z0-9._-]{1,32}")
 _ORIGINAL_STCN_PUBLISHERS = frozenset({"证券时报网", "证券时报", "券商中国", "人民财讯"})
 _IGNORED_HTML_TAGS = frozenset({"iframe", "noscript", "script", "style"})
+_VOID_HTML_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
+_CRITICAL_HTML_ATTRIBUTES = frozenset({"class", "href", "id", "rel"})
 _CONTENT_BLOCK_TAGS = frozenset(
     {"article", "blockquote", "br", "div", "h1", "h2", "h3", "li", "p", "section"}
 )
@@ -97,6 +121,18 @@ def _bounded_text(value: object, name: str, *, allow_empty: bool = False) -> str
     return normalized
 
 
+def _bounded_exact_ascii_url(value: object, name: str) -> str:
+    if type(value) is not str:
+        raise IntelligenceParseError(f"{name} must be exact ASCII text")
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        raise IntelligenceParseError(f"{name} must be exact ASCII text") from None
+    if not value or len(value) > _MAX_TEXT_CHARS or any(char.isspace() for char in value):
+        raise IntelligenceParseError(f"{name} must be bounded ASCII without whitespace")
+    return value
+
+
 def _validate_retrieved_at(value: object) -> datetime:
     if (
         type(value) is not datetime
@@ -120,7 +156,11 @@ def _mapping_without_duplicate_keys(pairs: List[Tuple[str, object]]) -> Dict[str
     return result
 
 
-def _decode_json(payload_utf8: object) -> object:
+def _decode_json(
+    payload_utf8: object,
+    *,
+    top_level_list_limit: int = _MAX_JSON_COLLECTION_ITEMS,
+) -> object:
     if type(payload_utf8) is not str:
         raise IntelligenceParseError("payload must be exact UTF-8 text")
     payload_bytes = payload_utf8.encode("utf-8")
@@ -137,11 +177,16 @@ def _decode_json(payload_utf8: object) -> object:
         raise
     except (json.JSONDecodeError, UnicodeError) as exc:
         raise IntelligenceParseError("payload contains malformed JSON") from exc
-    _validate_json_tree(value)
+    _validate_json_tree(value, top_level_list_limit=top_level_list_limit)
     return value
 
 
-def _validate_json_tree(value: object, *, depth: int = 0) -> None:
+def _validate_json_tree(
+    value: object,
+    *,
+    depth: int = 0,
+    top_level_list_limit: int = _MAX_JSON_COLLECTION_ITEMS,
+) -> None:
     if depth > _MAX_JSON_DEPTH:
         raise IntelligenceParseError("JSON exceeds the public tree depth limit")
     if type(value) is dict:
@@ -150,13 +195,22 @@ def _validate_json_tree(value: object, *, depth: int = 0) -> None:
         for key, item in value.items():
             if type(key) is not str or len(key) > _MAX_TEXT_CHARS:
                 raise IntelligenceParseError("JSON mapping key is invalid")
-            _validate_json_tree(item, depth=depth + 1)
+            _validate_json_tree(
+                item,
+                depth=depth + 1,
+                top_level_list_limit=top_level_list_limit,
+            )
         return
     if type(value) is list:
-        if len(value) > _MAX_JSON_COLLECTION_ITEMS:
+        list_limit = top_level_list_limit if depth == 0 else _MAX_JSON_COLLECTION_ITEMS
+        if len(value) > list_limit:
             raise IntelligenceParseError("JSON list has too many items")
         for item in value:
-            _validate_json_tree(item, depth=depth + 1)
+            _validate_json_tree(
+                item,
+                depth=depth + 1,
+                top_level_list_limit=top_level_list_limit,
+            )
         return
     if type(value) is str:
         if len(value) > _MAX_PAYLOAD_BYTES:
@@ -224,7 +278,7 @@ def _parsed_item(
 
 def parse_gov_policy_list(payload_utf8: str, retrieved_at: datetime) -> Tuple[ParsedItem, ...]:
     retrieved = _validate_retrieved_at(retrieved_at)
-    payload = _decode_json(payload_utf8)
+    payload = _decode_json(payload_utf8, top_level_list_limit=_MAX_GOV_POLICY_ROWS)
     if type(payload) is not list:
         raise IntelligenceParseError("government policy payload must be an exact list")
 
@@ -237,7 +291,7 @@ def parse_gov_policy_list(payload_utf8: str, retrieved_at: datetime) -> Tuple[Pa
         subtitle = _bounded_text(
             row["SUB_TITLE"], "government policy subtitle", allow_empty=True
         )
-        canonical_url = _bounded_text(row["URL"], "government policy URL")
+        canonical_url = _bounded_exact_ascii_url(row["URL"], "government policy URL")
         if _GOV_POLICY_URL.fullmatch(canonical_url) is None:
             raise IntelligenceParseError("government policy URL is not an exact gov.cn policy path")
         publication_date_text = _bounded_text(
@@ -385,82 +439,173 @@ def parse_stcn_fund_list(
 class _StcnDetailParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.canonical_urls: List[str] = []
+        self.canonical_urls: List[Optional[str]] = []
         self.titles: List[str] = []
-        self.visible_parts: List[str] = []
-        self.content_parts: List[str] = []
+        self.metadata_parts: List[str] = []
+        self.contents: List[str] = []
+        self._stack: List[str] = []
         self._title_parts: Optional[List[str]] = None
-        self._content_depth = 0
+        self._title_root_depth: Optional[int] = None
+        self._metadata_parts: Optional[List[str]] = None
+        self._metadata_root_depth: Optional[int] = None
+        self._content_parts: Optional[List[str]] = None
+        self._content_root_depth: Optional[int] = None
+        self._metadata_containers = 0
         self._content_containers = 0
         self._ignored_depth = 0
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         tag = tag.lower()
+        attributes = self._validated_attributes(attrs)
+        is_void = tag in _VOID_HTML_TAGS
         if self._ignored_depth:
-            self._ignored_depth += 1
+            if not is_void:
+                self._stack.append(tag)
+                self._ignored_depth += 1
             return
         if tag in _IGNORED_HTML_TAGS:
+            if is_void:
+                raise IntelligenceParseError("STCN detail HTML is malformed")
+            self._stack.append(tag)
             self._ignored_depth = 1
             return
-        attributes = dict(attrs)
+
         class_names = frozenset((attributes.get("class") or "").split())
-        if tag == "link" and "canonical" in (attributes.get("rel") or "").split():
-            href = attributes.get("href")
-            if href:
-                self.canonical_urls.append(href)
+        rel_tokens = tuple(token.lower() for token in (attributes.get("rel") or "").split())
+        if len(rel_tokens) != len(set(rel_tokens)):
+            raise IntelligenceParseError("STCN detail HTML is malformed")
+        if tag == "link" and "canonical" in rel_tokens:
+            self.canonical_urls.append(attributes.get("href"))
+
+        if is_void:
+            if self._content_parts is not None and tag in _CONTENT_BLOCK_TAGS:
+                self._content_parts.append(" ")
+            return
+
+        self._stack.append(tag)
+        depth = len(self._stack)
         if tag == "h1":
             if self._title_parts is not None:
-                self.titles.append(_normalize_text("".join(self._title_parts)))
+                raise IntelligenceParseError("STCN detail HTML is malformed")
             self._title_parts = []
+            self._title_root_depth = depth
+
+        is_metadata = "article-meta" in class_names
+        if is_metadata:
+            self._metadata_containers += 1
+            if self._metadata_parts is not None:
+                raise IntelligenceParseError("STCN detail HTML is malformed")
+            self._metadata_parts = []
+            self._metadata_root_depth = depth
+
         is_content = (
             attributes.get("id") == "article-content" or "article-content" in class_names
         )
         if is_content:
             self._content_containers += 1
-            self._content_depth = 1
-        elif self._content_depth:
-            self._content_depth += 1
-        if self._content_depth and tag in _CONTENT_BLOCK_TAGS:
-            self.content_parts.append(" ")
+            if self._content_parts is not None:
+                raise IntelligenceParseError("STCN detail HTML is malformed")
+            self._content_parts = []
+            self._content_root_depth = depth
+        if self._content_parts is not None and tag in _CONTENT_BLOCK_TAGS:
+            self._content_parts.append(" ")
 
     def handle_startendtag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         self.handle_starttag(tag, attrs)
-        self.handle_endtag(tag)
+        if tag.lower() not in _VOID_HTML_TAGS:
+            self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        if tag in _VOID_HTML_TAGS or not self._stack or self._stack[-1] != tag:
+            raise IntelligenceParseError("STCN detail HTML is malformed")
         if self._ignored_depth:
+            self._stack.pop()
             self._ignored_depth -= 1
             return
-        if tag == "h1" and self._title_parts is not None:
+
+        depth = len(self._stack)
+        if self._content_parts is not None and tag in _CONTENT_BLOCK_TAGS:
+            self._content_parts.append(" ")
+        if self._title_root_depth == depth:
             self.titles.append(_normalize_text("".join(self._title_parts)))
             self._title_parts = None
-        if self._content_depth:
-            if tag in _CONTENT_BLOCK_TAGS:
-                self.content_parts.append(" ")
-            self._content_depth -= 1
+            self._title_root_depth = None
+        if self._metadata_root_depth == depth:
+            self.metadata_parts.append(_normalize_text(" ".join(self._metadata_parts)))
+            self._metadata_parts = None
+            self._metadata_root_depth = None
+        if self._content_root_depth == depth:
+            self.contents.append(_normalize_text("".join(self._content_parts)))
+            self._content_parts = None
+            self._content_root_depth = None
+        self._stack.pop()
 
     def handle_data(self, data: str) -> None:
         if self._ignored_depth:
             return
-        self.visible_parts.append(data)
         if self._title_parts is not None:
             self._title_parts.append(data)
-        if self._content_depth:
-            self.content_parts.append(data)
+        if self._metadata_parts is not None:
+            self._metadata_parts.append(data)
+        if self._content_parts is not None:
+            self._content_parts.append(data)
 
     def finish(self) -> None:
-        self.close()
-        if self._title_parts is not None:
-            self.titles.append(_normalize_text("".join(self._title_parts)))
-            self._title_parts = None
+        if self.rawdata:
+            raise IntelligenceParseError("STCN detail HTML is malformed")
+        try:
+            self.close()
+        except (AssertionError, UnicodeError) as exc:
+            raise IntelligenceParseError("STCN detail HTML is malformed") from exc
+        if (
+            self._stack
+            or self._ignored_depth
+            or self._title_parts is not None
+            or self._metadata_parts is not None
+            or self._content_parts is not None
+        ):
+            raise IntelligenceParseError("STCN detail HTML is malformed")
+
+    @staticmethod
+    def _validated_attributes(
+        attrs: List[Tuple[str, Optional[str]]],
+    ) -> Dict[str, Optional[str]]:
+        attributes: Dict[str, Optional[str]] = {}
+        for raw_name, value in attrs:
+            name = raw_name.lower()
+            if name in _CRITICAL_HTML_ATTRIBUTES and name in attributes:
+                raise IntelligenceParseError("STCN detail HTML is malformed")
+            if name not in attributes:
+                attributes[name] = value
+        return attributes
 
 
-def _one_match(pattern: str, text: str, label: str) -> str:
-    matches = re.findall(pattern, text)
-    if len(matches) != 1:
-        raise IntelligenceParseError(f"STCN detail requires exactly one {label}")
-    return _bounded_text(matches[0], f"STCN detail {label}")
+def _stcn_metadata_fields(text: str) -> Tuple[str, str, str]:
+    source_marker = r"来源\s*[:：]"
+    author_marker = r"作者\s*[:：]"
+    minute = r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}"
+    for marker, label in (
+        (source_marker, "source label"),
+        (author_marker, "author label"),
+        (rf"(?<!\d){minute}(?!\d)", "minute publication time"),
+    ):
+        if len(re.findall(marker, text)) != 1:
+            raise IntelligenceParseError(f"STCN detail requires exactly one {label}")
+
+    match = re.fullmatch(
+        rf"{source_marker}\s*(?P<source>.+?)\s+"
+        rf"{author_marker}\s*(?P<author>.+?)\s+"
+        rf"(?P<minute>{minute})",
+        text,
+    )
+    if match is None:
+        raise IntelligenceParseError("STCN detail metadata fields are ambiguous")
+    return (
+        _bounded_text(match.group("source"), "STCN detail source label"),
+        _bounded_text(match.group("author"), "STCN detail author label"),
+        _bounded_text(match.group("minute"), "STCN detail minute publication time"),
+    )
 
 
 def parse_stcn_detail(payload_utf8: str, retrieved_at: datetime) -> ParsedItem:
@@ -469,32 +614,34 @@ def parse_stcn_detail(payload_utf8: str, retrieved_at: datetime) -> ParsedItem:
     _feed_html(parser, payload_utf8)
     parser.finish()
 
-    canonical_details = [
-        parsed
-        for value in parser.canonical_urls
-        if (parsed := _canonical_stcn_detail_url(value)) is not None
-    ]
-    titles = [title for title in parser.titles if title]
-    if len(canonical_details) != 1 or len(titles) != 1 or parser._content_containers != 1:
-        raise IntelligenceParseError(
-            "STCN detail requires one canonical detail ID, title, and article container"
-        )
-    _detail_id, canonical_url = canonical_details[0]
-    visible_text = _normalize_text(" ".join(parser.visible_parts))
-    source = _one_match(r"来源\s*[:：]\s*([^\s]+)", visible_text, "source label")
-    author = _one_match(r"作者\s*[:：]\s*([^\s]+)", visible_text, "author label")
-    publication_text = _one_match(
-        r"(?<!\d)(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2})(?!\d)",
-        visible_text,
-        "minute publication time",
+    canonical_detail = (
+        _canonical_stcn_detail_url(parser.canonical_urls[0])
+        if len(parser.canonical_urls) == 1 and parser.canonical_urls[0] is not None
+        else None
     )
+    titles = [title for title in parser.titles if title]
+    if len(parser.canonical_urls) != 1 or canonical_detail is None:
+        raise IntelligenceParseError("STCN detail requires exactly one valid canonical URL")
+    if (
+        len(titles) != 1
+        or parser._metadata_containers != 1
+        or len(parser.metadata_parts) != 1
+        or parser._content_containers != 1
+        or len(parser.contents) != 1
+    ):
+        raise IntelligenceParseError(
+            "STCN detail requires one title, metadata container, and article container"
+    )
+    _detail_id, canonical_url = canonical_detail
+    metadata_text = parser.metadata_parts[0]
+    source, author, publication_text = _stcn_metadata_fields(metadata_text)
     try:
         local_published_at = datetime.strptime(publication_text, "%Y-%m-%d %H:%M").replace(
             tzinfo=_SHANGHAI
         )
     except ValueError:
         raise IntelligenceParseError("STCN detail publication time is invalid") from None
-    content = _normalize_text("".join(parser.content_parts))
+    content = parser.contents[0]
     if not content:
         raise IntelligenceParseError("STCN detail article container is empty")
     lineage = (

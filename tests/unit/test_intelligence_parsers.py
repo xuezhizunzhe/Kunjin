@@ -68,6 +68,95 @@ def test_gov_policy_validates_unknown_values_before_ignoring_them() -> None:
         parse_gov_policy_list(json.dumps(payload), retrieved_at=NOW)
 
 
+def test_gov_policy_allows_audited_top_level_feed_but_bounds_nested_lists() -> None:
+    row = json.loads(fixture("gov_policy.json"))[0]
+    feed = [
+        dict(row, URL=f"https://www.gov.cn/zhengce/202607/content_{index}.htm")
+        for index in range(1077)
+    ]
+
+    assert len(parse_gov_policy_list(json.dumps(feed), retrieved_at=NOW)) == 1077
+
+    feed[0]["unknown"] = list(range(513))
+    with pytest.raises(IntelligenceParseError, match="too many items"):
+        parse_gov_policy_list(json.dumps(feed), retrieved_at=NOW)
+
+
+def test_gov_policy_enforces_independent_top_level_audit_limit() -> None:
+    row = json.loads(fixture("gov_policy.json"))[0]
+    feed = [
+        dict(row, URL=f"https://www.gov.cn/zhengce/202607/content_{index}.htm")
+        for index in range(2049)
+    ]
+
+    with pytest.raises(IntelligenceParseError, match="too many items"):
+        parse_gov_policy_list(json.dumps(feed), retrieved_at=NOW)
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/zhengce/content/202607/content_710001.htm",
+        "/zhengce/202607/content_710001.htm",
+        "/zhengce/zhengceku/202607/content_710001.htm",
+        "/zhengce/content/2026-07/14/content_710001.htm",
+        "/zhengce/2026-07/14/content_710001.htm",
+    ),
+)
+def test_gov_policy_accepts_only_reviewed_official_path_families(path: str) -> None:
+    payload = json.loads(fixture("gov_policy.json"))[:1]
+    payload[0]["URL"] = f"https://www.gov.cn{path}"
+
+    item = parse_gov_policy_list(json.dumps(payload), retrieved_at=NOW)[0]
+    assert item.canonical_url.endswith(path)
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://www.gov.cn/zhengce/202607/content_1.htm",
+        "https://www.gov.cn:443/zhengce/202607/content_1.htm",
+        "https://www.gov.cn/zhengce/202607/content_1.htm?from=feed",
+        "https://www.gov.cn/zhengce/202607/content_1.htm#section",
+        "https://gov.cn/zhengce/202607/content_1.htm",
+    ),
+)
+def test_gov_policy_rejects_nonexact_origin_and_url_components(url: str) -> None:
+    payload = json.loads(fixture("gov_policy.json"))[:1]
+    payload[0]["URL"] = url
+
+    with pytest.raises(IntelligenceParseError, match="government policy URL"):
+        parse_gov_policy_list(json.dumps(payload), retrieved_at=NOW)
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        " https://www.gov.cn/zhengce/202607/content_1.htm",
+        "https://www.gov.cn/zhengce/202607/content_1.htm ",
+        "https://www.gov.cn/zhengce/202607/ content_1.htm",
+        "https：//www.gov.cn/zhengce/202607/content_1.htm",
+        "https://www．gov．cn/zhengce/202607/content_1.htm",
+    ),
+)
+def test_gov_policy_url_is_validated_as_raw_exact_ascii(url: str) -> None:
+    payload = json.loads(fixture("gov_policy.json"))[:1]
+    payload[0]["URL"] = url
+
+    with pytest.raises(IntelligenceParseError, match="government policy URL"):
+        parse_gov_policy_list(json.dumps(payload), retrieved_at=NOW)
+
+
+def test_gov_policy_preserves_payload_depth_and_mapping_bounds() -> None:
+    with pytest.raises(IntelligenceParseError, match="at most 5 MiB"):
+        parse_gov_policy_list("[" + " " * (5 * 1024 * 1024) + "]", retrieved_at=NOW)
+
+    payload = json.loads(fixture("gov_policy.json"))[:1]
+    payload[0]["unknown"] = {f"key_{index}": index for index in range(129)}
+    with pytest.raises(IntelligenceParseError, match="mapping has too many items"):
+        parse_gov_policy_list(json.dumps(payload), retrieved_at=NOW)
+
+
 def test_stcn_fund_list_extracts_only_exact_detail_ids() -> None:
     candidates = parse_stcn_fund_list(fixture("stcn_fund_list.html"), retrieved_at=NOW)
 
@@ -97,6 +186,32 @@ def test_stcn_enabled_publisher_on_canonical_detail_may_be_original() -> None:
     assert parse_stcn_detail(html, retrieved_at=NOW).lineage_hint is LineageKind.ORIGINAL
 
 
+@pytest.mark.parametrize(
+    ("displayed_source", "normalized_source"),
+    (
+        ("证券时报，中国基金报", "证券时报,中国基金报"),
+        ("证券时报；中国基金报", "证券时报;中国基金报"),
+        ("证券时报|中国基金报", "证券时报|中国基金报"),
+    ),
+)
+def test_stcn_preserves_complete_displayed_publisher_without_original_upgrade(
+    displayed_source: str,
+    normalized_source: str,
+) -> None:
+    html = fixture("stcn_fund_detail.html").replace("中国基金报", displayed_source)
+
+    item = parse_stcn_detail(html, retrieved_at=NOW)
+
+    assert item.attributed_publisher == normalized_source
+    assert item.lineage_hint is LineageKind.REPRINT
+
+
+def test_stcn_preserves_complete_displayed_author_without_silent_truncation() -> None:
+    html = fixture("stcn_fund_detail.html").replace("测试记者", "测试记者；另一记者")
+
+    assert parse_stcn_detail(html, retrieved_at=NOW).author == "测试记者;另一记者"
+
+
 def test_stcn_fingerprints_full_content_but_bounds_utf8_excerpt() -> None:
     full_text = "基" * 700 + " 基金行业持续关注长期资金配置。"
     html = fixture("stcn_fund_detail.html").replace("政策内容。", "基" * 700)
@@ -118,6 +233,116 @@ def test_stcn_detail_requires_exactly_one_source_author_and_minute(missing_label
     html = fixture("stcn_fund_detail.html").replace(missing_label, "")
 
     with pytest.raises(IntelligenceParseError, match="STCN detail"):
+        parse_stcn_detail(html, retrieved_at=NOW)
+
+
+def test_stcn_detail_reads_metadata_only_from_unique_reviewed_container() -> None:
+    html = fixture("stcn_fund_detail.html").replace(
+        '<div class="article-meta">',
+        '<div>来源：诱饵媒体 作者：诱饵作者 2025-01-01 00:00</div>'
+        '<div class="article-meta">',
+    )
+
+    item = parse_stcn_detail(html, retrieved_at=NOW)
+
+    assert item.attributed_publisher == "中国基金报"
+    assert item.author == "测试记者"
+    assert item.published_at.isoformat() == "2026-07-17T07:51:00+00:00"
+
+
+def test_stcn_body_decoy_cannot_replace_missing_reviewed_metadata() -> None:
+    html = fixture("stcn_fund_detail.html").replace("来源：中国基金报", "").replace(
+        "政策内容。", "来源：诱饵媒体 政策内容。"
+    )
+
+    with pytest.raises(IntelligenceParseError, match="source label"):
+        parse_stcn_detail(html, retrieved_at=NOW)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda html: html.replace(
+            "</div>\n      <div id=\"article-content\"",
+            "</div><div class=\"article-meta\">来源：证券时报 作者：另一作者 "
+            "2026-07-17 15:52</div>\n      <div id=\"article-content\"",
+            1,
+        ),
+        lambda html: html.replace("来源：中国基金报", "来源：中国基金报 来源：证券时报"),
+        lambda html: html.replace("来源：中国基金报", "来源：中国基金报；来源：证券时报"),
+        lambda html: html.replace("作者：测试记者", "作者：测试记者 作者：另一作者"),
+        lambda html: html.replace("作者：测试记者", "作者：测试记者；作者：另一作者"),
+        lambda html: html.replace("2026-07-17 15:51", "2026-07-17 15:51 2026-07-17 15:52"),
+    ),
+)
+def test_stcn_detail_rejects_duplicate_metadata_containers_or_fields(mutation) -> None:
+    with pytest.raises(IntelligenceParseError, match="STCN detail"):
+        parse_stcn_detail(mutation(fixture("stcn_fund_detail.html")), retrieved_at=NOW)
+
+
+def test_stcn_detail_uses_void_tag_semantics_and_stops_at_content_sibling() -> None:
+    html = fixture("stcn_fund_detail.html").replace(
+        "<p>政策内容。</p>",
+        '<p>政策<img src="/chart.png"><br>内容。</p>',
+    ).replace(
+        "</div>\n    </article>",
+        "</div><aside>正文外诱饵。</aside>\n    </article>",
+    )
+
+    assert parse_stcn_detail(html, retrieved_at=NOW).normalized_public_content == (
+        "政策 内容。 基金行业持续关注长期资金配置。"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda html: html.replace("</p>\n        <p>", "</div>\n        <p>", 1),
+        lambda html: html.replace("</div>\n    </article>", "\n    </article>", 1),
+    ),
+)
+def test_stcn_detail_fails_closed_on_mismatched_or_unclosed_html(mutation) -> None:
+    with pytest.raises(IntelligenceParseError, match="malformed"):
+        parse_stcn_detail(mutation(fixture("stcn_fund_detail.html")), retrieved_at=NOW)
+
+
+@pytest.mark.parametrize("trailing", ("<", "<!--", "<!", "<div", '<div class="unfinished'))
+def test_stcn_detail_fails_closed_on_incomplete_html_tokens(trailing: str) -> None:
+    with pytest.raises(IntelligenceParseError, match="malformed"):
+        parse_stcn_detail(fixture("stcn_fund_detail.html") + trailing, retrieved_at=NOW)
+
+
+def test_stcn_detail_requires_exactly_one_valid_canonical_declaration() -> None:
+    html = fixture("stcn_fund_detail.html").replace(
+        "</head>",
+        '<link rel="canonical" href="https://evil.example/article/detail/3359541.html"></head>',
+    )
+    with pytest.raises(IntelligenceParseError, match="canonical"):
+        parse_stcn_detail(html, retrieved_at=NOW)
+
+    duplicate = fixture("stcn_fund_detail.html").replace(
+        "</head>",
+        '<link rel="canonical" '
+        'href="https://www.stcn.com/article/detail/3359541.html"></head>',
+    )
+    with pytest.raises(IntelligenceParseError, match="canonical"):
+        parse_stcn_detail(duplicate, retrieved_at=NOW)
+
+
+@pytest.mark.parametrize(
+    "link",
+    (
+        '<link rel="canonical" rel="alternate" href="https://www.stcn.com/article/detail/3359541.html">',
+        '<link rel="canonical" href="https://www.stcn.com/article/detail/3359541.html" href="https://evil.example/">',
+    ),
+)
+def test_stcn_detail_rejects_duplicate_critical_attributes(link: str) -> None:
+    html = fixture("stcn_fund_detail.html").replace(
+        '<link rel="canonical" href="https://www.stcn.com/article/detail/3359541.html">',
+        link,
+    )
+
+    with pytest.raises(IntelligenceParseError, match="malformed"):
         parse_stcn_detail(html, retrieved_at=NOW)
 
 
