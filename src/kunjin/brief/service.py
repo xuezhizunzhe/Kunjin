@@ -23,6 +23,10 @@ from kunjin.brief.facts import (
 from kunjin.brief.models import HeldFundBriefOutcome, HeldFundBriefReport
 from kunjin.brief.policy import HeldFundBriefPolicyV1
 from kunjin.brief.portfolio import PortfolioObservationResult
+from kunjin.brief.public_acceptance_portfolio import (
+    SYNTHETIC_OBSERVATION_VERSION,
+    PublicAcceptancePortfolioService,
+)
 from kunjin.brief.research import build_owner_report, build_snapshot
 from kunjin.brief.store import BriefStore
 from kunjin.decision.budget import BudgetExpired, RequestBudget
@@ -600,6 +604,11 @@ class HeldFundBriefService:
                 raise ValueError("portfolio result has no exact source attempt")
             stored = context.audit_store.authenticated_source_attempt(source_attempt_id)
             attempt = stored.attempt
+            expected_observation_version = (
+                SYNTHETIC_OBSERVATION_VERSION
+                if type(self._portfolio_service) is PublicAcceptancePortfolioService
+                else f"source_attempt_{source_attempt_id}"
+            )
             if (
                 stored.id != source_attempt_id
                 or stored.request_run_id != context.request_run_id
@@ -609,7 +618,7 @@ class HeldFundBriefService:
                 or attempt.subject_key != f"fund:{fund_code}"
                 or attempt.outcome is not SourceAttemptOutcome.SUCCESS
                 or attempt.data_as_of != binding.observed_at
-                or binding.observation_version != f"source_attempt_{source_attempt_id}"
+                or binding.observation_version != expected_observation_version
                 or not binding.snapshot_complete
                 or binding.request_id != context.budget.request_id
                 or binding.request_mode is not context.budget.mode

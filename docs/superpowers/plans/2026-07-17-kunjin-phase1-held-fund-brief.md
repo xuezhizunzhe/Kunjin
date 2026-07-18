@@ -687,9 +687,13 @@ git commit -m "feat: expose held fund brief command"
 **Files:**
 
 - Create: scripts/run_phase1_acceptance.sh
+- Create: src/kunjin/brief/public_acceptance_portfolio.py
+- Create: tests/unit/test_brief_public_acceptance_portfolio.py
+- Modify: src/kunjin/brief/service.py
+- Modify: src/kunjin/cli.py
 - Modify: tests/test_smoke.py
 
-- [ ] **Step 1: Write failing offline acceptance tests**
+- [x] **Step 1: Write failing offline acceptance tests**
 
 Use fake CLI healthy/unsupported/owner projections and all action routes. Cover timeout, interrupt, ignored TERM, detached descendants, oversized output, unknown fields, output conflict/inode replacement, and private sentinel rejection.
 
@@ -702,28 +706,36 @@ scripts/run_phase1_acceptance.sh \
 
 Codes differ; output must not exist. Real-owner acceptance remains separate and private.
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ~~~bash
 .venv/bin/python -m pytest -q tests/test_smoke.py -k phase1_acceptance
 ~~~
 
-- [ ] **Step 3: Implement strict public acceptance**
+- [x] **Step 3: Implement strict public acceptance**
 
 Reuse reviewed Phase 0 process ownership, deadline, strict projection, private staging, exclusive rename, inode verification, and cleanup. Never copy raw JSON. Healthy output must contain useful sourced facts, not counts. Unsupported output must contain gaps and supplementation. Validate continue, reduce, exit, and both switch legs with exact false.
 
-- [ ] **Step 4: Add private owner projection**
+- [x] **Step 4: Add private owner projection**
 
 Use a random subject ID and retain only position-present, state, maturity, coverage class, elapsed time, and stable codes. Destroy the private ID mapping. Never retain the fund code, amount, shares, cost, profit, weight, account title, or full holdings.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ~~~bash
 /bin/bash -n scripts/run_phase1_acceptance.sh
+.venv/bin/python -m pytest -q \
+  tests/unit/test_brief_public_acceptance_portfolio.py \
+  tests/unit/test_brief_service.py
 .venv/bin/python -m pytest -q tests/test_smoke.py -k phase1_acceptance
-.venv/bin/ruff check tests/test_smoke.py
+.venv/bin/python -m pytest -q tests/integration/test_cli.py -k brief
+.venv/bin/ruff check src tests
 git diff --check
-git add scripts/run_phase1_acceptance.sh tests/test_smoke.py
+git add scripts/run_phase1_acceptance.sh \
+  src/kunjin/brief/public_acceptance_portfolio.py \
+  src/kunjin/brief/service.py src/kunjin/cli.py \
+  tests/unit/test_brief_public_acceptance_portfolio.py tests/test_smoke.py \
+  docs/superpowers/plans/2026-07-17-kunjin-phase1-held-fund-brief.md
 git commit -m "test: add held fund brief acceptance"
 ~~~
 

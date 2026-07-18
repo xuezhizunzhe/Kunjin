@@ -1138,6 +1138,863 @@ print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
                     )
                     self.assertEqual(result.returncode, expected_exit)
 
+    def _install_phase1_acceptance_fixture(self, temporary_root: Path) -> tuple[Path, Path]:
+        root = Path(__file__).resolve().parents[1]
+        repository = temporary_root / "repository"
+        scripts = repository / "scripts"
+        cli_directory = repository / ".venv" / "bin"
+        scripts.mkdir(parents=True)
+        cli_directory.mkdir(parents=True)
+        acceptance = scripts / "run_phase1_acceptance.sh"
+        shutil.copy2(root / "scripts" / acceptance.name, acceptance)
+        cli = cli_directory / "kunjin"
+        cli.write_text(
+            r'''#!/usr/bin/env python3
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+argv = sys.argv[1:]
+log = Path(os.environ["FAKE_KUNJIN_LOG"])
+with log.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(argv, separators=(",", ":")) + "\n")
+
+scenario = os.environ.get("FAKE_KUNJIN_SCENARIO", "healthy")
+if argv[:3] == ["--json", "source", "status"]:
+    code = argv[argv.index("--fund-code") + 1]
+    now = "2026-07-17T00:00:00+00:00"
+    payload = {
+        "schema_version": "1",
+        "command": "source.status",
+        "as_of": now,
+        "data": {
+            "fund_code": code,
+            "mode": "rapid",
+            "policy_checksum": "c" * 64,
+            "policy_version": "1",
+            "registry_checksum": "d" * 64,
+            "registry_version": "1",
+            "request_field_resolutions": [{
+                "action": "fact_research",
+                "field_id": "fund_manager_product_announcement",
+                "primary_source_id": (
+                    "unrelated_source"
+                    if scenario == "unbound_supplementation"
+                    else "fund_manager_official_documents"
+                ),
+                "resolution": "manual_supplement_required",
+                "risk_effect": "information",
+            }],
+            "request_id": "e" * 32,
+            "snapshot_at": now,
+            "source_fields": [{
+                "acceptable_alternatives": [],
+                "consecutive_failures": 1,
+                "cooldown_until": None,
+                "field_id": "fund_manager_product_announcement",
+                "field_scope": "official product announcement",
+                "last_failure_at": now,
+                "last_failure_reason": "unsupported_source_family",
+                "last_success_at": None,
+                "last_success_data_as_of": None,
+                "source_id": "fund_manager_official_documents",
+                "source_kind": "official_document",
+                "source_scope": "fund manager official website",
+                "source_tier": "tier_1",
+                "state": "unsupported",
+                "supplementation": {
+                    "accepted_input": ["公开官方公告 URL", "带日期的官方公告截图"],
+                    "freshness_requirement": "当前有效版本",
+                    "impact_if_missing": "不能排除影响持有或退出判断的正式公告",
+                    "missing_item": "official_events",
+                    "suggested_location": "基金管理人官网产品公告页",
+                    "supported_without_it": "仍可展示已取得的基金事实",
+                    "unsupported_without_it": "不能形成公告驱动的行动判断",
+                    "why_required": "正式公告可能改变申购、赎回或存续状态",
+                },
+            }],
+        },
+        "warnings": [],
+        "errors": [],
+    }
+    if scenario == "spliced_supplementation":
+        announcement_field = payload["data"]["source_fields"][0]
+        announcement_resolution = payload["data"]["request_field_resolutions"][0]
+        announcement_resolution["resolution"] = "usable"
+        fee_field = json.loads(json.dumps(announcement_field))
+        fee_field["field_id"] = "fees_share_class_relationship"
+        fee_field["source_id"] = "fund_manager_official_fees"
+        fee_field["supplementation"]["missing_item"] = "fees_share_class_relationship"
+        fee_resolution = json.loads(json.dumps(announcement_resolution))
+        fee_resolution["field_id"] = "fees_share_class_relationship"
+        fee_resolution["primary_source_id"] = "fund_manager_official_fees"
+        fee_resolution["resolution"] = "manual_supplement_required"
+        payload["data"]["source_fields"] = [fee_field, announcement_field]
+        payload["data"]["request_field_resolutions"] = [
+            fee_resolution,
+            announcement_resolution,
+        ]
+    json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    raise SystemExit(0)
+
+action = argv[argv.index("--action") + 1]
+code = argv[3]
+if scenario == "timeout" and action == "continue_holding":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    Path(os.environ["FAKE_KUNJIN_PID"]).write_text(str(os.getpid()), encoding="ascii")
+    time.sleep(5)
+if scenario == "spawn_on_term" and action == "continue_holding":
+    Path(os.environ["FAKE_KUNJIN_PID"]).write_text(str(os.getpid()), encoding="ascii")
+    def spawn_descendant(_signal_number, _frame):
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(5)",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        Path(os.environ["FAKE_KUNJIN_SPAWNED_PID"]).write_text(
+            str(child.pid), encoding="ascii"
+        )
+    signal.signal(signal.SIGTERM, spawn_descendant)
+    time.sleep(5)
+if scenario == "detached" and action == "continue_holding":
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(5)",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    Path(os.environ["FAKE_KUNJIN_PID"]).write_text(str(child.pid), encoding="ascii")
+if scenario == "oversized" and action == "continue_holding":
+    sys.stdout.write("x" * (4 * 1024 * 1024 + 1))
+    raise SystemExit(0)
+if scenario == "oversized_stderr" and action == "continue_holding":
+    sys.stderr.write("x" * (4 * 1024 * 1024 + 1))
+    raise SystemExit(0)
+
+now = "2026-07-17T00:00:00+00:00"
+source_tier = "tier_2" if code == "000002" else "tier_1"
+
+def fact(index, field_id, value):
+    return {
+        "calculated": False,
+        "canonical_url": f"https://example.invalid/{code}/{field_id}",
+        "completeness": "complete",
+        "conflict_ids": [],
+        "data_as_of": now,
+        "fact_id": f"fact_{index}",
+        "field_id": field_id,
+        "freshness": "current",
+        "published_at": now,
+        "publisher": "公开验收来源",
+        "retrieved_at": now,
+        "source_id": f"source_{index}",
+        "source_lineage_id": f"lineage_{index}",
+        "source_tier": ("tier_2" if field_id == "formal_nav" else source_tier),
+        "unit": None,
+        "value": value,
+    }
+
+fact_fields = (
+    ("share_class_identity", {
+        "fund_name": "公开验收基金A",
+        "related_fund_code": "000004",
+        "share_class": "A",
+    }),
+    ("current_manager_team", {
+        "manager_name": "公开基金经理",
+        "tenure_end": None,
+        "tenure_start": "2024-01-01",
+    }),
+    ("formal_nav", "1.2345"),
+    ("fees_share_class_relationship", {
+        "effective_from": "2024-01-01",
+        "effective_to": None,
+        "fee_type": "management",
+        "fixed_fee": None,
+        "holding_days_maximum": None,
+        "holding_days_minimum": None,
+        "rate": "0.5%",
+        "rule_order": 1,
+        "share_class": "A",
+        "threshold_maximum": None,
+        "threshold_minimum": None,
+    }),
+    ("holdings_industries", {
+        "disclosure_scope": ["top10"],
+        "items": [{
+            "asset_class": "equity",
+            "disclosed_weight": "5.2",
+            "rank": 1,
+            "security_code": "600000",
+            "security_name": "公开持仓",
+        }],
+        "report_period": "2026-06-30",
+    }),
+    ("fund_manager_product_announcement", {
+        "category": "periodic",
+        "record_published_at": now,
+        "record_publisher": "公开验收来源",
+        "record_url": f"https://example.invalid/{code}/announcement",
+        "title": "公开验收公告",
+    }),
+)
+facts = [fact(index, field_id, value) for index, (field_id, value) in enumerate(fact_fields)]
+unsupported = code == "000002"
+action_ids = {
+    "continue_holding": ["fact_research", "continue_holding"],
+    "reduce_to_cash": ["fact_research", "reduce_to_cash"],
+    "full_exit": ["fact_research", "full_exit"],
+    "switch_funds": ["fact_research", "switch_reduce", "switch_buy"],
+}[action]
+owner_actions = action_ids[1:]
+
+def interpretation(action_id):
+    switch_buy = action_id == "switch_buy"
+    transaction_action = action_id in {
+        "reduce_to_cash", "full_exit", "switch_reduce", "switch_buy"
+    }
+    unavailable = ["exact_amount"]
+    if transaction_action:
+        unavailable.append("automatic_trade")
+    if switch_buy:
+        unavailable.append("switch_buy")
+    state = (
+        "abstain"
+        if switch_buy
+        else (
+            "reduce_or_exit_review"
+            if transaction_action
+            else "watch"
+        )
+    )
+    return {
+        "action_id": action_id,
+        "action_maturity": "experimental_shadow",
+        "blocking_codes": (["d3_missing", "post_trade_missing"] if switch_buy else []),
+        "exact_amount_available": False,
+        "invalidation_conditions": ["证据变化时重新评估"],
+        "missing_fields": (["d3", "post_trade"] if switch_buy else []),
+        "opposing_evidence_ids": [],
+        "state": state,
+        "state_inputs": {"phase_b_blocked": False},
+        "supporting_evidence_ids": ["fact_0"],
+        "unavailable_actions": unavailable,
+    }
+
+interpretations = [interpretation(item) for item in owner_actions]
+primary_interpretation = next(
+    (
+        item
+        for item in interpretations
+        if item["state"] == "reduce_or_exit_review"
+    ),
+    interpretations[0],
+)
+primary_state = primary_interpretation["state"]
+top_blocking_codes = sorted({
+    code for item in interpretations for code in item["blocking_codes"]
+})
+
+def state_text(state):
+    return {
+        "reduce_or_exit_review": (
+            "本次规则结果进入减仓或退出复核流程（reduce_or_exit_review）；"
+            "不表示系统发现了确定卖出信号，也不是立即赎回指令。"
+        ),
+        "watch": (
+            "本次规则结果为继续观察（watch）；"
+            "现有证据不足以形成确定的持有、减仓或退出结论。"
+        ),
+        "abstain": (
+            "本次暂不形成行动倾向（abstain）；"
+            "请先处理列示的证据缺口、冲突或交易限制。"
+        ),
+    }[state]
+
+def headline_item_text(item):
+    text = state_text(item["state"])
+    if item["action_id"] == "switch_reduce":
+        return "转出腿：" + text
+    if item["action_id"] == "switch_buy":
+        return "转入腿：" + text + " 不得从转出腿继承许可。"
+    return text
+
+coverage = {
+    "coverage_id": "minimum_relationship_coverage",
+    "evidence_ids": ["relationship_1"],
+    "evidence_state": "complete",
+    "included_fund_codes": [code, "000003"],
+    "known_percent": None,
+    "omitted_fund_codes": [],
+    "scope": "current_portfolio",
+    "unknown_fields": [],
+}
+holdings_coverage = dict(coverage)
+holdings_coverage["coverage_id"] = "disclosed_holdings_coverage"
+relationship = {
+    "evidence_ids": ["fact_4"],
+    "evidence_state": "complete",
+    "fund_codes": [code],
+    "metrics": {"multiple_observations": True},
+    "publication_times": [now],
+    "relationship_id": "relationship_1",
+    "relationship_type": "duplicate_holding_identity",
+    "report_periods": [],
+    "warnings": [],
+}
+status = {
+    "acceptable_alternative_ids": (["user_official_document"] if unsupported else []),
+    "conflicted_fields": [],
+    "cooldown_fields": [],
+    "manual_supplementation_codes": (["provide_official_document"] if unsupported else []),
+    "missing_fields": (["official_events"] if unsupported else []),
+    "obtained_fields": [item[0] for item in fact_fields],
+    "required_fields": [item[0] for item in fact_fields],
+    "stale_fields": [],
+    "state": ("partial" if unsupported else "complete"),
+    "supported_interpretations": owner_actions,
+    "unsupported_fields": (["official_events"] if unsupported else []),
+    "unsupported_interpretations": [],
+}
+missing = []
+if unsupported:
+    missing = [{
+        "affected_action_ids": owner_actions,
+        "condition": "unsupported",
+        "field_id": "official_events",
+        "scope": "decision_evidence_status",
+    }]
+payload = {
+    "schema_version": "1",
+    "command": "fund.brief",
+    "as_of": now,
+    "data": {
+        "request": {
+            "action_ids": action_ids,
+            "created_at": now,
+            "decision_snapshot_id": 1,
+            "evidence_fingerprint": "a" * 64,
+            "mode": "rapid",
+            "omitted_work": (["official_events"] if unsupported else []),
+            "request_run_id": 1,
+            "result_checksum": "b" * 64,
+            "terminal_status": ("partial" if unsupported else "complete"),
+        },
+        "subject": {
+            "fund_code": code,
+            "observation_version": "synthetic_non_personal_v1",
+            "observed_at": now,
+            "portfolio_evidence_state": "current",
+            "portfolio_weight": "0.25",
+            "position_present": True,
+        },
+        "facts": facts,
+        "official_events": [],
+        "portfolio_relationship": {
+            "disclosed_holdings_coverage": holdings_coverage,
+            "minimum_relationship_coverage": coverage,
+            "relationships": [relationship],
+        },
+        "sync_status": status,
+        "decision_evidence_status": status,
+        "action_interpretation": {
+            "action_maturity": "experimental_shadow",
+            "affected_action_abstentions": (["switch_buy"] if action == "switch_funds" else []),
+            "blocking_codes": top_blocking_codes,
+            "conflicts": [],
+            "constraints": [],
+            "interpretations": interpretations,
+            "primary_state": primary_state,
+            "triggered_reviews": [],
+        },
+        "missing_evidence": missing,
+        "beginner_explanation_zh": {
+            "headline": {
+                "action_maturity": "experimental_shadow",
+                "items": [{
+                    "action_id": item["action_id"],
+                    "action_maturity": item["action_maturity"],
+                    "state": item["state"],
+                    "text": headline_item_text(item),
+                } for item in interpretations],
+                "maturity_scope": (
+                    "primary_state_only" if action == "switch_funds" else "all_actions"
+                ),
+                "maturity_text": "实验性状态不授权交易。",
+                "primary_state": primary_state,
+                "text": state_text(primary_state),
+            },
+            "fund_identity": {"data_dates": [], "evidence_ids": [], "text": "身份事实"},
+            "portfolio_relationship": {
+                "coverage_ids": [],
+                "relationship_ids": [],
+                "text": "组合关系",
+                "unknown_fields": {},
+            },
+            "recent_official_events": {
+                "event_ids": [],
+                "inactive_items": [],
+                "text": "正式公告范围",
+            },
+            "why_this_state": {"items": [], "text": "条件判断"},
+            "evidence_gaps": {"items": missing, "text": "证据缺口"},
+            "change_conditions": {"items": [], "text": "重新评估条件"},
+        },
+    },
+    "warnings": [],
+    "errors": [],
+}
+if scenario == "unknown_field" and action == "continue_holding":
+    payload["data"]["unknown_field"] = "must fail closed"
+if scenario == "private_sentinel" and action == "continue_holding":
+    payload["data"]["facts"][0]["value"]["fund_name"] = (
+        "PRIVATE_ACCEPTANCE_SENTINEL_918273645"
+    )
+if scenario == "stale_identity" and action == "continue_holding":
+    payload["data"]["facts"][0]["freshness"] = "stale"
+if scenario == "unsafe_headline" and action == "continue_holding":
+    payload["data"]["beginner_explanation_zh"]["headline"]["text"] = "今天买入100元"
+if scenario == "disguised_headline" and action == "continue_holding":
+    payload["data"]["beginner_explanation_zh"]["headline"]["text"] = (
+        "建议全额赎回，但不构成交易指令"
+    )
+if scenario == "exact_share_headline" and action == "continue_holding":
+    payload["data"]["beginner_explanation_zh"]["headline"]["text"] = (
+        "赎回100份，但不构成交易指令"
+    )
+if scenario == "bare_liquidation_headline" and action == "continue_holding":
+    payload["data"]["beginner_explanation_zh"]["headline"]["text"] = (
+        "清仓，但不构成交易指令"
+    )
+if scenario == "half_shares_headline" and action == "continue_holding":
+    payload["data"]["beginner_explanation_zh"]["headline"]["text"] = (
+        "赎回一半份额，但不构成交易指令"
+    )
+if scenario == "half_position_headline" and action == "continue_holding":
+    payload["data"]["beginner_explanation_zh"]["headline"]["text"] = (
+        "卖掉半仓，但不构成交易指令"
+    )
+if scenario == "chinese_exact_shares_headline" and action == "continue_holding":
+    payload["data"]["beginner_explanation_zh"]["headline"]["text"] = (
+        "赎回一百份，但不构成交易指令"
+    )
+if scenario == "invalid_reduce_state" and action == "reduce_to_cash":
+    payload["data"]["action_interpretation"]["interpretations"][0]["state"] = "watch"
+    payload["data"]["beginner_explanation_zh"]["headline"]["items"][0]["state"] = "watch"
+    payload["data"]["action_interpretation"]["primary_state"] = "watch"
+    payload["data"]["beginner_explanation_zh"]["headline"]["primary_state"] = "watch"
+if scenario == "switch_buy_permission" and action == "switch_funds":
+    buy = payload["data"]["action_interpretation"]["interpretations"][1]
+    buy["state"] = "hold"
+    buy["blocking_codes"] = []
+    buy["missing_fields"] = []
+    buy["unavailable_actions"] = []
+if scenario == "switch_primary_mismatch" and action == "switch_funds":
+    payload["data"]["action_interpretation"]["primary_state"] = "abstain"
+    payload["data"]["beginner_explanation_zh"]["headline"]["primary_state"] = "abstain"
+if scenario == "private_metric" and action == "continue_holding":
+    payload["data"]["portfolio_relationship"]["relationships"][0]["metrics"] = {
+        "owner_weight": "0.25"
+    }
+if scenario == "owner_coverage_unknown" and action == "continue_holding":
+    disclosed = payload["data"]["portfolio_relationship"][
+        "disclosed_holdings_coverage"
+    ]
+    disclosed["evidence_state"] = "partial"
+    disclosed["known_percent"] = None
+    disclosed["unknown_fields"] = ["top10_overlap_unknown"]
+    payload["data"]["decision_evidence_status"]["state"] = "partial"
+    payload["data"]["decision_evidence_status"]["missing_fields"] = [
+        "manager_evidence_missing_000999"
+    ]
+fixture_fd_text = os.environ.get("KUNJIN_PHASE1_PUBLIC_FIXTURE_FD")
+marker_fd_text = os.environ.get("KUNJIN_PHASE1_PUBLIC_MARKER_FD")
+if fixture_fd_text is not None or marker_fd_text is not None:
+    fixture_fd = int(fixture_fd_text)
+    marker_fd = int(marker_fd_text)
+    fixture = json.loads(os.read(fixture_fd, 512).decode("ascii"))
+    os.close(fixture_fd)
+    if fixture["fund_code"] != code or fixture["run_id"] != os.environ[
+        "KUNJIN_PHASE1_RUN_ID"
+    ]:
+        raise SystemExit(93)
+    marker = json.dumps(
+        {
+            "contract": "kunjin_phase1_public_portfolio_used_v1",
+            "fund_code": code,
+            "observation_version": "synthetic_non_personal_v1",
+            "payload_sha256": "f" * 64,
+            "request_id": "9" * 32,
+            "run_id": fixture["run_id"],
+            "schema_version": 1,
+            "source_attempt_id": 1,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    os.write(marker_fd, marker)
+    os.close(marker_fd)
+json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+''',
+            encoding="utf-8",
+        )
+        cli.chmod(0o700)
+        return acceptance, cli
+
+    def test_phase1_acceptance_script_contract_is_strict_and_amount_free(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script_path = root / "scripts" / "run_phase1_acceptance.sh"
+        script = script_path.read_text(encoding="utf-8")
+
+        self.assertTrue(script_path.stat().st_mode & 0o100)
+        for phrase in (
+            "set -euo pipefail",
+            '^[0-9]{6}$',
+            "HEALTHY_PUBLIC_CODE UNSUPPORTED_PUBLIC_CODE OUTPUT_DIR",
+            "--owner OUTPUT_DIR",
+            "KUNJIN_PHASE1_RUN_ID",
+            "start_new_session=True",
+            "SIGTERM",
+            "SIGKILL",
+            "MAX_RAW_BYTES",
+            "renameatx_np",
+            "RENAME_EXCL",
+            "os.O_NOFOLLOW",
+            "terminal_status",
+            "decision_evidence_status",
+            "exact_amount_available",
+            "opaque_subject_id",
+            "relationship_coverage_class",
+        ):
+            self.assertIn(phrase, script)
+        for forbidden in (
+            "docker build",
+            "docker pull",
+            "pip install",
+            "brew install",
+            "sync fund-documents",
+        ):
+            self.assertNotIn(forbidden, script.casefold())
+
+    def test_phase1_acceptance_runs_offline_public_and_private_projections(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            acceptance, _cli = self._install_phase1_acceptance_fixture(temporary_root)
+            log = temporary_root / "calls.log"
+            public_output = temporary_root / "public-output"
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "FAKE_KUNJIN_LOG": str(log),
+                "KUNJIN_PHASE1_PUBLIC_FIXTURE_ATTESTATION": "synthetic_non_personal",
+            }
+            public = subprocess.run(
+                [str(acceptance), "000001", "000002", str(public_output)],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(public.returncode, 0, public.stderr.decode())
+            summary = json.loads((public_output / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["acceptance"], "phase1_public_live")
+            self.assertEqual(summary["status"], "passed")
+            self.assertEqual(summary["portfolio_fixture"], "synthetic_non_personal")
+            self.assertEqual(summary["fund_fact_scope"], "live_public_sources")
+            self.assertEqual(summary["healthy"]["useful_fact_fields"][:3], [
+                "share_class_identity",
+                "current_manager_team",
+                "formal_nav",
+            ])
+            healthy_brief = json.loads(
+                (public_output / "healthy-continue_holding.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            formal_nav = next(
+                item for item in healthy_brief["facts"] if item["field_id"] == "formal_nav"
+            )
+            self.assertEqual(formal_nav["source_tier"], "tier_2")
+            self.assertEqual(
+                healthy_brief["subject"]["portfolio_fixture"],
+                "synthetic_non_personal",
+            )
+            projected_files = sorted(path.name for path in public_output.iterdir())
+            self.assertEqual(
+                projected_files,
+                [
+                    "healthy-continue_holding.json",
+                    "healthy-full_exit.json",
+                    "healthy-reduce_to_cash.json",
+                    "healthy-switch_funds.json",
+                    "summary.json",
+                    "unsupported-continue_holding.json",
+                    "unsupported-source-status.json",
+                ],
+            )
+            rendered = "".join(
+                path.read_text(encoding="utf-8") for path in public_output.iterdir()
+            )
+            for forbidden in (
+                "portfolio_weight",
+                '"fund_codes"',
+                "current_value",
+                "shares",
+                "cost",
+                "profit",
+                "PRIVATE_ACCEPTANCE_SENTINEL",
+            ):
+                self.assertNotIn(forbidden, rendered)
+            calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+            action_calls = [call for call in calls if "--action" in call]
+            self.assertEqual(
+                [call[call.index("--action") + 1] for call in action_calls],
+                [
+                    "continue_holding",
+                    "reduce_to_cash",
+                    "full_exit",
+                    "switch_funds",
+                    "continue_holding",
+                ],
+            )
+            self.assertIn(
+                ["--json", "source", "status", "--fund-code", "000002"],
+                calls,
+            )
+
+            owner_output = temporary_root / "owner-output"
+            owner = subprocess.run(
+                [str(acceptance), "--owner", str(owner_output)],
+                env=env,
+                input=b"000001\n",
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(owner.returncode, 0, owner.stderr.decode())
+            owner_summary = json.loads(
+                (owner_output / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertRegex(owner_summary["opaque_subject_id"], r"^[0-9a-f]{32}$")
+            self.assertTrue(owner_summary["position_present"])
+            self.assertEqual(owner_summary["relationship_coverage_class"], "complete")
+            owner_rendered = json.dumps(owner_summary, ensure_ascii=False)
+            self.assertNotIn("000001", owner_rendered)
+            self.assertNotIn("0.25", owner_rendered)
+            self.assertNotIn("portfolio_weight", owner_rendered)
+
+            conservative_output = temporary_root / "owner-conservative-output"
+            conservative_env = dict(env)
+            conservative_env["FAKE_KUNJIN_SCENARIO"] = "owner_coverage_unknown"
+            conservative = subprocess.run(
+                [str(acceptance), "--owner", str(conservative_output)],
+                env=conservative_env,
+                input=b"000001\n",
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(conservative.returncode, 0, conservative.stderr.decode())
+            conservative_summary = json.loads(
+                (conservative_output / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                conservative_summary["relationship_coverage_class"],
+                "partial",
+            )
+            self.assertEqual(
+                conservative_summary["decision_evidence_state"],
+                "partial",
+            )
+            self.assertEqual(
+                conservative_summary["acceptance_scope"],
+                "technical_safety_not_financial_sufficiency",
+            )
+            self.assertNotIn("000999", json.dumps(conservative_summary))
+
+    def test_phase1_acceptance_fails_closed_for_faults_and_privacy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            acceptance, _cli = self._install_phase1_acceptance_fixture(temporary_root)
+            log = temporary_root / "calls.log"
+            for scenario in (
+                "oversized",
+                "oversized_stderr",
+                "unknown_field",
+                "private_sentinel",
+                "stale_identity",
+                "unsafe_headline",
+                "disguised_headline",
+                "exact_share_headline",
+                "bare_liquidation_headline",
+                "half_shares_headline",
+                "half_position_headline",
+                "chinese_exact_shares_headline",
+                "invalid_reduce_state",
+                "switch_buy_permission",
+                "switch_primary_mismatch",
+                "private_metric",
+                "unbound_supplementation",
+                "spliced_supplementation",
+                "detached",
+                "spawn_on_term",
+                "timeout",
+            ):
+                with self.subTest(scenario=scenario):
+                    output = temporary_root / f"output-{scenario}"
+                    pid_file = temporary_root / f"{scenario}.pid"
+                    spawned_pid_file = temporary_root / f"{scenario}-spawned.pid"
+                    env = {
+                        "PATH": "/usr/bin:/bin",
+                        "FAKE_KUNJIN_LOG": str(log),
+                        "FAKE_KUNJIN_PID": str(pid_file),
+                        "FAKE_KUNJIN_SCENARIO": scenario,
+                        "FAKE_KUNJIN_SPAWNED_PID": str(spawned_pid_file),
+                        "KUNJIN_PHASE1_ACCEPTANCE_TIMEOUT_SECONDS": "1",
+                        "KUNJIN_PHASE1_PUBLIC_FIXTURE_ATTESTATION": "synthetic_non_personal",
+                    }
+                    result = subprocess.run(
+                        [str(acceptance), "000001", "000002", str(output)],
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                        timeout=5,
+                    )
+                    self.assertNotEqual(
+                        result.returncode,
+                        0,
+                        f"scenario unexpectedly passed: {scenario}",
+                    )
+                    self.assertFalse(output.exists())
+                    if pid_file.exists():
+                        pid = int(pid_file.read_text(encoding="ascii"))
+                        deadline = time.monotonic() + 2
+                        while time.monotonic() < deadline:
+                            try:
+                                os.kill(pid, 0)
+                            except ProcessLookupError:
+                                break
+                            time.sleep(0.01)
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(pid, 0)
+                    if spawned_pid_file.exists():
+                        spawned_pid = int(spawned_pid_file.read_text(encoding="ascii"))
+                        deadline = time.monotonic() + 2
+                        while time.monotonic() < deadline:
+                            try:
+                                os.kill(spawned_pid, 0)
+                            except ProcessLookupError:
+                                break
+                            time.sleep(0.01)
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(spawned_pid, 0)
+
+    def test_phase1_acceptance_interrupt_cleans_ignored_term_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            acceptance, _cli = self._install_phase1_acceptance_fixture(temporary_root)
+            output = temporary_root / "interrupted-output"
+            pid_file = temporary_root / "interrupted.pid"
+            process = subprocess.Popen(
+                [str(acceptance), "000001", "000002", str(output)],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "FAKE_KUNJIN_LOG": str(temporary_root / "interrupt.log"),
+                    "FAKE_KUNJIN_PID": str(pid_file),
+                    "FAKE_KUNJIN_SCENARIO": "timeout",
+                    "KUNJIN_PHASE1_ACCEPTANCE_TIMEOUT_SECONDS": "10",
+                    "KUNJIN_PHASE1_PUBLIC_FIXTURE_ATTESTATION": "synthetic_non_personal",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 3
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(pid_file.exists())
+            child_pid = int(pid_file.read_text(encoding="ascii"))
+            os.killpg(process.pid, signal.SIGINT)
+            _stdout, stderr = process.communicate(timeout=5)
+            self.assertNotEqual(process.returncode, 0, stderr.decode())
+            self.assertFalse(output.exists())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+
+    def test_phase1_acceptance_rejects_arguments_conflicts_and_inode_replacement(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = root / "scripts" / "run_phase1_acceptance.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            existing = temporary_root / "existing"
+            existing.mkdir()
+            cases = (
+                ([], 64),
+                (["000001", "000001", str(temporary_root / "same")], 65),
+                (["12345", "000002", str(temporary_root / "bad")], 65),
+                (["000001", "000002", "relative-output"], 65),
+                (["000001", "000002", str(existing)], 66),
+            )
+            for args, expected in cases:
+                with self.subTest(args=args):
+                    result = subprocess.run(
+                        [str(script), *args],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, expected)
+
+            acceptance, _cli = self._install_phase1_acceptance_fixture(temporary_root)
+            replacement = temporary_root / "replacement-source"
+            replacement.mkdir()
+            replacement_inode = replacement.stat().st_ino
+            output = temporary_root / "replaced-output"
+            result = subprocess.run(
+                [str(acceptance), "000001", "000002", str(output)],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "FAKE_KUNJIN_LOG": str(temporary_root / "replace.log"),
+                    "KUNJIN_PHASE1_PUBLIC_FIXTURE_ATTESTATION": "synthetic_non_personal",
+                    "KUNJIN_PHASE1_TEST_RENAME_HOOK": "replace_after_rename",
+                    "KUNJIN_PHASE1_TEST_REPLACEMENT_SOURCE": str(replacement),
+                },
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(output.stat().st_ino, replacement_inode)
+            self.assertIn(
+                "concurrent publication residue may remain",
+                result.stderr.decode(),
+            )
+
     def _run_build_script_with_iidfile_bytes(
         self,
         iidfile_bytes: bytes,

@@ -317,12 +317,21 @@ class ApplicationContext:
     brief_service: Optional["HeldFundBriefService"] = None
 
 
-def build_context() -> ApplicationContext:
+def build_context(*, public_acceptance_subject: Optional[str] = None) -> ApplicationContext:
     from kunjin.brief.nav import BoundedNavService
     from kunjin.brief.portfolio import BoundedPortfolioService
+    from kunjin.brief.public_acceptance_portfolio import (
+        build_public_acceptance_portfolio_service,
+        load_public_acceptance_capability,
+    )
     from kunjin.brief.service import HeldFundBriefService
 
-    paths = RuntimePaths.from_environment().ensure()
+    paths = RuntimePaths.from_environment()
+    public_acceptance = load_public_acceptance_capability(
+        paths,
+        public_acceptance_subject,
+    )
+    paths.ensure()
     repository = Repository(paths.database)
     repository.migrate()
     token_store = KeychainTokenStore()
@@ -365,14 +374,23 @@ def build_context() -> ApplicationContext:
         registry=source_registry,
         policy=evidence_policy,
     )
+    portfolio_service = (
+        BoundedPortfolioService(
+            repository,
+            sync_service=sync_service,
+        )
+        if public_acceptance is None
+        else build_public_acceptance_portfolio_service(
+            repository,
+            sync_service,
+            public_acceptance,
+        )
+    )
     brief_service = HeldFundBriefService(
         repository=repository,
         suitability_service=suitability_service,
         disclosure_service=fund_disclosure_service,
-        portfolio_service=BoundedPortfolioService(
-            repository,
-            sync_service=sync_service,
-        ),
+        portfolio_service=portfolio_service,
         nav_service=BoundedNavService(repository),
         audit_store=decision_audit_store,
         health_service=source_health_service,
@@ -3272,7 +3290,16 @@ def run(
         if args.command == "version":
             payload = envelope("version", {"version": __version__})
         else:
-            payload = execute(args, context or build_context())
+            public_acceptance_subject = (
+                args.fund_code
+                if args.command == "fund" and args.fund_command == "brief"
+                else None
+            )
+            payload = execute(
+                args,
+                context
+                or build_context(public_acceptance_subject=public_acceptance_subject),
+            )
         exit_code = 1 if payload["errors"] else 0
     except (
         CredentialStoreError,
