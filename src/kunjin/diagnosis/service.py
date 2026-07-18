@@ -5,7 +5,7 @@ import json
 import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Callable, Dict, Mapping, Optional
+from typing import Callable, Dict, Mapping, Optional, Tuple
 
 from kunjin.analytics.portfolio import analyze_portfolio
 from kunjin.brief.d2 import PortfolioEvidenceBinding, build_d2_relationships
@@ -14,12 +14,17 @@ from kunjin.brief.models import BriefCoverage, RelationshipEvidence
 from kunjin.decision.budget import RequestBudget
 from kunjin.decision.models import RequestMode
 from kunjin.diagnosis.models import (
+    CandidateImpact,
     DiagnosisCoverage,
     DiagnosisFinding,
     DiagnosisRelationship,
     PortfolioDiagnosis,
 )
-from kunjin.funds.peers.research import build_portfolio_overlap_report
+from kunjin.funds.models import DisclosureBundle
+from kunjin.funds.peers.research import (
+    build_explicit_compare_report,
+    build_portfolio_overlap_report,
+)
 from kunjin.funds.store import FundDisclosureStore
 from kunjin.storage.repository import Repository
 
@@ -174,6 +179,90 @@ def _finding_for_relationship(
     return result
 
 
+def _candidate_unknown_fields(
+    bundle: DisclosureBundle,
+    as_of: datetime,
+) -> Tuple[str, ...]:
+    bundle.validate()
+    local_date = as_of.date()
+    unknown = []
+    if bundle.identity is None:
+        unknown.append("candidate_identity")
+    current_managers = tuple(
+        item
+        for item in bundle.manager_tenures
+        if item.start_date <= local_date
+        and (item.end_date is None or item.end_date >= local_date)
+    )
+    if not current_managers:
+        unknown.append("candidate_manager")
+    current_benchmarks = tuple(
+        item
+        for item in bundle.benchmarks
+        if (item.effective_from is None or item.effective_from <= local_date)
+        and (item.effective_to is None or item.effective_to >= local_date)
+    )
+    if not current_benchmarks:
+        unknown.append("candidate_benchmark")
+    if not bundle.holdings:
+        unknown.append("candidate_holdings")
+    return tuple(sorted(unknown))
+
+
+def _candidate_overlap(
+    report: Mapping[str, object],
+    candidate_fund_code: str,
+) -> Tuple[Optional[Decimal], Optional[Decimal], Tuple[str, ...]]:
+    section = report.get("candidate_portfolio_overlap")
+    if not isinstance(section, Mapping):
+        return None, None, ("candidate_overlap",)
+    item = section.get(candidate_fund_code)
+    if not isinstance(item, Mapping) or item.get("evidence_level") != "deterministic_calculation":
+        return None, None, ("candidate_overlap",)
+    try:
+        disclosed = Decimal(str(item["candidate_disclosed_weight"]))
+        overlap = Decimal(str(item["overlap"]))
+    except (KeyError, ValueError):
+        return None, None, ("candidate_overlap",)
+    if (
+        not disclosed.is_finite()
+        or not overlap.is_finite()
+        or not Decimal("0") <= overlap <= disclosed <= Decimal("1")
+    ):
+        return None, None, ("candidate_overlap",)
+    return disclosed, overlap, ()
+
+
+def _candidate_label(
+    relationships: Tuple[DiagnosisRelationship, ...],
+    disclosed_weight: Optional[Decimal],
+    observed_overlap: Optional[Decimal],
+    unknown_fields: Tuple[str, ...],
+) -> str:
+    if unknown_fields or disclosed_weight is None or observed_overlap is None:
+        return "insufficient_data"
+    relation_types = {item.relationship_type for item in relationships}
+    if "share_class_sibling" in relation_types:
+        return "observed_duplicates_existing_exposure"
+    duplicate_relationship = bool(
+        relation_types.intersection(
+            {
+                "disclosed_overlap",
+                "same_current_benchmark",
+                "same_manager",
+                "top10_disclosed_overlap",
+            }
+        )
+    )
+    if duplicate_relationship or observed_overlap > 0:
+        if disclosed_weight > observed_overlap:
+            return "mixed_observed_impact"
+        return "observed_duplicates_existing_exposure"
+    if disclosed_weight == Decimal("1") and observed_overlap == 0:
+        return "observed_adds_distinct_exposure"
+    return "insufficient_data"
+
+
 class DiagnosisService:
     def __init__(
         self,
@@ -202,7 +291,6 @@ class DiagnosisService:
                 or candidate_fund_code == "000000"
             ):
                 raise ValueError("candidate fund code must be six digits and non-reserved")
-            raise NotImplementedError("candidate impact is implemented in Phase 3 Task 3")
         as_of = _utc(self._clock(), "diagnosis clock")
         positions = tuple(self._repository.latest_positions())
         held_codes = tuple(sorted({item.fund_code for item in positions if item.shares > 0}))
@@ -250,9 +338,17 @@ class DiagnosisService:
         bundles = {
             code: self._disclosure_store.load_bundle(code) for code in held_codes
         }
+        comparison_codes = held_codes
+        if candidate_fund_code is not None:
+            if candidate_fund_code in held_codes:
+                raise ValueError("candidate fund code is already held")
+            bundles[candidate_fund_code] = self._disclosure_store.load_bundle(
+                candidate_fund_code
+            )
+            comparison_codes = (*held_codes, candidate_fund_code)
         fact_sets: Dict[str, SourceLinkedFactSet] = {}
         projection_failures = []
-        for code in held_codes:
+        for code in comparison_codes:
             try:
                 fact_sets[code] = build_source_linked_facts(
                     bundles[code],
@@ -282,7 +378,7 @@ class DiagnosisService:
                 request_id=budget.request_id,
                 request_mode=RequestMode.RAPID,
             )
-            for code in held_codes
+            for code in comparison_codes
         ]
         relationship_by_id: Dict[str, DiagnosisRelationship] = {}
         for d2 in d2_results:
@@ -299,10 +395,65 @@ class DiagnosisService:
             sorted(relationship_by_id.values(), key=lambda item: item.relationship_id)
         )
 
-        overlap_report = build_portfolio_overlap_report(bundles, positions, as_of)
+        held_bundles = {code: bundles[code] for code in held_codes}
+        overlap_report = build_portfolio_overlap_report(held_bundles, positions, as_of)
         primary = d2_results[0]
         relationship_coverage = _coverage(primary.coverage, analysis.weights)
         holdings_coverage = _coverage(primary.holdings_coverage, analysis.weights)
+
+        candidate_impact = None
+        if candidate_fund_code is not None:
+            candidate_d2 = d2_results[-1]
+            candidate_relationships = tuple(
+                item for item in relationships if candidate_fund_code in item.fund_codes
+            )
+            candidate_unknown = set(
+                _candidate_unknown_fields(bundles[candidate_fund_code], as_of)
+            )
+            candidate_unknown.update(
+                item
+                for item in projection_failures
+                if item.endswith(f"_{candidate_fund_code}")
+            )
+            candidate_unknown.update(candidate_d2.missing_fields)
+            candidate_unknown.update(candidate_d2.conflicts)
+            explicit_codes = (*held_codes[:9], candidate_fund_code)
+            try:
+                explicit_report = build_explicit_compare_report(
+                    explicit_codes,
+                    bundles,
+                    {code: () for code in explicit_codes},
+                    positions,
+                    as_of,
+                )
+                disclosed_weight, observed_overlap, overlap_unknown = _candidate_overlap(
+                    explicit_report,
+                    candidate_fund_code,
+                )
+            except (KeyError, TypeError, ValueError):
+                disclosed_weight, observed_overlap, overlap_unknown = (
+                    None,
+                    None,
+                    ("candidate_overlap",),
+                )
+            candidate_unknown.update(overlap_unknown)
+            candidate_unknown_tuple = tuple(sorted(candidate_unknown))
+            candidate_impact = CandidateImpact(
+                fund_code=candidate_fund_code,
+                label=_candidate_label(
+                    candidate_relationships,
+                    disclosed_weight,
+                    observed_overlap,
+                    candidate_unknown_tuple,
+                ),
+                relationship_ids=tuple(
+                    sorted(item.relationship_id for item in candidate_relationships)
+                ),
+                disclosed_weight=disclosed_weight,
+                observed_overlap=observed_overlap,
+                unknown_fields=candidate_unknown_tuple,
+            )
+            candidate_impact.validate()
 
         findings = []
         if analysis.hhi is not None:
@@ -332,6 +483,27 @@ class DiagnosisService:
             for relationship in relationships
             if (finding := _finding_for_relationship(relationship)) is not None
         )
+        if candidate_impact is not None and candidate_impact.label in {
+            "mixed_observed_impact",
+            "observed_duplicates_existing_exposure",
+        }:
+            candidate_relationship_codes = {
+                code
+                for relationship in relationships
+                if relationship.relationship_id in candidate_impact.relationship_ids
+                for code in relationship.fund_codes
+            }
+            candidate_relationship_codes.add(candidate_impact.fund_code)
+            findings.append(
+                DiagnosisFinding(
+                    finding_id="finding_candidate_observed_duplication",
+                    finding_type="candidate_observed_duplication",
+                    severity="attention",
+                    fund_codes=tuple(sorted(candidate_relationship_codes)),
+                    relationship_ids=candidate_impact.relationship_ids,
+                    evidence_scope="candidate_disclosed_context",
+                )
+            )
 
         missing = set(projection_failures)
         conflicts = set()
@@ -342,6 +514,8 @@ class DiagnosisService:
             warnings.update(d2.warnings)
         if not analysis.weights:
             missing.add("portfolio_valuation_unavailable")
+        if candidate_impact is not None:
+            missing.update(candidate_impact.unknown_fields)
         overlap_data_gaps = overlap_report.get("data_gaps", [])
         if isinstance(overlap_data_gaps, list):
             for item in overlap_data_gaps:
@@ -381,6 +555,9 @@ class DiagnosisService:
                 }
                 for item in relationships
             ],
+            "candidate_impact": (
+                None if candidate_impact is None else candidate_impact.__dict__
+            ),
             "value_basis": value_basis,
         }
         result = PortfolioDiagnosis(
@@ -392,7 +569,7 @@ class DiagnosisService:
             relationship_coverage=relationship_coverage,
             holdings_coverage=holdings_coverage,
             relationships=relationships,
-            candidate_impact=None,
+            candidate_impact=candidate_impact,
             findings=findings_tuple,
             missing_evidence=tuple(sorted(missing)),
             conflicts=tuple(sorted(conflicts)),

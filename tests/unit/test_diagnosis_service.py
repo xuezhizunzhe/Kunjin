@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from kunjin.brief.models import BriefCoverage, BriefEvidenceState, RelationshipEvidence
 from kunjin.diagnosis.models import PortfolioDiagnosis
 from kunjin.diagnosis.service import DiagnosisService
@@ -218,5 +220,111 @@ def test_d2_manager_and_benchmark_relationships_keep_their_exact_limits(
     assert projected_benchmark.evidence_state == "partial"
     assert projected_benchmark.warnings == ("benchmark_text_is_not_index_identity",)
     assert "same_exact_index_or_theme" not in {
+        finding.finding_type for finding in result.findings
+    }
+
+
+def test_candidate_without_local_public_evidence_is_insufficient(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _save_positions(repository, ("000001", "10", "1"))
+
+    result = _service(repository).diagnose("000003")
+
+    result.validate()
+    assert result.candidate_impact is not None
+    assert result.candidate_impact.fund_code == "000003"
+    assert result.candidate_impact.label == "insufficient_data"
+    assert set(result.candidate_impact.unknown_fields) >= {
+        "candidate_identity",
+        "candidate_manager",
+        "candidate_benchmark",
+        "candidate_holdings",
+    }
+    assert result.action_authorized is False
+
+
+@pytest.mark.parametrize("code", ("000000", "12345", "abcdef"))
+def test_candidate_code_is_exact_and_non_reserved(tmp_path: Path, code: str) -> None:
+    with pytest.raises(ValueError, match="candidate fund code"):
+        _service(_repository(tmp_path)).diagnose(code)
+
+
+def test_candidate_partial_overlap_is_mixed_and_never_called_safe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from kunjin.diagnosis import service as service_module
+
+    repository = _repository(tmp_path)
+    _save_positions(repository, ("000001", "10", "1"))
+    manager = RelationshipEvidence(
+        relationship_id="same_manager_000001_000003",
+        relationship_type="same_manager",
+        fund_codes=("000001", "000003"),
+        evidence_state=BriefEvidenceState.COMPLETE,
+        metrics={"shared_manager_name": "示例经理"},
+        evidence_ids=(),
+        report_periods=(),
+        publication_times=(NOW,),
+        warnings=(),
+    )
+    relationship_coverage = BriefCoverage(
+        coverage_id="d2_minimum_relationship_coverage",
+        scope="minimum_relationship_coverage",
+        evidence_state=BriefEvidenceState.COMPLETE,
+        included_fund_codes=("000001",),
+        omitted_fund_codes=(),
+        known_percent=None,
+        unknown_fields=("authenticated_index_identity_000001",),
+        evidence_ids=(),
+    )
+    holdings = BriefCoverage(
+        coverage_id="d2_disclosed_holdings_coverage",
+        scope="disclosed_holdings_overlap",
+        evidence_state=BriefEvidenceState.COMPLETE,
+        included_fund_codes=("000001",),
+        omitted_fund_codes=(),
+        known_percent=None,
+        unknown_fields=(),
+        evidence_ids=(),
+    )
+
+    class FakeD2:
+        relationships = (manager,)
+        coverage = relationship_coverage
+        holdings_coverage = holdings
+        missing_fields = ()
+        conflicts = ()
+        warnings = ()
+
+        def validate(self) -> None:
+            return None
+
+    monkeypatch.setattr(service_module, "build_d2_relationships", lambda *args, **kwargs: FakeD2())
+    monkeypatch.setattr(service_module, "_candidate_unknown_fields", lambda bundle, as_of: ())
+    monkeypatch.setattr(
+        service_module,
+        "build_explicit_compare_report",
+        lambda *args, **kwargs: {
+            "candidate_portfolio_overlap": {
+                "000003": {
+                    "evidence_level": "deterministic_calculation",
+                    "candidate_disclosed_weight": "0.8",
+                    "overlap": "0.2",
+                }
+            }
+        },
+    )
+
+    result = _service(repository).diagnose("000003")
+
+    result.validate()
+    assert result.candidate_impact is not None
+    assert result.candidate_impact.label == "mixed_observed_impact"
+    assert result.candidate_impact.disclosed_weight == Decimal("0.8")
+    assert result.candidate_impact.observed_overlap == Decimal("0.2")
+    assert "safe" not in result.candidate_impact.label
+    assert "recommended" not in result.candidate_impact.label
+    assert "candidate_observed_duplication" in {
         finding.finding_type for finding in result.findings
     }
