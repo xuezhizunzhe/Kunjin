@@ -57,7 +57,7 @@ from kunjin.decision.source_registry import (
     SOURCE_REGISTRY_V1_CHECKSUM,
     SourceRegistryV1,
 )
-from kunjin.decision.store import DecisionAuditStore
+from kunjin.decision.store import DecisionAuditStore, DecisionAuditStoreError
 from kunjin.models import InvestmentThesis
 from kunjin.storage.repository import Repository
 
@@ -881,6 +881,25 @@ def test_history_authenticates_is_bounded_and_uses_sanitized_conclusion(tmp_path
 def test_empty_history_does_not_require_a_policy_row(tmp_path) -> None:
     _, _, brief_store = _stores(tmp_path)
     assert brief_store.history("123456") == ()
+
+
+def test_unreadable_latest_history_is_not_used_for_conclusion_comparison(tmp_path) -> None:
+    repository, decision_store, brief_store = _stores(tmp_path)
+    previous = _publish(decision_store, brief_store, request_id="1" * 32)[2]
+    current = replace(previous.snapshot, created_at=NOW + timedelta(seconds=3))
+
+    with patch.object(
+        brief_store,
+        "_stored_snapshot",
+        side_effect=DecisionAuditStoreError("legacy registry is unavailable"),
+    ):
+        assert brief_store.latest_history_comparable("123456") is False
+        with repository.connect() as connection:
+            assert brief_store._conclusion_changed(
+                connection,
+                current,
+                HeldFundBriefPolicyV1(),
+            ) == (False, False)
 
 
 def test_history_returns_at_most_64_authenticated_snapshots(tmp_path) -> None:

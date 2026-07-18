@@ -94,12 +94,28 @@ import sys
 import time
 
 cli, code, live_sources = sys.argv[1:]
+all_source_ids = set(live_sources.split())
+usable_outcomes = {"success", "cache_hit"}
 commands = (
     ("news_recent", [cli, "--json", "news", "recent", "--window", "recent", "--mode", "rapid"]),
     ("market_overview", [cli, "--json", "market", "overview", "--window", "recent", "--mode", "rapid"]),
     ("fund_intelligence", [cli, "--json", "fund", "intelligence", code, "--window", "recent", "--mode", "rapid"]),
 )
 summaries = []
+
+def fail_live(label, reason_code):
+    print(json.dumps({
+        "mode": "live",
+        "status": "failed",
+        "failed_workflow": label,
+        "failure_reason_code": reason_code,
+        "source_allowlist": live_sources.split(),
+        "stores_response_bodies_in_git": False,
+        "never_places_trades": True,
+        "results": summaries,
+    }, ensure_ascii=True, sort_keys=True))
+    raise SystemExit(1)
+
 for label, command in commands:
     started = time.monotonic()
     completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=95)
@@ -125,6 +141,12 @@ for label, command in commands:
             "workflow": label,
             "elapsed_ms": elapsed_ms,
             "terminal_status": request["terminal_status"],
+            "published_item_count": len(data["items"]),
+            "dimension_count": len(data["dimensions"]),
+            "fund_context_field_count": len(
+                data["fund_relevance"].get("covered_fields", [])
+            ),
+            "fund_relevance_link_count": len(data["fund_relevance"]["links"]),
             "sources": sources,
             "omitted_work": request["omitted_work"],
             "action_maturity": data["action_maturity"],
@@ -132,6 +154,48 @@ for label, command in commands:
             "exact_amount_available": data["exact_amount_available"],
         }
     )
+    expected_source_ids = (
+        {"gov_cn_policy", "stcn_fund_news"}
+        if label == "news_recent"
+        else all_source_ids
+    )
+    returned_source_ids = {source["source_id"] for source in request["sources"]}
+    if returned_source_ids != expected_source_ids:
+        fail_live(label, "live_source_set_mismatch")
+    usable_source_ids = {
+        source["source_id"]
+        for source in request["sources"]
+        if source["outcome"] in usable_outcomes
+    }
+    if (
+        data["action_maturity"] != "evidence_only"
+        or data["action_authorized"] is not False
+        or data["exact_amount_available"] is not False
+    ):
+        fail_live(label, "live_action_boundary_violation")
+    if label == "news_recent" and (
+        not usable_source_ids.intersection({"gov_cn_policy", "stcn_fund_news"})
+        or not data["items"]
+    ):
+        fail_live(label, "live_news_requires_published_items")
+    if label == "market_overview" and (
+        "eastmoney_market" not in usable_source_ids or not data["dimensions"]
+    ):
+        fail_live(label, "live_market_requires_eastmoney_evidence")
+    if label == "fund_intelligence":
+        if (
+            request["subject_scope"] != "named_public_fund"
+            or request["subject_fund_code"] != code
+        ):
+            fail_live(label, "live_fund_subject_mismatch")
+        if not usable_source_ids or not (data["items"] or data["dimensions"]):
+            fail_live(label, "live_fund_requires_usable_evidence")
+        if (
+            data["fund_relevance"]["context"] is None
+            or not data["fund_relevance"].get("covered_fields")
+            or not data["fund_relevance"]["links"]
+        ):
+            fail_live(label, "live_fund_requires_named_context")
 print(json.dumps({
     "mode": "live",
     "source_allowlist": live_sources.split(),
@@ -167,38 +231,60 @@ run_owner() {
 
     # SQLite backup reads the owner database without mutating it. All commands write only to the
     # private throwaway copy. The emitted audit has no code, amount, NAV, fee, or profile value.
-    "${PYTHON}" - "${CLI}" "${OWNER_CASE}" "${OWNER_SOURCE_DB}" "${KUNJIN_DATA_DIR}/kunjin.db" <<'PY'
+    readonly OWNER_FINANCIAL_GATE_MARKER="${RUNTIME_DIR}/owner-financial-gate-failed"
+    "${PYTHON}" - "${CLI}" "${OWNER_CASE}" "${OWNER_SOURCE_DB}" \
+        "${KUNJIN_DATA_DIR}/kunjin.db" "${OWNER_FINANCIAL_GATE_MARKER}" <<'PY'
 import json
 import re
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 
-cli, owner_case, source_db, target_db = sys.argv[1:]
+cli, owner_case, source_db, target_db, financial_gate_marker = sys.argv[1:]
 with sqlite3.connect(f"file:{source_db}?mode=ro", uri=True) as source:
     with sqlite3.connect(target_db) as target:
         source.backup(target)
 
-def invoke(arguments):
+def invoke(label, arguments):
     completed = subprocess.run([cli, "--json", *arguments], stdin=subprocess.DEVNULL, capture_output=True, timeout=95)
     if completed.returncode != 0:
-        raise SystemExit(f"owner read failed with exit={completed.returncode}")
+        try:
+            failed_payload = json.loads(completed.stdout)
+            error_codes = sorted(
+                error["code"]
+                for error in failed_payload.get("errors", [])
+                if isinstance(error, dict) and isinstance(error.get("code"), str)
+            )
+        except (KeyError, TypeError, ValueError):
+            error_codes = []
+        rendered_codes = ",".join(error_codes) if error_codes else "unavailable"
+        raise SystemExit(
+            f"owner {label} read failed with exit={completed.returncode} "
+            f"error_codes={rendered_codes}"
+        )
     payload = json.loads(completed.stdout)
     return payload["data"], payload
 
-status, _ = invoke(["status"])
-portfolio, _ = invoke(["portfolio", "show"])
+status, _ = invoke("status", ["status"])
+portfolio, _ = invoke("portfolio_show", ["portfolio", "show"])
 positions = portfolio.get("positions", []) if isinstance(portfolio, dict) else []
 codes = [item.get("fund_code") for item in positions if isinstance(item, dict)]
 codes = [code for code in codes if isinstance(code, str) and re.fullmatch(r"[0-9]{6}", code)]
 if not codes:
     raise SystemExit("owner acceptance requires at least one locally stored held fund")
 fund_code = sorted(set(codes))[0]
-analysis, _ = invoke(["portfolio", "analyze"])
-overlap, _ = invoke(["portfolio", "overlap"])
-brief, _ = invoke(["fund", "brief", fund_code, "--action", "continue_holding", "--mode", "rapid"])
-result, raw_intelligence = invoke(["fund", "intelligence", fund_code, "--window", "recent", "--mode", "rapid"])
-thesis, _ = invoke(["thesis", "review", fund_code])
+analysis, _ = invoke("portfolio_analyze", ["portfolio", "analyze"])
+overlap, _ = invoke("portfolio_overlap", ["portfolio", "overlap"])
+brief, _ = invoke(
+    "fund_brief",
+    ["fund", "brief", fund_code, "--action", "continue_holding", "--mode", "rapid"],
+)
+result, raw_intelligence = invoke(
+    "fund_intelligence",
+    ["fund", "intelligence", fund_code, "--window", "recent", "--mode", "rapid"],
+)
+thesis, _ = invoke("thesis_review", ["thesis", "review", fund_code])
 raw_intelligence_text = json.dumps(raw_intelligence, ensure_ascii=True, sort_keys=True)
 for forbidden_key in (
     '"amount"', '"cost"', '"current_value"', '"debt"', '"income"',
@@ -207,9 +293,22 @@ for forbidden_key in (
     if forbidden_key in raw_intelligence_text:
         raise SystemExit("public intelligence leaked a forbidden private field")
 request = result["request"]
+brief_omitted = set(brief["request"]["omitted_work"])
+brief_core_stages = {
+    "identity_profile",
+    "personal_position_observation",
+    "formal_nav",
+    "manager_fee_profile",
+    "holdings_industries",
+    "official_announcements",
+}
+core_brief_evidence_complete = brief_core_stages.isdisjoint(brief_omitted)
 summary = {
     "mode": "owner",
     "case": owner_case,
+    "acceptance_scope": "privacy_and_degradation_contract",
+    "core_brief_evidence_complete": core_brief_evidence_complete,
+    "financial_action_usability_assessed": False,
     "held_fund_selected_internally": True,
     "held_fund_code_exposed": False,
     "private_amount_exposed": False,
@@ -218,6 +317,8 @@ summary = {
     "portfolio_analysis_checked": isinstance(analysis, dict),
     "portfolio_overlap_checked": isinstance(overlap, dict),
     "held_fund_brief_checked": isinstance(brief, dict),
+    "held_fund_brief_terminal_status": brief["request"]["terminal_status"],
+    "held_fund_brief_omitted_work": brief["request"]["omitted_work"],
     "thesis_review_checked": isinstance(thesis, dict),
     "public_intelligence_private_field_scan_passed": True,
     "terminal_status": request["terminal_status"],
@@ -233,8 +334,17 @@ encoded = json.dumps(summary, ensure_ascii=True, sort_keys=True)
 if fund_code in encoded:
     raise SystemExit("owner code leaked into the audit summary")
 print(encoded)
+if not core_brief_evidence_complete:
+    Path(financial_gate_marker).write_text(
+        "owner_brief_core_sources_incomplete\n",
+        encoding="ascii",
+    )
 PY
     check_no_process_residue
+    if [[ -f "${OWNER_FINANCIAL_GATE_MARKER}" ]]; then
+        printf 'owner financial evidence gate failed: owner_brief_core_sources_incomplete\n' >&2
+        return 1
+    fi
 }
 
 case "${MODE}" in

@@ -100,9 +100,14 @@ complete D2 gate required for buy/add or the purchase leg of a switch.
 Official events cover only audited fund, product, and manager announcements.
 Keep the result conditional and preserve `exact_amount_available=false`.
 
-Broad financial-media ingestion, complete D2 portfolio construction, D3
-selection and pre-purchase checks, and Phase E mature monitoring and sell timing
-are not implemented.
+If any of `identity_profile`, `personal_position_observation`, `formal_nav`, `manager_fee_profile`,
+`holdings_industries`, or `official_announcements` is in `omitted_work`, show every omitted code and
+do not conclude hold, reduce, exit, `no_add`, watch, or "no change". With none omitted, only core
+evidence completeness is established; still apply the current route and all gates. When
+`historical_brief_comparison_unavailable` appears, supported current facts remain usable, but the
+historical brief proves neither "changed" nor "unchanged".
+
+Broad financial-media ingestion, complete D2, D3 selection, and mature Phase E monitoring are not implemented.
 
 ## Apply Each Action Independently
 
@@ -447,23 +452,18 @@ Route the five personal MVP scenarios without implying unavailable decisions:
 - held-fund daily review: clarify partial reduction versus full exit, use the corresponding `fund brief` action, then `fund intelligence` and `thesis review`; this reviews evidence and does not time a sale; and
 - portfolio diagnosis: run `status`, current `sync portfolio`, `portfolio analyze`, inspect held-fund holdings, refresh each stale/missing/due holding disclosure, then run `portfolio overlap`.
 
-Preserve source outcome, date, source tier, publication date, `fact` versus
-`reasoned_inference`, lineage, reprint, conflict, partial, cooldown, cap, and
-manual supplementation fields. A reprint is not independent confirmation. At
-`market_session=unknown`, state `direction=insufficient_data`; never turn HTTP
-retrieval time or `experimental_shadow` into market timing. Source accuracy is
-not prediction accuracy.
+Preserve source outcome, date, source tier, publication date, `fact` versus `reasoned_inference`,
+lineage, reprint, conflict, partial, cooldown, cap, and manual supplementation fields. A reprint is
+not independent confirmation. At `market_session=unknown`, state `direction=insufficient_data`;
+never turn HTTP retrieval time or `experimental_shadow` into market timing. Source accuracy is not prediction accuracy.
 
-Treat fund relevance as `disclosed_context`, not current or complete exposure.
-Use `fund profile`, `fund fees`, and `fund research` for identity, manager, fee,
-formal-NAV, and risk facts. A thesis `possible_invalidation_match` or
-`no_matching_evidence` requires manual semantic review and cannot trigger a
-sale. Preserve `action_maturity=evidence_only`, `action_authorized=false`, and
-`exact_amount_available=false`.
+Treat fund relevance as `disclosed_context`, not current or complete exposure. Use `fund profile`,
+`fund fees`, and `fund research` for identity, manager, fee, formal-NAV, and risk facts. A thesis
+`possible_invalidation_match` or `no_matching_evidence` requires manual semantic review and cannot
+trigger a sale. Preserve `action_maturity=evidence_only`, `action_authorized=false`, and `exact_amount_available=false`.
 
-Use read-only browsing only as visibly separate transient `external_context`
-with its own sources and dates. It cannot strengthen KunJin's persisted evidence
-state, and empty conflicts do not prove complete cross-source agreement.
+Use read-only browsing only as visibly separate transient `external_context` with its own sources
+and dates. It cannot strengthen persisted evidence or make empty conflicts prove source agreement.
 
 ## Safety Boundaries
 

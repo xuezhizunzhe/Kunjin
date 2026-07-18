@@ -3373,6 +3373,25 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         self.assertIn("public intelligence leaked a forbidden private field", owner_body)
         self.assertIn("never places trades", script)
         self.assertIn('source["outcome"]', script)
+        for evidence_gate in (
+            "live_source_set_mismatch",
+            "live_news_requires_published_items",
+            "live_market_requires_eastmoney_evidence",
+            "live_fund_subject_mismatch",
+            "live_fund_requires_usable_evidence",
+            "live_fund_requires_named_context",
+            "live_action_boundary_violation",
+            "owner_brief_core_sources_incomplete",
+        ):
+            self.assertIn(evidence_gate, script)
+        self.assertIn('or not data["fund_relevance"]["links"]', script)
+        self.assertIn(
+            "core_brief_evidence_complete = "
+            "brief_core_stages.isdisjoint(brief_omitted)",
+            owner_body,
+        )
+        self.assertIn('"financial_action_usability_assessed": False', owner_body)
+        self.assertNotIn("financial_usability_passed", owner_body)
         self.assertIn('source["source_tier"]', script)
         self.assertNotIn('source["status"]', script)
 

@@ -28,7 +28,10 @@ from kunjin.brief.public_acceptance_portfolio import (
     PublicAcceptancePortfolioService,
 )
 from kunjin.brief.research import build_owner_report, build_snapshot
-from kunjin.brief.store import BriefStore
+from kunjin.brief.store import (
+    HISTORICAL_BRIEF_COMPARISON_UNAVAILABLE,
+    BriefStore,
+)
 from kunjin.decision.budget import BudgetExpired, RequestBudget
 from kunjin.decision.health import SourceHealthService
 from kunjin.decision.models import (
@@ -423,6 +426,13 @@ class HeldFundBriefService:
             )
             completed.add("action_evaluation")
             budget.require_publishable()
+
+            try:
+                history_comparable = self._brief_store.latest_history_comparable(fund_code)
+            except Exception:
+                history_comparable = False
+            if not history_comparable:
+                self._add_omitted(omitted, HISTORICAL_BRIEF_COMPARISON_UNAVAILABLE)
 
             terminal_omitted = tuple(dict.fromkeys(omitted))
             terminal_status = (

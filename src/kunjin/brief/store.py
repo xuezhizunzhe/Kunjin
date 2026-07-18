@@ -51,6 +51,7 @@ MAX_BRIEF_SNAPSHOT_JSON_BYTES = 4 * 1024 * 1024
 MAX_BRIEF_SUMMARY_ITEMS = 128
 MAX_BRIEF_SUMMARY_JSON_BYTES = 16 * 1024
 MAX_BRIEF_PUBLIC_TREE_DEPTH = 12
+HISTORICAL_BRIEF_COMPARISON_UNAVAILABLE = "historical_brief_comparison_unavailable"
 _FUND_CODE_PATTERN = re.compile(r"^[0-9]{6}$")
 _SOURCE_ATTEMPT_LINEAGE_PATTERN = re.compile(r"^source_attempt_([1-9][0-9]*)$")
 
@@ -163,11 +164,16 @@ class BriefStore:
                         route,
                         created_at,
                     )
-                    conclusion_changed = self._conclusion_changed(
+                    conclusion_changed, history_comparable = self._conclusion_changed(
                         connection,
                         snapshot,
                         brief_policy,
                     )
+                    if (
+                        not history_comparable
+                        and HISTORICAL_BRIEF_COMPARISON_UNAVAILABLE not in omitted_work
+                    ):
+                        raise BriefStoreError("unreadable brief history was not disclosed")
                     stored = self._insert_snapshot(
                         connection,
                         snapshot,
@@ -237,6 +243,32 @@ class BriefStore:
             RecursionError,
         ):
             raise BriefStoreError("brief history authentication failed") from None
+
+    def latest_history_comparable(self, fund_code: str) -> bool:
+        _fund_code(fund_code)
+        try:
+            with self.repository.connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT * FROM fund_brief_snapshots
+                    WHERE fund_code = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (fund_code,),
+                ).fetchone()
+                if row is None:
+                    return True
+                policy = self._load_policy(connection)
+                try:
+                    self._stored_snapshot(row, policy, connection)
+                except (BriefStoreError, DecisionAuditStoreError):
+                    return False
+                return True
+        except BriefStoreError:
+            raise
+        except sqlite3.DatabaseError:
+            raise BriefStoreError("brief history preflight failed") from None
 
     @staticmethod
     def _authenticate_or_insert_policy(
@@ -356,7 +388,7 @@ class BriefStore:
         connection: sqlite3.Connection,
         snapshot: BriefSnapshot,
         policy: HeldFundBriefPolicyV1,
-    ) -> bool:
+    ) -> Tuple[bool, bool]:
         row = connection.execute(
             """
             SELECT * FROM fund_brief_snapshots
@@ -367,11 +399,14 @@ class BriefStore:
             (snapshot.fund_code,),
         ).fetchone()
         if row is None:
-            return False
-        previous = self._stored_snapshot(row, policy, connection).snapshot
+            return False, True
+        try:
+            previous = self._stored_snapshot(row, policy, connection).snapshot
+        except (BriefStoreError, DecisionAuditStoreError):
+            return False, False
         if snapshot.created_at < previous.created_at:
             raise BriefStoreError("brief publication order rejected")
-        return _conclusion_bytes(previous) != _conclusion_bytes(snapshot)
+        return _conclusion_bytes(previous) != _conclusion_bytes(snapshot), True
 
     def _insert_snapshot(
         self,

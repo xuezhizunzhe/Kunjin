@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -441,6 +442,23 @@ def test_brief_outcome_returns_authenticated_partial_terminal_contract(tmp_path:
     assert outcome.terminal_status is RequestTerminalStatus.PARTIAL
     assert outcome.omitted_work
     assert len(script.calls) == 6
+
+
+def test_brief_marks_unreadable_historical_comparison_as_omitted(tmp_path: Path) -> None:
+    _repository_value, _audit, _script, service = _service(tmp_path)
+
+    with patch.object(
+        service._brief_store,
+        "latest_history_comparable",
+        return_value=False,
+    ):
+        outcome = service.brief_outcome(
+            FUND_CODE,
+            action=ActionKind.CONTINUE_HOLDING,
+            mode=RequestMode.RAPID,
+        )
+
+    assert "historical_brief_comparison_unavailable" in outcome.omitted_work
 
 
 def test_compatible_brief_executes_once_and_returns_outcome_report(tmp_path: Path) -> None:
