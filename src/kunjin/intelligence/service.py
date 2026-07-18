@@ -23,6 +23,7 @@ from kunjin.decision.models import (
     SourceAttemptOutcome,
     SourceErrorCode,
     SourceFieldState,
+    SourceTier,
     validate_identifier,
     validate_identifier_tuple,
     validate_public_text,
@@ -151,6 +152,7 @@ class IntelligenceSourceSummary:
     source_attempt_id: int
     source_id: str
     field_id: str
+    source_tier: SourceTier
     outcome: SourceAttemptOutcome
     data_as_of: Optional[datetime]
     retrieved_at: Optional[datetime]
@@ -167,6 +169,8 @@ class IntelligenceSourceSummary:
             raise ValueError("source summary attempt id must be positive")
         validate_identifier(self.source_id, "source summary source id")
         validate_identifier(self.field_id, "source summary field id")
+        if type(self.source_tier) is not SourceTier:
+            raise ValueError("source summary tier must be exact")
         for value, name in (
             (self.data_as_of, "source summary data time"),
             (self.retrieved_at, "source summary retrieval time"),
@@ -1464,6 +1468,10 @@ class IntelligenceService:
                 source_attempt_id=stored.id,
                 source_id=attempt.source_id,
                 field_id=attempt.field_id,
+                source_tier=SourceRegistryV1().field(
+                    attempt.source_id,
+                    attempt.field_id,
+                ).source_tier,
                 outcome=attempt.outcome,
                 data_as_of=None,
                 retrieved_at=(

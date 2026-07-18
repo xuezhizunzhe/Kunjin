@@ -367,6 +367,10 @@ def test_null_snapshot_keeps_request_subject_but_no_fund_facts(tmp_path: Path) -
     assert {item["outcome"] for item in payload["request"]["sources"]} == {
         "unavailable"
     }
+    assert {item["source_tier"] for item in payload["request"]["sources"]} == {
+        "tier_1",
+        "tier_2",
+    }
     assert set(result.terminal_request.omitted_work).issubset(payload["missing_evidence"])
 
 

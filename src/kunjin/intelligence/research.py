@@ -11,6 +11,7 @@ def _source_payload(result: PragmaticIntelligenceResult) -> list[dict[str, objec
             "source_attempt_id": item.source_attempt_id,
             "source_id": item.source_id,
             "field_id": item.field_id,
+            "source_tier": item.source_tier.value,
             "outcome": item.outcome.value,
             "endpoint": item.endpoint,
             "data_as_of": (
