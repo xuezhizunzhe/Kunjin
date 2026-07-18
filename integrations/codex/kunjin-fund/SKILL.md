@@ -211,10 +211,9 @@ workflow; never build or pull it during fund research. Never execute a trade.
 For fact-only D1 research, Phase B and Phase C are not gates: fact-only D1
 research does not require Phase B or Phase C. Preserve `failure_stage` and
 `failure_reason` exactly when present. Never reconstruct omitted exception text,
-paths, response details, or document content. The Phase 1 brief implements only
-the minimum D2 subset above; complete D2 and D3 product-selection and
-pre-purchase checks are not implemented, so no mature risk-increasing conclusion
-or amount is available.
+paths, response details, or document content. The Phase 3 diagnosis reuses the minimum D2
+subset and disclosed-overlap engine; complete D2 and D3 product-selection and pre-purchase
+checks are not implemented, so no mature risk-increasing conclusion or amount is available.
 
 For all workflows:
 
@@ -230,7 +229,7 @@ For all workflows:
 10. For questions containing today, current, latest, or sync, run `--json sync portfolio` before portfolio analysis.
 11. If authorization is missing, run `auth login yangjibao` without `--json`; tell the user to scan the local QR. Never expose the returned token.
 12. Run `--json portfolio show` to inspect normalized positions.
-13. Run `--json portfolio analyze` for totals, weights, HHI, largest-position share, profit coverage, and missing-data warnings.
+13. Run `--json portfolio diagnose` for coverage-aware concentration and observed duplication; preserve every included, omitted, and unknown fund code.
 14. Explain facts, deterministic calculations, limitations, conflicts, and conditional action implications separately.
 15. For a named fund's latest formal-NAV performance or risk, run `--json sync fund CODE` before `--json fund research CODE`.
 16. Before answering about identity, share classes, managers, fees, size, benchmark, or announcements, inspect the relevant `freshness.sections` returned by `fund profile`, `fund fees`, or `fund announcements`. Run `--json sync fund-profile CODE` first when any required section is stale, missing, unknown, or unavailable.
@@ -243,7 +242,7 @@ For all workflows:
 19. For current market form, run `--json sync market` before `--json market sectors`.
 20. For latest peer questions, run `--json fund peers CODE` and inspect its status, data dates, coverage, warnings, errors, and stored-group freshness. Run `--json sync fund-peers CODE` when the group is missing or stale, then read it again.
 21. For an explicit latest comparison, synchronize profile, holdings, and formal NAV for every code before running `--json fund compare CODE1 CODE2`.
-22. For current portfolio overlap, run `--json sync portfolio`, refresh stale held-fund holdings with `--json sync fund-holdings CODE`, then run `--json portfolio overlap`.
+22. For one user-supplied candidate only, run `--json portfolio diagnose --candidate CODE`; never use it to discover or rank candidates.
 23. Preserve aligned NAV dates, manager-team dates, metric-specific orderings, disclosure scope, coverage, source tier, warnings, and errors. Never turn platform directory order into merit.
 24. Record a decision thesis only when the user provides a reason, horizon, and invalidation condition.
 25. Use `--json report weekly` for a combined learning-oriented summary.
@@ -272,8 +271,8 @@ kunjin --json allocation policy
 kunjin --json sync portfolio
 kunjin --json status
 kunjin --json portfolio show
-kunjin --json portfolio analyze
-kunjin --json portfolio overlap
+kunjin --json portfolio diagnose
+kunjin --json portfolio diagnose --candidate 519755
 kunjin --json ledger import /absolute/path/to/alipay.jpg --fund-code 519755
 kunjin --json ledger drafts
 kunjin --json ledger confirm 1 --field fund_code=519755
@@ -450,7 +449,7 @@ Route the five personal MVP scenarios without implying unavailable decisions:
 - market context or a direction-to-buy question: route `fact_research` and also `buy_or_add` when purchase intent exists, then run `market overview`; expect `direction=insufficient_data` until its missing dimensions are authenticated;
 - named candidate: route `fact_research` and `buy_or_add`, run `fund intelligence` plus the fact commands and returned gates, and label the result candidate facts plus mandatory purchase abstention while complete D2 or D3 is missing;
 - held-fund daily review: clarify partial reduction versus full exit, use the corresponding `fund brief` action, then `fund intelligence` and `thesis review`; this reviews evidence and does not time a sale; and
-- portfolio diagnosis: run `status`, current `sync portfolio`, `portfolio analyze`, inspect held-fund holdings, refresh each stale/missing/due holding disclosure, then run `portfolio overlap`.
+- portfolio diagnosis: run `status -> sync portfolio -> portfolio diagnose`; refresh stale or missing disclosures separately when broader observed coverage is needed.
 
 Preserve source outcome, date, source tier, publication date, `fact` versus `reasoned_inference`,
 lineage, reprint, conflict, partial, cooldown, cap, and manual supplementation fields. A reprint is
@@ -462,6 +461,7 @@ Treat fund relevance as `disclosed_context`, not current or complete exposure. U
 `possible_invalidation_match` or `no_matching_evidence` requires manual semantic review and cannot
 trigger a sale. Preserve `action_maturity=evidence_only`, `action_authorized=false`, and `exact_amount_available=false`.
 
+`portfolio diagnose` is evidence only. Its optional `--candidate` accepts one user-supplied candidate; it does not satisfy complete D2, D3, buy or add, hold, reduce, or exit, or exact amount gates. Preserve coverage and unknown codes. Legacy `portfolio analyze` and `portfolio overlap` remain lower-level tools.
 Use read-only browsing only as visibly separate transient `external_context` with its own sources
 and dates. It cannot strengthen persisted evidence or make empty conflicts prove source agreement.
 

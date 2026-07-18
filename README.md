@@ -122,9 +122,9 @@ identity terms, benchmark terms, and disclosed top-ten security names may
 explain a relevance link, but they do not prove current exposure or
 whole-portfolio composition. Use
 `fund brief`, `fund profile`, `fund fees`, and `fund research` for held-position,
-identity, manager, fee, formal-NAV, and risk facts. Use `portfolio analyze` and
-`portfolio overlap` for current weights, concentration, and
-`top10_disclosed_overlap`; the intelligence command does not replace them.
+identity, manager, fee, formal-NAV, and risk facts. Use `portfolio diagnose` for
+current concentration, authenticated relationships, and
+`top10_disclosed_overlap`; the intelligence command does not replace it.
 
 A thesis result of `possible_invalidation_match` or `no_matching_evidence`
 always requires manual semantic review. A string match cannot understand
@@ -139,7 +139,7 @@ The personal MVP routes its five common questions as follows:
 - market context or a direction-to-buy question: route `fact_research` and `buy_or_add` when purchase intent exists, then `market overview`; current missing dimensions can require a direction abstention;
 - named candidate: route `fact_research` and `buy_or_add`, then combine `fund intelligence`, fund fact commands, and returned gates; while complete D2 or D3 is missing this is candidate research, not a suitability approval;
 - held-fund daily review: first distinguish partial reduction from full exit, use the matching `fund brief` action, then `fund intelligence` and thesis review; this cannot time a sale;
-- portfolio diagnosis: `status`, current `sync portfolio`, `portfolio analyze`, refresh each stale/missing/due held-fund disclosure, then `portfolio overlap`.
+- portfolio diagnosis: `status -> sync portfolio -> portfolio diagnose`; refresh stale or missing held-fund disclosures separately when broader observed coverage is needed.
 
 Read-only browsing may be added as visibly separate transient
 `external_context`. It must retain its own URLs and dates and cannot strengthen
@@ -153,6 +153,30 @@ complete D2 look-through/correlation/stress testing, D3 exact amount and mature
 channel authorization, mature Phase E automatic monitoring/sell timing, and
 broad official adapters. Privacy, read-only operation, no automatic trading,
 and fail-closed `insufficient_data` remain mandatory.
+
+## Pragmatic Portfolio Diagnosis (Phase 3)
+
+After a current portfolio synchronization, run one local evidence projection:
+
+```bash
+.venv/bin/kunjin --json portfolio diagnose
+.venv/bin/kunjin --json portfolio diagnose --candidate 519755
+```
+
+The first command reports value-basis concentration, manager and benchmark-text
+relationships, share-class siblings, and observed disclosed-holdings overlap.
+The second accepts one user-supplied candidate and reports only its observed
+duplication or evidence gaps against the current holdings. Missing NAV,
+identity, manager, benchmark, or quarterly holdings remains unknown; it is
+never converted to zero overlap or a diversification claim.
+
+This is an on-demand local projection and performs no network refresh. Preserve
+included and omitted fund codes, report dates, publication dates, conflicts,
+warnings, and both coverage states. The result always remains
+`action_maturity=evidence_only`, `action_authorized=false`, and
+`exact_amount_available=false`. It does not satisfy complete D2, D3, buy or add,
+hold, reduce, or exit, or exact amount gates. Legacy `portfolio analyze` and
+`portfolio overlap` remain available for lower-level inspection.
 
 ## Requirements
 
@@ -212,6 +236,8 @@ When PyPI access is available, install terminal QR rendering with:
 .venv/bin/kunjin --json portfolio show
 .venv/bin/kunjin --json portfolio analyze
 .venv/bin/kunjin --json portfolio overlap
+.venv/bin/kunjin --json portfolio diagnose
+.venv/bin/kunjin --json portfolio diagnose --candidate 519755
 .venv/bin/kunjin --json fund brief 519755 --action continue_holding --mode rapid
 .venv/bin/kunjin --json decision route --mode rapid --action fact_research
 .venv/bin/kunjin --json decision route --mode rapid --action fact_research --action buy_or_add

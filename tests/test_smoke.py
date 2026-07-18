@@ -3463,6 +3463,70 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         self.assertNotIn("Do not persist news in KunJin until", skill)
         self.assertNotIn("automated news ingestion are not implemented", skill)
 
+    def test_phase3_acceptance_declares_bounded_modes_privacy_and_action_boundary(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts/run_phase3_acceptance.sh").read_text(
+            encoding="utf-8"
+        )
+
+        for mode in ("local", "fault", "owner"):
+            self.assertIn(mode, script)
+        for case in (
+            "complete_relationships",
+            "partial_holdings",
+            "missing_nav",
+            "benchmark_text_limitation",
+            "candidate_duplication",
+            "candidate_insufficient_data",
+            "privacy_scan",
+            "no_process_residue",
+        ):
+            self.assertIn(case, script)
+
+        self.assertIn("KUNJIN_PHASE3_OWNER_APPROVED", script)
+        self.assertIn("explicit_private_read_only", script)
+        self.assertIn('mode=ro', script)
+        self.assertIn("source.backup(target)", script)
+        self.assertIn('[cli, "--json", "portfolio", "diagnose"]', script)
+        self.assertIn('"action_maturity"', script)
+        self.assertIn('"evidence_only"', script)
+        self.assertIn('"action_authorized"', script)
+        self.assertIn('"exact_amount_available"', script)
+        self.assertIn("owner fund code leaked", script)
+        self.assertIn("owner private key leaked", script)
+        self.assertIn("never_places_trades", script)
+
+    def test_phase3_readme_and_skill_route_portfolio_diagnosis_without_authorization(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        combined = " ".join((readme + "\n" + skill).split())
+
+        for command in (
+            "kunjin --json portfolio diagnose",
+            "kunjin --json portfolio diagnose --candidate 519755",
+        ):
+            self.assertIn(command, combined)
+        self.assertIn(
+            "status -> sync portfolio -> portfolio diagnose",
+            combined,
+        )
+        for phrase in (
+            "one user-supplied candidate",
+            "complete D2",
+            "D3",
+            "buy or add",
+            "hold, reduce, or exit",
+            "exact amount",
+            "action_maturity=evidence_only",
+            "action_authorized=false",
+            "exact_amount_available=false",
+        ):
+            self.assertIn(phrase, combined)
+        self.assertLessEqual(len(skill.splitlines()), 500)
+
 
 if __name__ == "__main__":
     unittest.main()
