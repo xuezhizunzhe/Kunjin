@@ -199,23 +199,28 @@ class IntelligenceStore:
                 canonical = canonical_json_bytes(edge.to_canonical_dict())
                 _bounded(canonical, "lineage edge")
                 checksum = hashlib.sha256(canonical).hexdigest()
-                connection.execute(
-                    """
-                    INSERT INTO intelligence_lineage_edges(
-                        edge_key, from_item_id, to_item_id, kind,
-                        evidence_ids_json, canonical_edge_json, edge_checksum
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        edge.edge_id,
-                        from_id,
-                        to_id,
-                        edge.kind.value,
-                        _ascii_json(edge.evidence_ids),
-                        canonical.decode("ascii"),
-                        checksum,
-                    ),
-                )
+                existing = connection.execute(
+                    "SELECT * FROM intelligence_lineage_edges WHERE edge_key=?",
+                    (edge.edge_id,),
+                ).fetchone()
+                if existing is None:
+                    connection.execute(
+                        """
+                        INSERT INTO intelligence_lineage_edges(
+                            edge_key, from_item_id, to_item_id, kind,
+                            evidence_ids_json, canonical_edge_json, edge_checksum
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            edge.edge_id,
+                            from_id,
+                            to_id,
+                            edge.kind.value,
+                            _ascii_json(edge.evidence_ids),
+                            canonical.decode("ascii"),
+                            checksum,
+                        ),
+                    )
                 self._authenticate_payload(
                     connection,
                     "intelligence_lineage_edges",
@@ -225,6 +230,15 @@ class IntelligenceStore:
                     "edge_checksum",
                     canonical,
                 )
+                authenticated_edge = self._lineage_from_authenticated_row(
+                    connection,
+                    connection.execute(
+                        "SELECT * FROM intelligence_lineage_edges WHERE edge_key=?",
+                        (edge.edge_id,),
+                    ).fetchone(),
+                )
+                if authenticated_edge != edge:
+                    raise IntelligenceStoreError("intelligence lineage authentication failed")
 
             event_keys = set()
             prepared_events = []
@@ -254,33 +268,48 @@ class IntelligenceStore:
                     )
 
             event_row_ids = {}
+            new_event_keys = set()
             for event, canonical, checksum in prepared_events:
-                cursor = connection.execute(
-                    """
-                    INSERT INTO intelligence_events(
-                        event_key, event_type, normalized_title, confidence_state,
-                        earliest_published_at, latest_published_at, integrity_state,
-                        superseded_by_event_key, invalidation_conditions_json,
-                        canonical_event_json, event_checksum
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event.event_id,
-                        event.event_type.value,
-                        event.normalized_title,
-                        event.confidence_state.value,
-                        _utc_text(event.earliest_published_at),
-                        _utc_text(event.latest_published_at),
-                        event.integrity_state.value,
-                        event.superseded_by_event_id,
-                        _ascii_json(event.invalidation_conditions),
-                        canonical.decode("ascii"),
-                        checksum,
-                    ),
-                )
-                event_row_ids[event.event_id] = int(cursor.lastrowid)
+                existing = connection.execute(
+                    "SELECT id FROM intelligence_events WHERE event_key=?",
+                    (event.event_id,),
+                ).fetchone()
+                if existing is None:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO intelligence_events(
+                            event_key, event_type, normalized_title, confidence_state,
+                            earliest_published_at, latest_published_at, integrity_state,
+                            superseded_by_event_key, invalidation_conditions_json,
+                            canonical_event_json, event_checksum
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event.event_id,
+                            event.event_type.value,
+                            event.normalized_title,
+                            event.confidence_state.value,
+                            _utc_text(event.earliest_published_at),
+                            _utc_text(event.latest_published_at),
+                            event.integrity_state.value,
+                            event.superseded_by_event_id,
+                            _ascii_json(event.invalidation_conditions),
+                            canonical.decode("ascii"),
+                            checksum,
+                        ),
+                    )
+                    event_row_ids[event.event_id] = int(cursor.lastrowid)
+                    new_event_keys.add(event.event_id)
+                else:
+                    event_row_ids[event.event_id] = int(existing["id"])
+                    if self._authenticate_event_row(connection, event.event_id) != event:
+                        raise IntelligenceStoreError(
+                            "intelligence event authentication failed"
+                        )
 
             for event, _canonical, _checksum_value in prepared_events:
+                if event.event_id not in new_event_keys:
+                    continue
                 roles = (
                     ("supporting", event.supporting_item_ids),
                     ("opposing", event.opposing_item_ids),
@@ -309,6 +338,8 @@ class IntelligenceStore:
                     "event_checksum",
                     canonical,
                 )
+                if self._authenticate_event_row(connection, event.event_id) != event:
+                    raise IntelligenceStoreError("intelligence event authentication failed")
                 if event.superseded_by_event_id is not None:
                     self._authenticate_event_row(
                         connection,
@@ -1386,6 +1417,38 @@ class IntelligenceStore:
         links: Tuple[EventEntityLink, ...],
         entity_ids: dict,
     ) -> None:
+        def authenticate_link(link: EventEntityLink, canonical: bytes) -> None:
+            self._authenticate_payload(
+                connection,
+                "intelligence_event_entities",
+                "link_key",
+                link.link_id,
+                "canonical_link_json",
+                "link_checksum",
+                canonical,
+            )
+            row = connection.execute(
+                """
+                SELECT event.event_key, entity.entity_key, binding.relationship,
+                       binding.evidence_ids_json
+                FROM intelligence_event_entities AS binding
+                JOIN intelligence_events AS event ON event.id=binding.event_id
+                JOIN market_entities AS entity ON entity.id=binding.entity_id
+                WHERE binding.link_key=?
+                """,
+                (link.link_id,),
+            ).fetchone()
+            if row is None or (
+                row["event_key"] != link.event_id
+                or row["entity_key"] != link.entity_id
+                or row["relationship"] != link.relationship.value
+                or _ascii_bytes(
+                    row["evidence_ids_json"], "event entity evidence ids"
+                )
+                != _ascii_json(link.evidence_ids).encode("ascii")
+            ):
+                raise IntelligenceStoreError("event entity link authentication failed")
+
         for link in links:
             if link.entity_id not in entity_ids:
                 raise IntelligenceStoreError("event entity binding failed")
@@ -1396,32 +1459,29 @@ class IntelligenceStore:
                 raise IntelligenceStoreError("event entity binding failed")
             canonical = canonical_json_bytes(link.to_canonical_dict())
             checksum = hashlib.sha256(canonical).hexdigest()
-            connection.execute(
-                """
-                INSERT INTO intelligence_event_entities(
-                    link_key, event_id, entity_id, relationship, evidence_ids_json,
-                    canonical_link_json, link_checksum
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    link.link_id,
-                    int(event["id"]),
-                    entity_ids[link.entity_id],
-                    link.relationship.value,
-                    _ascii_json(link.evidence_ids),
-                    canonical.decode("ascii"),
-                    checksum,
-                ),
-            )
-            self._authenticate_payload(
-                connection,
-                "intelligence_event_entities",
-                "link_key",
-                link.link_id,
-                "canonical_link_json",
-                "link_checksum",
-                canonical,
-            )
+            existing = connection.execute(
+                "SELECT 1 FROM intelligence_event_entities WHERE link_key=?",
+                (link.link_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO intelligence_event_entities(
+                        link_key, event_id, entity_id, relationship, evidence_ids_json,
+                        canonical_link_json, link_checksum
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        link.link_id,
+                        int(event["id"]),
+                        entity_ids[link.entity_id],
+                        link.relationship.value,
+                        _ascii_json(link.evidence_ids),
+                        canonical.decode("ascii"),
+                        checksum,
+                    ),
+                )
+            authenticate_link(link, canonical)
 
     def _save_market_state(
         self,

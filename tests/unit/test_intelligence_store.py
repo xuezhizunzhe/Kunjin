@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,12 +18,15 @@ from kunjin.decision.models import (
 from kunjin.decision.store import DecisionAuditStore
 from kunjin.intelligence.models import (
     EventConfidenceState,
+    EventEntityLink,
+    EventEntityRelationship,
     IntegrityState,
     IntelligenceSnapshot,
     IntelligenceWorkflow,
     LineageEdge,
     LineageKind,
     MarketDimension,
+    MarketEntity,
     MarketShadowState,
     MarketStateSnapshot,
     NewsEvent,
@@ -240,6 +244,84 @@ def test_save_is_append_only_and_reloads_exact_bytes(
     with repository.connect() as connection, pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             "UPDATE intelligence_events SET normalized_title='tampered' WHERE event_key='event_one'"
+        )
+
+
+def test_lineage_and_events_reuse_identical_canonical_rows_and_reject_key_drift(
+    repository: Repository,
+    store: IntelligenceStore,
+) -> None:
+    _budget_value, _run_id, _attempt_id, _item_ids, _items = (
+        _seed_request_and_evidence(repository, store)
+    )
+    edge = LineageEdge(
+        edge_id="edge_one",
+        from_item_id="item_one",
+        to_item_id="item_two",
+        kind=LineageKind.DIRECT_QUOTE,
+        evidence_ids=("item_one", "item_two"),
+    )
+    with repository.connect() as connection, connection:
+        store.save_lineage_and_events((edge,), (_event(),), connection)
+        assert connection.execute(
+            "SELECT count(*) FROM intelligence_lineage_edges"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM intelligence_events"
+        ).fetchone()[0] == 1
+
+    with repository.connect() as connection, connection, pytest.raises(
+        IntelligenceStoreError, match="authentication"
+    ):
+        store.save_lineage_and_events(
+            (replace(edge, kind=LineageKind.REPRINT),), (), connection
+        )
+    with repository.connect() as connection, connection, pytest.raises(
+        IntelligenceStoreError, match="authentication"
+    ):
+        store.save_lineage_and_events(
+            (), (replace(_event(), normalized_title="Drifted event"),), connection
+        )
+
+
+def test_event_entity_links_reuse_identical_canonical_rows_and_reject_key_drift(
+    repository: Repository,
+    store: IntelligenceStore,
+) -> None:
+    _budget_value, _run_id, _attempt_id, _item_ids, _items = (
+        _seed_request_and_evidence(repository, store)
+    )
+    entity = MarketEntity(
+        entity_id="market_cn",
+        entity_type="market",
+        canonical_name="China public fund market",
+        active_from=NOW - timedelta(days=1),
+        active_until=None,
+        evidence_ids=("item_one",),
+    )
+    link = EventEntityLink(
+        link_id="event_link_one",
+        event_id="event_one",
+        entity_id=entity.entity_id,
+        relationship=EventEntityRelationship.POLICY_CATALYST,
+        evidence_ids=("item_one",),
+    )
+    with repository.connect() as connection, connection:
+        entity_ids = store._save_entities(connection, (entity,))
+        store._save_event_entity_links(connection, (link,), entity_ids)
+        store._save_event_entity_links(connection, (link,), entity_ids)
+        assert connection.execute(
+            "SELECT count(*) FROM intelligence_event_entities"
+        ).fetchone()[0] == 1
+
+    with repository.connect() as connection, connection, pytest.raises(
+        IntelligenceStoreError, match="authentication"
+    ):
+        entity_ids = store._save_entities(connection, (entity,))
+        store._save_event_entity_links(
+            connection,
+            (replace(link, relationship=EventEntityRelationship.AFFECTS),),
+            entity_ids,
         )
 
 
