@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import http.client
 import json
 import socket
 import time
@@ -296,6 +297,11 @@ def _run_worker_main(request, opener) -> object:
         (urllib.error.URLError(socket.gaierror()), SourceErrorCode.DNS_FAILURE, True),
         (urllib.error.URLError(TimeoutError()), SourceErrorCode.NETWORK_TIMEOUT, True),
         (TimeoutError(), SourceErrorCode.NETWORK_TIMEOUT, True),
+        (
+            http.client.RemoteDisconnected("remote closed"),
+            SourceErrorCode.TRANSIENT_NETWORK_FAILURE,
+            True,
+        ),
     ),
 )
 def test_worker_maps_dns_connect_and_read_timeouts(error, reason, retryable) -> None:

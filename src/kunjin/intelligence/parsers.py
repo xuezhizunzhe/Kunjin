@@ -27,11 +27,14 @@ _EXCERPT_MAX_BYTES = 2_048
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _UTC = timezone.utc
 _GOV_POLICY_URL = re.compile(
-    r"https://www\.gov\.cn/zhengce/"
+    r"https://www\.gov\.cn/"
     r"(?:"
+    r"zhengce/(?:"
     r"(?:content/)?\d{6}/content_\d+\.htm"
     r"|zhengceku/\d{6}/content_\d+\.htm"
     r"|(?:content/)?\d{4}-\d{2}/\d{2}/content_\d+\.htm"
+    r")"
+    r"|xinwen/\d{4}-\d{2}/\d{2}/content_\d+\.htm"
     r")"
 )
 _STCN_DETAIL_PATH = re.compile(r"/article/detail/(\d+)\.html")
@@ -333,10 +336,14 @@ def parse_gov_policy_list(payload_utf8: str, retrieved_at: datetime) -> Tuple[Pa
 class _StcnListParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.anchors: List[Tuple[str, str]] = []
+        self.anchors: List[Tuple[str, str, bool]] = []
         self._href: Optional[str] = None
         self._parts: List[str] = []
+        self._anchor_is_reviewed_title = False
         self._ignored_depth = 0
+        self._stack: List[Tuple[str, bool, bool]] = []
+        self._article_list_depth = 0
+        self._title_depth = 0
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         tag = tag.lower()
@@ -346,11 +353,23 @@ class _StcnListParser(HTMLParser):
         if tag in _IGNORED_HTML_TAGS:
             self._ignored_depth = 1
             return
+        attributes = dict(attrs)
+        classes = frozenset((attributes.get("class") or "").split())
+        opens_article_list = tag == "ul" and {"list", "infinite-list"}.issubset(classes)
+        opens_title = tag == "div" and "tt" in classes and (
+            self._article_list_depth > 0 or opens_article_list
+        )
+        if tag not in _VOID_HTML_TAGS:
+            self._stack.append((tag, opens_article_list, opens_title))
+            self._article_list_depth += int(opens_article_list)
+            self._title_depth += int(opens_title)
         if tag == "a":
             self._finish_anchor()
-            attributes = dict(attrs)
             self._href = attributes.get("href")
             self._parts = []
+            self._anchor_is_reviewed_title = (
+                self._article_list_depth > 0 and self._title_depth > 0
+            )
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
@@ -359,6 +378,14 @@ class _StcnListParser(HTMLParser):
             return
         if tag == "a":
             self._finish_anchor()
+        if tag in _VOID_HTML_TAGS:
+            return
+        while self._stack:
+            open_tag, opened_article_list, opened_title = self._stack.pop()
+            self._article_list_depth -= int(opened_article_list)
+            self._title_depth -= int(opened_title)
+            if open_tag == tag:
+                break
 
     def handle_data(self, data: str) -> None:
         if not self._ignored_depth and self._href is not None:
@@ -370,9 +397,16 @@ class _StcnListParser(HTMLParser):
 
     def _finish_anchor(self) -> None:
         if self._href is not None:
-            self.anchors.append((self._href, _normalize_text("".join(self._parts))))
+            self.anchors.append(
+                (
+                    self._href,
+                    _normalize_text("".join(self._parts)),
+                    self._anchor_is_reviewed_title,
+                )
+            )
         self._href = None
         self._parts = []
+        self._anchor_is_reviewed_title = False
 
 
 def _feed_html(parser: HTMLParser, payload_utf8: object) -> None:
@@ -416,9 +450,10 @@ def parse_stcn_fund_list(
     _feed_html(parser, payload_utf8)
     parser.finish()
 
-    candidates: List[ArticleCandidate] = []
-    seen: Dict[str, ArticleCandidate] = {}
-    for href, text in parser.anchors:
+    order: List[str] = []
+    reviewed: Dict[str, List[ArticleCandidate]] = {}
+    generic: Dict[str, List[ArticleCandidate]] = {}
+    for href, text, is_reviewed_title in parser.anchors:
         parsed_detail = _canonical_stcn_detail_url(
             urljoin("https://www.stcn.com/article/list/fund.html", href)
         )
@@ -427,12 +462,19 @@ def parse_stcn_fund_list(
         detail_id, canonical_url = parsed_detail
         title = _bounded_text(text, "STCN listed title")
         candidate = ArticleCandidate(detail_id, canonical_url, title)
-        previous = seen.get(detail_id)
-        if previous is not None and previous != candidate:
+        if detail_id not in reviewed:
+            order.append(detail_id)
+            reviewed[detail_id] = []
+            generic[detail_id] = []
+        (reviewed if is_reviewed_title else generic)[detail_id].append(candidate)
+
+    candidates: List[ArticleCandidate] = []
+    for detail_id in order:
+        choices = reviewed[detail_id] or generic[detail_id]
+        candidate = choices[0]
+        if any(choice != candidate for choice in choices[1:]):
             raise IntelligenceParseError("STCN list contains conflicting duplicate detail IDs")
-        if previous is None:
-            seen[detail_id] = candidate
-            candidates.append(candidate)
+        candidates.append(candidate)
     return tuple(candidates)
 
 
@@ -484,13 +526,16 @@ class _StcnDetailParser(HTMLParser):
 
         self._stack.append(tag)
         depth = len(self._stack)
-        if tag == "h1":
+        is_title = "detail-title" in class_names or (
+            tag == "h1" and "article-title" in class_names
+        )
+        if is_title:
             if self._title_parts is not None:
                 raise IntelligenceParseError("STCN detail HTML is malformed")
             self._title_parts = []
             self._title_root_depth = depth
 
-        is_metadata = "article-meta" in class_names
+        is_metadata = bool({"article-meta", "detail-info"}.intersection(class_names))
         if is_metadata:
             self._metadata_containers += 1
             if self._metadata_parts is not None:
@@ -499,7 +544,8 @@ class _StcnDetailParser(HTMLParser):
             self._metadata_root_depth = depth
 
         is_content = (
-            attributes.get("id") == "article-content" or "article-content" in class_names
+            attributes.get("id") == "article-content"
+            or bool({"article-content", "detail-content"}.intersection(class_names))
         )
         if is_content:
             self._content_containers += 1
@@ -582,6 +628,7 @@ class _StcnDetailParser(HTMLParser):
 
 
 def _stcn_metadata_fields(text: str) -> Tuple[str, str, str]:
+    text = _bounded_text(text, "STCN detail metadata")
     source_marker = r"来源\s*[:：]"
     author_marker = r"作者\s*[:：]"
     minute = r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}"
@@ -596,7 +643,7 @@ def _stcn_metadata_fields(text: str) -> Tuple[str, str, str]:
     match = re.fullmatch(
         rf"{source_marker}\s*(?P<source>.+?)\s+"
         rf"{author_marker}\s*(?P<author>.+?)\s+"
-        rf"(?P<minute>{minute})",
+        rf"(?P<minute>{minute})(?:\s+.+)?",
         text,
     )
     if match is None:
@@ -608,20 +655,37 @@ def _stcn_metadata_fields(text: str) -> Tuple[str, str, str]:
     )
 
 
-def parse_stcn_detail(payload_utf8: str, retrieved_at: datetime) -> ParsedItem:
+def parse_stcn_detail(
+    payload_utf8: str,
+    retrieved_at: datetime,
+    *,
+    expected_url: Optional[str] = None,
+) -> ParsedItem:
     retrieved = _validate_retrieved_at(retrieved_at)
     parser = _StcnDetailParser()
     _feed_html(parser, payload_utf8)
     parser.finish()
 
-    canonical_detail = (
+    expected_detail = (
+        None if expected_url is None else _canonical_stcn_detail_url(expected_url)
+    )
+    if expected_url is not None and expected_detail is None:
+        raise IntelligenceParseError("STCN detail expected URL is not canonical")
+    if len(parser.canonical_urls) > 1:
+        raise IntelligenceParseError("STCN detail requires at most one valid canonical URL")
+    declared_detail = (
         _canonical_stcn_detail_url(parser.canonical_urls[0])
-        if len(parser.canonical_urls) == 1 and parser.canonical_urls[0] is not None
+        if parser.canonical_urls and parser.canonical_urls[0] is not None
         else None
     )
+    if parser.canonical_urls and declared_detail is None:
+        raise IntelligenceParseError("STCN detail requires a valid canonical URL")
+    if declared_detail is not None and expected_detail not in {None, declared_detail}:
+        raise IntelligenceParseError("STCN detail canonical URL differs from expected URL")
+    canonical_detail = declared_detail or expected_detail
     titles = [title for title in parser.titles if title]
-    if len(parser.canonical_urls) != 1 or canonical_detail is None:
-        raise IntelligenceParseError("STCN detail requires exactly one valid canonical URL")
+    if canonical_detail is None:
+        raise IntelligenceParseError("STCN detail requires a valid canonical URL")
     if (
         len(titles) != 1
         or parser._metadata_containers != 1

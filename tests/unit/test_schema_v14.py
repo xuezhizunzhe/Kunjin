@@ -236,7 +236,7 @@ class SchemaV14Test(unittest.TestCase):
                         if version >= 13
                         else None
                     )
-                self.assertEqual(versions, tuple(range(1, 20)))
+                self.assertEqual(versions, tuple(range(1, 21)))
                 self.assertEqual(tuple(classification_after), tuple(classification_before))
                 if selection_before is not None:
                     self.assertEqual(tuple(selection_after), tuple(selection_before))
@@ -250,8 +250,8 @@ class SchemaV14Test(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             )
-        self.assertEqual(SCHEMA_VERSION, 19)
-        self.assertEqual(versions, tuple(range(1, 20)))
+        self.assertEqual(SCHEMA_VERSION, 20)
+        self.assertEqual(versions, tuple(range(1, 21)))
 
     def test_failed_v14_migration_rolls_back_objects_marker_and_prior_bytes(self) -> None:
         repository = self._create_at_version(13)

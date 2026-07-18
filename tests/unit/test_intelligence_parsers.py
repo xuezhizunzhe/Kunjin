@@ -101,6 +101,7 @@ def test_gov_policy_enforces_independent_top_level_audit_limit() -> None:
         "/zhengce/zhengceku/202607/content_710001.htm",
         "/zhengce/content/2026-07/14/content_710001.htm",
         "/zhengce/2026-07/14/content_710001.htm",
+        "/xinwen/2022-12/12/content_5731572.htm",
     ),
 )
 def test_gov_policy_accepts_only_reviewed_official_path_families(path: str) -> None:
@@ -167,6 +168,44 @@ def test_stcn_fund_list_extracts_only_exact_detail_ids() -> None:
         candidates[0].detail_id = "1"  # type: ignore[misc]
 
 
+def test_stcn_fund_list_prefers_reviewed_title_over_excerpt_duplicate() -> None:
+    html = """
+    <ul class="list infinite-list">
+      <li>
+        <div class="content">
+          <div class="tt">
+            <a href="/article/detail/4027262.html">明确文章标题</a>
+          </div>
+          <div class="text ellipsis-2">
+            <a href="/article/detail/4027262.html">这是同一篇文章的长摘要，不是标题。</a>
+          </div>
+        </div>
+        <div class="side">
+          <a href="/article/detail/4027262.html"><img src="cover.png"></a>
+        </div>
+      </li>
+    </ul>
+    """
+
+    candidates = parse_stcn_fund_list(html, retrieved_at=NOW)
+
+    assert len(candidates) == 1
+    assert candidates[0].detail_id == "4027262"
+    assert candidates[0].listed_title == "明确文章标题"
+
+
+def test_stcn_fund_list_still_rejects_ambiguous_generic_duplicate_titles() -> None:
+    html = """
+    <main class="fund-list">
+      <a href="/article/detail/4027262.html">候选标题甲</a>
+      <a href="/article/detail/4027262.html">候选标题乙</a>
+    </main>
+    """
+
+    with pytest.raises(IntelligenceParseError, match="conflicting duplicate"):
+        parse_stcn_fund_list(html, retrieved_at=NOW)
+
+
 def test_stcn_hosted_reprint_is_not_independent() -> None:
     item = parse_stcn_detail(fixture("stcn_fund_detail.html"), retrieved_at=NOW)
 
@@ -178,6 +217,41 @@ def test_stcn_hosted_reprint_is_not_independent() -> None:
     assert item.publication_precision == "minute"
     assert item.publication_interval_end is None
     assert item.canonical_url == "https://www.stcn.com/article/detail/3359541.html"
+
+
+def test_stcn_current_detail_schema_requires_authenticated_requested_url() -> None:
+    html = """
+    <!doctype html>
+    <html lang="zh-CN">
+      <body>
+        <div class="detail-title">当前页面文章标题</div>
+        <div class="detail-info">
+          <span>来源：证券时报网</span><span>作者：测试记者</span>
+          <span>2026-07-17 15:51</span>
+          <div class="font-adjust"><span>字号</span><div>超大</div><div>大</div></div>
+        </div>
+        <div class="detail-content"><p>当前页面正文。</p></div>
+      </body>
+    </html>
+    """
+    requested_url = "https://www.stcn.com/article/detail/4027262.html"
+
+    item = parse_stcn_detail(html, retrieved_at=NOW, expected_url=requested_url)
+
+    assert item.canonical_url == requested_url
+    assert item.title == "当前页面文章标题"
+    assert item.normalized_public_content == "当前页面正文。"
+    with pytest.raises(IntelligenceParseError, match="canonical"):
+        parse_stcn_detail(html, retrieved_at=NOW)
+
+
+def test_stcn_detail_rejects_expected_url_that_conflicts_with_page_canonical() -> None:
+    with pytest.raises(IntelligenceParseError, match="canonical"):
+        parse_stcn_detail(
+            fixture("stcn_fund_detail.html"),
+            retrieved_at=NOW,
+            expected_url="https://www.stcn.com/article/detail/4027262.html",
+        )
 
 
 def test_stcn_enabled_publisher_on_canonical_detail_may_be_original() -> None:

@@ -262,6 +262,101 @@ def test_partial_stcn_group_keeps_later_success_and_is_not_cached(
     assert stcn.supplementation is not None
 
 
+def test_stcn_detail_parse_failure_keeps_later_valid_article_as_partial(
+    tmp_path: Path,
+) -> None:
+    list_payload = (FIXTURES / "stcn_fund_list.html").read_text(encoding="utf-8")
+    detail_template = (FIXTURES / "stcn_fund_detail.html").read_text(encoding="utf-8")
+
+    def acquire(request, _budget):
+        if request.source_kind is IntelligenceSourceKind.GOV_POLICY:
+            raise IntelligenceAcquisitionError(
+                SourceErrorCode.SOURCE_UNAVAILABLE,
+                retryable=False,
+            )
+        if request.source_kind is IntelligenceSourceKind.STCN_FUND_LIST:
+            return _response(request, list_payload)
+        if "3359541" in request.requested_url:
+            return _response(request, detail_template.replace("来源：中国基金报", ""))
+        return _response(
+            request,
+            detail_template.replace("3359541", "3359602").replace(
+                "公募基金积极布局长期资金",
+                "指数基金规模稳步增长",
+            ),
+        )
+
+    result = _service(tmp_path, acquire).news_recent()
+
+    assert tuple(item.title for item in result.items) == ("指数基金规模稳步增长",)
+    assert "stcn_fund_news_parse_failure" in result.terminal_request.omitted_work
+    stcn = next(
+        summary for summary in result.source_summaries if summary.source_id == "stcn_fund_news"
+    )
+    assert stcn.outcome is SourceAttemptOutcome.SUCCESS
+    assert stcn.completeness == "partial"
+    assert stcn.coverage_gap_codes == ("stcn_fund_news_parse_failure",)
+
+
+def test_stcn_batch_accepts_items_retrieved_before_aggregate_attempt_finishes(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    list_payload = (FIXTURES / "stcn_fund_list.html").read_text(encoding="utf-8")
+    detail_template = (FIXTURES / "stcn_fund_detail.html").read_text(encoding="utf-8")
+    detail_number = 0
+    current_time = [NOW]
+
+    def response(request, payload: str, retrieved_at: datetime) -> IntelligenceWorkerResponse:
+        return IntelligenceWorkerResponse(
+            requested_url=request.requested_url,
+            final_url=request.requested_url,
+            retrieved_at=retrieved_at,
+            content_type="text/html; charset=utf-8",
+            payload_sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            payload_utf8=payload,
+        )
+
+    def acquire(request, _budget):
+        nonlocal detail_number
+        if request.source_kind is IntelligenceSourceKind.GOV_POLICY:
+            raise IntelligenceAcquisitionError(
+                SourceErrorCode.SOURCE_UNAVAILABLE,
+                retryable=False,
+            )
+        if request.source_kind is IntelligenceSourceKind.STCN_FUND_LIST:
+            current_time[0] += timedelta(seconds=1)
+            return response(request, list_payload, current_time[0])
+        detail_number += 1
+        current_time[0] += timedelta(seconds=1)
+        detail_id = request.requested_url.rsplit("/", 1)[1].split(".", 1)[0]
+        payload = detail_template.replace("3359541", detail_id)
+        return response(request, payload, current_time[0])
+
+    repository = Repository(tmp_path / "staggered-intelligence-service.db")
+    repository.migrate()
+    audit = DecisionAuditStore(repository)
+    service = IntelligenceService(
+        repository,
+        audit,
+        IntelligenceStore(repository, audit),
+        SourceHealthService(audit, wall_clock=lambda: current_time[0]),
+        FundDisclosureStore(repository),
+        clock=lambda: current_time[0],
+        acquire=acquire,
+        monotonic=lambda: 10.0,
+    )
+
+    result = service.news_recent()
+
+    assert len(result.items) == 2
+    assert {item.retrieved_at for item in result.items} == {
+        NOW + timedelta(seconds=2),
+        NOW + timedelta(seconds=3),
+    }
+
+
 def test_partial_stcn_cache_is_not_reused_across_request_subjects(
     tmp_path: Path,
 ) -> None:

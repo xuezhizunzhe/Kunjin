@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -3875,4 +3875,18 @@ CREATE TRIGGER intelligence_snapshot_no_update BEFORE UPDATE ON intelligence_sna
 BEGIN SELECT RAISE(ABORT, 'intelligence snapshots are immutable'); END;
 CREATE TRIGGER intelligence_snapshot_no_delete BEFORE DELETE ON intelligence_snapshots
 BEGIN SELECT RAISE(ABORT, 'intelligence snapshots are immutable'); END;
+"""
+
+SCHEMA_V20 = """
+DROP TRIGGER intelligence_news_item_insert_guard;
+CREATE TRIGGER intelligence_news_item_insert_guard BEFORE INSERT ON intelligence_news_items
+WHEN NOT EXISTS (
+    SELECT 1 FROM source_attempts
+    WHERE id=NEW.source_attempt_id
+      AND source_id=NEW.source_id
+      AND outcome IN ('success', 'cache_hit')
+      AND julianday(NEW.retrieved_at) >= julianday(started_at, '-1 second')
+      AND julianday(NEW.retrieved_at) <= julianday(finished_at, '+1 second')
+)
+BEGIN SELECT RAISE(ABORT, 'intelligence item source attempt binding failed'); END;
 """

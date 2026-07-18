@@ -278,8 +278,8 @@ class SchemaV15Test(unittest.TestCase):
                 "FROM request_runs"
             ).fetchone()
 
-        self.assertEqual(SCHEMA_VERSION, 19)
-        self.assertEqual(versions, tuple(range(1, 20)))
+        self.assertEqual(SCHEMA_VERSION, 20)
+        self.assertEqual(versions, tuple(range(1, 21)))
         self.assertEqual(
             tables_after - tables_before,
             {

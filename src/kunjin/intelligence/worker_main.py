@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import socket
 import sys
@@ -242,7 +243,13 @@ def _execute(request: IntelligenceWorkerRequest) -> bytes:
         return _failure(request, reason, retrieved_at, http_status=exc.code)
     except OverflowError:
         return _failure(request, SourceErrorCode.OVERSIZED_RESPONSE, _utc_now())
-    except (TimeoutError, socket.timeout, socket.gaierror, urllib.error.URLError) as exc:
+    except (
+        TimeoutError,
+        http.client.RemoteDisconnected,
+        socket.timeout,
+        socket.gaierror,
+        urllib.error.URLError,
+    ) as exc:
         return _failure(request, _network_failure(exc), _utc_now())
     except (TypeError, UnicodeError, ValueError):
         return _failure(request, SourceErrorCode.DECODE_FAILURE, _utc_now())

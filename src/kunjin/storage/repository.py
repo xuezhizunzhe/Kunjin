@@ -46,6 +46,7 @@ from kunjin.storage.schema import (
     SCHEMA_V17,
     SCHEMA_V18,
     SCHEMA_V19,
+    SCHEMA_V20,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -114,6 +115,22 @@ _INTELLIGENCE_OBJECT_PREFIXES = (
     "market_state_snapshots_",
     "entity_alias_",
     "entity_aliases_",
+)
+_INTELLIGENCE_DROP_TABLES = (
+    "intelligence_snapshots",
+    "market_state_snapshots",
+    "intelligence_event_entities",
+    "intelligence_event_items",
+    "intelligence_events",
+    "intelligence_lineage_edges",
+    "intelligence_item_integrity_events",
+    "intelligence_snapshot_item_uses",
+    "intelligence_news_excerpts",
+    "intelligence_news_items",
+    "market_dimension_observations",
+    "entity_aliases",
+    "market_entities",
+    "intelligence_policy_versions",
 )
 _DECISION_AUDIT_OBJECT_NAMESPACES = (
     "request_run_",
@@ -205,6 +222,7 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (17, SCHEMA_V17),
         (18, SCHEMA_V18),
         (19, SCHEMA_V19),
+        (20, SCHEMA_V20),
     )
 
 
@@ -826,6 +844,60 @@ def _normalize_exact_legacy_v8_if_needed(
     _normalize_legacy_v8(connection)
 
 
+def _normalize_empty_legacy_v19_if_needed(
+    connection: sqlite3.Connection,
+    applied_versions: set,
+    migrations: Tuple[Tuple[int, str], ...],
+) -> None:
+    if applied_versions != set(range(1, 20)):
+        return
+
+    actual = _read_schema_objects(connection)
+    expected_before = _expected_schema_objects(
+        tuple(schema for version, schema in migrations if version < 19)
+    )
+    if any(actual.get(name) != value for name, value in expected_before.items()):
+        return
+
+    expected_through_v19 = _expected_schema_objects(
+        tuple(schema for version, schema in migrations if version <= 19)
+    )
+    expected_owned = _owned_intelligence_objects(expected_through_v19)
+    actual_owned = _owned_intelligence_objects(actual)
+    if actual_owned == expected_owned:
+        return
+    if not actual_owned or not set(actual_owned).issubset(expected_owned):
+        return
+    if set(actual).difference(expected_before) != set(actual_owned):
+        return
+
+    actual_tables = {
+        name for name, value in actual_owned.items() if value[0] == "table"
+    }
+    if not actual_tables.issubset(_INTELLIGENCE_TABLES):
+        return
+    for table in actual_tables:
+        row = connection.execute(
+            f"SELECT 1 FROM {_quote_sqlite_identifier(table)} LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            return
+
+    for name, value in sorted(actual_owned.items()):
+        if value[0] not in {"index", "trigger", "view"}:
+            continue
+        connection.execute(
+            f"DROP {value[0].upper()} {_quote_sqlite_identifier(name)}"
+        )
+    for table in _INTELLIGENCE_DROP_TABLES:
+        if table in actual_tables:
+            connection.execute(f"DROP TABLE {_quote_sqlite_identifier(table)}")
+    if _owned_intelligence_objects(_read_schema_objects(connection)):
+        raise sqlite3.DatabaseError("empty legacy V19 normalization failed")
+    connection.execute("DELETE FROM schema_migrations WHERE version=19")
+    applied_versions.remove(19)
+
+
 def _validate_applied_schema(
     connection: sqlite3.Connection,
     applied_versions: set,
@@ -1188,6 +1260,11 @@ class Repository:
                 }
                 _validate_migration_markers(applied_versions)
                 _normalize_exact_legacy_v8_if_needed(connection, applied_versions, migrations)
+                _normalize_empty_legacy_v19_if_needed(
+                    connection,
+                    applied_versions,
+                    migrations,
+                )
                 _validate_applied_schema(connection, applied_versions, migrations)
                 for version, schema in migrations:
                     if version in applied_versions:

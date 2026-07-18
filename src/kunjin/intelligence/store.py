@@ -1122,7 +1122,7 @@ class IntelligenceStore:
             or row["outcome"] not in {"success", "cache_hit"}
             or item.retrieved_at < _stored_utc(row["started_at"]) - timedelta(seconds=1)
             or item.retrieved_at
-            > _stored_utc(row["request_deadline_at"]) + timedelta(seconds=1)
+            > _stored_utc(row["finished_at"]) + timedelta(seconds=1)
         ):
             raise IntelligenceStoreError("intelligence item source attempt binding failed")
 

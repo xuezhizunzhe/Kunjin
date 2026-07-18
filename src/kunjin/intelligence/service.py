@@ -912,7 +912,11 @@ class IntelligenceService:
                         ),
                         budget,
                     )
-                    parsed = parse_stcn_detail(detail.payload_utf8, detail.retrieved_at)
+                    parsed = parse_stcn_detail(
+                        detail.payload_utf8,
+                        detail.retrieved_at,
+                        expected_url=candidate.canonical_url,
+                    )
                     if parsed.canonical_url != candidate.canonical_url:
                         raise ValueError("STCN detail canonical URL differs from its list entry")
                 except BudgetExpired:
