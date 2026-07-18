@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -3477,4 +3477,402 @@ BEFORE DELETE ON portfolio_observation_snapshots
 BEGIN
     SELECT RAISE(ABORT, 'portfolio observation snapshots are immutable');
 END;
+"""
+
+SCHEMA_V19 = """
+CREATE TABLE intelligence_policy_versions (
+    version TEXT PRIMARY KEY CHECK(typeof(version) = 'text' AND length(version) BETWEEN 1 AND 64),
+    canonical_policy_json TEXT NOT NULL CHECK(json_valid(canonical_policy_json)),
+    policy_checksum TEXT NOT NULL CHECK(
+        typeof(policy_checksum) = 'text'
+        AND length(CAST(policy_checksum AS BLOB)) = 64
+        AND policy_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL)
+);
+
+CREATE TABLE market_entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_key TEXT NOT NULL UNIQUE,
+    entity_type TEXT NOT NULL,
+    canonical_name TEXT NOT NULL,
+    active_from TEXT NOT NULL CHECK(julianday(active_from) IS NOT NULL),
+    active_until TEXT CHECK(active_until IS NULL OR julianday(active_until) IS NOT NULL),
+    evidence_ids_json TEXT NOT NULL CHECK(json_valid(evidence_ids_json)),
+    canonical_entity_json TEXT NOT NULL CHECK(json_valid(canonical_entity_json)),
+    entity_checksum TEXT NOT NULL CHECK(length(entity_checksum) = 64)
+);
+
+CREATE TABLE entity_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id INTEGER NOT NULL REFERENCES market_entities(id) ON DELETE RESTRICT,
+    alias TEXT NOT NULL,
+    alias_type TEXT NOT NULL,
+    active_from TEXT NOT NULL CHECK(julianday(active_from) IS NOT NULL),
+    active_until TEXT CHECK(active_until IS NULL OR julianday(active_until) IS NOT NULL),
+    evidence_ids_json TEXT NOT NULL CHECK(json_valid(evidence_ids_json)),
+    canonical_alias_json TEXT NOT NULL CHECK(json_valid(canonical_alias_json)),
+    alias_checksum TEXT NOT NULL CHECK(length(alias_checksum) = 64),
+    UNIQUE(entity_id, alias, alias_type, active_from)
+);
+
+CREATE TABLE intelligence_news_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_key TEXT NOT NULL UNIQUE,
+    source_id TEXT NOT NULL,
+    publisher TEXT NOT NULL,
+    canonical_url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    excerpt_original_bytes INTEGER NOT NULL CHECK(excerpt_original_bytes BETWEEN 1 AND 5242880),
+    excerpt_sha256 TEXT NOT NULL CHECK(length(excerpt_sha256) = 64),
+    published_at TEXT NOT NULL CHECK(julianday(published_at) IS NOT NULL),
+    publication_precision TEXT NOT NULL CHECK(publication_precision IN ('date', 'minute')),
+    publication_interval_end TEXT CHECK(
+        publication_interval_end IS NULL OR julianday(publication_interval_end) IS NOT NULL
+    ),
+    retrieved_at TEXT NOT NULL CHECK(julianday(retrieved_at) IS NOT NULL),
+    source_tier TEXT NOT NULL CHECK(source_tier IN ('tier_1', 'tier_2')),
+    content_fingerprint TEXT NOT NULL CHECK(length(content_fingerprint) = 64),
+    category TEXT NOT NULL,
+    integrity_state TEXT NOT NULL CHECK(
+        integrity_state IN ('active', 'corrected', 'retracted', 'superseded', 'unknown')
+    ),
+    source_attempt_id INTEGER NOT NULL
+        REFERENCES source_attempts(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX intelligence_news_items_attempt
+ON intelligence_news_items(source_attempt_id, retrieved_at, id);
+
+CREATE TABLE intelligence_news_excerpts (
+    item_id INTEGER PRIMARY KEY REFERENCES intelligence_news_items(id) ON DELETE RESTRICT,
+    excerpt_text TEXT NOT NULL CHECK(length(CAST(excerpt_text AS BLOB)) BETWEEN 1 AND 2048),
+    truncated INTEGER NOT NULL CHECK(typeof(truncated) = 'integer' AND truncated IN (0, 1)),
+    expires_at TEXT NOT NULL CHECK(julianday(expires_at) IS NOT NULL)
+);
+
+CREATE TABLE intelligence_snapshot_item_uses (
+    request_run_id INTEGER NOT NULL
+        REFERENCES request_runs(id) ON DELETE RESTRICT,
+    item_id INTEGER NOT NULL
+        REFERENCES intelligence_news_items(id) ON DELETE RESTRICT,
+    source_attempt_id INTEGER NOT NULL
+        REFERENCES source_attempts(id) ON DELETE RESTRICT,
+    PRIMARY KEY(request_run_id, item_id)
+);
+
+CREATE TABLE intelligence_item_integrity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    integrity_event_key TEXT NOT NULL UNIQUE,
+    request_run_id INTEGER NOT NULL
+        REFERENCES request_runs(id) ON DELETE RESTRICT,
+    item_id INTEGER NOT NULL REFERENCES intelligence_news_items(id) ON DELETE RESTRICT,
+    previous_state TEXT NOT NULL CHECK(
+        previous_state IN ('active', 'corrected', 'retracted', 'superseded', 'unknown')
+    ),
+    current_state TEXT NOT NULL CHECK(
+        current_state IN ('active', 'corrected', 'retracted', 'superseded', 'unknown')
+    ),
+    evidence_item_id INTEGER REFERENCES intelligence_news_items(id) ON DELETE RESTRICT,
+    occurred_at TEXT NOT NULL CHECK(julianday(occurred_at) IS NOT NULL),
+    canonical_event_json TEXT NOT NULL CHECK(json_valid(canonical_event_json)),
+    event_checksum TEXT NOT NULL CHECK(length(event_checksum) = 64)
+);
+
+CREATE TABLE intelligence_lineage_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    edge_key TEXT NOT NULL UNIQUE,
+    from_item_id INTEGER NOT NULL REFERENCES intelligence_news_items(id) ON DELETE RESTRICT,
+    to_item_id INTEGER NOT NULL REFERENCES intelligence_news_items(id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK(kind IN (
+        'original', 'direct_quote', 'reprint', 'independently_reported',
+        'correction_of', 'retraction_of', 'clarification_of', 'unknown'
+    )),
+    evidence_ids_json TEXT NOT NULL CHECK(json_valid(evidence_ids_json)),
+    canonical_edge_json TEXT NOT NULL CHECK(json_valid(canonical_edge_json)),
+    edge_checksum TEXT NOT NULL CHECK(length(edge_checksum) = 64),
+    CHECK(from_item_id != to_item_id)
+);
+
+CREATE TABLE intelligence_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL CHECK(event_type IN (
+        'policy', 'fund_official', 'fund_media', 'market', 'sector'
+    )),
+    normalized_title TEXT NOT NULL,
+    confidence_state TEXT NOT NULL CHECK(
+        confidence_state IN ('sufficient', 'partial', 'conflicted', 'insufficient')
+    ),
+    earliest_published_at TEXT NOT NULL CHECK(julianday(earliest_published_at) IS NOT NULL),
+    latest_published_at TEXT NOT NULL CHECK(julianday(latest_published_at) IS NOT NULL),
+    integrity_state TEXT NOT NULL CHECK(
+        integrity_state IN ('active', 'corrected', 'retracted', 'superseded', 'unknown')
+    ),
+    superseded_by_event_key TEXT
+        REFERENCES intelligence_events(event_key) ON DELETE RESTRICT
+        DEFERRABLE INITIALLY DEFERRED,
+    invalidation_conditions_json TEXT NOT NULL CHECK(json_valid(invalidation_conditions_json)),
+    canonical_event_json TEXT NOT NULL CHECK(json_valid(canonical_event_json)),
+    event_checksum TEXT NOT NULL CHECK(length(event_checksum) = 64),
+    CHECK(superseded_by_event_key IS NULL OR superseded_by_event_key != event_key)
+);
+
+CREATE TABLE intelligence_event_items (
+    event_id INTEGER NOT NULL REFERENCES intelligence_events(id) ON DELETE RESTRICT,
+    item_id INTEGER NOT NULL REFERENCES intelligence_news_items(id) ON DELETE RESTRICT,
+    role TEXT NOT NULL CHECK(role IN ('supporting', 'opposing', 'correction', 'retraction')),
+    PRIMARY KEY(event_id, item_id),
+    UNIQUE(event_id, item_id, role)
+);
+
+CREATE TABLE intelligence_event_entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    link_key TEXT NOT NULL UNIQUE,
+    event_id INTEGER NOT NULL REFERENCES intelligence_events(id) ON DELETE RESTRICT,
+    entity_id INTEGER NOT NULL REFERENCES market_entities(id) ON DELETE RESTRICT,
+    relationship TEXT NOT NULL CHECK(relationship IN (
+        'subject', 'affects', 'policy_catalyst',
+        'fund_holding_exposure', 'fund_benchmark_exposure'
+    )),
+    evidence_ids_json TEXT NOT NULL CHECK(json_valid(evidence_ids_json)),
+    canonical_link_json TEXT NOT NULL CHECK(json_valid(canonical_link_json)),
+    link_checksum TEXT NOT NULL CHECK(length(link_checksum) = 64)
+);
+
+CREATE TABLE market_dimension_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_key TEXT NOT NULL UNIQUE,
+    entity_id INTEGER NOT NULL REFERENCES market_entities(id) ON DELETE RESTRICT,
+    source_attempt_ids_json TEXT NOT NULL CHECK(
+        json_valid(source_attempt_ids_json) AND json_type(source_attempt_ids_json) = 'array'
+    ),
+    canonical_observation_json TEXT NOT NULL CHECK(json_valid(canonical_observation_json)),
+    observation_checksum TEXT NOT NULL CHECK(length(observation_checksum) = 64),
+    data_as_of TEXT NOT NULL CHECK(julianday(data_as_of) IS NOT NULL),
+    retrieved_at TEXT NOT NULL CHECK(julianday(retrieved_at) IS NOT NULL)
+);
+
+CREATE TABLE market_state_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_run_id INTEGER NOT NULL UNIQUE REFERENCES request_runs(id) ON DELETE RESTRICT,
+    policy_version TEXT NOT NULL
+        REFERENCES intelligence_policy_versions(version) ON DELETE RESTRICT,
+    observation_ids_json TEXT NOT NULL CHECK(json_valid(observation_ids_json)),
+    canonical_state_json TEXT NOT NULL CHECK(json_valid(canonical_state_json)),
+    state_checksum TEXT NOT NULL CHECK(length(state_checksum) = 64),
+    created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL)
+);
+
+CREATE TABLE intelligence_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_run_id INTEGER NOT NULL UNIQUE REFERENCES request_runs(id) ON DELETE RESTRICT,
+    market_state_snapshot_id INTEGER NOT NULL UNIQUE
+        REFERENCES market_state_snapshots(id) ON DELETE RESTRICT,
+    policy_version TEXT NOT NULL
+        REFERENCES intelligence_policy_versions(version) ON DELETE RESTRICT,
+    workflow TEXT NOT NULL CHECK(
+        workflow IN ('news_recent', 'market_overview', 'fund_intelligence')
+    ),
+    canonical_snapshot_json TEXT NOT NULL CHECK(json_valid(canonical_snapshot_json)),
+    result_checksum TEXT NOT NULL CHECK(length(result_checksum) = 64),
+    created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL)
+);
+
+CREATE TRIGGER intelligence_policy_no_replace BEFORE INSERT ON intelligence_policy_versions
+WHEN EXISTS(SELECT 1 FROM intelligence_policy_versions WHERE version=NEW.version)
+BEGIN SELECT RAISE(ABORT, 'intelligence policies cannot be replaced'); END;
+CREATE TRIGGER intelligence_policy_no_update BEFORE UPDATE ON intelligence_policy_versions
+BEGIN SELECT RAISE(ABORT, 'intelligence policies are immutable'); END;
+CREATE TRIGGER intelligence_policy_no_delete BEFORE DELETE ON intelligence_policy_versions
+BEGIN SELECT RAISE(ABORT, 'intelligence policies are immutable'); END;
+
+CREATE TRIGGER market_entity_no_replace BEFORE INSERT ON market_entities
+WHEN EXISTS(SELECT 1 FROM market_entities WHERE entity_key=NEW.entity_key)
+BEGIN SELECT RAISE(ABORT, 'market entities cannot be replaced'); END;
+CREATE TRIGGER market_entity_no_update BEFORE UPDATE ON market_entities
+BEGIN SELECT RAISE(ABORT, 'market entities are immutable'); END;
+CREATE TRIGGER market_entity_no_delete BEFORE DELETE ON market_entities
+BEGIN SELECT RAISE(ABORT, 'market entities are immutable'); END;
+CREATE TRIGGER entity_alias_no_update BEFORE UPDATE ON entity_aliases
+BEGIN SELECT RAISE(ABORT, 'entity aliases are immutable'); END;
+CREATE TRIGGER entity_alias_no_delete BEFORE DELETE ON entity_aliases
+BEGIN SELECT RAISE(ABORT, 'entity aliases are immutable'); END;
+
+CREATE TRIGGER intelligence_news_item_insert_guard BEFORE INSERT ON intelligence_news_items
+WHEN NOT EXISTS (
+    SELECT 1 FROM source_attempts
+    WHERE id=NEW.source_attempt_id
+      AND source_id=NEW.source_id
+      AND outcome IN ('success', 'cache_hit')
+      AND finished_at <= NEW.retrieved_at
+)
+BEGIN SELECT RAISE(ABORT, 'intelligence item source attempt binding failed'); END;
+CREATE TRIGGER intelligence_news_item_no_replace BEFORE INSERT ON intelligence_news_items
+WHEN EXISTS(SELECT 1 FROM intelligence_news_items WHERE item_key=NEW.item_key)
+BEGIN SELECT RAISE(ABORT, 'intelligence news items cannot be replaced'); END;
+CREATE TRIGGER intelligence_news_item_no_update BEFORE UPDATE ON intelligence_news_items
+BEGIN SELECT RAISE(ABORT, 'intelligence news items are immutable'); END;
+CREATE TRIGGER intelligence_news_item_no_delete BEFORE DELETE ON intelligence_news_items
+BEGIN SELECT RAISE(ABORT, 'intelligence news items are immutable'); END;
+
+CREATE TRIGGER intelligence_excerpt_insert_guard BEFORE INSERT ON intelligence_news_excerpts
+WHEN NOT EXISTS (
+    SELECT 1 FROM intelligence_news_items AS item
+    WHERE item.id=NEW.item_id
+      AND item.excerpt_sha256=lower(hex(sha256(NEW.excerpt_text)))
+      AND ((NEW.truncated=1 AND item.excerpt_original_bytes > 2048)
+           OR (NEW.truncated=0 AND item.excerpt_original_bytes=
+               length(CAST(NEW.excerpt_text AS BLOB))))
+)
+BEGIN SELECT RAISE(ABORT, 'intelligence excerpt authentication failed'); END;
+CREATE TRIGGER intelligence_excerpt_no_update BEFORE UPDATE ON intelligence_news_excerpts
+BEGIN SELECT RAISE(ABORT, 'intelligence excerpts are immutable'); END;
+CREATE TRIGGER intelligence_excerpt_delete_guard BEFORE DELETE ON intelligence_news_excerpts
+WHEN julianday(OLD.expires_at) > julianday(kunjin_excerpt_expiry_cutoff())
+BEGIN SELECT RAISE(ABORT, 'intelligence excerpt has not expired'); END;
+
+CREATE TRIGGER intelligence_snapshot_item_use_insert_guard
+BEFORE INSERT ON intelligence_snapshot_item_uses
+WHEN NOT EXISTS(
+    SELECT 1
+    FROM intelligence_news_items AS item
+    JOIN source_attempts AS attempt ON attempt.id=NEW.source_attempt_id
+    JOIN request_runs AS run ON run.id=NEW.request_run_id
+    WHERE item.id=NEW.item_id
+      AND attempt.request_run_id=NEW.request_run_id
+      AND attempt.source_id=item.source_id
+      AND attempt.outcome IN ('success', 'cache_hit')
+      AND run.status='running'
+)
+BEGIN SELECT RAISE(ABORT, 'intelligence item use binding failed'); END;
+CREATE TRIGGER intelligence_snapshot_item_use_no_replace
+BEFORE INSERT ON intelligence_snapshot_item_uses
+WHEN EXISTS(
+    SELECT 1 FROM intelligence_snapshot_item_uses
+    WHERE request_run_id=NEW.request_run_id AND item_id=NEW.item_id
+)
+BEGIN SELECT RAISE(ABORT, 'intelligence item uses cannot be replaced'); END;
+CREATE TRIGGER intelligence_snapshot_item_use_no_update
+BEFORE UPDATE ON intelligence_snapshot_item_uses
+BEGIN SELECT RAISE(ABORT, 'intelligence item uses are immutable'); END;
+CREATE TRIGGER intelligence_snapshot_item_use_no_delete
+BEFORE DELETE ON intelligence_snapshot_item_uses
+BEGIN SELECT RAISE(ABORT, 'intelligence item uses are immutable'); END;
+
+CREATE TRIGGER intelligence_integrity_event_no_replace
+BEFORE INSERT ON intelligence_item_integrity_events
+WHEN EXISTS(
+    SELECT 1 FROM intelligence_item_integrity_events
+    WHERE integrity_event_key=NEW.integrity_event_key
+)
+BEGIN SELECT RAISE(ABORT, 'intelligence integrity events cannot be replaced'); END;
+CREATE TRIGGER intelligence_integrity_event_insert_guard
+BEFORE INSERT ON intelligence_item_integrity_events
+WHEN NEW.item_id=NEW.evidence_item_id
+ OR NOT (
+    (NEW.previous_state='active' AND NEW.current_state IN (
+        'corrected', 'retracted', 'superseded'
+    ))
+    OR (NEW.previous_state='corrected' AND NEW.current_state IN (
+        'retracted', 'superseded'
+    ))
+    OR (NEW.previous_state='unknown' AND NEW.current_state IN (
+        'active', 'corrected', 'retracted', 'superseded'
+    ))
+ )
+ OR NOT EXISTS(
+    SELECT 1 FROM request_runs
+    WHERE id=NEW.request_run_id AND status='running'
+ )
+ OR NOT EXISTS(
+    SELECT 1
+    FROM intelligence_news_items AS evidence
+    JOIN source_attempts AS attempt ON attempt.id=evidence.source_attempt_id
+    WHERE evidence.id=NEW.evidence_item_id
+      AND attempt.request_run_id=NEW.request_run_id
+      AND attempt.outcome IN ('success', 'cache_hit')
+    UNION ALL
+    SELECT 1
+    FROM intelligence_snapshot_item_uses AS item_use
+    JOIN source_attempts AS attempt ON attempt.id=item_use.source_attempt_id
+    WHERE item_use.item_id=NEW.evidence_item_id
+      AND item_use.request_run_id=NEW.request_run_id
+      AND attempt.outcome IN ('success', 'cache_hit')
+ )
+ OR EXISTS(
+    SELECT 1 FROM intelligence_item_integrity_events
+    WHERE item_id=NEW.item_id AND occurred_at >= NEW.occurred_at
+ )
+BEGIN SELECT RAISE(ABORT, 'intelligence integrity transition binding failed'); END;
+CREATE TRIGGER intelligence_integrity_event_no_update
+BEFORE UPDATE ON intelligence_item_integrity_events
+BEGIN SELECT RAISE(ABORT, 'intelligence integrity events are immutable'); END;
+CREATE TRIGGER intelligence_integrity_event_no_delete
+BEFORE DELETE ON intelligence_item_integrity_events
+BEGIN SELECT RAISE(ABORT, 'intelligence integrity events are immutable'); END;
+
+CREATE TRIGGER intelligence_lineage_no_replace BEFORE INSERT ON intelligence_lineage_edges
+WHEN EXISTS(SELECT 1 FROM intelligence_lineage_edges WHERE edge_key=NEW.edge_key)
+BEGIN SELECT RAISE(ABORT, 'intelligence lineage cannot be replaced'); END;
+CREATE TRIGGER intelligence_lineage_no_update BEFORE UPDATE ON intelligence_lineage_edges
+BEGIN SELECT RAISE(ABORT, 'intelligence lineage is immutable'); END;
+CREATE TRIGGER intelligence_lineage_no_delete BEFORE DELETE ON intelligence_lineage_edges
+BEGIN SELECT RAISE(ABORT, 'intelligence lineage is immutable'); END;
+
+CREATE TRIGGER intelligence_event_no_replace BEFORE INSERT ON intelligence_events
+WHEN EXISTS(SELECT 1 FROM intelligence_events WHERE event_key=NEW.event_key)
+BEGIN SELECT RAISE(ABORT, 'intelligence events cannot be replaced'); END;
+CREATE TRIGGER intelligence_event_no_update BEFORE UPDATE ON intelligence_events
+BEGIN SELECT RAISE(ABORT, 'intelligence events are immutable'); END;
+CREATE TRIGGER intelligence_event_no_delete BEFORE DELETE ON intelligence_events
+BEGIN SELECT RAISE(ABORT, 'intelligence events are immutable'); END;
+CREATE TRIGGER intelligence_event_item_no_update BEFORE UPDATE ON intelligence_event_items
+BEGIN SELECT RAISE(ABORT, 'intelligence event items are immutable'); END;
+CREATE TRIGGER intelligence_event_item_no_delete BEFORE DELETE ON intelligence_event_items
+BEGIN SELECT RAISE(ABORT, 'intelligence event items are immutable'); END;
+CREATE TRIGGER intelligence_event_entity_no_update BEFORE UPDATE ON intelligence_event_entities
+BEGIN SELECT RAISE(ABORT, 'intelligence event entities are immutable'); END;
+CREATE TRIGGER intelligence_event_entity_no_delete BEFORE DELETE ON intelligence_event_entities
+BEGIN SELECT RAISE(ABORT, 'intelligence event entities are immutable'); END;
+
+CREATE TRIGGER market_dimension_observation_insert_guard
+BEFORE INSERT ON market_dimension_observations
+WHEN EXISTS (
+    SELECT 1 FROM json_each(NEW.source_attempt_ids_json) AS attempt_id
+    LEFT JOIN source_attempts AS attempt ON attempt.id=attempt_id.value
+    WHERE attempt.id IS NULL OR attempt.outcome NOT IN ('success', 'cache_hit')
+)
+BEGIN SELECT RAISE(ABORT, 'market observation source attempt binding failed'); END;
+CREATE TRIGGER market_dimension_observation_no_replace
+BEFORE INSERT ON market_dimension_observations
+WHEN EXISTS(SELECT 1 FROM market_dimension_observations WHERE observation_key=NEW.observation_key)
+BEGIN SELECT RAISE(ABORT, 'market observations cannot be replaced'); END;
+CREATE TRIGGER market_dimension_observation_no_update BEFORE UPDATE ON market_dimension_observations
+BEGIN SELECT RAISE(ABORT, 'market observations are immutable'); END;
+CREATE TRIGGER market_dimension_observation_no_delete BEFORE DELETE ON market_dimension_observations
+BEGIN SELECT RAISE(ABORT, 'market observations are immutable'); END;
+
+CREATE TRIGGER market_state_snapshot_insert_guard BEFORE INSERT ON market_state_snapshots
+WHEN NOT EXISTS(SELECT 1 FROM request_runs WHERE id=NEW.request_run_id AND status='running')
+BEGIN SELECT RAISE(ABORT, 'market state requires a running request'); END;
+CREATE TRIGGER market_state_snapshot_no_update BEFORE UPDATE ON market_state_snapshots
+BEGIN SELECT RAISE(ABORT, 'market state snapshots are immutable'); END;
+CREATE TRIGGER market_state_snapshot_no_delete BEFORE DELETE ON market_state_snapshots
+BEGIN SELECT RAISE(ABORT, 'market state snapshots are immutable'); END;
+
+CREATE TRIGGER intelligence_snapshot_insert_guard BEFORE INSERT ON intelligence_snapshots
+WHEN NOT EXISTS(SELECT 1 FROM request_runs WHERE id=NEW.request_run_id AND status='running')
+ OR NOT EXISTS(
+    SELECT 1 FROM market_state_snapshots
+    WHERE id=NEW.market_state_snapshot_id AND request_run_id=NEW.request_run_id
+ )
+BEGIN SELECT RAISE(ABORT, 'intelligence snapshot request binding failed'); END;
+CREATE TRIGGER intelligence_snapshot_no_replace BEFORE INSERT ON intelligence_snapshots
+WHEN EXISTS(SELECT 1 FROM intelligence_snapshots WHERE request_run_id=NEW.request_run_id)
+BEGIN SELECT RAISE(ABORT, 'intelligence snapshots cannot be replaced'); END;
+CREATE TRIGGER intelligence_snapshot_no_update BEFORE UPDATE ON intelligence_snapshots
+BEGIN SELECT RAISE(ABORT, 'intelligence snapshots are immutable'); END;
+CREATE TRIGGER intelligence_snapshot_no_delete BEFORE DELETE ON intelligence_snapshots
+BEGIN SELECT RAISE(ABORT, 'intelligence snapshots are immutable'); END;
 """

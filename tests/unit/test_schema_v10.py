@@ -281,7 +281,7 @@ class SchemaV10Test(unittest.TestCase):
         return tuple(tuple(row) for row in rows)
 
     def test_schema_version_is_ten(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 18)
+        self.assertEqual(SCHEMA_VERSION, 19)
 
     def test_fresh_migration_adds_exact_d1_tables_and_versions(self) -> None:
         repository = self.repository()
@@ -292,7 +292,7 @@ class SchemaV10Test(unittest.TestCase):
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
 
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 19)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 20)))
         self.assertEqual(
             repository.table_names()
             & {
@@ -558,7 +558,7 @@ class SchemaV10Test(unittest.TestCase):
                     sync_run = connection.execute(
                         "SELECT source, trigger FROM sync_runs WHERE id = 1"
                     ).fetchone()
-                self.assertEqual([int(row["version"]) for row in versions], list(range(1, 19)))
+                self.assertEqual([int(row["version"]) for row in versions], list(range(1, 20)))
                 self.assertEqual(
                     dict(sync_run),
                     {"source": "preserved-source", "trigger": "preserved-trigger"},
@@ -691,7 +691,7 @@ class SchemaV10Test(unittest.TestCase):
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
             journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 19)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 20)))
         self.assertEqual(journal_mode.lower(), "wal")
         self.assertEqual(repository.database.stat().st_mode & 0o777, 0o600)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -44,6 +45,7 @@ from kunjin.storage.schema import (
     SCHEMA_V16,
     SCHEMA_V17,
     SCHEMA_V18,
+    SCHEMA_V19,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -86,6 +88,33 @@ _DECISION_AUDIT_TABLES = {
 }
 _BRIEF_TABLES = {"brief_policy_versions", "fund_brief_snapshots"}
 _BRIEF_OBJECT_PREFIXES = ("brief_policy_", "fund_brief_snapshot")
+_INTELLIGENCE_TABLES = {
+    "intelligence_policy_versions",
+    "market_entities",
+    "entity_aliases",
+    "intelligence_news_items",
+    "intelligence_news_excerpts",
+    "intelligence_snapshot_item_uses",
+    "intelligence_item_integrity_events",
+    "intelligence_lineage_edges",
+    "intelligence_events",
+    "intelligence_event_items",
+    "intelligence_event_entities",
+    "market_dimension_observations",
+    "market_state_snapshots",
+    "intelligence_snapshots",
+}
+_INTELLIGENCE_OBJECT_PREFIXES = (
+    "intelligence_",
+    "market_entity_",
+    "market_entities_",
+    "market_dimension_",
+    "market_dimension_observations_",
+    "market_state_",
+    "market_state_snapshots_",
+    "entity_alias_",
+    "entity_aliases_",
+)
 _DECISION_AUDIT_OBJECT_NAMESPACES = (
     "request_run_",
     "request_runs_",
@@ -175,6 +204,7 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (16, SCHEMA_V16),
         (17, SCHEMA_V17),
         (18, SCHEMA_V18),
+        (19, SCHEMA_V19),
     )
 
 
@@ -252,6 +282,17 @@ def _owned_brief_objects(
         for name, value in objects.items()
         if _ascii_identifier(value[1]) in _BRIEF_TABLES
         or _ascii_identifier(name).startswith(_BRIEF_OBJECT_PREFIXES)
+    }
+
+
+def _owned_intelligence_objects(
+    objects: Dict[str, Tuple[str, str, str]],
+) -> Dict[str, Tuple[str, str, str]]:
+    return {
+        name: value
+        for name, value in objects.items()
+        if _ascii_identifier(value[1]) in _INTELLIGENCE_TABLES
+        or _ascii_identifier(name).startswith(_INTELLIGENCE_OBJECT_PREFIXES)
     }
 
 
@@ -854,6 +895,17 @@ def _validate_applied_schema(
         protected_tables=_BRIEF_TABLES,
         error_message="brief schema does not match V16",
     )
+    if 19 not in applied_versions:
+        return
+    if _owned_intelligence_objects(actual) != _owned_intelligence_objects(expected):
+        raise sqlite3.DatabaseError("intelligence schema does not match V19")
+    _reject_unexpected_schema_dependencies(
+        connection,
+        expected,
+        actual,
+        protected_tables=_INTELLIGENCE_TABLES,
+        error_message="intelligence schema does not match V19",
+    )
 
 
 _FUND_MANDATE_FACT_NO_UPDATE = """
@@ -1091,6 +1143,17 @@ class Repository:
         connection = sqlite3.connect(str(self.database))
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.create_function(
+            "sha256",
+            1,
+            lambda value: hashlib.sha256(str(value).encode("utf-8")).digest(),
+            deterministic=True,
+        )
+        connection.create_function(
+            "kunjin_excerpt_expiry_cutoff",
+            0,
+            lambda: _utc_now().isoformat(),
+        )
         try:
             yield connection
         finally:

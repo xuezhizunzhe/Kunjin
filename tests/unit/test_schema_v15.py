@@ -278,8 +278,8 @@ class SchemaV15Test(unittest.TestCase):
                 "FROM request_runs"
             ).fetchone()
 
-        self.assertEqual(SCHEMA_VERSION, 18)
-        self.assertEqual(versions, tuple(range(1, 19)))
+        self.assertEqual(SCHEMA_VERSION, 19)
+        self.assertEqual(versions, tuple(range(1, 20)))
         self.assertEqual(
             tables_after - tables_before,
             {
@@ -288,6 +288,20 @@ class SchemaV15Test(unittest.TestCase):
                 "fund_brief_snapshots",
                 "portfolio_observation_snapshots",
                 "portfolio_observation_accounts",
+                "intelligence_policy_versions",
+                "market_entities",
+                "entity_aliases",
+                "intelligence_news_items",
+                "intelligence_news_excerpts",
+                "intelligence_item_integrity_events",
+                "intelligence_lineage_edges",
+                "intelligence_events",
+                "intelligence_event_items",
+                "intelligence_event_entities",
+                "market_dimension_observations",
+                "market_state_snapshots",
+                "intelligence_snapshots",
+                "intelligence_snapshot_item_uses",
             },
         )
         self.assertEqual(tuple(before), tuple(after))
