@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from enum import Enum
@@ -10,6 +11,7 @@ from urllib.parse import urlsplit
 
 from kunjin.brief.models import OfficialEventCode
 from kunjin.decision.models import (
+    MAX_TUPLE_ITEMS,
     ActionKind,
     canonical_json_bytes,
     canonical_value,
@@ -238,11 +240,15 @@ def _validate_bounded_public_content(value: object, name: str) -> str:
     encoded = value.encode("utf-8")
     if len(encoded) > _MAX_ANNOUNCEMENT_CONTENT_BYTES:
         raise ValueError(f"{name} exceeds the bounded byte limit")
-    step = _PUBLIC_TEXT_CHUNK_CHARS - _PUBLIC_TEXT_CHUNK_OVERLAP
-    for offset in range(0, len(value), step):
-        chunk = value[offset : offset + _PUBLIC_TEXT_CHUNK_CHARS]
-        validate_public_text(chunk, name)
-        _validate_public_tree(_freeze_public_tree({"content": chunk}), name)
+    if unicodedata.normalize("NFKC", value) != value:
+        raise ValueError(f"{name} must already be normalized as NFKC")
+    if any(
+        ord(character) <= 0x1F
+        or 0x7F <= ord(character) <= 0x9F
+        or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    ):
+        raise ValueError(f"{name} contains unsupported characters")
     normalized = " ".join(part for part in re.split(r"[\W_]+", value.casefold()) if part)
     private_markers = (
         "access token",
@@ -253,7 +259,25 @@ def _validate_bounded_public_content(value: object, name: str) -> str:
     )
     if any(marker in normalized for marker in private_markers):
         raise ValueError(f"{name} contains a secret or private marker")
+    credential_patterns = (
+        r"\b(?:password|api[_ ]?key|credential|cookie)\s*[:=]\s*\S+",
+        r"https://\S*[?&](?:access_?token|auth|authorization|cookie|password|secret|token)=",
+    )
+    if any(re.search(pattern, value, flags=re.IGNORECASE) for pattern in credential_patterns):
+        raise ValueError(f"{name} contains a secret or private marker")
     return value
+
+
+def _validate_no_percent_identity_alias(path: str, name: str) -> None:
+    if re.search(r"%(?![0-9A-Fa-f]{2})", path):
+        raise ValueError(f"{name} must be a canonical public HTTPS URL")
+    escapes = tuple(re.finditer(r"%([0-9A-Fa-f]{2})", path))
+    if path.count("%") != len(escapes):
+        raise ValueError(f"{name} must be a canonical public HTTPS URL")
+    for match in escapes:
+        character = chr(int(match.group(1), 16))
+        if character.isascii() and (character.isalnum() or character in "-._~/\\"):
+            raise ValueError(f"{name} must be a canonical public HTTPS URL")
 
 
 def _validate_canonical_public_tree(value: object, name: str) -> None:
@@ -265,7 +289,8 @@ def _validate_canonical_public_tree(value: object, name: str) -> None:
                     _freeze_public_tree({key: "public"}),
                     f"{name}.{key}",
                 )
-            _validate_canonical_public_tree(item, f"{name}.{key}")
+            if key != "normalized_content":
+                _validate_canonical_public_tree(item, f"{name}.{key}")
         return
     if type(value) is list:
         for index, item in enumerate(value):
@@ -389,6 +414,7 @@ class OfficialAnnouncementContent(_AuthenticatedRecord):
         _positive_int(self.listing_source_document_id, "listing source document id")
         _validate_public_https_url(self.canonical_announcement_url, "announcement URL")
         parsed = urlsplit(self.canonical_announcement_url)
+        _validate_no_percent_identity_alias(parsed.path, "announcement URL")
         if parsed.query or "//" in parsed.path or any(
             part in {".", ".."} for part in parsed.path.split("/")
         ):
@@ -553,6 +579,8 @@ class ThesisMatchProjection(_AuthenticatedRecord):
         _exact_enum(self.projection_state, ThesisMatchProjectionState, "projection state")
         if type(self.evidence_descriptors) is not tuple:
             raise ValueError("projection evidence descriptors must be an exact tuple")
+        if len(self.evidence_descriptors) > MAX_TUPLE_ITEMS:
+            raise ValueError("projection evidence descriptors have too many items")
         for item in self.evidence_descriptors:
             if type(item) is not ReviewEvidenceItem:
                 raise ValueError("projection evidence descriptors must contain exact records")
@@ -716,6 +744,8 @@ class HoldingReviewInputs(_CanonicalRecord):
         _exact_enum(self.thesis_review_state, ThesisMatchState, "thesis review state")
         if type(self.review_evidence_items) is not tuple:
             raise ValueError("review evidence items must be an exact tuple")
+        if len(self.review_evidence_items) > MAX_TUPLE_ITEMS:
+            raise ValueError("review evidence items have too many items")
         ids = []
         for item in self.review_evidence_items:
             if type(item) is not ReviewEvidenceItem:
@@ -800,6 +830,12 @@ class HoldingReviewResult(_CanonicalRecord):
     policy_checksum: str
     created_at: datetime
 
+    def semantic_canonical_dict(self) -> dict:
+        return self._canonical_fields(frozenset(("created_at",)))
+
+    def expected_result_fingerprint(self) -> str:
+        return hashlib.sha256(canonical_json_bytes(self.semantic_canonical_dict())).hexdigest()
+
     def validate(self) -> None:
         _exact_record(self, HoldingReviewResult, "holding review result")
         _fund_code(self.fund_code)
@@ -851,6 +887,21 @@ class HoldingReviewResult(_CanonicalRecord):
         self.evidence_delta.validate()
         if self.history_comparability is not self.evidence_delta.history_comparability:
             raise ValueError("result history comparability and evidence delta differ")
+        if self.evidence_delta.evidence_unchanged and (
+            self.flow_status is not FlowStatus.COMPLETE
+            or self.evidence_readiness is not EvidenceReadiness.READY
+            or not self.official_negative_check_complete
+            or not self.intelligence_schedule_complete
+            or self.omitted_work
+            or self.intelligence_omitted_work
+            or self.intelligence_degraded_sources
+        ):
+            raise ValueError("unchanged evidence requires complete current coverage")
+        if (
+            self.action_review_source_sufficiency is ActionReviewSourceSufficiency.SUFFICIENT
+            and not self.evidence_ids
+        ):
+            raise ValueError("sufficient source evidence requires evidence ids")
         validate_version(self.policy_version, "policy version")
         validate_checksum(self.policy_checksum, "policy checksum")
         _utc(self.created_at, "review result creation time")
@@ -883,6 +934,8 @@ class HoldingReviewResult(_CanonicalRecord):
                 raise ValueError("continue observing evidence is incomplete")
         if self.hard_event_review != hard_trigger:
             raise ValueError("hard event review requires an authenticated hard-event trigger")
+        if hard_trigger and not self.evidence_ids:
+            raise ValueError("authenticated hard-event trigger requires evidence ids")
         if self.review_disposition in {
             ReviewDisposition.REDUCE_REVIEW,
             ReviewDisposition.EXIT_REVIEW,
@@ -1095,7 +1148,7 @@ class HoldingReviewSnapshot(_AuthenticatedRecord):
         if (self.result.thesis_review_state in adjudicated_states) != adjudication_present:
             raise ValueError("adjudication binding and result thesis state are inconsistent")
         validate_checksum(self.result_fingerprint, "review result fingerprint")
-        if self.result_fingerprint != self.result.checksum():
+        if self.result_fingerprint != self.result.expected_result_fingerprint():
             raise ValueError("review result fingerprint does not match")
         validate_version(self.policy_version, "holding review policy version")
         validate_checksum(self.policy_checksum, "holding review policy checksum")

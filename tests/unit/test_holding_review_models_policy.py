@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from kunjin.brief.models import OfficialEventCode
-from kunjin.decision.models import ActionKind, canonical_json_bytes
+from kunjin.decision.models import MAX_TUPLE_ITEMS, ActionKind, canonical_json_bytes
 from kunjin.holding_review.models import (
     ActionReviewSourceSufficiency,
     AdjudicationDecision,
@@ -470,6 +470,10 @@ def test_announcement_host_must_bind_exact_registered_manager_publisher() -> Non
     (
         "authorization bearer abc",
         "access token abc",
+        "password=abc",
+        "api_key=abc",
+        "cookie: sessionvalue",
+        "https://example.test/doc?token=abc",
         "local path /private/tmp/input",
         "exact amount 100",
         "private value abc",
@@ -586,7 +590,7 @@ def desired_snapshot() -> HoldingReviewSnapshot:
         adjudication_checksum="9" * 64,
         previous_review_id=None,
         result=result,
-        result_fingerprint=result.checksum(),
+        result_fingerprint=result.expected_result_fingerprint(),
         policy_version="1",
         policy_checksum=CHECKSUM,
         created_at=NOW,
@@ -758,7 +762,7 @@ def test_snapshot_rejects_failed_or_incoherent_thesis_and_adjudication_bindings(
         replace(
             snapshot,
             result=failed_result,
-            result_fingerprint=failed_result.checksum(),
+            result_fingerprint=failed_result.expected_result_fingerprint(),
         ).validate()
     with pytest.raises(ValueError, match="active thesis state"):
         replace(snapshot, active_thesis_state=BindingState.MISSING).validate()
@@ -817,3 +821,143 @@ def test_bounded_content_above_public_text_limit_is_validated_without_truncation
     value.validate()
     assert value.normalized_content == content
     assert value.to_canonical_dict()["normalized_content"] == content
+
+
+@pytest.mark.parametrize(
+    "alias",
+    (
+        "https://www.fund001.com/fund/123456/%7enotice.html",
+        "https://www.fund001.com/fund/123456/%7Enotice.html",
+        "https://www.fund001.com/fund/123456/%2e%2e/notice.html",
+        "https://www.fund001.com/fund/123456/%2fnotice.html",
+        "https://www.fund001.com/fund/123456/%2Fnotice.html",
+        "https://www.fund001.com/fund/123456/%5cnotice.html",
+        "https://www.fund001.com/fund/123456/%5Cnotice.html",
+    ),
+)
+def test_announcement_url_rejects_percent_encoded_identity_aliases(alias: str) -> None:
+    with pytest.raises(ValueError, match="canonical public HTTPS URL"):
+        desired_announcement(canonical_announcement_url=alias).validate()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"flow_status": FlowStatus.PARTIAL},
+        {"evidence_readiness": EvidenceReadiness.PARTIAL},
+        {"official_negative_check_complete": False},
+        {"intelligence_schedule_complete": False},
+        {"omitted_work": ("formal_nav",)},
+        {"intelligence_omitted_work": ("stcn_detail_cap_reached",)},
+        {"intelligence_degraded_sources": ("stcn_fund_news",)},
+    ),
+)
+def test_evidence_unchanged_rejects_every_coverage_gap(changes: dict[str, object]) -> None:
+    result = review_result(
+        history_comparability=HistoryComparability.COMPARABLE,
+        evidence_delta=EvidenceDelta(HistoryComparability.COMPARABLE, True),
+        **changes,
+    )
+    with pytest.raises(ValueError, match="unchanged evidence requires complete current coverage"):
+        result.validate()
+
+
+def test_sufficient_source_state_requires_nonempty_evidence_ids() -> None:
+    with pytest.raises(ValueError, match="sufficient source evidence requires evidence ids"):
+        review_result(evidence_ids=()).validate()
+    incomplete = RedemptionEvidence(
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.MISSING,
+        RedemptionComponentState.MISSING,
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.MISSING,
+    )
+    with pytest.raises(ValueError, match="sufficient source evidence requires evidence ids"):
+        review_result(
+            action=ActionKind.FULL_EXIT,
+            thesis_review_state=ThesisMatchState.PRESENTED_MATCH_CONFIRMED,
+            review_disposition=ReviewDisposition.EXIT_REVIEW,
+            evidence_ids=(),
+            redemption_feasibility=RedemptionFeasibility.INSUFFICIENT_DATA,
+            redemption_evidence=incomplete,
+        ).validate()
+
+
+def test_result_timestamp_does_not_change_semantic_fingerprint_or_snapshot_identity() -> None:
+    original = desired_snapshot()
+    later_result = replace(original.result, created_at=NOW + timedelta(minutes=1))
+    assert later_result.expected_result_fingerprint() == original.result_fingerprint
+    changed = replace(
+        original,
+        result=later_result,
+        created_at=NOW + timedelta(minutes=2),
+    )
+    assert changed.expected_semantic_identity_checksum() == original.semantic_identity_checksum
+    changed = replace(
+        changed,
+        semantic_identity_checksum=changed.expected_semantic_identity_checksum(),
+    )
+    assert changed.expected_record_checksum() != original.record_checksum
+    changed = replace(changed, record_checksum=changed.expected_record_checksum())
+    changed.validate()
+
+
+def test_real_result_change_changes_fingerprint_semantic_identity_and_record_checksum() -> None:
+    original = desired_snapshot()
+    changed_result = replace(
+        original.result,
+        upstream_action_boundary=("no_add", "research_only"),
+    )
+    changed_fingerprint = changed_result.expected_result_fingerprint()
+    assert changed_fingerprint != original.result_fingerprint
+    changed = replace(
+        original,
+        result=changed_result,
+        result_fingerprint=changed_fingerprint,
+    )
+    changed_semantic = changed.expected_semantic_identity_checksum()
+    assert changed_semantic != original.semantic_identity_checksum
+    changed = replace(changed, semantic_identity_checksum=changed_semantic)
+    assert changed.expected_record_checksum() != original.record_checksum
+    changed = replace(changed, record_checksum=changed.expected_record_checksum())
+    changed.validate()
+
+
+def test_normalized_content_requires_nfkc_and_rejects_fullwidth_private_marker() -> None:
+    fullwidth = "ａｃｃｅｓｓ　ｔｏｋｅｎ abc"
+    with pytest.raises(ValueError, match="NFKC"):
+        desired_announcement(
+            normalized_content=fullwidth,
+            normalized_content_bytes=len(fullwidth.encode()),
+            normalized_content_sha256=hashlib.sha256(fullwidth.encode()).hexdigest(),
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "ordinary_text",
+    (
+        "The form contains an email address field.",
+        "The transfer may reference an account number field.",
+        "The notice confirms that no secret is included.",
+    ),
+)
+def test_ordinary_official_privacy_words_are_not_false_positives(ordinary_text: str) -> None:
+    value = desired_announcement(
+        normalized_content=ordinary_text,
+        normalized_content_bytes=len(ordinary_text.encode()),
+        normalized_content_sha256=hashlib.sha256(ordinary_text.encode()).hexdigest(),
+    )
+    value.validate()
+    assert value.to_canonical_dict()["normalized_content"] == ordinary_text
+
+
+def test_evidence_descriptor_tuples_are_bounded() -> None:
+    descriptors = tuple(
+        replace(evidence_item(), evidence_id=f"evidence_{index:03d}")
+        for index in range(MAX_TUPLE_ITEMS + 1)
+    )
+    projection = replace(desired_projection(), evidence_descriptors=descriptors)
+    with pytest.raises(ValueError, match="too many"):
+        projection.validate()
