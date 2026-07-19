@@ -1143,7 +1143,6 @@ def test_noncanonical_or_unsafe_percent_paths_are_rejected(path: str) -> None:
         "/private/var/kunjin/input.txt",
         "file:///Users/owner/Documents/fund.txt",
         "Authorization: Bearer credentialvalue",
-        "Bearer credentialvalue",
         "session_id=credentialvalue",
         "password=credentialvalue",
         "api_key=credentialvalue",
@@ -1171,6 +1170,70 @@ def test_announcement_content_rejects_owner_paths_and_shaped_credentials(
     ),
 )
 def test_broad_privacy_words_remain_valid_public_content(ordinary_text: str) -> None:
+    value = desired_announcement(
+        normalized_content=ordinary_text,
+        normalized_content_bytes=len(ordinary_text.encode()),
+        normalized_content_sha256=hashlib.sha256(ordinary_text.encode()).hexdigest(),
+    )
+    value.validate()
+
+
+@pytest.mark.parametrize(
+    "private_content",
+    (
+        "/var/folders/ab/private-input.txt",
+        "/tmp/private-input.txt",
+        "/home/owner/private-input.txt",
+        "file:///var/folders/ab/private-input.txt",
+        "file:///tmp/private-input.txt",
+        "file:///home/owner/private-input.txt",
+        r"C:\Users\owner\private-input.txt",
+        r"d:\users\owner\private-input.txt",
+        "file:///C:/Users/owner/private-input.txt",
+        "file:///d:/users/owner/private-input.txt",
+        "credential = credentialvalue",
+        "secret: credentialvalue",
+        "client_secret = credentialvalue",
+        "auth: credentialvalue",
+        "authorization = credentialvalue",
+        "session: credentialvalue",
+        "session_id = credentialvalue",
+        "password: credentialvalue",
+        "api_key = credentialvalue",
+        "access_token: credentialvalue",
+        "token = credentialvalue",
+        "cookie = credentialvalue",
+        "Authorization: Basic credentialvalue",
+        "Authorization : Digest credentialvalue",
+        "Authorization=Bearer credentialvalue",
+    ),
+)
+def test_sensitive_shape_validator_rejects_extended_paths_and_credentials(
+    private_content: str,
+) -> None:
+    with pytest.raises(ValueError, match="private|secret"):
+        desired_announcement(
+            normalized_content=private_content,
+            normalized_content_bytes=len(private_content.encode()),
+            normalized_content_sha256=hashlib.sha256(private_content.encode()).hexdigest(),
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "ordinary_text",
+    (
+        "The credential policy is described without a value.",
+        "The notice confirms that no secret is present.",
+        "The public session remains available.",
+        "The local path field is discussed without a filesystem value.",
+        "The document discusses an exact amount in general terms.",
+        "Authorization schemes include Basic, Digest, and Bearer.",
+        "Client secret handling is described conceptually.",
+    ),
+)
+def test_sensitive_words_without_assignment_header_or_path_remain_valid(
+    ordinary_text: str,
+) -> None:
     value = desired_announcement(
         normalized_content=ordinary_text,
         normalized_content_bytes=len(ordinary_text.encode()),

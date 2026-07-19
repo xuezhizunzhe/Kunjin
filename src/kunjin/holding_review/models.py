@@ -250,12 +250,13 @@ def _validate_bounded_public_content(value: object, name: str) -> str:
     ):
         raise ValueError(f"{name} contains unsupported characters")
     private_patterns = (
-        r"(?:file://)?/(?:users/[^/\s]+|private/(?:tmp|var))(?:/|\b)",
-        r"\bauthorization\s*(?::|=|\s+bearer\b)\s*\S+",
-        r"\bbearer\s+[A-Za-z0-9._~+/=-]{3,}",
-        r"\b(?:session_id|password|api[_ ]?key|access[_ ]?token|token|cookie)"
-        r"\s*[:=]\s*\S+",
-        r"https://\S*[?&](?:session_id|password|api_?key|access_?token|token)=",
+        r"(?<![A-Za-z0-9])(?:file://)?/"
+        r"(?:users/[^/\s]+|private/(?:tmp|var)|var/folders|tmp|home/[^/\s]+)(?:/|$)",
+        r"(?<![A-Za-z0-9])(?:file:/{2,3})?[a-z]:[\\/]+users[\\/]+"
+        r"[^\\/\s]+(?:[\\/]|$)",
+        r"\bauthorization\s*(?:[:=]\s*)?(?:basic|digest|bearer)\s+\S+",
+        r"\b(?:credential|secret|client_secret|auth|authorization|session|session_id|"
+        r"password|api[_ ]?key|access[_ ]?token|token|cookie)\s*[:=]\s*\S+",
     )
     if any(re.search(pattern, value, flags=re.IGNORECASE) for pattern in private_patterns):
         raise ValueError(f"{name} contains a secret or private marker")
