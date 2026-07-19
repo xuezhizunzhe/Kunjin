@@ -14,6 +14,7 @@ from kunjin.decision.models import (
     FreshnessContext,
     RequestFieldResolution,
     RiskEffect,
+    SourceAttemptOutcome,
     SourceFieldRef,
     SourceFieldState,
     SourceTier,
@@ -30,6 +31,20 @@ from kunjin.storage.repository import Repository
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,127}$", flags=re.ASCII)
 _FUND_CODE = re.compile(r"^[0-9]{6}$", flags=re.ASCII)
+
+
+class _FrozenMappingTag(Enum):
+    VALUE = "kunjin_frozen_mapping_v1"
+
+
+_FROZEN_MAPPING_TAG = _FrozenMappingTag.VALUE
+_SOURCE_FAILURE_OUTCOMES = frozenset(
+    {
+        SourceAttemptOutcome.TRANSIENT_FAILURE,
+        SourceAttemptOutcome.UNAVAILABLE,
+        SourceAttemptOutcome.UNSUPPORTED,
+    }
+)
 _SOURCE_FIELDS = (
     "adjusted_return_series",
     "current_manager_team",
@@ -84,6 +99,12 @@ _COMMAND_ORDER = {kind: index for index, (kind, _template) in enumerate(REFRESH_
 
 
 def _canonical_utc(value: object, name: str) -> datetime:
+    if type(value) is not datetime or value.tzinfo is not timezone.utc:
+        raise ValueError(f"{name} must use canonical UTC")
+    return value
+
+
+def _clock_utc(value: object, name: str) -> datetime:
     if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
     return value.astimezone(timezone.utc)
@@ -96,26 +117,32 @@ def _exact_dataclass(value: object, expected: type, name: str) -> None:
         raise ValueError(f"{name} must be an exact {expected.__name__}")
 
 
-def _freeze(value: object) -> object:
+def _freeze_nested(value: object) -> object:
     if isinstance(value, Mapping):
-        return tuple((str(key), _freeze(item)) for key, item in sorted(value.items()))
+        if any(type(key) is not str for key in value):
+            raise ValueError("readiness mapping keys must be exact strings")
+        return (
+            _FROZEN_MAPPING_TAG,
+            tuple(
+                (key, _freeze_nested(item))
+                for key, item in sorted(value.items())
+            ),
+        )
     if type(value) in {list, tuple}:
-        return tuple(_freeze(item) for item in value)
+        return tuple(_freeze_nested(item) for item in value)
     if isinstance(value, Enum):
         return value.value
     return value
 
 
-def _thaw(value: object) -> object:
+def _thaw_nested(value: object) -> object:
     if type(value) is tuple:
-        if value and all(
-            type(item) is tuple
-            and len(item) == 2
-            and type(item[0]) is str
-            for item in value
-        ):
-            return {item[0]: _thaw(item[1]) for item in value}
-        return [_thaw(item) for item in value]
+        if len(value) == 2 and value[0] is _FROZEN_MAPPING_TAG:
+            entries = value[1]
+            if type(entries) is not tuple:
+                raise ValueError("frozen readiness mapping is invalid")
+            return {key: _thaw_nested(item) for key, item in entries}
+        return [_thaw_nested(item) for item in value]
     if type(value) is Decimal:
         return format(value, "f")
     if type(value) in {date, datetime}:
@@ -138,17 +165,21 @@ def _validate_dynamic(value: object, path: tuple[str, ...] = ()) -> None:
         _canonical_utc(value, "readiness datetime")
         return
     if type(value) is tuple:
-        mapping_shape = bool(value) and all(
-            type(item) is tuple
-            and len(item) == 2
-            and type(item[0]) is str
-            for item in value
-        )
-        if mapping_shape:
-            keys = tuple(item[0] for item in value)
+        if len(value) == 2 and value[0] is _FROZEN_MAPPING_TAG:
+            entries = value[1]
+            if type(entries) is not tuple:
+                raise ValueError("frozen readiness mapping is invalid")
+            keys = tuple(item[0] for item in entries)
             if keys != tuple(sorted(set(keys))):
                 raise ValueError("readiness mapping keys must be unique and sorted")
-            for key, item in value:
+            for entry in entries:
+                if (
+                    type(entry) is not tuple
+                    or len(entry) != 2
+                    or type(entry[0]) is not str
+                ):
+                    raise ValueError("frozen readiness mapping entry is invalid")
+                key, item = entry
                 if key.casefold() in _PRIVATE_KEYS and key not in {"amount_min", "amount_max"}:
                     raise ValueError("readiness values contain a private field")
                 _validate_dynamic(item, (*path, key))
@@ -161,11 +192,38 @@ def _validate_dynamic(value: object, path: tuple[str, ...] = ()) -> None:
 
 
 def _payload(value: Mapping[str, object]) -> tuple[tuple[str, object], ...]:
-    frozen = _freeze(value)
-    if type(frozen) is not tuple:
-        raise ValueError("readiness component must be a mapping")
-    _validate_dynamic(frozen)
+    if any(type(key) is not str for key in value):
+        raise ValueError("readiness component keys must be exact strings")
+    frozen = tuple(
+        (key, _freeze_nested(item)) for key, item in sorted(value.items())
+    )
+    _validate_component_payload(frozen)
     return frozen
+
+
+def _validate_component_payload(value: object) -> None:
+    if type(value) is not tuple:
+        raise ValueError("readiness component must be an exact tuple payload")
+    keys = []
+    for entry in value:
+        if (
+            type(entry) is not tuple
+            or len(entry) != 2
+            or type(entry[0]) is not str
+        ):
+            raise ValueError("readiness component mapping entry is invalid")
+        key, item = entry
+        keys.append(key)
+        if key.casefold() in _PRIVATE_KEYS and key not in {"amount_min", "amount_max"}:
+            raise ValueError("readiness values contain a private field")
+        _validate_dynamic(item, (key,))
+    if tuple(keys) != tuple(sorted(set(keys))):
+        raise ValueError("readiness component keys must be unique and sorted")
+
+
+def _thaw_component(value: tuple[tuple[str, object], ...]) -> dict[str, object]:
+    _validate_component_payload(value)
+    return {key: _thaw_nested(item) for key, item in value}
 
 
 @dataclass(frozen=True)
@@ -189,9 +247,7 @@ class CandidateReadinessEvidence:
             raise ValueError("candidate readiness fund code is invalid")
         for name in _COMPONENT_NAMES:
             value = getattr(self, name)
-            if type(value) is not tuple:
-                raise ValueError(f"candidate {name} must be an exact tuple payload")
-            _validate_dynamic(value, (name,))
+            _validate_component_payload(value)
 
 
 @dataclass(frozen=True)
@@ -212,8 +268,7 @@ class ShortlistReadinessResult:
 
     def validate(self) -> None:
         _exact_dataclass(self, ShortlistReadinessResult, "shortlist readiness result")
-        if _canonical_utc(self.as_of, "readiness as-of") != self.as_of:
-            raise ValueError("readiness as-of must use canonical UTC")
+        _canonical_utc(self.as_of, "readiness as-of")
         codes = validate_candidate_codes(self.candidate_codes)
         if type(self.candidate_codes) is not tuple:
             raise ValueError("candidate codes must be an exact tuple")
@@ -344,13 +399,14 @@ class ShortlistReadinessService:
 
     def review(self, candidate_codes: Sequence[str]) -> ShortlistReadinessResult:
         codes = validate_candidate_codes(candidate_codes)
-        as_of = _canonical_utc(self.clock(), "readiness clock")
+        as_of = _clock_utc(self.clock(), "readiness clock")
         positions, position_failed = self._load_positions()
         personal_gate = self._load_personal_gate()
         held_codes = {
             position.fund_code
             for position in positions
             if type(getattr(position, "fund_code", None)) is str
+            and position.shares > 0
         }
 
         candidates = []
@@ -473,9 +529,8 @@ class ShortlistReadinessService:
         profile_payload, profile_ready = self._profile_payload(report, bundle)
         nav_payload, nav_dates, nav_ready = self._nav_payload(history, failures, as_of)
         holdings_payload, holdings_ready = self._holdings_payload(report, failures)
-        d1_payload, d1_ready, d1_documents_ready, mapped_layer = self._d1_payload(
+        d1_payload, d1_ready, mapped_layer = self._d1_payload(
             classification,
-            bundle,
             as_of,
             failures,
         )
@@ -553,7 +608,6 @@ class ShortlistReadinessService:
         return candidate, {
             "base_comparison_ready": base_ready,
             "blocking_codes": blocking,
-            "d1_documents_ready": d1_documents_ready,
             "d1_ready": d1_ready,
             "failures": failures,
             "holdings_ready": holdings_ready,
@@ -608,10 +662,6 @@ class ShortlistReadinessService:
                 "blocked_fields": set(_SOURCE_FIELDS),
                 "resolutions": {},
             }
-        projected = {
-            (item.history.reference.source_id, item.history.reference.field_id): item.state.value
-            for item in snapshot.projections
-        }
         fields_payload = []
         resolutions: dict[str, str] = {}
         blocked_fields = set()
@@ -626,14 +676,20 @@ class ShortlistReadinessService:
                 for field in source.fields
                 if field.field_id == reference.field_id
             )
-            states = [
-                {
-                    "field_id": item.field_id,
-                    "source_id": item.source_id,
-                    "state": projected[(item.source_id, item.field_id)],
-                }
-                for item in (reference, *policy.acceptable_alternatives)
-            ]
+            states = []
+            for item in (reference, *policy.acceptable_alternatives):
+                projection = next(
+                    projection
+                    for projection in snapshot.projections
+                    if projection.history.reference == item
+                )
+                states.append(
+                    self._source_history_payload(
+                        projection,
+                        source_id=item.source_id,
+                        field_id=item.field_id,
+                    )
+                )
             resolutions[reference.field_id] = resolution.value
             if resolution is RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED or (
                 resolution is RequestFieldResolution.PARTIAL
@@ -653,6 +709,77 @@ class ShortlistReadinessService:
                 "fields": fields_payload,
             }
         ), {"blocked_fields": blocked_fields, "resolutions": resolutions}
+
+    def _source_history_payload(
+        self,
+        projection,
+        *,
+        source_id: str,
+        field_id: str,
+    ) -> dict[str, object]:
+        source = next(
+            source
+            for source in self.source_health_service.registry.sources
+            if source.source_id == source_id
+        )
+        field = next(field for field in source.fields if field.field_id == field_id)
+        attempts = tuple(record.attempt for record in projection.history.attempts)
+        successful = tuple(
+            attempt
+            for attempt in attempts
+            if attempt.outcome
+            in {SourceAttemptOutcome.SUCCESS, SourceAttemptOutcome.CACHE_HIT}
+        )
+        failed = tuple(
+            attempt for attempt in attempts if attempt.outcome in _SOURCE_FAILURE_OUTCOMES
+        )
+        consecutive_failures = 0
+        for attempt in attempts:
+            if attempt.outcome in {
+                SourceAttemptOutcome.SUCCESS,
+                SourceAttemptOutcome.CACHE_HIT,
+            }:
+                break
+            if attempt.outcome in _SOURCE_FAILURE_OUTCOMES:
+                consecutive_failures += 1
+        latest = attempts[0] if attempts else None
+        last_success = successful[0] if successful else None
+        last_failure = failed[0] if failed else None
+        return {
+            "acceptable_alternatives": [
+                item.to_canonical_dict() for item in field.acceptable_alternatives
+            ],
+            "consecutive_failures": consecutive_failures,
+            "cooldown_until": (
+                latest.cooldown_until
+                if projection.state is SourceFieldState.COOLDOWN
+                and latest is not None
+                else None
+            ),
+            "field_id": field_id,
+            "field_scope": field.scope,
+            "last_failure_at": (
+                None if last_failure is None else last_failure.finished_at
+            ),
+            "last_failure_reason": (
+                None
+                if last_failure is None or last_failure.error_code is None
+                else last_failure.error_code.value
+            ),
+            "last_success_at": (
+                None if last_success is None else last_success.finished_at
+            ),
+            "last_success_data_as_of": (
+                None if last_success is None else last_success.data_as_of
+            ),
+            "latest_outcome": None if latest is None else latest.outcome.value,
+            "source_id": source_id,
+            "source_kind": source.source_kind,
+            "source_scope": source.scope,
+            "source_tier": field.source_tier.value,
+            "state": projection.state.value,
+            "supplementation": field.supplementation.to_canonical_dict(),
+        }
 
     @staticmethod
     def _profile_payload(report, bundle) -> tuple[tuple[tuple[str, object], ...], bool]:
@@ -692,6 +819,7 @@ class ShortlistReadinessService:
             "freshness": report["freshness"],
             "identity": identity,
             "managers": managers,
+            "missing_sections": report["missing_sections"],
             "publication_dates": report["publication_dates"],
             "report_dates": report["report_dates"],
             "warnings": report["warnings"],
@@ -757,8 +885,7 @@ class ShortlistReadinessService:
         ), bool(ready and not report["conflicts"])
 
     @staticmethod
-    def _d1_payload(classification, bundle, as_of, failures):
-        documents_ready = bool(bundle is not None and bundle.source_documents)
+    def _d1_payload(classification, as_of, failures):
         if classification is None:
             return _payload(
                 {
@@ -767,7 +894,7 @@ class ShortlistReadinessService:
                         "classification_load_failed" if "d1" in failures else None
                     ),
                 }
-            ), False, documents_ready, None
+            ), False, None
         freshness = (
             "current"
             if classification.classified_at <= as_of < classification.valid_until
@@ -800,7 +927,7 @@ class ShortlistReadinessService:
                 "risk_bucket": classification.risk_bucket.value,
                 "valid_until": classification.valid_until,
             }
-        ), ready, documents_ready, mapped_layer
+        ), ready, mapped_layer
 
     @staticmethod
     def _common_nav_dates(states: list[dict[str, object]]) -> set[date]:
@@ -844,7 +971,7 @@ class ShortlistReadinessService:
                     or resolutions.get("holdings_industries")
                     != RequestFieldResolution.USABLE.value
                 ),
-                "d1_documents": not state["d1_ready"] and not state["d1_documents_ready"],
+                "d1_documents": not state["d1_ready"],
                 "d1_classification": not state["d1_ready"],
             }
             blocked_by_action = {
@@ -885,7 +1012,7 @@ def public_shortlist_readiness_payload(
             {
                 "fund_code": item.fund_code,
                 **{
-                    name: _thaw(getattr(item, name))
+                    name: _thaw_component(getattr(item, name))
                     for name in _COMPONENT_NAMES
                 },
             }

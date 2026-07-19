@@ -15,9 +15,14 @@ from kunjin.decision.health import (
 )
 from kunjin.decision.models import (
     RequestFieldResolution,
+    SourceAttempt,
+    SourceAttemptOutcome,
+    SourceErrorCode,
     SourceFieldHistory,
     SourceFieldState,
+    StoredSourceAttempt,
 )
+from kunjin.decision.source_registry import SOURCE_REGISTRY_V1_CHECKSUM
 from kunjin.decision.store import DecisionAuditStore
 from kunjin.funds.models import (
     AssetType,
@@ -184,20 +189,76 @@ def _snapshot(
         )
         references.extend((primary, *policy.acceptable_alternatives))
     references = list(dict.fromkeys(references))
-    projections = tuple(
-        ProjectedSourceField(
-            state_by_field.get(reference.field_id, SourceFieldState.HEALTHY),
-            SourceFieldHistory(reference, ()),
+    projections = []
+    for index, reference in enumerate(references, start=1):
+        state = state_by_field.get(reference.field_id, SourceFieldState.HEALTHY)
+        if state in {SourceFieldState.HEALTHY, SourceFieldState.DEGRADED}:
+            outcome = SourceAttemptOutcome.SUCCESS
+            data_as_of = NOW - timedelta(days=1)
+            error_code = None
+            cooldown_until = None
+        elif state is SourceFieldState.COOLDOWN:
+            outcome = SourceAttemptOutcome.TRANSIENT_FAILURE
+            data_as_of = None
+            error_code = SourceErrorCode.NETWORK_TIMEOUT
+            cooldown_until = NOW + timedelta(minutes=30)
+        elif state is SourceFieldState.UNAVAILABLE:
+            outcome = SourceAttemptOutcome.UNAVAILABLE
+            data_as_of = None
+            error_code = SourceErrorCode.PARSE_FAILURE
+            cooldown_until = None
+        elif state is SourceFieldState.UNSUPPORTED:
+            outcome = SourceAttemptOutcome.UNSUPPORTED
+            data_as_of = None
+            error_code = SourceErrorCode.FIELD_UNSUPPORTED
+            cooldown_until = None
+        else:
+            projections.append(
+                ProjectedSourceField(state, SourceFieldHistory(reference, ()))
+            )
+            continue
+        finished_at = NOW - timedelta(minutes=1)
+        attempt = SourceAttempt(
+            reference.source_id,
+            reference.field_id,
+            "fund:000001",
+            1,
+            outcome,
+            finished_at - timedelta(seconds=1),
+            finished_at,
+            data_as_of,
+            error_code,
+            cooldown_until,
+            None,
+            None,
+            "1",
+            SOURCE_REGISTRY_V1_CHECKSUM,
+            100 if outcome is SourceAttemptOutcome.SUCCESS else 0,
         )
-        for reference in references
-    )
+        attempt.validate()
+        record = StoredSourceAttempt(
+            index,
+            index,
+            f"{index:032x}",
+            None,
+            attempt,
+        )
+        record.validate()
+        projections.append(
+            ProjectedSourceField(state, SourceFieldHistory(reference, (record,)))
+        )
+    projections = tuple(projections)
     resolutions = tuple(
         RequestFieldResolution.MANUAL_SUPPLEMENT_REQUIRED
         if state_by_field.get(reference.field_id) in {
             SourceFieldState.UNAVAILABLE,
             SourceFieldState.UNSUPPORTED,
         }
-        else RequestFieldResolution.USABLE
+        else (
+            RequestFieldResolution.PARTIAL
+            if state_by_field.get(reference.field_id) is SourceFieldState.COOLDOWN
+            else RequestFieldResolution.USABLE
+        )
         for reference in service._source_primary_references
     )
     result = SourceStatusSnapshot(projections, resolutions, NOW)
@@ -335,6 +396,11 @@ def test_ready_projection_preserves_components_and_loads_each_once(
     ] == "1"
     assert payload["candidate_evidence"][0]["profile"]["warnings"] == []
     assert payload["candidate_evidence"][0]["d1"]["conflicts"] == []
+    assert payload["candidate_evidence"][0]["profile"]["missing_sections"] == {
+        "announcement": "insufficient_data",
+        "industry_exposure": "insufficient_data",
+        "size_history": "insufficient_data",
+    }
     assert set(payload) == {
         "action_boundary",
         "blocking_codes",
@@ -442,6 +508,40 @@ def test_unavailable_source_is_preserved_as_manual_supplement_not_refresh(
     assert {item["state"] for item in formal_field["acceptable_sources"]} == {
         "unavailable"
     }
+
+
+def test_source_history_metadata_preserves_cooldown_failure_semantics(
+    tmp_path, monkeypatch
+) -> None:
+    service, _repository_value, _calls = _build_service(tmp_path, monkeypatch)
+
+    def cooldown_source(*_args):
+        return _snapshot(
+            service,
+            state_by_field={"formal_nav": SourceFieldState.COOLDOWN},
+        )
+
+    monkeypatch.setattr(
+        service.source_health_service,
+        "stored_source_status_snapshot",
+        cooldown_source,
+    )
+
+    payload = public_shortlist_readiness_payload(service.review(CODES))
+    formal_field = next(
+        item
+        for item in payload["candidate_evidence"][0]["source_health"]["fields"]
+        if item["field_id"] == "formal_nav"
+    )
+    source = formal_field["acceptable_sources"][0]
+    assert source["state"] == "cooldown"
+    assert source["latest_outcome"] == "transient_failure"
+    assert source["last_success_at"] is None
+    assert source["last_success_data_as_of"] is None
+    assert source["last_failure_at"] == (NOW - timedelta(minutes=1)).isoformat()
+    assert source["last_failure_reason"] == "network_timeout"
+    assert source["cooldown_until"] == (NOW + timedelta(minutes=30)).isoformat()
+    assert source["consecutive_failures"] == 1
 
 
 def test_candidate_failure_is_local_and_base_exceptions_propagate(
@@ -599,6 +699,11 @@ def test_future_nav_and_future_classification_fail_closed(tmp_path, monkeypatch)
     assert result.comparison_evidence_ready is False
     assert payload["candidate_evidence"][0]["formal_nav"]["future_observation_count"] == 1
     assert payload["candidate_evidence"][0]["d1"]["freshness"] == "stale"
+    assert result.bounded_refresh_actions[:2] == (
+        ("000002", "sync fund 000002"),
+        ("000002", "sync fund-documents 000002"),
+    )
+    assert ("000002", "fund classify 000002") in result.bounded_refresh_actions
 
 
 def test_portfolio_binding_failure_prevents_comparison_readiness(
@@ -615,6 +720,78 @@ def test_portfolio_binding_failure_prevents_comparison_readiness(
 
     assert result.comparison_evidence_ready is False
     assert "portfolio_binding_load_failed" in result.blocking_codes
+
+
+def test_zero_share_position_is_not_held(tmp_path, monkeypatch) -> None:
+    service, repository, _calls = _build_service(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        repository,
+        "latest_positions",
+        lambda: [
+            StoredPosition(
+                "private account",
+                CODES[0],
+                "zero position",
+                Decimal("0"),
+                NOW,
+            )
+        ],
+    )
+
+    payload = public_shortlist_readiness_payload(service.review(CODES))
+
+    assert payload["candidate_evidence"][0]["portfolio_binding"] == {
+        "position_state": "not_held",
+        "technical_failure": None,
+    }
+
+
+def test_profile_document_without_classification_requires_both_d1_actions(
+    tmp_path, monkeypatch
+) -> None:
+    service, _repository_value, _calls = _build_service(tmp_path, monkeypatch)
+    service.classification_loader = lambda _code: None
+
+    result = service.review(CODES)
+
+    assert result.bounded_refresh_actions[:2] == (
+        ("000002", "sync fund-documents 000002"),
+        ("000002", "fund classify 000002"),
+    )
+
+
+def test_nested_mapping_roundtrip_is_unambiguous(tmp_path, monkeypatch) -> None:
+    service, _repository_value, _calls = _build_service(tmp_path, monkeypatch)
+    result = service.review(CODES)
+    first = replace(
+        result.candidate_evidence[0],
+        profile=readiness_module._payload(
+            {
+                "empty_mapping": {},
+                "string_pairs": [["left", "right"], ["up", "down"]],
+            }
+        ),
+    )
+    replaced = replace(
+        result,
+        candidate_evidence=(first, *result.candidate_evidence[1:]),
+    )
+
+    profile = public_shortlist_readiness_payload(replaced)["candidate_evidence"][0][
+        "profile"
+    ]
+
+    assert profile["empty_mapping"] == {}
+    assert profile["string_pairs"] == [["left", "right"], ["up", "down"]]
+
+
+def test_exact_record_rejects_noncanonical_utc(tmp_path, monkeypatch) -> None:
+    service, _repository_value, _calls = _build_service(tmp_path, monkeypatch)
+    result = service.review(CODES)
+    noncanonical = NOW.astimezone(timezone(timedelta(hours=8)))
+
+    with pytest.raises(ValueError, match="canonical UTC"):
+        replace(result, as_of=noncanonical).validate()
 
 
 def test_review_does_not_write_repository_tables(tmp_path, monkeypatch) -> None:
