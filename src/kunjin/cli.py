@@ -117,6 +117,8 @@ from kunjin.logging import redact_secrets
 from kunjin.models import InvestmentThesis
 from kunjin.paths import RuntimePaths
 from kunjin.security.keychain import CredentialStoreError, KeychainTokenStore
+from kunjin.selection.research import public_shortlist_payload
+from kunjin.selection.service import ShortlistService
 from kunjin.services.research import ResearchSyncService
 from kunjin.services.sync import PortfolioSyncService, SyncError
 from kunjin.storage.repository import Repository
@@ -321,6 +323,7 @@ class ApplicationContext:
     brief_service: Optional["HeldFundBriefService"] = None
     intelligence_service: Optional["IntelligenceService"] = None
     diagnosis_service: Optional[DiagnosisService] = None
+    selection_service: Optional[ShortlistService] = None
 
 
 def build_context(*, public_acceptance_subject: Optional[str] = None) -> ApplicationContext:
@@ -372,6 +375,22 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
         SuitabilityAssessmentStore(repository),
         AssessmentCipher(profile_key_store),
         SuitabilityPolicyV1(),
+    )
+    allocation_service = AllocationService(
+        suitability_service,
+        AllocationPolicyStore(repository),
+        AllocationAssessmentStore(repository),
+        AllocationCipher(profile_key_store),
+        AllocationPolicyV1(),
+    )
+    fund_risk_service = FundRiskService(
+        risk_store=fund_risk_store,
+        disclosure_store=fund_disclosure_store,
+        repository=repository,
+        discovery=OfficialDocumentDiscovery(client=official_index_client),
+        document_client=OfficialDocumentClient(paths=paths),
+        legacy_converter=legacy_converter,
+        policy=ClassificationPolicyV1(),
     )
     decision_audit_store = DecisionAuditStore(repository)
     evidence_policy = EvidencePolicyV1()
@@ -432,23 +451,9 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
         ),
         profile_service=profile_service,
         suitability_service=suitability_service,
-        allocation_service=AllocationService(
-            suitability_service,
-            AllocationPolicyStore(repository),
-            AllocationAssessmentStore(repository),
-            AllocationCipher(profile_key_store),
-            AllocationPolicyV1(),
-        ),
+        allocation_service=allocation_service,
         fund_risk_store=fund_risk_store,
-        fund_risk_service=FundRiskService(
-            risk_store=fund_risk_store,
-            disclosure_store=fund_disclosure_store,
-            repository=repository,
-            discovery=OfficialDocumentDiscovery(client=official_index_client),
-            document_client=OfficialDocumentClient(paths=paths),
-            legacy_converter=legacy_converter,
-            policy=ClassificationPolicyV1(),
-        ),
+        fund_risk_service=fund_risk_service,
         decision_service=DecisionRoutingService(
             suitability_service,
             decision_audit_store,
@@ -465,6 +470,13 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
             fund_disclosure_store,
         ),
         diagnosis_service=DiagnosisService(repository, fund_disclosure_store),
+        selection_service=ShortlistService(
+            repository,
+            fund_disclosure_store,
+            classification_loader=fund_risk_service.current_classification,
+            suitability_status_loader=suitability_service.status,
+            allocation_status_loader=allocation_service.status,
+        ),
     )
 
 
@@ -647,6 +659,8 @@ def build_parser() -> argparse.ArgumentParser:
     fund_peers.add_argument("fund_code")
     fund_compare = fund_subparsers.add_parser("compare")
     fund_compare.add_argument("fund_codes", nargs="+")
+    fund_shortlist = fund_subparsers.add_parser("shortlist")
+    fund_shortlist.add_argument("fund_codes", nargs="+")
     fund_classify = fund_subparsers.add_parser("classify")
     fund_classify.add_argument("fund_code")
     fund_classification = fund_subparsers.add_parser("classification")
@@ -828,6 +842,20 @@ def _validate_compare_codes(fund_codes: Sequence[str]) -> Tuple[str, ...]:
         _validate_fund_code(fund_code)
     if len(codes) < 2 or len(codes) > 10 or len(set(codes)) != len(codes):
         raise CliUsageError("fund compare requires 2 to 10 unique fund codes")
+    return codes
+
+
+def _validate_shortlist_codes(fund_codes: Sequence[str]) -> Tuple[str, ...]:
+    codes = tuple(fund_codes)
+    for fund_code in codes:
+        _validate_fund_code(fund_code)
+    if (
+        len(codes) < 2
+        or len(codes) > 5
+        or len(set(codes)) != len(codes)
+        or "000000" in codes
+    ):
+        raise CliUsageError("fund shortlist requires 2 to 5 unique fund codes")
     return codes
 
 
@@ -3294,6 +3322,24 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             anchor_fund_code=fund_codes[0],
         )
         return envelope("fund.compare", data)
+
+    if args.command == "fund" and args.fund_command == "shortlist":
+        fund_codes = _validate_shortlist_codes(args.fund_codes)
+        if context.selection_service is None:
+            raise CliUsageError("fund shortlist service is unavailable")
+        result = context.selection_service.review(fund_codes)
+        data = public_shortlist_payload(result)
+        errors = []
+        if result.comparison_state == "insufficient_data":
+            errors.append(
+                {
+                    "code": "insufficient_data",
+                    "message": (
+                        "Candidate shortlist has insufficient authenticated evidence"
+                    ),
+                }
+            )
+        return envelope("fund.shortlist", data, errors=errors)
 
     if args.command == "fund" and args.fund_command in {
         "profile",

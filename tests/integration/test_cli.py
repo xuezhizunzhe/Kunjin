@@ -97,6 +97,7 @@ from kunjin.models import (
     SyncResult,
 )
 from kunjin.paths import RuntimePaths
+from kunjin.selection.models import ShortlistResult
 from kunjin.services.research import ResearchSyncResult, ResearchSyncService
 from kunjin.services.sync import PortfolioSyncService
 from kunjin.storage.repository import Repository
@@ -114,6 +115,7 @@ from kunjin.suitability.store import (
     SuitabilityAssessmentStore,
     SuitabilityPolicyStore,
 )
+from tests.unit.test_selection_models import shortlist_result_fixture
 from tests.unit.test_suitability_models import valid_profile
 
 
@@ -441,6 +443,17 @@ def disclosure_sync_result(fund_code="519755", profile=True, total_failure=False
             error_code="remote_unavailable" if failed else None,
         )
     return FundDisclosureSyncResult(fund_code, sections, ())
+
+
+class FakeShortlistService:
+    def __init__(self, result: ShortlistResult) -> None:
+        self.result = result
+        self.calls: list[tuple[str, ...]] = []
+
+    def review(self, fund_codes) -> ShortlistResult:
+        codes = tuple(fund_codes)
+        self.calls.append(codes)
+        return self.result
 
 
 class CliIntegrationTest(unittest.TestCase):
@@ -1787,6 +1800,24 @@ class CliIntegrationTest(unittest.TestCase):
         )
         self.assertIs(context.brief_service._risk_store, context.fund_risk_store)
         self.assertIsNone(context.brief_service._announcement_content_loader)
+        self.assertIsNotNone(context.selection_service)
+        self.assertIs(context.selection_service._repository, context.repository)
+        self.assertIs(
+            context.selection_service._disclosure_store,
+            context.fund_disclosure_store,
+        )
+        self.assertIs(
+            context.selection_service._classification_loader.__self__,
+            context.fund_risk_service,
+        )
+        self.assertIs(
+            context.selection_service._suitability_status_loader.__self__,
+            context.suitability_service,
+        )
+        self.assertIs(
+            context.selection_service._allocation_status_loader.__self__,
+            context.allocation_service,
+        )
         for forbidden_dependency in (
             "_profile_service",
             "_suitability_service",
@@ -3772,6 +3803,127 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertFalse(payload["data"]["action_boundary"]["action_authorized"])
         self.assertFalse(payload["data"]["action_boundary"]["exact_amount_available"])
         self.assertEqual(payload["errors"][0]["code"], "insufficient_data")
+
+    def test_fund_shortlist_parser_and_success_payload_are_bounded(self) -> None:
+        parsed = build_parser().parse_args(
+            ["--json", "fund", "shortlist", "000002", "000001"]
+        )
+        self.assertEqual(parsed.fund_command, "shortlist")
+        self.assertEqual(parsed.fund_codes, ["000002", "000001"])
+
+        service = FakeShortlistService(shortlist_result_fixture())
+        self.context.selection_service = service
+        payload, exit_code, _ = run(
+            ["--json", "fund", "shortlist", "000002", "000001"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(payload, "fund.shortlist")
+        self.assertEqual(service.calls, [("000002", "000001")])
+        self.assertEqual(payload["data"]["comparison_state"], "conditional_shortlist")
+        self.assertFalse(payload["data"]["conditional_shortlist"]["merit_ordered"])
+        self.assertFalse(payload["data"]["action_boundary"]["action_authorized"])
+
+    def test_fund_shortlist_insufficient_data_is_a_structured_error(self) -> None:
+        source = shortlist_result_fixture()
+        result = replace(
+            source,
+            comparison_state="insufficient_data",
+            candidate_reviews=tuple(
+                replace(item, evidence_state="insufficient_data")
+                for item in source.candidate_reviews
+            ),
+            shortlist_codes=(),
+            missing_evidence=("formal_nav_unavailable",),
+        )
+        result.validate()
+        service = FakeShortlistService(result)
+        self.context.selection_service = service
+
+        payload, exit_code, _ = run(
+            ["--json", "fund", "shortlist", "000002", "000001"],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "fund.shortlist")
+        self.assertEqual(payload["errors"], [
+            {
+                "code": "insufficient_data",
+                "message": "Candidate shortlist has insufficient authenticated evidence",
+            }
+        ])
+        self.assertEqual(payload["data"]["missing_evidence"], ["formal_nav_unavailable"])
+
+    def test_fund_shortlist_validates_before_service_work(self) -> None:
+        service = FakeShortlistService(shortlist_result_fixture())
+        self.context.selection_service = service
+        invalid_commands = (
+            ["--json", "fund", "shortlist", "000001"],
+            [
+                "--json",
+                "fund",
+                "shortlist",
+                "000001",
+                "000002",
+                "000003",
+                "000004",
+                "000005",
+                "000006",
+            ],
+            ["--json", "fund", "shortlist", "000001", "000001"],
+            ["--json", "fund", "shortlist", "000000", "000001"],
+            ["--json", "fund", "shortlist", "000001", "abc123"],
+        )
+
+        for argv in invalid_commands:
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, "fund.shortlist")
+                self.assertIn(
+                    payload["errors"][0]["code"],
+                    {"invalid_arguments", "invalid_fund_code"},
+                )
+        self.assertEqual(service.calls, [])
+
+        accepted = ["000001", "000002", "000003", "000004", "000005"]
+        parsed = build_parser().parse_args(["--json", "fund", "shortlist", *accepted])
+        self.assertEqual(parsed.fund_codes, accepted)
+
+    def test_fund_shortlist_unavailable_and_legacy_dispatch_are_isolated(self) -> None:
+        self.context.selection_service = None
+        unavailable, exit_code, _ = run(
+            ["--json", "fund", "shortlist", "000001", "000002"],
+            self.context,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(unavailable, "fund.shortlist")
+        self.assertEqual(unavailable["errors"][0]["code"], "invalid_arguments")
+
+        class MustNotRun:
+            def review(self, fund_codes):
+                raise AssertionError("legacy commands must not invoke shortlist")
+
+        self.context.selection_service = MustNotRun()
+        diagnosis, diagnosis_exit, _ = run(
+            ["--json", "portfolio", "diagnose"], self.context
+        )
+        self.assertEqual(diagnosis_exit, 1)
+        self.assert_envelope(diagnosis, "portfolio.diagnose")
+        self.assertNotIn("conditional_shortlist", diagnosis["data"])
+
+        self.context.peer_store = FakePeerStore(peer_group("519755", "000001"))
+        self.context.fund_disclosure_store = FakeDisclosureStore(
+            empty_disclosure_bundle()
+        )
+        comparison, comparison_exit, _ = run(
+            ["--json", "fund", "compare", "519755", "000001"], self.context
+        )
+        self.assertEqual(comparison_exit, 0)
+        self.assert_envelope(comparison, "fund.compare")
+        self.assertNotIn("conditional_shortlist", comparison["data"])
 
     def test_peer_sync_partial_success_keeps_member_errors_in_data(self) -> None:
         result = PeerSyncResult(
