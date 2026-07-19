@@ -4222,6 +4222,75 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(scope.calls, [])
         self.assertEqual(readiness.calls, [])
 
+    def test_owner_readiness_static_failures_do_not_build_or_write_context(self) -> None:
+        cases = (
+            (
+                ["fund", "research-scope"],
+                "fund.research-scope",
+                "invalid_arguments",
+                "fund research-scope requires JSON mode",
+            ),
+            (
+                ["fund", "shortlist-readiness", "000002", "000001"],
+                "fund.shortlist-readiness",
+                "invalid_arguments",
+                "fund shortlist-readiness requires JSON mode",
+            ),
+            (
+                ["--json", "fund", "shortlist-readiness", "000001"],
+                "fund.shortlist-readiness",
+                "invalid_arguments",
+                "fund shortlist requires 2 to 5 unique fund codes",
+            ),
+            (
+                ["--json", "fund", "shortlist-readiness", "000001", "000001"],
+                "fund.shortlist-readiness",
+                "invalid_arguments",
+                "fund shortlist requires 2 to 5 unique fund codes",
+            ),
+            (
+                ["--json", "fund", "research-scope", "--objective", "unknown"],
+                "fund.research-scope",
+                "invalid_arguments",
+                None,
+            ),
+        )
+        for argv, command, error_code, error_message in cases:
+            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                data_dir = root / "data"
+                state_dir = root / "state"
+                environment = {
+                    "KUNJIN_DATA_DIR": str(data_dir),
+                    "KUNJIN_STATE_DIR": str(state_dir),
+                }
+                with (
+                    patch.dict(os.environ, environment),
+                    patch("kunjin.cli.build_context") as context_builder,
+                ):
+                    payload, exit_code, _ = run(argv)
+
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, command)
+                self.assertEqual(payload["errors"][0]["code"], error_code)
+                if error_message is not None:
+                    self.assertEqual(payload["errors"][0]["message"], error_message)
+                context_builder.assert_not_called()
+                self.assertFalse(data_dir.exists())
+                self.assertFalse(state_dir.exists())
+                for suffix in ("", "-wal", "-shm"):
+                    self.assertFalse((data_dir / f"kunjin.db{suffix}").exists())
+
+    def test_valid_owner_readiness_command_still_builds_context_once(self) -> None:
+        context = self.context
+        context.research_scope_service = FakeResearchScopeService()
+        with patch("kunjin.cli.build_context", return_value=context) as context_builder:
+            payload, exit_code, _ = run(["--json", "fund", "research-scope"])
+
+        self.assertEqual(exit_code, 0)
+        self.assert_envelope(payload, "fund.research-scope")
+        context_builder.assert_called_once_with(public_acceptance_subject=None)
+
     def test_owner_readiness_unavailable_and_technical_errors_are_sanitized(self) -> None:
         self.context.research_scope_service = None
         self.context.shortlist_readiness_service = None

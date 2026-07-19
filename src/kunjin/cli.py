@@ -3543,6 +3543,7 @@ def run(
     try:
         args = build_parser().parse_args(raw_argv)
         json_output = args.json_output
+        _preflight_before_context(args)
         if args.command == "version":
             payload = envelope("version", {"version": __version__})
         else:
@@ -3619,6 +3620,19 @@ def run(
         )
         exit_code = 1
     return serialize(payload), exit_code, json_output
+
+
+def _preflight_before_context(args: argparse.Namespace) -> None:
+    if args.command != "fund":
+        return
+    if args.fund_command == "research-scope":
+        if not args.json_output:
+            raise CliUsageError("fund research-scope requires JSON mode")
+        return
+    if args.fund_command == "shortlist-readiness":
+        if not args.json_output:
+            raise CliUsageError("fund shortlist-readiness requires JSON mode")
+        _validate_shortlist_codes(args.fund_codes)
 
 
 def _command_name(args: argparse.Namespace) -> str:
