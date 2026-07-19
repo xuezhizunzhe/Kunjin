@@ -170,15 +170,29 @@ class ResearchScopeResult:
             raise ValueError("research scope action boundary is invalid")
 
 
-def category_context(product_category: str | None) -> dict[str, object]:
-    selected = _choice(product_category, PRODUCT_CATEGORIES, "product category")
+def _closed_context(
+    selected: str | None,
+    values: tuple[str, ...],
+    meanings: Mapping[str, str],
+    name: str,
+) -> dict[str, object]:
+    selected = _choice(selected, values, name)
     return {
         "selected": selected,
         "choices": [
-            {"value": value, "meaning": _PRODUCT_CATEGORY_MEANINGS[value]}
-            for value in PRODUCT_CATEGORIES
+            {"value": value, "meaning": meanings[value]}
+            for value in values
         ],
     }
+
+
+def category_context(product_category: str | None) -> dict[str, object]:
+    return _closed_context(
+        product_category,
+        PRODUCT_CATEGORIES,
+        _PRODUCT_CATEGORY_MEANINGS,
+        "product category",
+    )
 
 
 def _gate_warnings(gate: PersonalGateEvidence) -> set[str]:
@@ -303,6 +317,18 @@ def public_research_scope_payload(result: ResearchScopeResult) -> dict[str, obje
             "horizon": result.request.horizon,
             "product_category": result.request.product_category,
             "risk_increase_conclusion_allowed": False,
+            "objective_context": _closed_context(
+                result.request.objective,
+                RESEARCH_OBJECTIVES,
+                _OBJECTIVE_MEANINGS,
+                "research objective",
+            ),
+            "horizon_context": _closed_context(
+                result.request.horizon,
+                RESEARCH_HORIZONS,
+                _HORIZON_MEANINGS,
+                "research horizon",
+            ),
         },
         "product_category_context": category_context(result.request.product_category),
         "personal_gate": public_personal_gate_payload(result.personal_gate),

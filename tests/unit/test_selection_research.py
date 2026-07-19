@@ -4,10 +4,7 @@ from dataclasses import replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from kunjin.selection.research import (
-    public_personal_gate_payload,
-    public_shortlist_payload,
-)
+from kunjin.selection.research import public_shortlist_payload
 from tests.unit.test_selection_models import shortlist_result_fixture
 
 _PRIVATE_KEYS = frozenset(
@@ -77,9 +74,16 @@ def test_public_shortlist_payload_has_stable_sections() -> None:
         "invalidation_conditions": ["allocation_state_changes"],
         "merit_ordered": False,
     }
-    assert payload["personal_gate"] == public_personal_gate_payload(
-        shortlist_result_fixture().personal_gate
-    )
+    assert payload["personal_gate"] == {
+        "allocation_freshness": "fresh",
+        "allocation_state": "fresh",
+        "allocation_status": "range_available",
+        "blocking_codes": [],
+        "constraint_codes": ["horizon_binding"],
+        "suitability_freshness": "fresh",
+        "suitability_state": "fresh",
+        "suitability_status": "ready_for_allocation",
+    }
 
 
 def test_public_projection_is_recursive_private_and_interpretation_key_free() -> None:

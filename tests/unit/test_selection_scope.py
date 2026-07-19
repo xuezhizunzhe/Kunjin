@@ -201,6 +201,69 @@ def test_missing_choices_are_explicit_and_never_guessed() -> None:
         choice["value"]
         for choice in payload["product_category_context"]["choices"]  # type: ignore[index]
     ] == list(PRODUCT_CATEGORIES)
+    assert payload["research_scope"]["objective_context"] == {  # type: ignore[index]
+        "selected": None,
+        "choices": [
+            {
+                "value": "learning",
+                "meaning": "education and product understanding only",
+            },
+            {
+                "value": "capital_preservation",
+                "meaning": (
+                    "study of principal-volatility and liquidity risks; never a "
+                    "capital guarantee"
+                ),
+            },
+            {
+                "value": "income_stability",
+                "meaning": (
+                    "study of distribution and income-stability evidence; never "
+                    "promised income"
+                ),
+            },
+            {
+                "value": "long_term_growth",
+                "meaning": (
+                    "study of long-horizon capital-growth evidence; never a "
+                    "suitability conclusion"
+                ),
+            },
+        ],
+    }
+    assert payload["research_scope"]["horizon_context"] == {  # type: ignore[index]
+        "selected": None,
+        "choices": [
+            {"value": "short_term", "meaning": "less than 1 year"},
+            {
+                "value": "medium_term",
+                "meaning": "at least 1 year and no more than 3 years",
+            },
+            {"value": "long_term", "meaning": "more than 3 years"},
+        ],
+    }
+
+
+def test_partial_scope_preserves_selection_and_exposes_omitted_closed_choice() -> None:
+    payload = public_research_scope_payload(
+        _status_loaders().form(
+            objective="learning",
+            horizon=None,
+            product_category="broad_index",
+        )
+    )
+    scope = payload["research_scope"]
+
+    assert scope["objective_context"]["selected"] == "learning"  # type: ignore[index]
+    assert [
+        item["value"] for item in scope["objective_context"]["choices"]  # type: ignore[index]
+    ] == list(RESEARCH_OBJECTIVES)
+    assert scope["horizon_context"]["selected"] is None  # type: ignore[index]
+    assert [
+        item["value"] for item in scope["horizon_context"]["choices"]  # type: ignore[index]
+    ] == list(RESEARCH_HORIZONS)
+    assert payload["product_category_context"]["selected"] == "broad_index"  # type: ignore[index]
+    assert payload["missing_inputs"] == ["horizon_required"]
 
 
 @pytest.mark.parametrize(
@@ -254,6 +317,44 @@ def test_nonfresh_or_blocked_gates_never_erase_or_authorize_research_scope(
         "horizon": "long_term",
         "product_category": "broad_index",
         "risk_increase_conclusion_allowed": False,
+        "objective_context": {
+            "selected": "long_term_growth",
+            "choices": [
+                {
+                    "value": value,
+                    "meaning": meaning,
+                }
+                for value, meaning in (
+                    ("learning", "education and product understanding only"),
+                    (
+                        "capital_preservation",
+                        "study of principal-volatility and liquidity risks; never a "
+                        "capital guarantee",
+                    ),
+                    (
+                        "income_stability",
+                        "study of distribution and income-stability evidence; never "
+                        "promised income",
+                    ),
+                    (
+                        "long_term_growth",
+                        "study of long-horizon capital-growth evidence; never a "
+                        "suitability conclusion",
+                    ),
+                )
+            ],
+        },
+        "horizon_context": {
+            "selected": "long_term",
+            "choices": [
+                {"value": "short_term", "meaning": "less than 1 year"},
+                {
+                    "value": "medium_term",
+                    "meaning": "at least 1 year and no more than 3 years",
+                },
+                {"value": "long_term", "meaning": "more than 3 years"},
+            ],
+        },
     }
     assert payload["action_boundary"] == {
         "action_maturity": "evidence_only",
