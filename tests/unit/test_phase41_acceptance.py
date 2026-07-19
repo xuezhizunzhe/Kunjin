@@ -357,6 +357,16 @@ def test_documents_terminal_failure_skips_classify_but_keeps_independent_action(
         "dependency_stopped": 1,
         "terminal_failure": 1,
     }
+    assert [
+        (record.role, record.action_type, record.state)
+        for record in result.action_terminal_records
+    ] == [
+        (ROLES[0], "sync_fund_profile", "completed"),
+        (ROLES[0], "sync_fund_documents", "terminal_failure"),
+        (ROLES[0], "fund_classify", "dependency_stopped"),
+        (ROLES[1], "sync_fund", "completed"),
+    ]
+    assert not any(code in repr(result.action_terminal_records) for code in CODES)
     assert readiness_count == 2
 
 
@@ -465,14 +475,34 @@ def _orchestration_result(
     outcome="not_run",
     refresh_calls=0,
 ):
+    initial_data = _readiness(actions=actions)["data"]
+    planned = acceptance._parse_actions(initial_data, CODES, ROLES)
+    remaining_states = dict({} if states is None else states)
+    records = []
+    for action in planned:
+        state = next(
+            (name for name, count in remaining_states.items() if count > 0),
+            None,
+        )
+        if state is None:
+            break
+        remaining_states[state] -= 1
+        records.append(
+            acceptance.ActionTerminalRecord(
+                role=action.role,
+                action_type=action.action_type,
+                state=state,
+            )
+        )
     return acceptance.OrchestrationResult(
         action_state_counts={} if states is None else states,
+        action_terminal_records=tuple(records),
         final_data=_readiness(
             ready=final_ready,
             evidence=final_evidence,
         )["data"],
         final_readiness_calls=1,
-        initial_data=_readiness(actions=actions)["data"],
+        initial_data=initial_data,
         initial_readiness_calls=1,
         outcome=outcome,
         refresh_action_calls=refresh_calls,
@@ -734,6 +764,18 @@ def test_engineering_flow_closes_requests_actions_and_gaps(mutation) -> None:
         validate_engineering_flow(invalid, expected_subject_count=4)
 
 
+def test_engineering_flow_rejects_dependency_stop_on_independent_action() -> None:
+    result = _orchestration_result(
+        actions=(("000001", "sync fund 000001"),),
+        states={"dependency_stopped": 1},
+        outcome="not_run",
+        refresh_calls=0,
+    )
+
+    with pytest.raises(StableFailure, match="engineering_flow_invalid"):
+        validate_engineering_flow(result, expected_subject_count=4)
+
+
 def test_engineering_evidence_rejects_ready_without_closed_candidates() -> None:
     result = _orchestration_result(final_ready=True, outcome="completed_once")
     result.final_data["candidate_evidence"] = []
@@ -775,6 +817,37 @@ def test_engineering_evidence_rejects_forged_usable_source_shape() -> None:
         project_engineering_evidence(
             _orchestration_result(final_evidence=evidence),
             _shortlist(),
+        )
+
+
+def test_engineering_evidence_rejects_inconsistent_usable_nav() -> None:
+    evidence = _closed_evidence(usable_first=True)
+    evidence[0]["formal_nav"] = {
+        "end_date": "not-a-date",
+        "future_observation_count": 0,
+        "latest_date": "not-a-date",
+        "observation_count": 0,
+        "start_date": "not-a-date",
+        "technical_failure": "formal_nav_load_failed",
+        "unique_date_count": 0,
+        "usable": True,
+    }
+
+    with pytest.raises(StableFailure, match="engineering_evidence_invalid"):
+        project_engineering_evidence(
+            _orchestration_result(final_evidence=evidence),
+            _shortlist(),
+        )
+
+
+def test_engineering_evidence_closes_position_state_across_projections() -> None:
+    shortlist = _shortlist()
+    shortlist["candidate_reviews"][0]["position_state"] = "not_held"
+
+    with pytest.raises(StableFailure, match="engineering_evidence_invalid"):
+        project_engineering_evidence(
+            _orchestration_result(final_evidence=_closed_evidence()),
+            shortlist,
         )
 
 
@@ -821,6 +894,7 @@ def test_engineering_projection_accepts_current_public_readiness_shape(
     payload = public_shortlist_readiness_payload(service.review(READINESS_CODES))
     result = acceptance.OrchestrationResult(
         action_state_counts={},
+        action_terminal_records=(),
         final_data=payload,
         final_readiness_calls=1,
         initial_data=payload,
@@ -832,8 +906,14 @@ def test_engineering_projection_accepts_current_public_readiness_shape(
     shortlist = {
         "request": payload["request"],
         "candidate_reviews": [
-            {"fund_code": code, "position_state": "not_held"}
-            for code in READINESS_CODES
+            {
+                "fund_code": code,
+                "position_state": evidence["portfolio_binding"]["position_state"],
+            }
+            for code, evidence in zip(
+                READINESS_CODES,
+                payload["candidate_evidence"],
+            )
         ],
         "comparability": [
             {
@@ -882,6 +962,31 @@ def test_partial_real_evidence_is_not_promoted_to_structural_observation() -> No
         },
         "comparison_reason_codes": ["missing_identity"],
     }
+
+
+def test_inactive_fund_pair_is_valid_but_not_structurally_observed() -> None:
+    projection = project_engineering_evidence(
+        _orchestration_result(final_evidence=_closed_evidence(usable_first=True)),
+        _shortlist(
+            pair_overrides={
+                0: {
+                    "state": "not_comparable",
+                    "reason_code": "inactive_fund",
+                }
+            }
+        ),
+    )
+
+    assert projection["comparison_state_counts"] == {
+        "comparable": 0,
+        "not_comparable": 1,
+        "insufficient_data": 5,
+    }
+    assert projection["comparison_reason_codes"] == [
+        "inactive_fund",
+        "missing_identity",
+    ]
+    assert projection["structural_comparability"] == "not_testable"
 
 
 def test_engineering_evidence_projects_ready_and_zero_component_states() -> None:
@@ -1276,6 +1381,13 @@ def test_engineering_controller_separates_flow_and_evidence_without_codes(
     )["data"]
     orchestration = acceptance.OrchestrationResult(
         action_state_counts={"terminal_failure": 1},
+        action_terminal_records=(
+            acceptance.ActionTerminalRecord(
+                role=ROLES[0],
+                action_type="sync_fund",
+                state="terminal_failure",
+            ),
+        ),
         final_data=final,
         final_readiness_calls=1,
         initial_data=initial,

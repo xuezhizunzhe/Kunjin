@@ -14,7 +14,7 @@ import sys
 from collections import Counter
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from itertools import combinations
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
@@ -107,8 +107,16 @@ class CommandResult:
 
 
 @dataclass(frozen=True)
+class ActionTerminalRecord:
+    role: str
+    action_type: str
+    state: str
+
+
+@dataclass(frozen=True)
 class OrchestrationResult:
     action_state_counts: Dict[str, int]
+    action_terminal_records: Tuple[ActionTerminalRecord, ...]
     final_data: dict
     final_readiness_calls: int
     initial_data: dict
@@ -405,6 +413,7 @@ def orchestrate(
     source_calls = 0
     action_calls = 0
     states = Counter()
+    terminal_records = []
     try:
         source_stops = {}
         for code, role in zip(codes, roles):
@@ -425,7 +434,11 @@ def orchestrate(
         for action in planned:
             source_failed, stopped_fields = source_stops[action.role]
             if source_failed or action.affected_fields & stopped_fields:
-                states["stopped_by_source_state"] += 1
+                state = "stopped_by_source_state"
+                states[state] += 1
+                terminal_records.append(
+                    ActionTerminalRecord(action.role, action.action_type, state)
+                )
                 if action.dependency == "d1_documents":
                     failed_dependencies.add((action.role, "d1_documents"))
                 continue
@@ -433,7 +446,11 @@ def orchestrate(
                 action.role,
                 "d1_documents",
             ) in failed_dependencies:
-                states["dependency_stopped"] += 1
+                state = "dependency_stopped"
+                states[state] += 1
+                terminal_records.append(
+                    ActionTerminalRecord(action.role, action.action_type, state)
+                )
                 continue
             try:
                 action_result = invoke(list(action.argv))
@@ -449,7 +466,11 @@ def orchestrate(
             except Exception:
                 action_calls += 1
                 succeeded = False
-            states["completed" if succeeded else "terminal_failure"] += 1
+            state = "completed" if succeeded else "terminal_failure"
+            states[state] += 1
+            terminal_records.append(
+                ActionTerminalRecord(action.role, action.action_type, state)
+            )
             if not succeeded and action.dependency == "d1_documents":
                 failed_dependencies.add((action.role, "d1_documents"))
     except (KeyboardInterrupt, SystemExit):
@@ -485,6 +506,7 @@ def orchestrate(
         outcome = "not_run"
     return OrchestrationResult(
         action_state_counts=dict(sorted(states.items())),
+        action_terminal_records=tuple(terminal_records),
         final_data=final_data,
         final_readiness_calls=final_calls,
         initial_data=initial_data,
@@ -633,12 +655,47 @@ def validate_engineering_flow(
         parsed_actions = _parse_actions(
             result.initial_data,
             initial_codes,
-            tuple(f"engineering_subject_{index}" for index in range(len(initial_codes))),
+            tuple(
+                f"engineering_subject_{index}"
+                for index in range(1, len(initial_codes) + 1)
+            ),
         )
     except StableFailure:
         raise StableFailure("engineering_flow_invalid") from None
     if len(parsed_actions) != len(actions):
         raise StableFailure("engineering_flow_invalid")
+    records = result.action_terminal_records
+    if type(records) is not tuple or len(records) != len(parsed_actions):
+        raise StableFailure("engineering_flow_invalid")
+    record_states = Counter()
+    state_by_action = {}
+    for action, record in zip(parsed_actions, records):
+        if (
+            type(record) is not ActionTerminalRecord
+            or set(vars(record)) != {"role", "action_type", "state"}
+            or record.role != action.role
+            or record.action_type != action.action_type
+            or record.state not in allowed_states
+        ):
+            raise StableFailure("engineering_flow_invalid")
+        record_states[record.state] += 1
+        state_by_action[(record.role, record.action_type)] = record.state
+    if dict(sorted(record_states.items())) != dict(sorted(states.items())):
+        raise StableFailure("engineering_flow_invalid")
+    failed_document_states = {"terminal_failure", "stopped_by_source_state"}
+    for record in records:
+        document_state = state_by_action.get((record.role, "sync_fund_documents"))
+        if record.state == "dependency_stopped" and (
+            record.action_type != "fund_classify"
+            or document_state not in failed_document_states
+        ):
+            raise StableFailure("engineering_flow_invalid")
+        if (
+            record.action_type == "fund_classify"
+            and document_state in failed_document_states
+            and record.state != "dependency_stopped"
+        ):
+            raise StableFailure("engineering_flow_invalid")
     if states.get("stopped_by_source_state", 0):
         expected_outcome = "stopped_by_source_state"
     elif result.final_data["comparison_evidence_ready"] is True:
@@ -761,16 +818,38 @@ def _validate_nav_component(nav: object) -> int:
     for name in ("future_observation_count", "observation_count", "unique_date_count"):
         if type(nav[name]) is not int or nav[name] < 0:
             raise StableFailure("engineering_evidence_invalid")
+    parsed_dates = {}
+    for name in ("end_date", "latest_date", "start_date"):
+        value = nav[name]
+        if value is None:
+            parsed_dates[name] = None
+            continue
+        if type(value) is not str:
+            raise StableFailure("engineering_evidence_invalid")
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError:
+            raise StableFailure("engineering_evidence_invalid") from None
+        if parsed.isoformat() != value:
+            raise StableFailure("engineering_evidence_invalid")
+        parsed_dates[name] = parsed
     if (
-        any(
-            nav[name] is not None and type(nav[name]) is not str
-            for name in ("end_date", "latest_date", "start_date")
-        )
-        or (
+        (
             nav["technical_failure"] is not None
             and nav["technical_failure"] != "formal_nav_load_failed"
         )
         or type(nav["usable"]) is not bool
+        or nav["unique_date_count"] > nav["observation_count"]
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+    if nav["usable"] and (
+        nav["technical_failure"] is not None
+        or nav["future_observation_count"] != 0
+        or nav["observation_count"] < 2
+        or nav["unique_date_count"] < 2
+        or any(value is None for value in parsed_dates.values())
+        or parsed_dates["start_date"] > parsed_dates["end_date"]
+        or parsed_dates["latest_date"] != parsed_dates["end_date"]
     ):
         raise StableFailure("engineering_evidence_invalid")
     return int(nav["usable"])
@@ -946,10 +1025,14 @@ def _validate_shortlist_entry(entry: object, *, position_state: str) -> None:
         raise StableFailure("engineering_evidence_invalid")
 
 
-def _usable_component_count(candidate_evidence: object, codes: Sequence[str]) -> int:
+def _usable_component_projection(
+    candidate_evidence: object,
+    codes: Sequence[str],
+) -> Tuple[int, Tuple[str, ...]]:
     if type(candidate_evidence) is not list or len(candidate_evidence) != len(codes):
         raise StableFailure("engineering_evidence_invalid")
     count = 0
+    position_states = []
     expected_keys = {
         "fund_code",
         "source_health",
@@ -976,11 +1059,12 @@ def _usable_component_count(candidate_evidence: object, codes: Sequence[str]) ->
             candidate["portfolio_binding"]
         )
         count += binding_count
+        position_states.append(position_state)
         _validate_shortlist_entry(
             candidate["shortlist_entry"],
             position_state=position_state,
         )
-    return count
+    return count, tuple(position_states)
 
 
 def project_engineering_evidence(
@@ -1001,7 +1085,7 @@ def project_engineering_evidence(
     comparison_ready = result.final_data.get("comparison_evidence_ready")
     if type(comparison_ready) is not bool:
         raise StableFailure("engineering_evidence_invalid")
-    usable_component_count = _usable_component_count(
+    usable_component_count, binding_position_states = _usable_component_projection(
         result.final_data.get("candidate_evidence"),
         readiness_codes,
     )
@@ -1028,6 +1112,9 @@ def project_engineering_evidence(
         or tuple(review.get("fund_code") for review in reviews) != readiness_codes
     ):
         raise StableFailure("engineering_evidence_invalid")
+    review_position_states = tuple(review.get("position_state") for review in reviews)
+    if review_position_states != binding_position_states:
+        raise StableFailure("engineering_evidence_invalid")
     expected_pairs = tuple(combinations(readiness_codes, 2))
     if len(pairs) != len(expected_pairs):
         raise StableFailure("engineering_evidence_invalid")
@@ -1041,7 +1128,7 @@ def project_engineering_evidence(
     }
     pair_reasons = {
         "comparable": {"classification_match"},
-        "not_comparable": structural_reasons,
+        "not_comparable": structural_reasons | {"inactive_fund"},
         "insufficient_data": {
             "identity_conflict",
             "missing_disclosure_bundle",
@@ -1084,10 +1171,10 @@ def project_engineering_evidence(
         observed = observed or state == "comparable" or (
             state == "not_comparable" and reason in structural_reasons
         )
-    if any(review.get("position_state") not in {"held", "not_held"} for review in reviews):
+    if any(state not in {"held", "not_held"} for state in review_position_states):
         raise StableFailure("engineering_evidence_invalid")
     held_binding_observed = any(
-        review.get("position_state") == "held" for review in reviews
+        state == "held" for state in review_position_states
     )
     structural_state = "observed" if observed else "not_testable"
     return {
@@ -2014,6 +2101,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 __all__ = [
     "ACTION_BOUNDARY",
+    "ActionTerminalRecord",
     "CommandResult",
     "InMemoryKeyStore",
     "OrchestrationResult",
