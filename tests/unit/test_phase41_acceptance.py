@@ -528,6 +528,10 @@ def _missing_gate_status():
     return {"state": "missing", "freshness": "missing", "capability": "research_only"}
 
 
+def _minimal_stale_gate_status():
+    return {"state": "stale", "freshness": "stale", "capability": "research_only"}
+
+
 def _fresh_suitability_status():
     return {
         "state": "fresh",
@@ -579,6 +583,51 @@ def test_owner_status_validation_accepts_exact_fresh_and_missing_shapes() -> Non
         _valid_scope(),
     )
     assert missing["phase_a"]["state"] == "missing"
+
+
+def test_owner_status_validation_accepts_production_suitability_stale_shapes() -> None:
+    minimal = validate_owner_statuses(
+        _confirmed_profile_status(),
+        _minimal_stale_gate_status(),
+        _missing_gate_status(),
+        _valid_scope(),
+    )
+    assert minimal["phase_b"] == {
+        "state": "stale",
+        "freshness": "stale",
+        "status": None,
+        "blocking_codes": [],
+        "constraint_codes": [],
+    }
+
+    full_status = {**_fresh_suitability_status(), "state": "stale", "freshness": "stale"}
+    full = validate_owner_statuses(
+        _confirmed_profile_status(),
+        full_status,
+        _missing_gate_status(),
+        _valid_scope(),
+    )
+    assert full["phase_b"]["status"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    (
+        {**_minimal_stale_gate_status(), "capability": "actionable"},
+        {**_minimal_stale_gate_status(), "status": None},
+        {"state": "stale", "freshness": "missing", "capability": "research_only"},
+    ),
+)
+def test_owner_status_validation_rejects_malformed_minimal_suitability_stale(
+    invalid,
+) -> None:
+    with pytest.raises(StableFailure, match="owner_status_invalid"):
+        validate_owner_statuses(
+            _confirmed_profile_status(),
+            invalid,
+            _missing_gate_status(),
+            _valid_scope(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -964,3 +1013,51 @@ def test_shell_kills_descendant_when_group_leader_exits_first(tmp_path, monkeypa
     while time.monotonic() < deadline and _pid_exists(descendant_pid):
         time.sleep(0.02)
     assert not _pid_exists(descendant_pid)
+
+
+@pytest.mark.parametrize("relative", (False, True))
+def test_owner_mode_rejects_noncanonical_entrypoint_before_private_access(
+    tmp_path, relative
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    repository = tmp_path / "repository"
+    scripts = repository / "scripts"
+    venv = repository / ".venv" / "bin"
+    scripts.mkdir(parents=True)
+    venv.mkdir(parents=True)
+    wrapper = scripts / "run_phase41_acceptance.sh"
+    helper = scripts / "phase41_acceptance.py"
+    shutil.copy2(root / "scripts/run_phase41_acceptance.sh", wrapper)
+    shutil.copy2(root / "scripts/phase41_acceptance.py", helper)
+    wrapper.chmod(0o755)
+    marker = tmp_path / "python-started"
+    fake_python = venv / "python"
+    fake_python.write_text(
+        "#!/bin/bash\nprintf started > \"${PHASE41_OWNER_MARKER}\"\nexit 70\n",
+        encoding="ascii",
+    )
+    fake_python.chmod(0o755)
+    env = {
+        **os.environ,
+        "KUNJIN_PHASE41_OWNER_APPROVED": "explicit_private_keychain_read_only",
+        "PHASE41_OWNER_MARKER": str(marker),
+    }
+    command = (
+        ["scripts/run_phase41_acceptance.sh", "owner"]
+        if relative
+        else [str(wrapper), "owner"]
+    )
+
+    completed = subprocess.run(
+        command,
+        cwd=repository,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 77
+    assert completed.stdout == b""
+    assert b'"error_code":"owner_entrypoint_invalid"' in completed.stderr
+    assert not marker.exists()

@@ -3635,6 +3635,12 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             self.assertIn(phrase, helper)
         self.assertIn("KUNJIN_DATA_DIR", script)
         self.assertIn("owner_runtime_override_prohibited", script)
+        self.assertIn(
+            'readonly OWNER_ENTRYPOINT="/Users/yanzihao/KunJin/scripts/run_phase41_acceptance.sh"',
+            script,
+        )
+        self.assertIn('readonly OWNER_REPOSITORY_ROOT="/Users/yanzihao/KunJin"', script)
+        self.assertIn("owner_entrypoint_invalid", script)
         self.assertNotIn('/bin/cat "${private_error}"', script)
         self.assertNotIn('/bin/cat "${private_output}"', script)
 

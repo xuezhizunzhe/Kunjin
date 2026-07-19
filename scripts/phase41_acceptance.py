@@ -638,7 +638,10 @@ def validate_owner_statuses(
         raise StableFailure("owner_status_invalid")
     b_state, b_freshness = _state_pair(suitability, {"fresh", "stale", "missing"})
     b_status = suitability.get("status")
-    if b_state == "missing":
+    minimal_nonfresh_keys = {"state", "freshness", "capability"}
+    if b_state == "missing" or (
+        b_state == "stale" and set(suitability) == minimal_nonfresh_keys
+    ):
         _exact_keys(suitability, {"state", "freshness", "capability"})
         if suitability["capability"] != "research_only":
             raise StableFailure("owner_status_invalid")

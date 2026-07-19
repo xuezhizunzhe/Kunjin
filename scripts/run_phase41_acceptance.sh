@@ -5,6 +5,8 @@ readonly PATH="/usr/bin:/bin"
 export PATH
 unset PYTHONHOME PYTHONPATH
 umask 077
+readonly OWNER_ENTRYPOINT="/Users/yanzihao/KunJin/scripts/run_phase41_acceptance.sh"
+readonly OWNER_REPOSITORY_ROOT="/Users/yanzihao/KunJin"
 
 usage() {
     printf 'usage: %s {local|fault|engineering|owner}\n' "$0" >&2
@@ -34,6 +36,12 @@ if [[ ! -x "${PYTHON}" || ! -f "${HELPER}" || -L "${HELPER}" ]]; then
 fi
 
 if [[ "${MODE}" == "owner" ]]; then
+    if [[ "$0" != "${OWNER_ENTRYPOINT}" \
+        || "${SCRIPT_DIR}/run_phase41_acceptance.sh" != "${OWNER_ENTRYPOINT}" \
+        || "${REPOSITORY_ROOT}" != "${OWNER_REPOSITORY_ROOT}" ]]; then
+        printf '{"error_code":"owner_entrypoint_invalid","ok":false}\n' >&2
+        exit 77
+    fi
     if [[ "${KUNJIN_PHASE41_OWNER_APPROVED:-}" != "explicit_private_keychain_read_only" ]]; then
         printf '{"error_code":"owner_approval_required","ok":false}\n' >&2
         exit 77
