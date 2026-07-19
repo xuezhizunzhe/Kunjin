@@ -3565,6 +3565,113 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         self.assertIn('"shortlist_ran_on_private_copy": True', script)
         self.assertIn("never_places_trades", script)
 
+    def test_phase41_acceptance_declares_private_finite_modes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts/run_phase41_acceptance.sh").read_text(
+            encoding="utf-8"
+        )
+
+        for mode in ("local", "fault", "engineering", "owner"):
+            self.assertIn(mode, script)
+        for role in (
+            "engineering_subject_1",
+            "engineering_subject_2",
+            "engineering_subject_3",
+            "engineering_subject_4",
+        ):
+            self.assertIn(role, script)
+        for case in (
+            "keychain_unavailable",
+            "candidate_failure_isolation",
+            "unsupported_source",
+            "source_cooldown",
+            "manual_supplement_required",
+            "no_automatic_retry",
+            "no_network_dependency",
+            "no_persistence",
+            "keyboard_interrupt",
+            "system_exit",
+            "ready_pair",
+            "not_held",
+            "not_comparable",
+            "maximum_finite_orchestration",
+        ):
+            self.assertIn(case, script)
+
+        self.assertIn("KUNJIN_PHASE41_OWNER_APPROVED", script)
+        self.assertIn("explicit_private_keychain_read_only", script)
+        self.assertIn("KUNJIN_PHASE41_ENGINEERING_SUBJECTS_FILE", script)
+        self.assertIn("fund shortlist-readiness", script)
+        self.assertIn("source status --fund-code", script)
+        self.assertIn("sync fund-profile", script)
+        self.assertIn("sync fund-holdings", script)
+        self.assertIn("sync fund-documents", script)
+        self.assertIn("fund classify", script)
+        self.assertIn("--force is prohibited", script)
+        self.assertIn("MAX_PUBLIC_SOURCE_STATUS_CALLS = 5", script)
+        self.assertIn("MAX_PUBLIC_ACTION_CALLS = 25", script)
+        self.assertIn("MAX_ENGINEERING_SOURCE_STATUS_CALLS = 4", script)
+        self.assertIn("MAX_ENGINEERING_ACTION_CALLS = 20", script)
+        self.assertIn("initial_readiness_calls != 1", script)
+        self.assertIn("final_readiness_calls != 1", script)
+        self.assertIn("owner_candidates_unavailable", script)
+        self.assertIn("financial_usability=not_yet_testable", script)
+        self.assertIn("candidate_formation.status=research_scope_only", script)
+        self.assertIn(
+            "candidate_formation.candidate_code_discovery=not_implemented",
+            script,
+        )
+
+    def test_phase41_acceptance_owner_and_private_file_contract_fail_closed(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts/run_phase41_acceptance.sh").read_text(
+            encoding="utf-8"
+        )
+        owner_body = script.split("run_owner() {", 1)[1].split(
+            'case "${MODE}"', 1
+        )[0]
+        engineering_body = script.split("run_engineering() {", 1)[1].split(
+            "run_owner() {", 1
+        )[0]
+
+        self.assertIn('Path(source_db).resolve().as_uri() + "?mode=ro"', owner_body)
+        self.assertIn("source.backup(target)", owner_body)
+        self.assertIn("ProfileKeyStore().load_existing_key()", owner_body)
+        self.assertIn("owner_keychain_unavailable", owner_body)
+        self.assertIn("com.kunjin.profile-encryption", owner_body)
+        self.assertIn('ACCOUNT = "v1"', owner_body)
+        self.assertIn("add-generic-password", owner_body)
+        self.assertIn("delete-generic-password", owner_body)
+        self.assertIn("Keychain write operation is prohibited", owner_body)
+        self.assertIn("real database changed during owner acceptance", owner_body)
+        self.assertIn("profile", owner_body)
+        self.assertIn("suitability", owner_body)
+        self.assertIn("allocation", owner_body)
+        self.assertIn("research-scope", owner_body)
+
+        self.assertIn("stat.S_ISREG", engineering_body)
+        self.assertIn("stat.S_ISLNK", engineering_body)
+        self.assertIn("0o600", engineering_body)
+        self.assertIn("0o700", engineering_body)
+        self.assertIn("path.is_absolute()", engineering_body)
+        self.assertIn("private subject file must be outside repository and Skill", engineering_body)
+        self.assertIn("four unique", engineering_body)
+        self.assertIn("financial_interpretation=prohibited", engineering_body)
+        self.assertNotIn("subprocess.run([cli", engineering_body)
+
+    def test_phase41_committed_contract_never_associates_private_subject_codes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts/run_phase41_acceptance.sh").read_text(
+            encoding="utf-8"
+        )
+        six_digit_literals = set(
+            __import__("re").findall(r'(?<![0-9])[0-9]{6}(?![0-9])', script)
+        )
+
+        self.assertEqual(six_digit_literals, set())
+        self.assertNotIn("ENGINEERING_SUBJECT_CODES", script)
+        self.assertNotIn("engineering_subject_codes", script)
+
     def test_phase4_readme_and_skill_route_exact_unordered_candidates(self) -> None:
         root = Path(__file__).resolve().parents[1]
         readme = (root / "README.md").read_text(encoding="utf-8")
