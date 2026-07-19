@@ -3,6 +3,7 @@ set -euo pipefail
 
 readonly PATH="/usr/bin:/bin"
 export PATH
+unset PYTHONHOME PYTHONPATH
 umask 077
 
 usage() {
@@ -52,14 +53,41 @@ export PYTHONPYCACHEPREFIX="${RUNTIME_DIR}/pycache"
 CHILD_PIDS=()
 set -m
 
+process_group_alive() {
+    local pgid="$1"
+    local result=0
+    /bin/kill -0 "-${pgid}" 2>/dev/null || result=$?
+    if [[ ${result} -eq 0 || ${result} -eq 1 ]]; then
+        return "${result}"
+    fi
+    return 70
+}
+
+kill_process_group() {
+    local pgid="$1"
+    local group_state=0
+    process_group_alive "${pgid}" || group_state=$?
+    if [[ ${group_state} -gt 1 ]]; then
+        return 70
+    fi
+    if [[ ${group_state} -eq 0 ]]; then
+        /bin/kill -TERM "-${pgid}" 2>/dev/null || true
+    fi
+    group_state=0
+    process_group_alive "${pgid}" || group_state=$?
+    if [[ ${group_state} -gt 1 ]]; then
+        return 70
+    fi
+    if [[ ${group_state} -eq 0 ]]; then
+        /bin/kill -KILL "-${pgid}" 2>/dev/null || true
+    fi
+}
+
 terminate_children() {
     local pid
     for pid in "${CHILD_PIDS[@]:-}"; do
-        if [[ -n "${pid}" ]] && /bin/kill -0 "${pid}" 2>/dev/null; then
-            /bin/kill -TERM "-${pid}" 2>/dev/null || true
-            if /bin/kill -0 "${pid}" 2>/dev/null; then
-                /bin/kill -KILL "-${pid}" 2>/dev/null || true
-            fi
+        if [[ -n "${pid}" ]]; then
+            kill_process_group "${pid}" || true
         fi
     done
     for pid in "${CHILD_PIDS[@]:-}"; do
@@ -87,12 +115,22 @@ run_tracked() {
     local result=0
     wait "${pid}" || result=$?
     if /bin/kill -0 "${pid}" 2>/dev/null; then
+        kill_process_group "${pid}" || true
         printf '{"error_code":"phase41_child_residue","ok":false}\n' >&2
+        CHILD_PIDS=()
         return 70
     fi
-    if [[ -x /usr/bin/pgrep ]] && /usr/bin/pgrep -g "${pid}" >/dev/null 2>&1; then
-        /bin/kill -KILL "-${pid}" 2>/dev/null || true
+    local group_state=0
+    process_group_alive "${pid}" || group_state=$?
+    if [[ ${group_state} -gt 1 ]]; then
+        printf '{"error_code":"phase41_process_group_check_failed","ok":false}\n' >&2
+        CHILD_PIDS=()
+        return 70
+    fi
+    if [[ ${group_state} -eq 0 ]]; then
+        kill_process_group "${pid}" || true
         printf '{"error_code":"phase41_descendant_residue","ok":false}\n' >&2
+        CHILD_PIDS=()
         return 70
     fi
     CHILD_PIDS=()
@@ -110,6 +148,10 @@ emit_scanned() {
         printf '{"error_code":"acceptance_output_invalid","ok":false}\n' >&2
         return 70
     fi
+    if [[ -s "${emit_error}" ]]; then
+        printf '{"error_code":"acceptance_output_invalid","ok":false}\n' >&2
+        return 70
+    fi
     while IFS= read -r line || [[ -n "${line}" ]]; do
         printf '%s\n' "${line}"
     done <"${emitted}"
@@ -120,6 +162,10 @@ check_private_residue() {
     local check_err="${RUNTIME_DIR}/check.err"
     if ! run_tracked "${check_out}" "${check_err}" \
         "${PYTHON}" "${HELPER}" check-runtime; then
+        printf '{"error_code":"phase41_runtime_permissions_invalid","ok":false}\n' >&2
+        return 70
+    fi
+    if [[ -s "${check_err}" ]]; then
         printf '{"error_code":"phase41_runtime_permissions_invalid","ok":false}\n' >&2
         return 70
     fi
@@ -153,6 +199,8 @@ run_tests() {
             tests/unit/test_decision_health.py
             tests/unit/test_selection_scope.py
             tests/unit/test_selection_readiness.py
+            tests/unit/test_selection_service.py
+            tests/unit/test_selection_research.py
             tests/integration/test_cli.py
             tests/test_smoke.py
         )
@@ -189,6 +237,11 @@ case "${MODE}" in
         private_result=0
         run_tracked "${private_output}" "${private_error}" \
             "${PYTHON}" "${HELPER}" "${MODE}" || private_result=$?
+        if [[ -s "${private_error}" ]]; then
+            printf '{"error_code":"phase41_private_stderr","ok":false}\n' \
+                >"${private_output}"
+            private_result=70
+        fi
         emit_scanned "${private_output}" private || private_result=$?
         check_private_residue || private_result=$?
         exit "${private_result}"

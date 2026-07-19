@@ -444,28 +444,64 @@ def test_public_maximum_is_five_status_and_twenty_five_ordered_actions() -> None
 
 def test_engineering_coverage_requires_held_not_comparable_gap_and_partial() -> None:
     initial = _readiness(
+        actions=(("000001", "sync fund 000001"),),
         evidence=[{"profile": {"freshness": "stale"}}],
         blocking=["profile_stale"],
     )["data"]
     shortlist = {
         "candidate_reviews": [{"position_state": "held"}],
-        "comparability": [{"state": "not_comparable"}],
+        "comparability": [
+            {"state": "not_comparable", "reason_code": "type_mismatch"}
+        ],
     }
     final = _readiness(ready=False, blocking=["formal_nav_missing"])["data"]
+    result = acceptance.OrchestrationResult(
+        action_state_counts={"completed": 1},
+        final_data=final,
+        final_readiness_calls=1,
+        initial_data=initial,
+        initial_readiness_calls=1,
+        outcome="partial_once",
+        refresh_action_calls=1,
+        source_status_calls=4,
+    )
 
-    assert validate_engineering_coverage(initial, shortlist, final) == {
+    assert validate_engineering_coverage(result, shortlist) == {
         "held": True,
         "initial_missing_or_stale": True,
         "not_comparable": True,
         "partial_degradation": True,
     }
-    for changed in (
-        ({**shortlist, "candidate_reviews": [{"position_state": "not_held"}]}, final),
-        ({**shortlist, "comparability": [{"state": "comparable"}]}, final),
-        (shortlist, _readiness(ready=True)["data"]),
+    for changed_shortlist, changed_result in (
+        (
+            {**shortlist, "candidate_reviews": [{"position_state": "not_held"}]},
+            result,
+        ),
+        ({**shortlist, "comparability": [{"state": "comparable"}]}, result),
+        (
+            {
+                **shortlist,
+                "comparability": [
+                    {
+                        "state": "not_comparable",
+                        "reason_code": "arbitrary_reason",
+                    }
+                ],
+            },
+            result,
+        ),
+        (
+            shortlist,
+            acceptance.OrchestrationResult(
+                **{
+                    **vars(result),
+                    "final_data": _readiness(ready=True)["data"],
+                }
+            ),
+        ),
     ):
         with pytest.raises(StableFailure, match="engineering_coverage_not_met"):
-            validate_engineering_coverage(initial, changed[0], changed[1])
+            validate_engineering_coverage(changed_result, changed_shortlist)
 
 
 def _valid_scope():
@@ -478,17 +514,59 @@ def _valid_scope():
     }
 
 
+def _confirmed_profile_status():
+    return {
+        "state": "confirmed",
+        "version": 1,
+        "confirmed_at": "2026-07-19T08:00:00+00:00",
+        "valid_until": "2026-10-19T08:00:00+00:00",
+        "freshness": "fresh",
+    }
+
+
+def _missing_gate_status():
+    return {"state": "missing", "freshness": "missing", "capability": "research_only"}
+
+
+def _fresh_suitability_status():
+    return {
+        "state": "fresh",
+        "freshness": "fresh",
+        "assessment_id": 1,
+        "profile_version_id": 1,
+        "policy_version": "1",
+        "status": "blocked",
+        "hard_blocks": ["emergency_reserve_shortfall"],
+        "constraints": ["monthly_ceiling_constrained"],
+        "assessed_at": "2026-07-19T08:00:00+00:00",
+        "valid_until": "2026-08-19T08:00:00+00:00",
+        "capability": "research_only",
+    }
+
+
+def _fresh_allocation_status():
+    return {
+        "state": "fresh",
+        "freshness": "fresh",
+        "assessment_id": 1,
+        "profile_version_id": 1,
+        "suitability_assessment_id": 1,
+        "policy_version": "1",
+        "status": "range_available",
+        "binding_constraints": ["horizon_binding"],
+        "safe_summary": {},
+        "permitted_region": {},
+        "assessed_at": "2026-07-19T08:00:00+00:00",
+        "valid_until": "2026-08-19T08:00:00+00:00",
+        "capability": "research_only",
+    }
+
+
 def test_owner_status_validation_accepts_exact_fresh_and_missing_shapes() -> None:
     fresh = validate_owner_statuses(
-        {"state": "active", "freshness": "fresh"},
-        {
-            "state": "fresh",
-            "freshness": "fresh",
-            "status": "blocked",
-            "hard_blocks": ["emergency_reserve_shortfall"],
-            "constraints": ["monthly_ceiling_constrained"],
-        },
-        {"state": "missing", "freshness": "missing", "capability": "research_only"},
+        _confirmed_profile_status(),
+        _fresh_suitability_status(),
+        _missing_gate_status(),
         _valid_scope(),
     )
     assert fresh["phase_b"]["status"] == "blocked"
@@ -496,8 +574,8 @@ def test_owner_status_validation_accepts_exact_fresh_and_missing_shapes() -> Non
 
     missing = validate_owner_statuses(
         {"state": "missing", "freshness": "missing"},
-        {"state": "missing", "freshness": "missing", "capability": "research_only"},
-        {"state": "missing", "freshness": "missing", "capability": "research_only"},
+        _missing_gate_status(),
+        _missing_gate_status(),
         _valid_scope(),
     )
     assert missing["phase_a"]["state"] == "missing"
@@ -507,19 +585,24 @@ def test_owner_status_validation_accepts_exact_fresh_and_missing_shapes() -> Non
     "phase_a,phase_b,phase_c",
     (
         (
-            {"state": "active", "freshness": None},
-            {"state": "missing", "freshness": "missing"},
-            {"state": "missing", "freshness": "missing"},
+            {**_confirmed_profile_status(), "freshness": None},
+            _missing_gate_status(),
+            _missing_gate_status(),
         ),
         (
-            {"state": "active", "freshness": "fresh"},
-            {"state": "fresh", "freshness": "fresh", "status": None},
-            {"state": "missing", "freshness": "missing"},
+            {**_confirmed_profile_status(), "state": "active"},
+            _missing_gate_status(),
+            _missing_gate_status(),
         ),
         (
-            {"state": "active", "freshness": "fresh"},
-            {"state": "missing", "freshness": "missing"},
-            {"state": "fresh", "freshness": "fresh", "status": "unknown"},
+            _confirmed_profile_status(),
+            {**_fresh_suitability_status(), "status": None},
+            _missing_gate_status(),
+        ),
+        (
+            _confirmed_profile_status(),
+            _missing_gate_status(),
+            {**_fresh_allocation_status(), "status": "unknown"},
         ),
     ),
 )
@@ -563,6 +646,13 @@ def test_keychain_failure_is_stable_and_never_exposes_stderr() -> None:
         load_owner_key_once(child)
     assert error.value.code == "owner_keychain_unavailable"
     assert "/private" not in str(error.value)
+
+
+def test_keychain_rejects_noncanonical_base64() -> None:
+    noncanonical = base64.b64encode(b"\xfb" * 32).decode("ascii")
+
+    with pytest.raises(StableFailure, match="owner_keychain_unavailable"):
+        load_owner_key_once(lambda _command: (0, noncanonical, ""))
 
 
 def test_owner_runtime_guards_block_network_process_and_os_spawn() -> None:
@@ -636,17 +726,11 @@ def test_owner_controller_uses_one_key_one_context_and_four_safe_calls(
     def safe_call(_cli, used_context, argv, expected):
         calls.append((used_context, tuple(argv), expected))
         if expected == "profile.status":
-            return {"state": "active", "freshness": "fresh"}
+            return _confirmed_profile_status()
         if expected == "suitability.status":
-            return {
-                "state": "fresh",
-                "freshness": "fresh",
-                "status": "blocked",
-                "hard_blocks": ["emergency_reserve_shortfall"],
-                "constraints": ["monthly_ceiling_constrained"],
-            }
+            return _fresh_suitability_status()
         if expected == "allocation.status":
-            return {"state": "missing", "freshness": "missing"}
+            return _missing_gate_status()
         return _valid_scope()
 
     monkeypatch.setattr(acceptance, "_safe_cli_call", safe_call)
@@ -688,6 +772,7 @@ def test_engineering_controller_requires_real_coverage_and_never_emits_codes(
         lambda *_args: pytest.fail("engineering must not read Keychain"),
     )
     initial = _readiness(
+        actions=(("000001", "sync fund 000001"),),
         evidence=[{"profile": {"freshness": "stale"}}],
         blocking=["profile_stale"],
     )["data"]
@@ -707,7 +792,12 @@ def test_engineering_controller_requires_real_coverage_and_never_emits_codes(
         "command": "fund.shortlist",
         "data": {
             "candidate_reviews": [{"position_state": "held"}],
-            "comparability": [{"state": "not_comparable"}],
+            "comparability": [
+                {
+                    "state": "not_comparable",
+                    "reason_code": "management_style_mismatch",
+                }
+            ],
         },
     }
     monkeypatch.setattr(
@@ -833,3 +923,44 @@ def test_shell_signal_kills_ignoring_process_group(tmp_path, monkeypatch) -> Non
             break
         time.sleep(0.02)
     assert all(not _pid_exists(pid) for pid in child_pids)
+
+
+def test_shell_kills_descendant_when_group_leader_exits_first(tmp_path, monkeypatch) -> None:
+    root = Path(__file__).resolve().parents[2]
+    repository = tmp_path / "repository"
+    scripts = repository / "scripts"
+    venv = repository / ".venv" / "bin"
+    scripts.mkdir(parents=True)
+    venv.mkdir(parents=True)
+    wrapper = scripts / "run_phase41_acceptance.sh"
+    helper = scripts / "phase41_acceptance.py"
+    shutil.copy2(root / "scripts/run_phase41_acceptance.sh", wrapper)
+    shutil.copy2(root / "scripts/phase41_acceptance.py", helper)
+    wrapper.chmod(0o755)
+    marker = tmp_path / "descendant.txt"
+    fake_python = venv / "python"
+    fake_python.write_text(
+        "#!/bin/bash\n"
+        "/bin/bash -c 'trap \"\" TERM INT HUP; printf \"%s\\n\" \"$$\" > "
+        "\"${PHASE41_DESCENDANT_MARKER}\"; while :; do /bin/sleep 1; done' &\n"
+        "while [[ ! -s \"${PHASE41_DESCENDANT_MARKER}\" ]]; do :; done\n"
+        "exit 0\n",
+        encoding="ascii",
+    )
+    fake_python.chmod(0o755)
+    monkeypatch.setenv("PHASE41_DESCENDANT_MARKER", str(marker))
+
+    completed = subprocess.run(
+        [str(wrapper), "fault"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 70
+    assert b"phase41_descendant_residue" in completed.stderr
+    descendant_pid = int(marker.read_text().strip())
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and _pid_exists(descendant_pid):
+        time.sleep(0.02)
+    assert not _pid_exists(descendant_pid)

@@ -3596,10 +3596,16 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         ):
             self.assertIn(phrase, combined)
         self.assertNotIn("<<'PY'", script)
-        self.assertLessEqual(len(script.splitlines()), 200)
+        self.assertLessEqual(len(script.splitlines()), 260)
         self.assertIn("run_tracked", script)
         self.assertIn("emit_scanned", script)
         self.assertIn("check_private_residue", script)
+        self.assertNotIn("pgrep", script)
+        self.assertIn('/bin/kill -0 "-${pgid}"', script)
+        self.assertIn("unset PYTHONHOME PYTHONPATH", script)
+        self.assertIn("phase41_private_stderr", script)
+        self.assertIn("tests/unit/test_selection_service.py", script)
+        self.assertIn("tests/unit/test_selection_research.py", script)
 
     def test_phase41_acceptance_owner_and_private_file_contract_fail_closed(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -3609,7 +3615,9 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         helper = (root / "scripts/phase41_acceptance.py").read_text(encoding="utf-8")
 
         for phrase in (
-            'Path.home() / ".local" / "share" / "kunjin" / "kunjin.db"',
+            'pwd.getpwuid(os.getuid()).pw_dir',
+            '_canonical_home() / ".local" / "share" / "kunjin" / "kunjin.db"',
+            "_validate_cli_origin",
             '"?mode=ro"',
             "self.connection.backup(target)",
             "O_NOFOLLOW",

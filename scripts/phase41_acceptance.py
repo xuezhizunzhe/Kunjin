@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import socket
@@ -15,6 +14,7 @@ import sys
 from collections import Counter
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
@@ -495,11 +495,50 @@ def _contains_missing_or_stale(value: object) -> bool:
     return False
 
 
-def validate_engineering_coverage(initial: dict, shortlist: dict, final: dict) -> dict:
-    if not all(type(value) is dict for value in (initial, shortlist, final)):
+def validate_engineering_coverage(
+    result: OrchestrationResult,
+    shortlist: dict,
+) -> dict:
+    if type(result) is not OrchestrationResult or type(shortlist) is not dict:
+        raise StableFailure("engineering_coverage_not_met")
+    initial = result.initial_data
+    final = result.final_data
+    actions = initial.get("bounded_refresh_actions")
+    action_states = result.action_state_counts
+    if (
+        type(actions) is not list
+        or not actions
+        or type(action_states) is not dict
+        or result.initial_readiness_calls != 1
+        or result.final_readiness_calls != 1
+        or result.source_status_calls != 4
+        or result.refresh_action_calls <= 0
+        or result.outcome not in {"partial_once", "stopped_by_source_state"}
+        or any(
+            key
+            not in {
+                "completed",
+                "terminal_failure",
+                "stopped_by_source_state",
+                "dependency_stopped",
+            }
+            or type(value) is not int
+            or value < 0
+            for key, value in action_states.items()
+        )
+        or sum(action_states.values()) != len(actions)
+        or action_states.get("completed", 0)
+        + action_states.get("terminal_failure", 0)
+        != result.refresh_action_calls
+    ):
         raise StableFailure("engineering_coverage_not_met")
     reviews = shortlist.get("candidate_reviews")
     comparability = shortlist.get("comparability")
+    structural_reasons = {
+        "type_mismatch",
+        "management_style_mismatch",
+        "benchmark_mismatch",
+    }
     coverage = {
         "held": type(reviews) is list
         and any(type(item) is dict and item.get("position_state") == "held" for item in reviews),
@@ -510,6 +549,7 @@ def validate_engineering_coverage(initial: dict, shortlist: dict, final: dict) -
         "not_comparable": type(comparability) is list
         and any(
             type(item) is dict and item.get("state") == "not_comparable"
+            and item.get("reason_code") in structural_reasons
             for item in comparability
         ),
         "partial_degradation": final.get("comparison_evidence_ready") is False
@@ -526,7 +566,34 @@ def _codes(value: object) -> list:
         type(item) is not str or _SAFE_CODE.fullmatch(item) is None for item in value
     ):
         raise StableFailure("owner_status_invalid")
-    return sorted(set(value))
+    if len(set(value)) != len(value):
+        raise StableFailure("owner_status_invalid")
+    return sorted(value)
+
+
+def _exact_keys(value: dict, expected: set) -> None:
+    if type(value) is not dict or set(value) != expected:
+        raise StableFailure("owner_status_invalid")
+
+
+def _positive_integer(value: object) -> None:
+    if type(value) is not int or value <= 0:
+        raise StableFailure("owner_status_invalid")
+
+
+def _nonempty_text(value: object) -> None:
+    if type(value) is not str or not value:
+        raise StableFailure("owner_status_invalid")
+
+
+def _aware_timestamp(value: object) -> None:
+    _nonempty_text(value)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise StableFailure("owner_status_invalid") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise StableFailure("owner_status_invalid")
 
 
 def _state_pair(value: dict, allowed_states: set) -> Tuple[str, str]:
@@ -549,31 +616,104 @@ def validate_owner_statuses(
     allocation: dict,
     scope: dict,
 ) -> dict:
-    profile_state, profile_freshness = _state_pair(
-        profile, {"active", "missing", "invalidated"}
-    )
-    if profile_state != "missing" and profile_freshness not in {"fresh", "stale"}:
+    if type(profile) is not dict:
+        raise StableFailure("owner_status_invalid")
+    profile_state = profile.get("state")
+    profile_freshness = profile.get("freshness")
+    if profile_state == "missing":
+        _exact_keys(profile, {"state", "freshness"})
+        if profile_freshness != "missing":
+            raise StableFailure("owner_status_invalid")
+    elif profile_state == "confirmed":
+        _exact_keys(
+            profile,
+            {"state", "version", "confirmed_at", "valid_until", "freshness"},
+        )
+        if profile_freshness not in {"fresh", "stale"}:
+            raise StableFailure("owner_status_invalid")
+        _positive_integer(profile["version"])
+        _aware_timestamp(profile["confirmed_at"])
+        _aware_timestamp(profile["valid_until"])
+    else:
         raise StableFailure("owner_status_invalid")
     b_state, b_freshness = _state_pair(suitability, {"fresh", "stale", "missing"})
     b_status = suitability.get("status")
     if b_state == "missing":
+        _exact_keys(suitability, {"state", "freshness", "capability"})
+        if suitability["capability"] != "research_only":
+            raise StableFailure("owner_status_invalid")
         if b_status is not None:
             raise StableFailure("owner_status_invalid")
         hard_blocks = []
         constraints = []
     else:
+        _exact_keys(
+            suitability,
+            {
+                "state",
+                "freshness",
+                "assessment_id",
+                "profile_version_id",
+                "policy_version",
+                "status",
+                "hard_blocks",
+                "constraints",
+                "assessed_at",
+                "valid_until",
+                "capability",
+            },
+        )
         if b_status not in {"blocked", "constrained", "ready_for_allocation"}:
             raise StableFailure("owner_status_invalid")
+        if suitability["capability"] != "research_only":
+            raise StableFailure("owner_status_invalid")
+        _positive_integer(suitability["assessment_id"])
+        _positive_integer(suitability["profile_version_id"])
+        _nonempty_text(suitability["policy_version"])
+        _aware_timestamp(suitability["assessed_at"])
+        _aware_timestamp(suitability["valid_until"])
         hard_blocks = _codes(suitability.get("hard_blocks"))
         constraints = _codes(suitability.get("constraints"))
     c_state, c_freshness = _state_pair(allocation, {"fresh", "stale", "missing"})
     c_status = allocation.get("status")
     if c_state == "missing":
+        _exact_keys(allocation, {"state", "freshness", "capability"})
+        if allocation["capability"] != "research_only":
+            raise StableFailure("owner_status_invalid")
         if c_status is not None:
             raise StableFailure("owner_status_invalid")
         binding = []
     else:
+        _exact_keys(
+            allocation,
+            {
+                "state",
+                "freshness",
+                "assessment_id",
+                "profile_version_id",
+                "suitability_assessment_id",
+                "policy_version",
+                "status",
+                "binding_constraints",
+                "safe_summary",
+                "permitted_region",
+                "assessed_at",
+                "valid_until",
+                "capability",
+            },
+        )
         if c_status not in {"blocked", "range_available"}:
+            raise StableFailure("owner_status_invalid")
+        if allocation["capability"] != "research_only":
+            raise StableFailure("owner_status_invalid")
+        for key in ("assessment_id", "profile_version_id", "suitability_assessment_id"):
+            _positive_integer(allocation[key])
+        _nonempty_text(allocation["policy_version"])
+        _aware_timestamp(allocation["assessed_at"])
+        _aware_timestamp(allocation["valid_until"])
+        if type(allocation["safe_summary"]) is not dict or type(
+            allocation["permitted_region"]
+        ) is not dict:
             raise StableFailure("owner_status_invalid")
         binding = _codes(allocation.get("binding_constraints"))
     if type(scope) is not dict:
@@ -610,29 +750,51 @@ def validate_owner_statuses(
 def load_owner_key_once(
     child_runner: Callable[[list], Tuple[int, str, str]],
 ) -> bytes:
-    command = [
-        "/usr/bin/security",
-        "find-generic-password",
-        "-s",
-        "com.kunjin.profile-encryption",
-        "-a",
-        "v1",
-        "-w",
-    ]
+    from kunjin.suitability.crypto import ProfileCryptoError, ProfileKeyStore
+
+    class ReadOnlyTokenStore:
+        def __init__(self) -> None:
+            self.load_calls = 0
+
+        def load(self):
+            self.load_calls += 1
+            if self.load_calls != 1:
+                raise OSError("repeated Keychain read is prohibited")
+            command = [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-s",
+                "com.kunjin.profile-encryption",
+                "-a",
+                "v1",
+                "-w",
+            ]
+            try:
+                returncode, stdout, _stderr = child_runner(command)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                raise OSError("Keychain read failed") from None
+            if returncode == 44:
+                return None
+            if returncode != 0 or type(stdout) is not str:
+                raise OSError("Keychain read failed")
+            return stdout.strip() or None
+
+        def save(self, _value):
+            raise OSError("Keychain write is prohibited")
+
+        def delete(self):
+            raise OSError("Keychain write is prohibited")
+
+    token_store = ReadOnlyTokenStore()
     try:
-        returncode, stdout, _stderr = child_runner(command)
+        key = ProfileKeyStore(token_store=token_store).load_existing_key()
     except (KeyboardInterrupt, SystemExit):
         raise
-    except Exception:
+    except (ProfileCryptoError, OSError, TypeError, ValueError):
         raise StableFailure("owner_keychain_unavailable") from None
-    if returncode != 0 or type(stdout) is not str:
-        raise StableFailure("owner_keychain_unavailable")
-    encoded = stdout.strip()
-    try:
-        key = base64.b64decode(encoded, altchars=b"-_", validate=True)
-    except (ValueError, TypeError, binascii.Error):
-        raise StableFailure("owner_keychain_unavailable") from None
-    if len(key) != 32:
+    if token_store.load_calls != 1 or type(key) is not bytes or len(key) != 32:
         raise StableFailure("owner_keychain_unavailable")
     return key
 
@@ -910,12 +1072,36 @@ def check_runtime_permissions(runtime: Path) -> None:
 def _canonical_owner_database() -> Path:
     if "KUNJIN_DATA_DIR" in os.environ or "KUNJIN_STATE_DIR" in os.environ:
         raise StableFailure("owner_runtime_override_prohibited")
-    return Path.home() / ".local" / "share" / "kunjin" / "kunjin.db"
+    return _canonical_home() / ".local" / "share" / "kunjin" / "kunjin.db"
+
+
+def _canonical_home() -> Path:
+    try:
+        value = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        raise StableFailure("phase41_runtime_invalid") from None
+    if type(value) is not str or not value or not Path(value).is_absolute():
+        raise StableFailure("phase41_runtime_invalid")
+    return Path(value)
+
+
+def _validate_cli_origin(cli) -> None:
+    expected = Path(__file__).resolve().parents[1] / "src" / "kunjin" / "cli.py"
+    actual_value = getattr(cli, "__file__", None)
+    if type(actual_value) is not str:
+        raise StableFailure("phase41_import_origin_invalid")
+    try:
+        actual = Path(actual_value).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise StableFailure("phase41_import_origin_invalid") from None
+    if actual != expected.resolve(strict=True):
+        raise StableFailure("phase41_import_origin_invalid")
 
 
 def _build_context_with_key(key: bytes):
     import kunjin.cli as cli
 
+    _validate_cli_origin(cli)
     key_store = InMemoryKeyStore(key)
     original = cli.ProfileKeyStore
     cli.ProfileKeyStore = lambda: key_store
@@ -931,6 +1117,7 @@ def _build_engineering_context():
     from kunjin.selection.readiness import ShortlistReadinessService
     from kunjin.selection.service import ShortlistService
 
+    _validate_cli_origin(cli)
     context = cli.build_context()
 
     def missing_gate():
@@ -1035,7 +1222,7 @@ def run_owner_acceptance() -> dict:
 
 
 def _engineering_excluded_roots(runtime: Path) -> Tuple[Path, ...]:
-    home = Path.home()
+    home = _canonical_home()
     repository = Path(__file__).resolve().parents[1]
     return (
         repository,
@@ -1069,7 +1256,7 @@ def run_engineering_acceptance() -> dict:
     )
     if "KUNJIN_DATA_DIR" in os.environ or "KUNJIN_STATE_DIR" in os.environ:
         raise StableFailure("engineering_runtime_override_prohibited")
-    source = Path.home() / ".local" / "share" / "kunjin" / "kunjin.db"
+    source = _canonical_home() / ".local" / "share" / "kunjin" / "kunjin.db"
     data_dir = runtime / "data"
     state_dir = runtime / "state"
     data_dir.mkdir(mode=0o700)
@@ -1097,11 +1284,7 @@ def run_engineering_acceptance() -> dict:
                     "fund.shortlist",
                     required=True,
                 )
-                coverage = validate_engineering_coverage(
-                    result.initial_data,
-                    shortlist_data,
-                    result.final_data,
-                )
+                coverage = validate_engineering_coverage(result, shortlist_data)
             finally:
                 children.restore_tracking()
                 children.assert_waited()
