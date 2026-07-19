@@ -26,7 +26,8 @@ def _public_value(value: object) -> object:
     raise ValueError("shortlist public projection contains an unsupported value")
 
 
-def _personal_gate_payload(value: PersonalGateEvidence) -> dict[str, object]:
+def public_personal_gate_payload(value: PersonalGateEvidence) -> dict[str, object]:
+    value.validate()
     return {
         "allocation_freshness": value.allocation_freshness,
         "allocation_state": value.allocation_state,
@@ -144,7 +145,7 @@ def public_shortlist_payload(result: ShortlistResult) -> dict[str, object]:
         "input_fingerprint": result.input_fingerprint,
         "metric_comparisons": _metric_payload(result.metric_comparisons),
         "missing_evidence": list(result.missing_evidence),
-        "personal_gate": _personal_gate_payload(result.personal_gate),
+        "personal_gate": public_personal_gate_payload(result.personal_gate),
         "request": {
             "candidate_codes": list(result.candidate_codes),
             "candidate_count": len(result.candidate_codes),
@@ -153,4 +154,4 @@ def public_shortlist_payload(result: ShortlistResult) -> dict[str, object]:
     }
 
 
-__all__ = ["public_shortlist_payload"]
+__all__ = ["public_personal_gate_payload", "public_shortlist_payload"]

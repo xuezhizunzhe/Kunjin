@@ -15,6 +15,7 @@ from kunjin.selection.policy import (
     SHORTLIST_POLICY_V1_GOLDEN_CHECKSUM,
     ShortlistPolicyV1,
     evaluate_shortlist_state,
+    personal_gate_passes,
 )
 
 
@@ -95,6 +96,13 @@ def test_policy_v1_is_canonical_frozen_and_checksummed() -> None:
         policy.version = "2"  # type: ignore[misc]
     with pytest.raises(ValueError, match="canonical"):
         replace(policy, version="2").validate()
+
+
+def test_exported_personal_gate_predicate_retains_policy_v1_requirements() -> None:
+    assert personal_gate_passes(_gate()) is True
+    assert personal_gate_passes(_gate(suitability_status="blocked")) is False
+    assert personal_gate_passes(_gate(allocation_freshness="stale")) is False
+    assert ShortlistPolicyV1().checksum() == SHORTLIST_POLICY_V1_GOLDEN_CHECKSUM
 
 
 @pytest.mark.parametrize(

@@ -27,11 +27,29 @@ from kunjin.funds.risk.models import (
 )
 from kunjin.funds.store import FundDisclosureStore
 from kunjin.models import AccountObservation, PositionObservation
-from kunjin.selection.service import ShortlistService
+from kunjin.selection.service import ShortlistService, project_personal_gate
 from kunjin.storage.repository import Repository
 
 NOW = datetime(2026, 7, 19, 6, tzinfo=timezone.utc)
 CODES = ("000001", "000002", "000003", "000004", "000005")
+
+
+def test_personal_gate_projection_is_shared_and_amount_free() -> None:
+    gate = project_personal_gate(
+        {
+            "state": "fresh",
+            "freshness": "fresh",
+            "status": "blocked",
+            "hard_blocks": ["emergency_reserve_shortfall"],
+            "constraints": ["monthly_ceiling_constrained"],
+        },
+        {"state": "missing", "freshness": "missing"},
+    )
+
+    gate.validate()
+    assert gate.blocking_codes == ("emergency_reserve_shortfall",)
+    assert gate.constraint_codes == ("monthly_ceiling_constrained",)
+    assert not hasattr(gate, "amount")
 
 
 def _repository(tmp_path: Path) -> Repository:

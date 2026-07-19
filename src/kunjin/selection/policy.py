@@ -44,7 +44,7 @@ def _all_pairs_have_state(
     )
 
 
-def _personal_gate_passes(personal_gate: PersonalGateEvidence) -> bool:
+def personal_gate_passes(personal_gate: PersonalGateEvidence) -> bool:
     return (
         personal_gate.suitability_state == "fresh"
         and personal_gate.suitability_freshness == "fresh"
@@ -147,7 +147,7 @@ def evaluate_shortlist_state(
         )
         if len(group) >= 2 and _all_pairs_have_state(group, pair_states, "comparable"):
             passing_groups.append(group)
-    if len(passing_groups) != 1 or not _personal_gate_passes(personal_gate):
+    if len(passing_groups) != 1 or not personal_gate_passes(personal_gate):
         return "relative_tradeoffs_only", ()
     return "conditional_shortlist", passing_groups[0]
 

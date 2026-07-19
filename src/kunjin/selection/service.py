@@ -188,7 +188,7 @@ def _gate_state(value: object) -> str:
     return value if type(value) is str and value in _GATE_STATES else "transient"
 
 
-def _personal_gate(
+def project_personal_gate(
     suitability_status: Mapping[str, object],
     allocation_status: Mapping[str, object],
 ) -> PersonalGateEvidence:
@@ -958,7 +958,7 @@ class ShortlistService:
         except Exception:
             allocation_status = {"state": "transient", "freshness": "transient"}
             status_missing.add("allocation_status_unavailable")
-        personal_gate = _personal_gate(suitability_status, allocation_status)
+        personal_gate = project_personal_gate(suitability_status, allocation_status)
 
         review_tuple = tuple(reviews)
         comparison_state, shortlist_codes = self._policy.evaluate(
@@ -1048,4 +1048,4 @@ class ShortlistService:
         return result
 
 
-__all__ = ["ShortlistService"]
+__all__ = ["ShortlistService", "project_personal_gate"]
