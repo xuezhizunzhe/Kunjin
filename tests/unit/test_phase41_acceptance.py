@@ -776,6 +776,54 @@ def test_engineering_flow_rejects_dependency_stop_on_independent_action() -> Non
         validate_engineering_flow(result, expected_subject_count=4)
 
 
+def test_source_failure_stops_documents_and_classify_before_dependency_logic() -> None:
+    actions = (
+        ("000001", "sync fund-documents 000001"),
+        ("000001", "fund classify 000001"),
+    )
+    readiness_calls = 0
+
+    def invoke(argv):
+        nonlocal readiness_calls
+        if argv[1:3] == ["fund", "shortlist-readiness"]:
+            readiness_calls += 1
+            return CommandResult(
+                1,
+                _readiness(
+                    actions=actions if readiness_calls == 1 else (),
+                    codes=CODES[:2],
+                ),
+            )
+        if argv[1:3] == ["source", "status"]:
+            return CommandResult(1, None)
+        raise AssertionError("source-stopped actions must not execute")
+
+    result = orchestrate(CODES[:2], ROLES[:2], invoke)
+
+    assert [record.state for record in result.action_terminal_records] == [
+        "stopped_by_source_state",
+        "stopped_by_source_state",
+    ]
+    assert validate_engineering_flow(result, expected_subject_count=2) == {
+        "engineering_flow": "pass"
+    }
+
+
+def test_engineering_flow_rejects_classify_source_stop_after_documents_complete() -> None:
+    result = _orchestration_result(
+        actions=(
+            ("000001", "sync fund-documents 000001"),
+            ("000001", "fund classify 000001"),
+        ),
+        states={"completed": 1, "stopped_by_source_state": 1},
+        outcome="stopped_by_source_state",
+        refresh_calls=1,
+    )
+
+    with pytest.raises(StableFailure, match="engineering_flow_invalid"):
+        validate_engineering_flow(result, expected_subject_count=4)
+
+
 def test_engineering_evidence_rejects_ready_without_closed_candidates() -> None:
     result = _orchestration_result(final_ready=True, outcome="completed_once")
     result.final_data["candidate_evidence"] = []
@@ -832,6 +880,23 @@ def test_engineering_evidence_rejects_inconsistent_usable_nav() -> None:
         "unique_date_count": 0,
         "usable": True,
     }
+
+    with pytest.raises(StableFailure, match="engineering_evidence_invalid"):
+        project_engineering_evidence(
+            _orchestration_result(final_evidence=evidence),
+            _shortlist(),
+        )
+
+
+def test_engineering_evidence_rejects_zero_length_usable_nav_interval() -> None:
+    evidence = _closed_evidence(usable_first=True)
+    evidence[0]["formal_nav"].update(
+        {
+            "start_date": "2026-07-18",
+            "end_date": "2026-07-18",
+            "latest_date": "2026-07-18",
+        }
+    )
 
     with pytest.raises(StableFailure, match="engineering_evidence_invalid"):
         project_engineering_evidence(

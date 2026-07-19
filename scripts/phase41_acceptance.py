@@ -682,19 +682,25 @@ def validate_engineering_flow(
         state_by_action[(record.role, record.action_type)] = record.state
     if dict(sorted(record_states.items())) != dict(sorted(states.items())):
         raise StableFailure("engineering_flow_invalid")
-    failed_document_states = {"terminal_failure", "stopped_by_source_state"}
     for record in records:
         document_state = state_by_action.get((record.role, "sync_fund_documents"))
-        if record.state == "dependency_stopped" and (
-            record.action_type != "fund_classify"
-            or document_state not in failed_document_states
-        ):
+        if record.action_type != "fund_classify":
+            if record.state == "dependency_stopped":
+                raise StableFailure("engineering_flow_invalid")
+            continue
+        if record.state == "dependency_stopped" and document_state != "terminal_failure":
+            raise StableFailure("engineering_flow_invalid")
+        if document_state == "terminal_failure" and record.state != "dependency_stopped":
             raise StableFailure("engineering_flow_invalid")
         if (
-            record.action_type == "fund_classify"
-            and document_state in failed_document_states
-            and record.state != "dependency_stopped"
+            document_state == "stopped_by_source_state"
+            and record.state != "stopped_by_source_state"
         ):
+            raise StableFailure("engineering_flow_invalid")
+        if document_state == "completed" and record.state in {
+            "dependency_stopped",
+            "stopped_by_source_state",
+        }:
             raise StableFailure("engineering_flow_invalid")
     if states.get("stopped_by_source_state", 0):
         expected_outcome = "stopped_by_source_state"
@@ -848,7 +854,7 @@ def _validate_nav_component(nav: object) -> int:
         or nav["observation_count"] < 2
         or nav["unique_date_count"] < 2
         or any(value is None for value in parsed_dates.values())
-        or parsed_dates["start_date"] > parsed_dates["end_date"]
+        or parsed_dates["start_date"] >= parsed_dates["end_date"]
         or parsed_dates["latest_date"] != parsed_dates["end_date"]
     ):
         raise StableFailure("engineering_evidence_invalid")
