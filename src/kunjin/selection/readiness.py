@@ -88,6 +88,15 @@ _COMPONENT_NAMES = (
     "portfolio_binding",
     "shortlist_entry",
 )
+_COMPARISON_PROFILE_REQUIRED_SECTIONS = frozenset(
+    {
+        "basic_profile",
+        "current_manager",
+        "fee_schedule",
+        "manager_history",
+        "redemption_fee_rules",
+    }
+)
 REFRESH_COMMANDS = (
     ("formal_nav", "sync fund {code}"),
     ("profile", "sync fund-profile {code} --mode rapid"),
@@ -169,9 +178,6 @@ def _validate_dynamic(value: object, path: tuple[str, ...] = ()) -> None:
             entries = value[1]
             if type(entries) is not tuple:
                 raise ValueError("frozen readiness mapping is invalid")
-            keys = tuple(item[0] for item in entries)
-            if keys != tuple(sorted(set(keys))):
-                raise ValueError("readiness mapping keys must be unique and sorted")
             for entry in entries:
                 if (
                     type(entry) is not tuple
@@ -183,6 +189,9 @@ def _validate_dynamic(value: object, path: tuple[str, ...] = ()) -> None:
                 if key.casefold() in _PRIVATE_KEYS and key not in {"amount_min", "amount_max"}:
                     raise ValueError("readiness values contain a private field")
                 _validate_dynamic(item, (*path, key))
+            keys = tuple(entry[0] for entry in entries)
+            if keys != tuple(sorted(set(keys))):
+                raise ValueError("readiness mapping keys must be unique and sorted")
             return
         for item in value:
             _validate_dynamic(item, path)
@@ -789,6 +798,10 @@ class ShortlistReadinessService:
         managers = report["managers"]
         fees = report["fees"]
         benchmarks = report["benchmarks"]
+        required_gaps = (
+            set(report["missing_sections"])
+            & _COMPARISON_PROFILE_REQUIRED_SECTIONS
+        )
         authenticated = all(
             (
                 identity is not None
@@ -824,7 +837,9 @@ class ShortlistReadinessService:
             "report_dates": report["report_dates"],
             "warnings": report["warnings"],
         }
-        return _payload(value), bool(authenticated and not report["conflicts"])
+        return _payload(value), bool(
+            authenticated and not report["conflicts"] and not required_gaps
+        )
 
     @staticmethod
     def _nav_payload(
@@ -971,6 +986,8 @@ class ShortlistReadinessService:
                     or resolutions.get("holdings_industries")
                     != RequestFieldResolution.USABLE.value
                 ),
+                # No independent authenticated D1-document freshness contract exists;
+                # refresh documents before reclassification whenever D1 is not ready.
                 "d1_documents": not state["d1_ready"],
                 "d1_classification": not state["d1_ready"],
             }

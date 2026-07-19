@@ -760,6 +760,40 @@ def test_profile_document_without_classification_requires_both_d1_actions(
     )
 
 
+def test_management_fee_without_redemption_rule_blocks_profile_readiness(
+    tmp_path, monkeypatch
+) -> None:
+    service, _repository_value, _calls = _build_service(tmp_path, monkeypatch)
+
+    def missing_redemption(code):
+        return replace(
+            _bundle(code),
+            fee_rules=(
+                FundFeeRule(
+                    code,
+                    FeeType.MANAGEMENT,
+                    1,
+                    share_class="A",
+                    rate=Decimal("1.2"),
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(service.disclosure_store, "load_bundle", missing_redemption)
+
+    result = service.review(CODES)
+    payload = public_shortlist_readiness_payload(result)
+
+    assert result.comparison_evidence_ready is False
+    assert "profile_evidence_not_ready" in result.blocking_codes
+    assert payload["candidate_evidence"][0]["profile"]["missing_sections"][
+        "redemption_fee_rules"
+    ] == "insufficient_data"
+    assert ("000002", "sync fund-profile 000002 --mode rapid") in (
+        result.bounded_refresh_actions
+    )
+
+
 def test_nested_mapping_roundtrip_is_unambiguous(tmp_path, monkeypatch) -> None:
     service, _repository_value, _calls = _build_service(tmp_path, monkeypatch)
     result = service.review(CODES)
@@ -783,6 +817,21 @@ def test_nested_mapping_roundtrip_is_unambiguous(tmp_path, monkeypatch) -> None:
 
     assert profile["empty_mapping"] == {}
     assert profile["string_pairs"] == [["left", "right"], ["up", "down"]]
+
+
+def test_malformed_tagged_mapping_fails_with_value_error(tmp_path, monkeypatch) -> None:
+    service, _repository_value, _calls = _build_service(tmp_path, monkeypatch)
+    result = service.review(CODES)
+    malformed = (
+        (
+            "nested",
+            (readiness_module._FROZEN_MAPPING_TAG, ((),)),
+        ),
+    )
+    candidate = replace(result.candidate_evidence[0], profile=malformed)
+
+    with pytest.raises(ValueError, match="mapping entry"):
+        candidate.validate()
 
 
 def test_exact_record_rejects_noncanonical_utc(tmp_path, monkeypatch) -> None:
