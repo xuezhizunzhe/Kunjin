@@ -1240,3 +1240,46 @@ def test_sensitive_words_without_assignment_header_or_path_remain_valid(
         normalized_content_sha256=hashlib.sha256(ordinary_text.encode()).hexdigest(),
     )
     value.validate()
+
+
+@pytest.mark.parametrize(
+    "private_content",
+    (
+        "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature",
+        "bearer a.b.c",
+        "Bearer abcdefghijklmnop",
+        "bearer opaque_token_1234567890",
+        "file://localhost/Users/owner/private-input.txt",
+        "FILE://public-host.example/private-input.txt",
+        "FiLe:/tmp/private-input.txt",
+        "file:relative/private-input.txt",
+        "~/Documents/private-input.txt",
+        "owner path is ~/private-input.txt",
+    ),
+)
+def test_sensitive_shape_rejects_bare_tokens_file_schemes_and_tilde_paths(
+    private_content: str,
+) -> None:
+    with pytest.raises(ValueError, match="private|secret"):
+        desired_announcement(
+            normalized_content=private_content,
+            normalized_content_bytes=len(private_content.encode()),
+            normalized_content_sha256=hashlib.sha256(private_content.encode()).hexdigest(),
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "ordinary_text",
+    (
+        "bearer funds may have different fee schedules.",
+        "The Bearer authentication scheme is discussed conceptually.",
+        "A bearer token format is described without a token value.",
+    ),
+)
+def test_bearer_words_without_token_shape_remain_valid(ordinary_text: str) -> None:
+    value = desired_announcement(
+        normalized_content=ordinary_text,
+        normalized_content_bytes=len(ordinary_text.encode()),
+        normalized_content_sha256=hashlib.sha256(ordinary_text.encode()).hexdigest(),
+    )
+    value.validate()

@@ -254,7 +254,12 @@ def _validate_bounded_public_content(value: object, name: str) -> str:
         r"(?:users/[^/\s]+|private/(?:tmp|var)|var/folders|tmp|home/[^/\s]+)(?:/|$)",
         r"(?<![A-Za-z0-9])(?:file:/{2,3})?[a-z]:[\\/]+users[\\/]+"
         r"[^\\/\s]+(?:[\\/]|$)",
+        r"(?<![A-Za-z0-9+.-])file:",
+        r"(?<!\w)~/\S+",
         r"\bauthorization\s*(?:[:=]\s*)?(?:basic|digest|bearer)\s+\S+",
+        r"\bbearer\s+[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+        r"(?![A-Za-z0-9_-])",
+        r"\bbearer\s+[A-Za-z0-9._~+/=-]{16,}(?![A-Za-z0-9._~+/=-])",
         r"\b(?:credential|secret|client_secret|auth|authorization|session|session_id|"
         r"password|api[_ ]?key|access[_ ]?token|token|cookie)\s*[:=]\s*\S+",
     )
