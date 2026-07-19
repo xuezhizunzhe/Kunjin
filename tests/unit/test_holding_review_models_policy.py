@@ -25,6 +25,7 @@ from kunjin.holding_review.models import (
     HoldingReviewResult,
     HoldingReviewSnapshot,
     OfficialAnnouncementContent,
+    OfficialEventEvidenceReference,
     RedemptionComponentState,
     RedemptionEvidence,
     RedemptionFeasibility,
@@ -74,6 +75,7 @@ def review_result(**changes: object) -> HoldingReviewResult:
         "thesis_review_state": ThesisMatchState.PRESENTED_MATCH_REJECTED,
         "review_disposition": ReviewDisposition.CONTINUE_OBSERVING,
         "triggered_reviews": (),
+        "official_event_evidence": (),
         "redemption_feasibility": RedemptionFeasibility.NOT_REQUESTED,
         "redemption_evidence": redemption_evidence(),
         "sell_timing": "insufficient_data",
@@ -350,7 +352,6 @@ def test_policy_rejects_subclasses() -> None:
         {"thesis_review_state": ThesisMatchState.MANUAL_REVIEW_UNCERTAIN},
         {"thesis_review_state": ThesisMatchState.PRESENTED_MATCH_CONFIRMED},
         {"hard_event_review": True},
-        {"triggered_reviews": (TriggeredReviewCode.MANAGER_CHANGE_REVIEW,)},
     ),
 )
 def test_continue_observing_requires_a_closed_complete_negative_check(
@@ -375,6 +376,10 @@ def test_bare_hard_event_boolean_cannot_bypass_action_source_sufficiency() -> No
 
 
 def test_non_hard_trigger_cannot_bypass_action_source_sufficiency() -> None:
+    reference = official_reference(
+        event_code=OfficialEventCode.MANAGER_CHANGE_NOTICE,
+        triggered_review_code=TriggeredReviewCode.MANAGER_CHANGE_REVIEW,
+    )
     result = review_result(
         action=ActionKind.FULL_EXIT,
         review_disposition=ReviewDisposition.EXIT_REVIEW,
@@ -382,6 +387,8 @@ def test_non_hard_trigger_cannot_bypass_action_source_sufficiency() -> None:
         action_review_source_sufficiency=ActionReviewSourceSufficiency.INSUFFICIENT_DATA,
         hard_event_review=True,
         triggered_reviews=(TriggeredReviewCode.MANAGER_CHANGE_REVIEW,),
+        official_event_evidence=(reference,),
+        evidence_ids=("evidence_a", reference.support_evidence_id),
         redemption_feasibility=RedemptionFeasibility.INSUFFICIENT_DATA,
     )
     with pytest.raises(ValueError, match="authenticated hard-event trigger"):
@@ -469,14 +476,12 @@ def test_announcement_host_must_bind_exact_registered_manager_publisher() -> Non
     "private_content",
     (
         "authorization bearer abc",
-        "access token abc",
+        "access token: abc",
         "password=abc",
         "api_key=abc",
         "cookie: sessionvalue",
         "https://example.test/doc?token=abc",
         "local path /private/tmp/input",
-        "exact amount 100",
-        "private value abc",
     ),
 )
 def test_announcement_content_rejects_private_markers(private_content: str) -> None:
@@ -511,6 +516,22 @@ def evidence_item() -> ReviewEvidenceItem:
         retracted=False,
         conflicted=False,
         direct_subject_binding=True,
+    )
+
+
+def official_reference(
+    *,
+    projection_id: int = 7,
+    event_code: OfficialEventCode = OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+    triggered_review_code: TriggeredReviewCode = (
+        TriggeredReviewCode.FULL_EXIT_FEASIBILITY_REVIEW
+    ),
+) -> OfficialEventEvidenceReference:
+    return OfficialEventEvidenceReference(
+        projection_id=projection_id,
+        projection_checksum="8" * 64,
+        event_code=event_code,
+        triggered_review_code=triggered_review_code,
     )
 
 
@@ -609,6 +630,7 @@ def test_every_exact_record_has_a_valid_canonical_roundtrip() -> None:
     records = (
         ReviewBoundary(),
         redemption_evidence(),
+        official_reference(),
         desired_announcement(),
         desired_event_projection(),
         evidence_item(),
@@ -802,12 +824,18 @@ def test_redemption_restriction_requires_exact_component_and_trigger_pair() -> N
             redemption_feasibility=RedemptionFeasibility.RESTRICTED,
             redemption_evidence=restricted,
         ).validate()
+    reference = official_reference(
+        event_code=OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE,
+        triggered_review_code=TriggeredReviewCode.REDEMPTION_RESTRICTION_REVIEW,
+    )
     review_result(
         action=ActionKind.FULL_EXIT,
         review_disposition=ReviewDisposition.ABSTAIN,
         redemption_feasibility=RedemptionFeasibility.RESTRICTED,
         redemption_evidence=restricted,
         triggered_reviews=(TriggeredReviewCode.REDEMPTION_RESTRICTION_REVIEW,),
+        official_event_evidence=(reference,),
+        evidence_ids=("evidence_a", reference.support_evidence_id),
     ).validate()
 
 
@@ -961,3 +989,191 @@ def test_evidence_descriptor_tuples_are_bounded() -> None:
     projection = replace(desired_projection(), evidence_descriptors=descriptors)
     with pytest.raises(ValueError, match="too many"):
         projection.validate()
+
+
+def test_official_event_reference_is_the_only_result_event_identity() -> None:
+    import kunjin.holding_review.models as review_models
+
+    reference_type = review_models.OfficialEventEvidenceReference
+    reference = reference_type(
+        projection_id=7,
+        projection_checksum="b" * 64,
+        event_code=OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+        triggered_review_code=TriggeredReviewCode.FULL_EXIT_FEASIBILITY_REVIEW,
+    )
+    reference.validate()
+    assert reference.to_canonical_dict()["projection_id"] == 7
+    assert "official_event_evidence" in {field.name for field in fields(HoldingReviewInputs)}
+    assert "official_event_codes" not in {field.name for field in fields(HoldingReviewInputs)}
+    assert "official_event_evidence" in {field.name for field in fields(HoldingReviewResult)}
+    assert "official_event_codes" not in {field.name for field in fields(HoldingReviewResult)}
+
+
+def test_official_event_reference_rejects_wrong_mapping_type_order_and_duplicate() -> None:
+    import kunjin.holding_review.models as review_models
+
+    reference_type = review_models.OfficialEventEvidenceReference
+    good = reference_type(
+        projection_id=7,
+        projection_checksum="b" * 64,
+        event_code=OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+        triggered_review_code=TriggeredReviewCode.FULL_EXIT_FEASIBILITY_REVIEW,
+    )
+    with pytest.raises(ValueError, match="do not match"):
+        replace(
+            good,
+            triggered_review_code=TriggeredReviewCode.MANAGER_CHANGE_REVIEW,
+        ).validate()
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        replace(good, projection_checksum="B" * 64).validate()
+    with pytest.raises(ValueError, match="positive exact integer"):
+        replace(good, projection_id=True).validate()
+    with pytest.raises(ValueError, match="exact OfficialEventEvidenceReference"):
+        review_result(official_event_evidence=("official_event_projection_7",)).validate()  # type: ignore[arg-type]
+
+    class ReferenceSubclass(OfficialEventEvidenceReference):
+        pass
+
+    with pytest.raises(ValueError, match="exact OfficialEventEvidenceReference"):
+        ReferenceSubclass(**vars(good)).validate()
+    later = replace(good, projection_id=8)
+    with pytest.raises(ValueError, match="ordered by unique projection id"):
+        review_result(official_event_evidence=(later, good)).validate()
+    with pytest.raises(ValueError, match="ordered by unique projection id"):
+        review_result(official_event_evidence=(good, good)).validate()
+
+
+def test_continue_observing_rejects_authenticated_event_reference() -> None:
+    reference = official_reference(
+        event_code=OfficialEventCode.MANAGER_CHANGE_NOTICE,
+        triggered_review_code=TriggeredReviewCode.MANAGER_CHANGE_REVIEW,
+    )
+    with pytest.raises(ValueError, match="continue observing evidence is incomplete"):
+        review_result(
+            triggered_reviews=(TriggeredReviewCode.MANAGER_CHANGE_REVIEW,),
+            official_event_evidence=(reference,),
+            evidence_ids=("evidence_a", reference.support_evidence_id),
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "synthetic_id",
+    (
+        "official_event_projection_99",
+        "fund_liquidation_notice",
+        "full_exit_feasibility_review",
+    ),
+)
+def test_synthetic_or_code_only_event_evidence_id_is_invalid(synthetic_id: str) -> None:
+    with pytest.raises(ValueError, match="support evidence ids"):
+        review_result(evidence_ids=("evidence_a", synthetic_id)).validate()
+
+
+def test_hard_event_reference_derives_trigger_hard_flag_and_support_id() -> None:
+    reference = official_reference()
+    incomplete = RedemptionEvidence(
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.MISSING,
+        RedemptionComponentState.MISSING,
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.MISSING,
+    )
+    result = review_result(
+        action=ActionKind.FULL_EXIT,
+        thesis_review_state=ThesisMatchState.NO_MATCHING_EVIDENCE,
+        review_disposition=ReviewDisposition.EXIT_REVIEW,
+        action_review_source_sufficiency=ActionReviewSourceSufficiency.INSUFFICIENT_DATA,
+        triggered_reviews=(TriggeredReviewCode.FULL_EXIT_FEASIBILITY_REVIEW,),
+        official_event_evidence=(reference,),
+        hard_event_review=True,
+        evidence_ids=("evidence_a", reference.support_evidence_id),
+        redemption_feasibility=RedemptionFeasibility.INSUFFICIENT_DATA,
+        redemption_evidence=incomplete,
+    )
+    result.validate()
+    with pytest.raises(ValueError, match="support evidence ids"):
+        replace(result, evidence_ids=("evidence_a",)).validate()
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "%3A",
+        "%2B",
+        "%E5%9F%BA%E9%87%91",
+    ),
+)
+def test_canonical_uppercase_percent_paths_are_accepted(path: str) -> None:
+    value = desired_announcement(
+        canonical_announcement_url=f"https://www.fund001.com/fund/123456/{path}.html"
+    )
+    value.validate()
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "%3a",
+        "%2b",
+        "%e5%9f%ba%e9%87%91",
+        "%3F",
+        "%253F",
+        "%00",
+        "%7F",
+        "%FF",
+        "%E5%9F",
+    ),
+)
+def test_noncanonical_or_unsafe_percent_paths_are_rejected(path: str) -> None:
+    with pytest.raises(ValueError, match="canonical public HTTPS URL"):
+        desired_announcement(
+            canonical_announcement_url=(
+                f"https://www.fund001.com/fund/123456/{path}.html"
+            )
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "private_content",
+    (
+        "/Users/owner/Documents/fund.txt",
+        "/private/tmp/kunjin/input.txt",
+        "/private/var/kunjin/input.txt",
+        "file:///Users/owner/Documents/fund.txt",
+        "Authorization: Bearer credentialvalue",
+        "Bearer credentialvalue",
+        "session_id=credentialvalue",
+        "password=credentialvalue",
+        "api_key=credentialvalue",
+        "access_token=credentialvalue",
+        "token=credentialvalue",
+    ),
+)
+def test_announcement_content_rejects_owner_paths_and_shaped_credentials(
+    private_content: str,
+) -> None:
+    with pytest.raises(ValueError, match="private|secret"):
+        desired_announcement(
+            normalized_content=private_content,
+            normalized_content_bytes=len(private_content.encode()),
+            normalized_content_sha256=hashlib.sha256(private_content.encode()).hexdigest(),
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "ordinary_text",
+    (
+        "The notice discusses an exact amount without owner data.",
+        "The form contains a local path description but no filesystem value.",
+        "The policy uses the phrase private value as a general concept.",
+    ),
+)
+def test_broad_privacy_words_remain_valid_public_content(ordinary_text: str) -> None:
+    value = desired_announcement(
+        normalized_content=ordinary_text,
+        normalized_content_bytes=len(ordinary_text.encode()),
+        normalized_content_sha256=hashlib.sha256(ordinary_text.encode()).hexdigest(),
+    )
+    value.validate()

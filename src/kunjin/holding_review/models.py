@@ -7,7 +7,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote_to_bytes, urlsplit
 
 from kunjin.brief.models import OfficialEventCode
 from kunjin.decision.models import (
@@ -249,35 +249,44 @@ def _validate_bounded_public_content(value: object, name: str) -> str:
         for character in value
     ):
         raise ValueError(f"{name} contains unsupported characters")
-    normalized = " ".join(part for part in re.split(r"[\W_]+", value.casefold()) if part)
-    private_markers = (
-        "access token",
-        "authorization bearer",
-        "exact amount",
-        "local path",
-        "private value",
+    private_patterns = (
+        r"(?:file://)?/(?:users/[^/\s]+|private/(?:tmp|var))(?:/|\b)",
+        r"\bauthorization\s*(?::|=|\s+bearer\b)\s*\S+",
+        r"\bbearer\s+[A-Za-z0-9._~+/=-]{3,}",
+        r"\b(?:session_id|password|api[_ ]?key|access[_ ]?token|token|cookie)"
+        r"\s*[:=]\s*\S+",
+        r"https://\S*[?&](?:session_id|password|api_?key|access_?token|token)=",
     )
-    if any(marker in normalized for marker in private_markers):
-        raise ValueError(f"{name} contains a secret or private marker")
-    credential_patterns = (
-        r"\b(?:password|api[_ ]?key|credential|cookie)\s*[:=]\s*\S+",
-        r"https://\S*[?&](?:access_?token|auth|authorization|cookie|password|secret|token)=",
-    )
-    if any(re.search(pattern, value, flags=re.IGNORECASE) for pattern in credential_patterns):
+    if any(re.search(pattern, value, flags=re.IGNORECASE) for pattern in private_patterns):
         raise ValueError(f"{name} contains a secret or private marker")
     return value
 
 
-def _validate_no_percent_identity_alias(path: str, name: str) -> None:
+def _validate_canonical_url_path(path: str, name: str) -> None:
     if re.search(r"%(?![0-9A-Fa-f]{2})", path):
         raise ValueError(f"{name} must be a canonical public HTTPS URL")
     escapes = tuple(re.finditer(r"%([0-9A-Fa-f]{2})", path))
     if path.count("%") != len(escapes):
         raise ValueError(f"{name} must be a canonical public HTTPS URL")
-    for match in escapes:
-        character = chr(int(match.group(1), 16))
-        if character.isascii() and (character.isalnum() or character in "-._~/\\"):
-            raise ValueError(f"{name} must be a canonical public HTTPS URL")
+    try:
+        decoded = unquote_to_bytes(path).decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise ValueError(f"{name} must be a canonical public HTTPS URL") from None
+    if any(
+        ord(character) <= 0x1F
+        or ord(character) == 0x7F
+        or character in "%?#\\"
+        for character in decoded
+    ):
+        raise ValueError(f"{name} must be a canonical public HTTPS URL")
+    canonical = quote(
+        decoded,
+        safe="/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~",
+        encoding="utf-8",
+        errors="strict",
+    )
+    if canonical != path:
+        raise ValueError(f"{name} must be a canonical public HTTPS URL")
 
 
 def _validate_canonical_public_tree(value: object, name: str) -> None:
@@ -387,6 +396,53 @@ class RedemptionEvidence(_CanonicalRecord):
 
 
 @dataclass(frozen=True)
+class OfficialEventEvidenceReference(_CanonicalRecord):
+    projection_id: int
+    projection_checksum: str
+    event_code: OfficialEventCode
+    triggered_review_code: TriggeredReviewCode
+
+    @property
+    def support_evidence_id(self) -> str:
+        return f"official_event_projection_{self.projection_id}"
+
+    def validate(self) -> None:
+        _exact_record(self, OfficialEventEvidenceReference, "official event evidence reference")
+        _positive_int(self.projection_id, "official event projection id")
+        validate_checksum(self.projection_checksum, "official event projection checksum")
+        _exact_enum(self.event_code, OfficialEventCode, "official event code")
+        if self.event_code not in _SUPPORTED_OFFICIAL_EVENTS:
+            raise ValueError("official event code is not supported by Phase 5")
+        _exact_enum(
+            self.triggered_review_code,
+            TriggeredReviewCode,
+            "triggered review code",
+        )
+        if _EVENT_TRIGGER_MAP[self.event_code] is not self.triggered_review_code:
+            raise ValueError("official event and triggered review code do not match")
+        validate_identifier(self.support_evidence_id, "official event support evidence id")
+
+
+def _validate_official_event_evidence(
+    value: object,
+    name: str,
+) -> Tuple[OfficialEventEvidenceReference, ...]:
+    if type(value) is not tuple:
+        raise ValueError(f"{name} must be an exact tuple")
+    if len(value) > MAX_TUPLE_ITEMS:
+        raise ValueError(f"{name} has too many items")
+    projection_ids = []
+    for item in value:
+        if type(item) is not OfficialEventEvidenceReference:
+            raise ValueError(f"{name} must contain exact OfficialEventEvidenceReference records")
+        item.validate()
+        projection_ids.append(item.projection_id)
+    if tuple(projection_ids) != tuple(sorted(set(projection_ids))):
+        raise ValueError(f"{name} must be ordered by unique projection id")
+    return value
+
+
+@dataclass(frozen=True)
 class OfficialAnnouncementContent(_AuthenticatedRecord):
     brief_request_run_id: int
     source_attempt_id: int
@@ -414,7 +470,7 @@ class OfficialAnnouncementContent(_AuthenticatedRecord):
         _positive_int(self.listing_source_document_id, "listing source document id")
         _validate_public_https_url(self.canonical_announcement_url, "announcement URL")
         parsed = urlsplit(self.canonical_announcement_url)
-        _validate_no_percent_identity_alias(parsed.path, "announcement URL")
+        _validate_canonical_url_path(parsed.path, "announcement URL")
         if parsed.query or "//" in parsed.path or any(
             part in {".", ".."} for part in parsed.path.split("/")
         ):
@@ -677,7 +733,7 @@ class HoldingReviewInputs(_CanonicalRecord):
     intelligence_request_run_id: int
     thesis_review_state: ThesisMatchState
     review_evidence_items: Tuple[ReviewEvidenceItem, ...]
-    official_event_codes: Tuple[OfficialEventCode, ...]
+    official_event_evidence: Tuple[OfficialEventEvidenceReference, ...]
     omitted_work: Tuple[str, ...]
     official_negative_check_complete: bool
     intelligence_schedule_complete: bool
@@ -713,7 +769,7 @@ class HoldingReviewInputs(_CanonicalRecord):
             intelligence_request_run_id=intelligence_request_run_id,
             thesis_review_state=ThesisMatchState.THESIS_MISSING,
             review_evidence_items=(),
-            official_event_codes=(),
+            official_event_evidence=(),
             omitted_work=(),
             official_negative_check_complete=False,
             intelligence_schedule_complete=False,
@@ -754,9 +810,10 @@ class HoldingReviewInputs(_CanonicalRecord):
             ids.append(item.evidence_id)
         if tuple(ids) != tuple(sorted(set(ids))):
             raise ValueError("review evidence item ids must be sorted and unique")
-        _enum_tuple(self.official_event_codes, OfficialEventCode, "official event codes")
-        if any(item not in _SUPPORTED_OFFICIAL_EVENTS for item in self.official_event_codes):
-            raise ValueError("holding review input contains an unsupported official event")
+        _validate_official_event_evidence(
+            self.official_event_evidence,
+            "input official event evidence",
+        )
         for values, name in (
             (self.omitted_work, "omitted work"),
             (self.intelligence_omitted_work, "intelligence omitted work"),
@@ -809,6 +866,7 @@ class HoldingReviewResult(_CanonicalRecord):
     thesis_review_state: ThesisMatchState
     review_disposition: ReviewDisposition
     triggered_reviews: Tuple[TriggeredReviewCode, ...]
+    official_event_evidence: Tuple[OfficialEventEvidenceReference, ...]
     redemption_feasibility: RedemptionFeasibility
     redemption_evidence: RedemptionEvidence
     sell_timing: str
@@ -865,6 +923,20 @@ class HoldingReviewResult(_CanonicalRecord):
             sorted(order[item] for item in self.triggered_reviews)
         ):
             raise ValueError("triggered reviews must be in canonical order")
+        references = _validate_official_event_evidence(
+            self.official_event_evidence,
+            "result official event evidence",
+        )
+        derived_triggered_reviews = tuple(
+            item
+            for item in TriggeredReviewCode
+            if any(
+                reference.triggered_review_code is item
+                for reference in references
+            )
+        )
+        if self.triggered_reviews != derived_triggered_reviews:
+            raise ValueError("triggered reviews do not match official event evidence")
         if type(self.redemption_evidence) is not RedemptionEvidence:
             raise ValueError("redemption evidence must be exact")
         self.redemption_evidence.validate()
@@ -908,7 +980,14 @@ class HoldingReviewResult(_CanonicalRecord):
         if self.sell_timing != "insufficient_data" or self.boundary != ReviewBoundary():
             raise ValueError("holding review action boundary is invalid")
         self.boundary.validate()
-        hard_trigger = TriggeredReviewCode.FULL_EXIT_FEASIBILITY_REVIEW in self.triggered_reviews
+        hard_trigger = any(
+            reference.event_code
+            in {
+                OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+                OfficialEventCode.FUND_TERMINATION_NOTICE,
+            }
+            for reference in references
+        )
         if self.review_disposition is ReviewDisposition.CONTINUE_OBSERVING:
             from kunjin.holding_review.policy import HeldFundManualReviewPolicyV1
 
@@ -934,8 +1013,18 @@ class HoldingReviewResult(_CanonicalRecord):
                 raise ValueError("continue observing evidence is incomplete")
         if self.hard_event_review != hard_trigger:
             raise ValueError("hard event review requires an authenticated hard-event trigger")
-        if hard_trigger and not self.evidence_ids:
-            raise ValueError("authenticated hard-event trigger requires evidence ids")
+        support_ids = {reference.support_evidence_id for reference in references}
+        declared_support_ids = {
+            evidence_id
+            for evidence_id in self.evidence_ids
+            if evidence_id.startswith("official_event_projection_")
+        }
+        code_only_ids = {
+            *(item.value for item in OfficialEventCode),
+            *(item.value for item in TriggeredReviewCode),
+        }.intersection(self.evidence_ids)
+        if declared_support_ids != support_ids or code_only_ids:
+            raise ValueError("official event support evidence ids do not match their references")
         if self.review_disposition in {
             ReviewDisposition.REDUCE_REVIEW,
             ReviewDisposition.EXIT_REVIEW,
