@@ -7,6 +7,10 @@ from pathlib import Path
 import pytest
 
 from kunjin.brief.models import BriefCoverage, BriefEvidenceState, RelationshipEvidence
+from kunjin.diagnosis import (
+    build_authenticated_portfolio_binding,
+    project_candidate_impact,
+)
 from kunjin.diagnosis.models import PortfolioDiagnosis
 from kunjin.diagnosis.service import DiagnosisService
 from kunjin.funds.store import FundDisclosureStore
@@ -241,6 +245,84 @@ def test_candidate_without_local_public_evidence_is_insufficient(tmp_path: Path)
         "candidate_holdings",
     }
     assert result.action_authorized is False
+
+
+def test_portfolio_binding_helper_preserves_authenticated_sync_identity(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _save_positions(repository, ("000001", "10", "1"))
+
+    binding = build_authenticated_portfolio_binding(
+        repository,
+        repository.latest_positions(),
+    )
+
+    binding.validate()
+    assert binding.source_state == "authenticated_cache"
+    assert binding.snapshot_complete is True
+    assert binding.observation_version.startswith("sync_run_")
+    assert binding.observed_at == NOW
+
+
+def test_candidate_projector_uses_existing_phase3_unknown_and_overlap_rules(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    bundle = FundDisclosureStore(repository).load_bundle("000003")
+
+    result = project_candidate_impact(
+        "000003",
+        bundle,
+        (),
+        {
+            "as_of": NOW,
+            "candidate_portfolio_overlap": {
+                "000003": {
+                    "evidence_level": "deterministic_calculation",
+                    "candidate_disclosed_weight": "1",
+                    "overlap": "0",
+                }
+            },
+        },
+    )
+
+    result.validate()
+    assert result.label == "insufficient_data"
+    assert result.disclosed_weight == Decimal("1")
+    assert result.observed_overlap == Decimal("0")
+    assert result.unknown_fields == (
+        "candidate_benchmark",
+        "candidate_holdings",
+        "candidate_identity",
+        "candidate_manager",
+    )
+
+
+def test_existing_diagnosis_uses_shared_candidate_projector(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from kunjin.diagnosis import service as service_module
+
+    repository = _repository(tmp_path)
+    _save_positions(repository, ("000001", "10", "1"))
+    calls = []
+    original_projector = service_module.project_candidate_impact
+
+    def record_projector(*args, **kwargs):
+        projected = original_projector(*args, **kwargs)
+        calls.append(projected)
+        return projected
+
+    monkeypatch.setattr(service_module, "project_candidate_impact", record_projector)
+
+    result = _service(repository).diagnose("000003")
+
+    assert calls == [result.candidate_impact]
+    assert result.input_fingerprint == (
+        "1ab6002ccc8104e9dc156cb2ffdf213d7715bf7b97b5a25475a9bd116c87ac4d"
+    )
 
 
 @pytest.mark.parametrize("code", ("000000", "12345", "abcdef"))

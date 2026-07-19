@@ -5,7 +5,7 @@ import json
 import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Callable, Dict, Mapping, Optional, Tuple
+from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from kunjin.analytics.portfolio import analyze_portfolio
 from kunjin.brief.d2 import PortfolioEvidenceBinding, build_d2_relationships
@@ -26,10 +26,12 @@ from kunjin.funds.peers.research import (
     build_portfolio_overlap_report,
 )
 from kunjin.funds.store import FundDisclosureStore
+from kunjin.models import StoredPosition
 from kunjin.storage.repository import Repository
 
 _FUND_CODE = re.compile(r"^[0-9]{6}$", flags=re.ASCII)
 _ACTION_IDS = ("fact_research", "continue_holding")
+_CANDIDATE_PROJECTION_UNKNOWNS = "_candidate_projection_unknown_fields"
 _RELATIONSHIP_FINDINGS = {
     "disclosed_overlap": "disclosed_security_duplication",
     "same_current_benchmark": "same_current_benchmark_text",
@@ -124,6 +126,34 @@ def _coverage(
     )
     result.validate()
     return result
+
+
+def build_authenticated_portfolio_binding(
+    repository: Repository,
+    positions: Sequence[StoredPosition],
+) -> PortfolioEvidenceBinding:
+    """Build the same authenticated/unbound binding used by DiagnosisService."""
+    position_tuple = tuple(positions)
+    sync = repository.latest_successful_sync("yangjibao")
+    observed_at = max(
+        _utc(item.observed_at, "position observation") for item in position_tuple
+    )
+    authenticated = sync is not None and sync.get("id") is not None
+    binding = PortfolioEvidenceBinding(
+        positions=position_tuple,
+        snapshot_complete=authenticated,
+        observation_version=(
+            f"sync_run_{int(sync['id'])}" if authenticated else "portfolio_unavailable"
+        ),
+        observed_at=observed_at,
+        source_state="authenticated_cache" if authenticated else "unbound",
+        request_id=None,
+        request_mode=None,
+        request_started_at=None,
+        request_deadline_at=None,
+    )
+    binding.validate()
+    return binding
 
 
 def _relationship(source: RelationshipEvidence) -> DiagnosisRelationship:
@@ -263,6 +293,46 @@ def _candidate_label(
     return "insufficient_data"
 
 
+def project_candidate_impact(
+    candidate_fund_code: str,
+    bundle: DisclosureBundle,
+    relationships: Tuple[DiagnosisRelationship, ...],
+    comparison_report: Mapping[str, object],
+) -> CandidateImpact:
+    """Project existing Phase 3 labels from already-calculated local evidence."""
+    as_of = comparison_report.get("as_of")
+    if type(as_of) is not datetime:
+        raise ValueError("candidate comparison report requires an as-of time")
+    candidate_unknown = set(_candidate_unknown_fields(bundle, as_of))
+    additional_unknown = comparison_report.get(_CANDIDATE_PROJECTION_UNKNOWNS, ())
+    if not isinstance(additional_unknown, (list, tuple)) or any(
+        type(item) is not str for item in additional_unknown
+    ):
+        raise ValueError("candidate projection unknown fields must be strings")
+    candidate_unknown.update(additional_unknown)
+    disclosed_weight, observed_overlap, overlap_unknown = _candidate_overlap(
+        comparison_report,
+        candidate_fund_code,
+    )
+    candidate_unknown.update(overlap_unknown)
+    candidate_unknown_tuple = tuple(sorted(candidate_unknown))
+    candidate_impact = CandidateImpact(
+        fund_code=candidate_fund_code,
+        label=_candidate_label(
+            relationships,
+            disclosed_weight,
+            observed_overlap,
+            candidate_unknown_tuple,
+        ),
+        relationship_ids=tuple(sorted(item.relationship_id for item in relationships)),
+        disclosed_weight=disclosed_weight,
+        observed_overlap=observed_overlap,
+        unknown_fields=candidate_unknown_tuple,
+    )
+    candidate_impact.validate()
+    return candidate_impact
+
+
 class DiagnosisService:
     def __init__(
         self,
@@ -317,23 +387,7 @@ class DiagnosisService:
             return result
 
         analysis = analyze_portfolio(positions)
-        sync = self._repository.latest_successful_sync("yangjibao")
-        observed_at = max(_utc(item.observed_at, "position observation") for item in positions)
-        authenticated = sync is not None and sync.get("id") is not None
-        binding = PortfolioEvidenceBinding(
-            positions=positions,
-            snapshot_complete=authenticated,
-            observation_version=(
-                f"sync_run_{int(sync['id'])}" if authenticated else "portfolio_unavailable"
-            ),
-            observed_at=observed_at,
-            source_state="authenticated_cache" if authenticated else "unbound",
-            request_id=None,
-            request_mode=None,
-            request_started_at=None,
-            request_deadline_at=None,
-        )
-        binding.validate()
+        binding = build_authenticated_portfolio_binding(self._repository, positions)
 
         bundles = {
             code: self._disclosure_store.load_bundle(code) for code in held_codes
@@ -407,14 +461,11 @@ class DiagnosisService:
             candidate_relationships = tuple(
                 item for item in relationships if candidate_fund_code in item.fund_codes
             )
-            candidate_unknown = set(
-                _candidate_unknown_fields(bundles[candidate_fund_code], as_of)
-            )
-            candidate_unknown.update(
+            candidate_unknown = {
                 item
                 for item in projection_failures
                 if item.endswith(f"_{candidate_fund_code}")
-            )
+            }
             candidate_unknown.update(candidate_d2.missing_fields)
             candidate_unknown.update(candidate_d2.conflicts)
             explicit_codes = (*held_codes[:9], candidate_fund_code)
@@ -426,34 +477,19 @@ class DiagnosisService:
                     positions,
                     as_of,
                 )
-                disclosed_weight, observed_overlap, overlap_unknown = _candidate_overlap(
-                    explicit_report,
-                    candidate_fund_code,
-                )
             except (KeyError, TypeError, ValueError):
-                disclosed_weight, observed_overlap, overlap_unknown = (
-                    None,
-                    None,
-                    ("candidate_overlap",),
-                )
-            candidate_unknown.update(overlap_unknown)
-            candidate_unknown_tuple = tuple(sorted(candidate_unknown))
-            candidate_impact = CandidateImpact(
-                fund_code=candidate_fund_code,
-                label=_candidate_label(
-                    candidate_relationships,
-                    disclosed_weight,
-                    observed_overlap,
-                    candidate_unknown_tuple,
-                ),
-                relationship_ids=tuple(
-                    sorted(item.relationship_id for item in candidate_relationships)
-                ),
-                disclosed_weight=disclosed_weight,
-                observed_overlap=observed_overlap,
-                unknown_fields=candidate_unknown_tuple,
+                explicit_report = {}
+            projection_report = {
+                **explicit_report,
+                "as_of": as_of,
+                _CANDIDATE_PROJECTION_UNKNOWNS: tuple(sorted(candidate_unknown)),
+            }
+            candidate_impact = project_candidate_impact(
+                candidate_fund_code,
+                bundles[candidate_fund_code],
+                candidate_relationships,
+                projection_report,
             )
-            candidate_impact.validate()
 
         findings = []
         if analysis.hhi is not None:
