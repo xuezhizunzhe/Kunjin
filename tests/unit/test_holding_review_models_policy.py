@@ -1,30 +1,43 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from kunjin.decision.models import ActionKind
+from kunjin.brief.models import OfficialEventCode
+from kunjin.decision.models import ActionKind, canonical_json_bytes
 from kunjin.holding_review.models import (
     ActionReviewSourceSufficiency,
     AdjudicationDecision,
+    BindingState,
     ConditionalReviewUsability,
+    EvidenceDelta,
     EvidenceReadiness,
     ExitReason,
     FlowStatus,
+    HeldReviewOfficialEventProjection,
     HistoryComparability,
+    HoldingReviewInputs,
+    HoldingReviewOutcome,
     HoldingReviewResult,
+    HoldingReviewSnapshot,
+    OfficialAnnouncementContent,
     RedemptionComponentState,
     RedemptionEvidence,
     RedemptionFeasibility,
     RemainderIntent,
     ReviewBoundary,
     ReviewDisposition,
+    ReviewEvidenceItem,
+    ThesisEvidenceAdjudication,
+    ThesisMatchProjection,
     ThesisMatchProjectionState,
     ThesisMatchState,
     ThesisReviewReadiness,
+    TransientHoldingReviewOutcome,
     TriggeredReviewCode,
     UseOfProceeds,
 )
@@ -32,20 +45,22 @@ from kunjin.holding_review.policy import (
     HELD_FUND_MANUAL_REVIEW_POLICY_V1_GOLDEN_CHECKSUM,
     HeldFundManualReviewPolicyV1,
 )
+from kunjin.intelligence.models import LineageKind
 
 NOW = datetime(2026, 7, 19, 4, 0, tzinfo=timezone.utc)
 CHECKSUM = "a" * 64
 
 
 def redemption_evidence() -> RedemptionEvidence:
+    missing = RedemptionComponentState.MISSING
     return RedemptionEvidence(
-        current_position=RedemptionComponentState.USABLE,
-        exact_share_class=RedemptionComponentState.USABLE,
-        applicable_holding_period_tier=RedemptionComponentState.MISSING,
-        channel_rule=RedemptionComponentState.MISSING,
-        current_redemption_restriction=RedemptionComponentState.USABLE,
-        applicable_fee_schedule=RedemptionComponentState.USABLE,
-        settlement_rule=RedemptionComponentState.MISSING,
+        current_position=missing,
+        exact_share_class=missing,
+        applicable_holding_period_tier=missing,
+        channel_rule=missing,
+        current_redemption_restriction=missing,
+        applicable_fee_schedule=missing,
+        settlement_rule=missing,
     )
 
 
@@ -72,6 +87,13 @@ def review_result(**changes: object) -> HoldingReviewResult:
         "action_review_source_sufficiency": ActionReviewSourceSufficiency.SUFFICIENT,
         "hard_event_review": False,
         "evidence_ids": ("evidence_a",),
+        "evidence_delta": EvidenceDelta(
+            history_comparability=HistoryComparability.NOT_AVAILABLE,
+            evidence_unchanged=False,
+        ),
+        "remainder_intent": RemainderIntent.UNKNOWN,
+        "exit_reason": ExitReason.UNKNOWN,
+        "use_of_proceeds": UseOfProceeds.UNKNOWN,
         "policy_version": "1",
         "policy_checksum": CHECKSUM,
         "created_at": NOW,
@@ -174,6 +196,7 @@ def test_every_closed_enum_has_the_reviewed_values() -> None:
         "partial",
         "not_testable",
     )
+    assert tuple(item.value for item in BindingState) == ("present", "missing")
 
 
 def test_minimal_review_result_is_canonical_and_valid() -> None:
@@ -313,3 +336,484 @@ def test_policy_rejects_subclasses() -> None:
 
     with pytest.raises(ValueError, match="subclasses"):
         DerivedPolicy().validate()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"flow_status": FlowStatus.PARTIAL},
+        {"flow_status": FlowStatus.FAILED},
+        {"evidence_readiness": EvidenceReadiness.PARTIAL},
+        {"evidence_readiness": EvidenceReadiness.INSUFFICIENT_DATA},
+        {"thesis_review_state": ThesisMatchState.THESIS_MISSING},
+        {"thesis_review_state": ThesisMatchState.MANUAL_REVIEW_PENDING},
+        {"thesis_review_state": ThesisMatchState.MANUAL_REVIEW_UNCERTAIN},
+        {"thesis_review_state": ThesisMatchState.PRESENTED_MATCH_CONFIRMED},
+        {"hard_event_review": True},
+        {"triggered_reviews": (TriggeredReviewCode.MANAGER_CHANGE_REVIEW,)},
+    ),
+)
+def test_continue_observing_requires_a_closed_complete_negative_check(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="continue observing evidence is incomplete"):
+        review_result(**changes).validate()
+
+
+def test_bare_hard_event_boolean_cannot_bypass_action_source_sufficiency() -> None:
+    result = review_result(
+        action=ActionKind.FULL_EXIT,
+        review_disposition=ReviewDisposition.EXIT_REVIEW,
+        thesis_review_state=ThesisMatchState.PRESENTED_MATCH_CONFIRMED,
+        action_review_source_sufficiency=ActionReviewSourceSufficiency.INSUFFICIENT_DATA,
+        hard_event_review=True,
+        triggered_reviews=(),
+        redemption_feasibility=RedemptionFeasibility.INSUFFICIENT_DATA,
+    )
+    with pytest.raises(ValueError, match="authenticated hard-event trigger"):
+        result.validate()
+
+
+def test_non_hard_trigger_cannot_bypass_action_source_sufficiency() -> None:
+    result = review_result(
+        action=ActionKind.FULL_EXIT,
+        review_disposition=ReviewDisposition.EXIT_REVIEW,
+        thesis_review_state=ThesisMatchState.PRESENTED_MATCH_CONFIRMED,
+        action_review_source_sufficiency=ActionReviewSourceSufficiency.INSUFFICIENT_DATA,
+        hard_event_review=True,
+        triggered_reviews=(TriggeredReviewCode.MANAGER_CHANGE_REVIEW,),
+        redemption_feasibility=RedemptionFeasibility.INSUFFICIENT_DATA,
+    )
+    with pytest.raises(ValueError, match="authenticated hard-event trigger"):
+        result.validate()
+
+
+def test_redemption_feasibility_must_match_all_seven_components() -> None:
+    usable = RedemptionComponentState.USABLE
+    complete = RedemptionEvidence(usable, usable, usable, usable, usable, usable, usable)
+    replace(
+        review_result(),
+        action=ActionKind.FULL_EXIT,
+        review_disposition=ReviewDisposition.ABSTAIN,
+        redemption_feasibility=RedemptionFeasibility.EVIDENCE_COMPLETE_NON_AUTHORIZING,
+        redemption_evidence=complete,
+    ).validate()
+    with pytest.raises(ValueError, match="redemption feasibility"):
+        replace(
+            review_result(),
+            action=ActionKind.FULL_EXIT,
+            review_disposition=ReviewDisposition.ABSTAIN,
+            redemption_feasibility=RedemptionFeasibility.EVIDENCE_COMPLETE_NON_AUTHORIZING,
+            redemption_evidence=replace(
+                complete,
+                applicable_holding_period_tier=RedemptionComponentState.MISSING,
+            ),
+        ).validate()
+    with pytest.raises(ValueError, match="redemption feasibility"):
+        replace(
+            review_result(),
+            action=ActionKind.FULL_EXIT,
+            review_disposition=ReviewDisposition.ABSTAIN,
+            redemption_feasibility=RedemptionFeasibility.RESTRICTED,
+            redemption_evidence=complete,
+        ).validate()
+
+
+def desired_announcement(**changes: object) -> OfficialAnnouncementContent:
+    content = "基金公告正文"
+    values: dict[str, object] = {
+        "brief_request_run_id": 1,
+        "source_attempt_id": 2,
+        "fund_code": "123456",
+        "listing_source_document_id": 3,
+        "canonical_announcement_url": "https://www.fund001.com/fund/123456/notice.html",
+        "announcement_title": "123456基金公告",
+        "announcement_published_at": NOW,
+        "publisher": "交银施罗德基金管理有限公司",
+        "normalized_content": content,
+        "normalized_content_bytes": len(content.encode("utf-8")),
+        "normalized_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "original_source_id": "fund_manager_official_documents",
+        "quoted_source_id": None,
+        "integrity_status": "active",
+        "integrity_checked_at": NOW,
+        "retrieved_at": NOW,
+        "record_checksum": CHECKSUM,
+    }
+    values.update(changes)
+    value = OfficialAnnouncementContent(**values)  # type: ignore[arg-type]
+    return replace(value, record_checksum=value.expected_record_checksum())
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://127.0.0.1/fund/123456/notice.html",
+        "https://localhost/fund/123456/notice.html",
+        "https://manager.local/fund/123456/notice.html",
+        "https://WWW.FUND001.COM/fund/123456/notice.html",
+        "https://www.fund001.com/fund/123456/notice.html?access_token=secret",
+    ),
+)
+def test_announcement_rejects_nonpublic_or_noncanonical_urls(url: str) -> None:
+    with pytest.raises(ValueError, match="canonical public HTTPS URL"):
+        desired_announcement(canonical_announcement_url=url).validate()
+
+
+def test_announcement_host_must_bind_exact_registered_manager_publisher() -> None:
+    with pytest.raises(ValueError, match="registered manager"):
+        desired_announcement(publisher="其他基金管理人").validate()
+
+
+@pytest.mark.parametrize(
+    "private_content",
+    (
+        "authorization bearer abc",
+        "access token abc",
+        "local path /private/tmp/input",
+        "exact amount 100",
+        "private value abc",
+    ),
+)
+def test_announcement_content_rejects_private_markers(private_content: str) -> None:
+    with pytest.raises(ValueError, match="private|secret"):
+        desired_announcement(
+            normalized_content=private_content,
+            normalized_content_bytes=len(private_content.encode()),
+            normalized_content_sha256=hashlib.sha256(private_content.encode()).hexdigest(),
+        ).validate()
+
+
+def test_authenticated_record_checksum_detects_key_field_tampering() -> None:
+    value = desired_announcement()
+    value.validate()
+    with pytest.raises(ValueError, match="record checksum does not match"):
+        replace(value, fund_code="654321").validate()
+
+
+def test_publish_before_storage_values_do_not_contain_database_ids() -> None:
+    assert "adjudication_id" not in {field.name for field in fields(ThesisEvidenceAdjudication)}
+    assert "review_snapshot_id" not in {field.name for field in fields(HoldingReviewSnapshot)}
+
+
+def evidence_item() -> ReviewEvidenceItem:
+    return ReviewEvidenceItem(
+        evidence_id="evidence_a",
+        source_tier=1,
+        lineage_kind=LineageKind.ORIGINAL,
+        current=True,
+        graph_closed=True,
+        original_lineage=True,
+        retracted=False,
+        conflicted=False,
+        direct_subject_binding=True,
+    )
+
+
+def desired_event_projection() -> HeldReviewOfficialEventProjection:
+    value = HeldReviewOfficialEventProjection(
+        brief_request_run_id=1,
+        fund_code="123456",
+        announcement_row_id=2,
+        announcement_content_id=3,
+        event_code=OfficialEventCode.MANAGER_CHANGE_NOTICE,
+        triggered_review_code=TriggeredReviewCode.MANAGER_CHANGE_REVIEW,
+        policy_version="1",
+        policy_checksum=CHECKSUM,
+        record_checksum=CHECKSUM,
+    )
+    return replace(value, record_checksum=value.expected_record_checksum())
+
+
+def desired_projection() -> ThesisMatchProjection:
+    value = ThesisMatchProjection(
+        fund_code="123456",
+        thesis_id=4,
+        thesis_fingerprint="b" * 64,
+        intelligence_request_run_id=5,
+        intelligence_snapshot_id=6,
+        intelligence_snapshot_checksum="c" * 64,
+        matcher_policy_version="1",
+        matcher_policy_checksum="d" * 64,
+        projection_state=ThesisMatchProjectionState.POSSIBLE_INVALIDATION_MATCH,
+        evidence_descriptors=(evidence_item(),),
+        evidence_set_checksum=CHECKSUM,
+        created_at=NOW,
+        record_checksum=CHECKSUM,
+    )
+    value = replace(value, evidence_set_checksum=value.expected_evidence_set_checksum())
+    return replace(value, record_checksum=value.expected_record_checksum())
+
+
+def desired_adjudication() -> ThesisEvidenceAdjudication:
+    evidence_ids = ("evidence_a",)
+    value = ThesisEvidenceAdjudication(
+        fund_code="123456",
+        thesis_id=4,
+        thesis_fingerprint="b" * 64,
+        thesis_match_projection_id=7,
+        thesis_match_projection_checksum="e" * 64,
+        intelligence_request_run_id=5,
+        intelligence_snapshot_checksum="c" * 64,
+        evidence_ids=evidence_ids,
+        evidence_set_checksum=hashlib.sha256(canonical_json_bytes(evidence_ids)).hexdigest(),
+        decision=AdjudicationDecision.PRESENTED_MATCH_REJECTED,
+        superseded_adjudication_id=None,
+        created_at=NOW,
+        record_checksum=CHECKSUM,
+    )
+    return replace(value, record_checksum=value.expected_record_checksum())
+
+
+def desired_snapshot() -> HoldingReviewSnapshot:
+    result = review_result()
+    value = HoldingReviewSnapshot(
+        fund_code="123456",
+        action=ActionKind.CONTINUE_HOLDING,
+        brief_request_run_id=1,
+        brief_snapshot_id=2,
+        brief_snapshot_checksum="f" * 64,
+        intelligence_request_run_id=5,
+        intelligence_snapshot_id=6,
+        intelligence_snapshot_checksum="c" * 64,
+        thesis_match_projection_id=7,
+        thesis_match_projection_checksum="e" * 64,
+        active_thesis_state=BindingState.PRESENT,
+        active_thesis_id=4,
+        active_thesis_fingerprint="b" * 64,
+        adjudication_state=BindingState.PRESENT,
+        adjudication_id=8,
+        adjudication_checksum="9" * 64,
+        previous_review_id=None,
+        result=result,
+        result_fingerprint=result.checksum(),
+        policy_version="1",
+        policy_checksum=CHECKSUM,
+        created_at=NOW,
+        semantic_identity_checksum=CHECKSUM,
+        record_checksum=CHECKSUM,
+    )
+    value = replace(
+        value,
+        semantic_identity_checksum=value.expected_semantic_identity_checksum(),
+    )
+    return replace(value, record_checksum=value.expected_record_checksum())
+
+
+def test_every_exact_record_has_a_valid_canonical_roundtrip() -> None:
+    snapshot = desired_snapshot()
+    records = (
+        ReviewBoundary(),
+        redemption_evidence(),
+        desired_announcement(),
+        desired_event_projection(),
+        evidence_item(),
+        desired_projection(),
+        desired_adjudication(),
+        EvidenceDelta(HistoryComparability.NOT_AVAILABLE, False),
+        HoldingReviewInputs.minimal(
+            fund_code="123456",
+            action=ActionKind.CONTINUE_HOLDING,
+            brief_request_run_id=1,
+            intelligence_request_run_id=2,
+            now=NOW,
+            policy_checksum=CHECKSUM,
+        ),
+        review_result(),
+        snapshot,
+        HoldingReviewOutcome(FlowStatus.COMPLETE, snapshot),
+        TransientHoldingReviewOutcome(
+            FlowStatus.PARTIAL,
+            None,
+            ("intelligence_snapshot_missing",),
+        ),
+    )
+    for record in records:
+        record.validate()
+        encoded = record.canonical_json()
+        assert encoded == json.dumps(
+            json.loads(encoded), ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode("ascii")
+
+
+@pytest.mark.parametrize(
+    "factory,changes",
+    (
+        (desired_announcement, {"source_attempt_id": 99}),
+        (desired_event_projection, {"announcement_content_id": 99}),
+        (desired_projection, {"intelligence_snapshot_id": 99}),
+        (desired_adjudication, {"decision": AdjudicationDecision.UNCERTAIN}),
+        (desired_snapshot, {"previous_review_id": 99}),
+    ),
+)
+def test_each_authenticated_record_rejects_business_field_tampering(
+    factory: object,
+    changes: dict[str, object],
+) -> None:
+    value = factory()  # type: ignore[operator]
+    with pytest.raises(ValueError, match="record checksum does not match"):
+        replace(value, **changes).validate()
+
+
+def test_authenticated_pre_checksum_payload_excludes_only_record_checksum() -> None:
+    for value in (
+        desired_announcement(),
+        desired_event_projection(),
+        desired_projection(),
+        desired_adjudication(),
+        desired_snapshot(),
+    ):
+        assert "record_checksum" not in value.pre_checksum_canonical_dict()
+        assert value.to_canonical_dict()["record_checksum"] == value.record_checksum
+        assert value.expected_record_checksum() == value.record_checksum
+
+
+def test_snapshot_semantic_identity_excludes_time_and_history_but_record_covers_them() -> None:
+    original = desired_snapshot()
+    changed = replace(
+        original,
+        previous_review_id=99,
+        created_at=NOW + timedelta(minutes=1),
+    )
+    assert changed.expected_semantic_identity_checksum() == original.semantic_identity_checksum
+    changed = replace(
+        changed,
+        semantic_identity_checksum=changed.expected_semantic_identity_checksum(),
+    )
+    assert changed.expected_record_checksum() != original.record_checksum
+    changed = replace(changed, record_checksum=changed.expected_record_checksum())
+    changed.validate()
+
+
+def test_projection_thesis_missing_state_requires_null_binding_and_empty_evidence() -> None:
+    value = desired_projection()
+    with pytest.raises(ValueError, match="thesis-missing projection"):
+        replace(value, projection_state=ThesisMatchProjectionState.THESIS_MISSING).validate()
+    missing = replace(
+        value,
+        thesis_id=None,
+        thesis_fingerprint=None,
+        projection_state=ThesisMatchProjectionState.THESIS_MISSING,
+        evidence_descriptors=(),
+    )
+    missing = replace(
+        missing,
+        evidence_set_checksum=missing.expected_evidence_set_checksum(),
+    )
+    missing = replace(missing, record_checksum=missing.expected_record_checksum())
+    missing.validate()
+
+
+def test_evidence_descriptor_rejects_free_string_lineage() -> None:
+    with pytest.raises(ValueError, match="exact LineageKind"):
+        replace(evidence_item(), lineage_kind="original").validate()  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "event_code,trigger",
+    (
+        (
+            OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+            TriggeredReviewCode.FULL_EXIT_FEASIBILITY_REVIEW,
+        ),
+        (
+            OfficialEventCode.FUND_TERMINATION_NOTICE,
+            TriggeredReviewCode.FULL_EXIT_FEASIBILITY_REVIEW,
+        ),
+        (
+            OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE,
+            TriggeredReviewCode.REDEMPTION_RESTRICTION_REVIEW,
+        ),
+        (OfficialEventCode.MANAGER_CHANGE_NOTICE, TriggeredReviewCode.MANAGER_CHANGE_REVIEW),
+        (OfficialEventCode.FEE_CHANGE_NOTICE, TriggeredReviewCode.FEE_CHANGE_REVIEW),
+        (OfficialEventCode.BENCHMARK_CHANGE_NOTICE, TriggeredReviewCode.BENCHMARK_CHANGE_REVIEW),
+    ),
+)
+def test_official_event_projection_has_one_fixed_nonempty_trigger(
+    event_code: OfficialEventCode,
+    trigger: TriggeredReviewCode,
+) -> None:
+    value = replace(
+        desired_event_projection(),
+        event_code=event_code,
+        triggered_review_code=trigger,
+    )
+    value = replace(value, record_checksum=value.expected_record_checksum())
+    value.validate()
+    wrong = replace(value, triggered_review_code=TriggeredReviewCode.BENCHMARK_CHANGE_REVIEW)
+    if trigger is not TriggeredReviewCode.BENCHMARK_CHANGE_REVIEW:
+        with pytest.raises(ValueError, match="do not match"):
+            wrong.validate()
+
+
+def test_snapshot_rejects_failed_or_incoherent_thesis_and_adjudication_bindings() -> None:
+    snapshot = desired_snapshot()
+    failed_result = replace(
+        snapshot.result,
+        flow_status=FlowStatus.FAILED,
+        evidence_readiness=EvidenceReadiness.INSUFFICIENT_DATA,
+        review_disposition=ReviewDisposition.ABSTAIN,
+    )
+    with pytest.raises(ValueError, match="failed holding review"):
+        replace(
+            snapshot,
+            result=failed_result,
+            result_fingerprint=failed_result.checksum(),
+        ).validate()
+    with pytest.raises(ValueError, match="active thesis state"):
+        replace(snapshot, active_thesis_state=BindingState.MISSING).validate()
+    with pytest.raises(ValueError, match="adjudication state"):
+        replace(snapshot, adjudication_state=BindingState.MISSING).validate()
+
+
+def test_action_review_requires_confirmed_thesis_or_authenticated_hard_event() -> None:
+    incomplete = RedemptionEvidence(
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.MISSING,
+        RedemptionComponentState.MISSING,
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.USABLE,
+        RedemptionComponentState.MISSING,
+    )
+    with pytest.raises(ValueError, match="confirmed thesis evidence or a hard event"):
+        review_result(
+            action=ActionKind.FULL_EXIT,
+            thesis_review_state=ThesisMatchState.NO_MATCHING_EVIDENCE,
+            review_disposition=ReviewDisposition.EXIT_REVIEW,
+            redemption_feasibility=RedemptionFeasibility.INSUFFICIENT_DATA,
+            redemption_evidence=incomplete,
+        ).validate()
+
+
+def test_redemption_restriction_requires_exact_component_and_trigger_pair() -> None:
+    restricted = replace(
+        redemption_evidence(),
+        current_redemption_restriction=RedemptionComponentState.RESTRICTED,
+    )
+    with pytest.raises(ValueError, match="authenticated review trigger"):
+        review_result(
+            action=ActionKind.FULL_EXIT,
+            review_disposition=ReviewDisposition.ABSTAIN,
+            redemption_feasibility=RedemptionFeasibility.RESTRICTED,
+            redemption_evidence=restricted,
+        ).validate()
+    review_result(
+        action=ActionKind.FULL_EXIT,
+        review_disposition=ReviewDisposition.ABSTAIN,
+        redemption_feasibility=RedemptionFeasibility.RESTRICTED,
+        redemption_evidence=restricted,
+        triggered_reviews=(TriggeredReviewCode.REDEMPTION_RESTRICTION_REVIEW,),
+    ).validate()
+
+
+def test_bounded_content_above_public_text_limit_is_validated_without_truncation() -> None:
+    content = "基金公告正文。" * 800
+    value = desired_announcement(
+        normalized_content=content,
+        normalized_content_bytes=len(content.encode()),
+        normalized_content_sha256=hashlib.sha256(content.encode()).hexdigest(),
+    )
+    value.validate()
+    assert value.normalized_content == content
+    assert value.to_canonical_dict()["normalized_content"] == content

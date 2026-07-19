@@ -1,6 +1,7 @@
 from kunjin.holding_review.models import (
     ActionReviewSourceSufficiency,
     AdjudicationDecision,
+    BindingState,
     ConditionalReviewUsability,
     EvidenceDelta,
     EvidenceReadiness,
@@ -37,6 +38,7 @@ from kunjin.holding_review.policy import (
 __all__ = (
     "ActionReviewSourceSufficiency",
     "AdjudicationDecision",
+    "BindingState",
     "ConditionalReviewUsability",
     "EvidenceDelta",
     "EvidenceReadiness",

@@ -6,11 +6,10 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 from kunjin.brief.models import OfficialEventCode
 from kunjin.decision.models import (
-    MAX_PUBLIC_TEXT_CHARS,
     ActionKind,
     canonical_json_bytes,
     canonical_value,
@@ -22,12 +21,32 @@ from kunjin.decision.models import (
     validate_public_text,
     validate_version,
 )
+from kunjin.funds.official_domains import FUND_COMPANY_DOMAINS
+from kunjin.intelligence.models import (
+    LineageKind,
+    _freeze_public_tree,
+    _validate_public_https_url,
+    _validate_public_tree,
+)
 
 _FUND_CODE_PATTERN = re.compile(r"^[0-9]{6}$")
+_MAX_ANNOUNCEMENT_CONTENT_BYTES = 512 * 1024
+_PUBLIC_TEXT_CHUNK_CHARS = 3_840
+_PUBLIC_TEXT_CHUNK_OVERLAP = 128
 _ALLOWED_ACTIONS = frozenset(
     (ActionKind.CONTINUE_HOLDING, ActionKind.REDUCE_TO_CASH, ActionKind.FULL_EXIT)
 )
-_MAX_ANNOUNCEMENT_CONTENT_BYTES = 512 * 1024
+_REVIEWED_PUBLIC_BOUNDARY_KEYS = frozenset(("exact_amount_available",))
+_SUPPORTED_OFFICIAL_EVENTS = frozenset(
+    (
+        OfficialEventCode.FUND_LIQUIDATION_NOTICE,
+        OfficialEventCode.FUND_TERMINATION_NOTICE,
+        OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE,
+        OfficialEventCode.MANAGER_CHANGE_NOTICE,
+        OfficialEventCode.FEE_CHANGE_NOTICE,
+        OfficialEventCode.BENCHMARK_CHANGE_NOTICE,
+    )
+)
 
 
 class FlowStatus(str, Enum):
@@ -143,6 +162,11 @@ class ConditionalReviewUsability(str, Enum):
     NOT_TESTABLE = "not_testable"
 
 
+class BindingState(str, Enum):
+    PRESENT = "present"
+    MISSING = "missing"
+
+
 def _exact_record(value: object, expected: type, name: str) -> None:
     if type(value) is not expected:
         raise ValueError(f"{name} must be an exact {expected.__name__}")
@@ -199,22 +223,6 @@ def _sorted_identifiers(
     return validated
 
 
-def _positive_int_tuple(value: object, name: str, *, allow_empty: bool = True) -> None:
-    if type(value) is not tuple or (not allow_empty and not value):
-        raise ValueError(f"{name} must be an exact tuple")
-    for item in value:
-        _positive_int(item, name)
-    if len(value) != len(set(value)) or value != tuple(sorted(value)):
-        raise ValueError(f"{name} must be a sorted unique exact tuple")
-
-
-def _bool_tuple(value: object, name: str, expected_length: int) -> None:
-    if type(value) is not tuple or len(value) != expected_length:
-        raise ValueError(f"{name} must align with the evidence set")
-    for item in value:
-        _exact_bool(item, name)
-
-
 def _enum_tuple(value: object, enum_type: type[Enum], name: str) -> None:
     if type(value) is not tuple:
         raise ValueError(f"{name} must be an exact tuple")
@@ -224,43 +232,96 @@ def _enum_tuple(value: object, enum_type: type[Enum], name: str) -> None:
         raise ValueError(f"{name} must be unique")
 
 
-def _https_url(value: object, name: str) -> str:
-    if type(value) is not str or len(value) > MAX_PUBLIC_TEXT_CHARS:
-        raise ValueError(f"{name} must be a canonical public HTTPS URL")
-    try:
-        parsed = urlparse(value)
-        port = parsed.port
-    except ValueError:
-        raise ValueError(f"{name} must be a canonical public HTTPS URL") from None
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.hostname != parsed.hostname.lower()
-        or parsed.username is not None
-        or parsed.password is not None
-        or port is not None
-        or parsed.fragment
-    ):
-        raise ValueError(f"{name} must be a canonical public HTTPS URL")
+def _validate_bounded_public_content(value: object, name: str) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{name} must be a non-empty exact string")
+    encoded = value.encode("utf-8")
+    if len(encoded) > _MAX_ANNOUNCEMENT_CONTENT_BYTES:
+        raise ValueError(f"{name} exceeds the bounded byte limit")
+    step = _PUBLIC_TEXT_CHUNK_CHARS - _PUBLIC_TEXT_CHUNK_OVERLAP
+    for offset in range(0, len(value), step):
+        chunk = value[offset : offset + _PUBLIC_TEXT_CHUNK_CHARS]
+        validate_public_text(chunk, name)
+        _validate_public_tree(_freeze_public_tree({"content": chunk}), name)
+    normalized = " ".join(part for part in re.split(r"[\W_]+", value.casefold()) if part)
+    private_markers = (
+        "access token",
+        "authorization bearer",
+        "exact amount",
+        "local path",
+        "private value",
+    )
+    if any(marker in normalized for marker in private_markers):
+        raise ValueError(f"{name} contains a secret or private marker")
     return value
+
+
+def _validate_canonical_public_tree(value: object, name: str) -> None:
+    if type(value) is dict:
+        for key, item in value.items():
+            validate_identifier(key, f"{name} key")
+            if key not in _REVIEWED_PUBLIC_BOUNDARY_KEYS:
+                _validate_public_tree(
+                    _freeze_public_tree({key: "public"}),
+                    f"{name}.{key}",
+                )
+            _validate_canonical_public_tree(item, f"{name}.{key}")
+        return
+    if type(value) is list:
+        for index, item in enumerate(value):
+            _validate_canonical_public_tree(item, f"{name}[{index}]")
+        return
+    if type(value) is str:
+        step = _PUBLIC_TEXT_CHUNK_CHARS - _PUBLIC_TEXT_CHUNK_OVERLAP
+        for offset in range(0, len(value), step):
+            chunk = value[offset : offset + _PUBLIC_TEXT_CHUNK_CHARS]
+            _validate_public_tree(
+                _freeze_public_tree({"value": chunk}),
+                name,
+            )
+        return
+    if type(value) in {int, bool} or value is None:
+        return
+    raise ValueError(f"{name} contains unsupported canonical public data")
 
 
 class _CanonicalRecord:
     def validate(self) -> None:
         raise NotImplementedError
 
-    def to_canonical_dict(self) -> dict:
-        self.validate()
+    def _canonical_fields(self, excluded: frozenset[str] = frozenset()) -> dict:
         return {
             item.name: canonical_value(getattr(self, item.name))
             for item in fields(self)
+            if item.name not in excluded
         }
+
+    def to_canonical_dict(self) -> dict:
+        self.validate()
+        result = self._canonical_fields()
+        _validate_canonical_public_tree(result, type(self).__name__)
+        return result
 
     def canonical_json(self) -> bytes:
         return canonical_json_bytes(self.to_canonical_dict())
 
     def checksum(self) -> str:
         return hashlib.sha256(self.canonical_json()).hexdigest()
+
+
+class _AuthenticatedRecord(_CanonicalRecord):
+    record_checksum: str
+
+    def pre_checksum_canonical_dict(self) -> dict:
+        return self._canonical_fields(frozenset(("record_checksum",)))
+
+    def expected_record_checksum(self) -> str:
+        return hashlib.sha256(canonical_json_bytes(self.pre_checksum_canonical_dict())).hexdigest()
+
+    def _validate_record_checksum(self, name: str) -> None:
+        validate_checksum(self.record_checksum, f"{name} record checksum")
+        if self.record_checksum != self.expected_record_checksum():
+            raise ValueError(f"{name} record checksum does not match")
 
 
 @dataclass(frozen=True)
@@ -295,46 +356,57 @@ class RedemptionEvidence(_CanonicalRecord):
                 f"redemption component {item.name}",
             )
 
+    def component_states(self) -> Tuple[RedemptionComponentState, ...]:
+        self.validate()
+        return tuple(getattr(self, item.name) for item in fields(self))
+
 
 @dataclass(frozen=True)
-class OfficialAnnouncementContent(_CanonicalRecord):
-    fund_code: str
+class OfficialAnnouncementContent(_AuthenticatedRecord):
     brief_request_run_id: int
-    listing_source_document_id: str
+    source_attempt_id: int
+    fund_code: str
+    listing_source_document_id: int
     canonical_announcement_url: str
     announcement_title: str
-    published_at: datetime
+    announcement_published_at: datetime
     publisher: str
-    registered_manager_domain: str
-    lineage_kind: str
+    normalized_content: str
+    normalized_content_bytes: int
+    normalized_content_sha256: str
+    original_source_id: str
+    quoted_source_id: Optional[str]
     integrity_status: str
     integrity_checked_at: datetime
     retrieved_at: datetime
-    normalized_content: str
-    normalized_content_sha256: str
-    normalized_content_bytes: int
+    record_checksum: str
 
     def validate(self) -> None:
         _exact_record(self, OfficialAnnouncementContent, "official announcement content")
-        _fund_code(self.fund_code)
         _positive_int(self.brief_request_run_id, "brief request run id")
-        validate_identifier(self.listing_source_document_id, "listing source document id")
-        _https_url(self.canonical_announcement_url, "announcement URL")
+        _positive_int(self.source_attempt_id, "source attempt id")
+        _fund_code(self.fund_code)
+        _positive_int(self.listing_source_document_id, "listing source document id")
+        _validate_public_https_url(self.canonical_announcement_url, "announcement URL")
+        parsed = urlsplit(self.canonical_announcement_url)
+        if parsed.query or "//" in parsed.path or any(
+            part in {".", ".."} for part in parsed.path.split("/")
+        ):
+            raise ValueError("announcement URL must be a canonical public HTTPS URL")
         validate_public_text(self.announcement_title, "announcement title")
         validate_public_text(self.publisher, "announcement publisher")
-        validate_public_text(self.registered_manager_domain, "registered manager domain")
-        validate_identifier(self.lineage_kind, "announcement lineage kind")
-        validate_identifier(self.integrity_status, "announcement integrity status")
-        _utc(self.published_at, "announcement publication time")
+        if FUND_COMPANY_DOMAINS.get(parsed.hostname or "") != self.publisher:
+            raise ValueError("announcement publisher does not match the registered manager")
+        _utc(self.announcement_published_at, "announcement publication time")
         _utc(self.integrity_checked_at, "announcement integrity check time")
         _utc(self.retrieved_at, "announcement retrieval time")
-        if self.integrity_checked_at < self.published_at or self.retrieved_at < self.published_at:
+        if (
+            self.integrity_checked_at < self.announcement_published_at
+            or self.retrieved_at < self.announcement_published_at
+        ):
             raise ValueError("announcement checks cannot precede publication")
-        if type(self.normalized_content) is not str or not self.normalized_content:
-            raise ValueError("normalized announcement content must be a non-empty exact string")
+        _validate_bounded_public_content(self.normalized_content, "normalized content")
         encoded = self.normalized_content.encode("utf-8")
-        if len(encoded) > _MAX_ANNOUNCEMENT_CONTENT_BYTES:
-            raise ValueError("normalized announcement content exceeds the bounded byte limit")
         if type(self.normalized_content_bytes) is not int or self.normalized_content_bytes != len(
             encoded
         ):
@@ -342,104 +414,170 @@ class OfficialAnnouncementContent(_CanonicalRecord):
         validate_checksum(self.normalized_content_sha256, "normalized content checksum")
         if hashlib.sha256(encoded).hexdigest() != self.normalized_content_sha256:
             raise ValueError("normalized announcement content checksum does not match")
+        validate_identifier(self.original_source_id, "announcement original source id")
+        if self.original_source_id != "fund_manager_official_documents":
+            raise ValueError("announcement original source is not the registered manager source")
+        if self.quoted_source_id is not None:
+            validate_identifier(self.quoted_source_id, "announcement quoted source id")
+            if self.quoted_source_id == self.original_source_id:
+                raise ValueError("announcement quote cannot duplicate its original source")
+        if self.integrity_status not in {"active", "corrected", "retracted"}:
+            raise ValueError("announcement integrity status is unsupported")
+        self._validate_record_checksum("official announcement content")
+
+
+_EVENT_TRIGGER_MAP = {
+    OfficialEventCode.FUND_LIQUIDATION_NOTICE: TriggeredReviewCode.FULL_EXIT_FEASIBILITY_REVIEW,
+    OfficialEventCode.FUND_TERMINATION_NOTICE: TriggeredReviewCode.FULL_EXIT_FEASIBILITY_REVIEW,
+    OfficialEventCode.REDEMPTION_RESTRICTION_NOTICE: (
+        TriggeredReviewCode.REDEMPTION_RESTRICTION_REVIEW
+    ),
+    OfficialEventCode.MANAGER_CHANGE_NOTICE: TriggeredReviewCode.MANAGER_CHANGE_REVIEW,
+    OfficialEventCode.FEE_CHANGE_NOTICE: TriggeredReviewCode.FEE_CHANGE_REVIEW,
+    OfficialEventCode.BENCHMARK_CHANGE_NOTICE: TriggeredReviewCode.BENCHMARK_CHANGE_REVIEW,
+}
 
 
 @dataclass(frozen=True)
-class HeldReviewOfficialEventProjection(_CanonicalRecord):
-    fund_code: str
+class HeldReviewOfficialEventProjection(_AuthenticatedRecord):
     brief_request_run_id: int
+    fund_code: str
+    announcement_row_id: int
     announcement_content_id: int
     event_code: OfficialEventCode
-    triggered_review: Optional[TriggeredReviewCode]
-    active: bool
-    corrected: bool
-    retracted: bool
+    triggered_review_code: TriggeredReviewCode
     policy_version: str
     policy_checksum: str
-    created_at: datetime
     record_checksum: str
 
     def validate(self) -> None:
         _exact_record(self, HeldReviewOfficialEventProjection, "official event projection")
-        _fund_code(self.fund_code)
         _positive_int(self.brief_request_run_id, "brief request run id")
+        _fund_code(self.fund_code)
+        _positive_int(self.announcement_row_id, "announcement row id")
         _positive_int(self.announcement_content_id, "announcement content id")
         _exact_enum(self.event_code, OfficialEventCode, "official event code")
-        if self.triggered_review is not None:
-            _exact_enum(self.triggered_review, TriggeredReviewCode, "triggered review code")
-        for value, name in (
-            (self.active, "official event active flag"),
-            (self.corrected, "official event corrected flag"),
-            (self.retracted, "official event retracted flag"),
-        ):
-            _exact_bool(value, name)
-        if self.active and (self.corrected or self.retracted):
-            raise ValueError("corrected or retracted official events cannot be active")
+        if self.event_code not in _SUPPORTED_OFFICIAL_EVENTS:
+            raise ValueError("official event code is not supported by Phase 5")
+        _exact_enum(
+            self.triggered_review_code,
+            TriggeredReviewCode,
+            "triggered review code",
+        )
+        if _EVENT_TRIGGER_MAP[self.event_code] is not self.triggered_review_code:
+            raise ValueError("official event and triggered review code do not match")
         validate_version(self.policy_version, "official event policy version")
         validate_checksum(self.policy_checksum, "official event policy checksum")
-        _utc(self.created_at, "official event projection creation time")
-        validate_checksum(self.record_checksum, "official event projection record checksum")
+        self._validate_record_checksum("official event projection")
 
 
 @dataclass(frozen=True)
-class ThesisMatchProjection(_CanonicalRecord):
+class ReviewEvidenceItem(_CanonicalRecord):
+    evidence_id: str
+    source_tier: int
+    lineage_kind: LineageKind
+    current: bool
+    graph_closed: bool
+    original_lineage: bool
+    retracted: bool
+    conflicted: bool
+    direct_subject_binding: bool
+
+    def validate(self) -> None:
+        _exact_record(self, ReviewEvidenceItem, "review evidence item")
+        validate_identifier(self.evidence_id, "review evidence id")
+        if type(self.source_tier) is not int or self.source_tier not in (1, 2):
+            raise ValueError("review evidence source tier must be exact 1 or 2")
+        _exact_enum(self.lineage_kind, LineageKind, "review evidence lineage kind")
+        for item in fields(self)[3:]:
+            _exact_bool(getattr(self, item.name), item.name.replace("_", " "))
+        if self.original_lineage != (self.lineage_kind is LineageKind.ORIGINAL):
+            raise ValueError("review evidence lineage fields are inconsistent")
+
+
+def _evidence_set_checksum(items: Tuple[ReviewEvidenceItem, ...]) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "evidence_descriptors": [item.to_canonical_dict() for item in items],
+                "evidence_ids": [item.evidence_id for item in items],
+            }
+        )
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class ThesisMatchProjection(_AuthenticatedRecord):
     fund_code: str
-    thesis_id: int
-    thesis_fingerprint: str
+    thesis_id: Optional[int]
+    thesis_fingerprint: Optional[str]
+    intelligence_request_run_id: int
+    intelligence_snapshot_id: int
+    intelligence_snapshot_checksum: str
     matcher_policy_version: str
     matcher_policy_checksum: str
-    intelligence_request_run_id: int
-    intelligence_snapshot_checksum: str
     projection_state: ThesisMatchProjectionState
-    evidence_ids: Tuple[str, ...]
-    source_tiers: Tuple[int, ...]
-    lineage_kinds: Tuple[str, ...]
-    current_flags: Tuple[bool, ...]
-    integrity_flags: Tuple[bool, ...]
-    conflict_flags: Tuple[bool, ...]
-    direct_subject_binding_flags: Tuple[bool, ...]
+    evidence_descriptors: Tuple[ReviewEvidenceItem, ...]
+    evidence_set_checksum: str
     created_at: datetime
     record_checksum: str
+
+    @property
+    def evidence_ids(self) -> Tuple[str, ...]:
+        return tuple(item.evidence_id for item in self.evidence_descriptors)
+
+    @property
+    def source_tiers(self) -> Tuple[int, ...]:
+        return tuple(item.source_tier for item in self.evidence_descriptors)
+
+    @property
+    def lineage_kinds(self) -> Tuple[str, ...]:
+        return tuple(item.lineage_kind.value for item in self.evidence_descriptors)
+
+    def expected_evidence_set_checksum(self) -> str:
+        return _evidence_set_checksum(self.evidence_descriptors)
 
     def validate(self) -> None:
         _exact_record(self, ThesisMatchProjection, "thesis match projection")
         _fund_code(self.fund_code)
-        _positive_int(self.thesis_id, "thesis id")
-        validate_checksum(self.thesis_fingerprint, "thesis fingerprint")
+        _optional_positive_int(self.thesis_id, "thesis id")
+        if (self.thesis_id is None) != (self.thesis_fingerprint is None):
+            raise ValueError("projection thesis id and fingerprint must be paired")
+        if self.thesis_fingerprint is not None:
+            validate_checksum(self.thesis_fingerprint, "thesis fingerprint")
+        _positive_int(self.intelligence_request_run_id, "intelligence request run id")
+        _positive_int(self.intelligence_snapshot_id, "intelligence snapshot id")
+        validate_checksum(self.intelligence_snapshot_checksum, "intelligence snapshot checksum")
         validate_version(self.matcher_policy_version, "matcher policy version")
         validate_checksum(self.matcher_policy_checksum, "matcher policy checksum")
-        _positive_int(self.intelligence_request_run_id, "intelligence request run id")
-        validate_checksum(self.intelligence_snapshot_checksum, "intelligence snapshot checksum")
         _exact_enum(self.projection_state, ThesisMatchProjectionState, "projection state")
-        _sorted_identifiers(self.evidence_ids, "projection evidence ids")
-        count = len(self.evidence_ids)
-        if type(self.source_tiers) is not tuple or len(self.source_tiers) != count:
-            raise ValueError("projection source tiers must align with the evidence set")
-        if any(type(item) is not int or item not in (1, 2) for item in self.source_tiers):
-            raise ValueError("projection source tiers must contain exact public tier integers")
-        if type(self.lineage_kinds) is not tuple or len(self.lineage_kinds) != count:
-            raise ValueError("projection lineage kinds must align with the evidence set")
-        for item in self.lineage_kinds:
-            validate_identifier(item, "projection lineage kind")
-        for values, name in (
-            (self.current_flags, "projection current flags"),
-            (self.integrity_flags, "projection integrity flags"),
-            (self.conflict_flags, "projection conflict flags"),
-            (self.direct_subject_binding_flags, "projection direct subject flags"),
-        ):
-            _bool_tuple(values, name, count)
-        has_evidence = bool(self.evidence_ids)
-        if has_evidence != (
+        if type(self.evidence_descriptors) is not tuple:
+            raise ValueError("projection evidence descriptors must be an exact tuple")
+        for item in self.evidence_descriptors:
+            if type(item) is not ReviewEvidenceItem:
+                raise ValueError("projection evidence descriptors must contain exact records")
+            item.validate()
+        if self.evidence_ids != tuple(sorted(set(self.evidence_ids))):
+            raise ValueError("projection evidence ids must be sorted and unique")
+        has_evidence = bool(self.evidence_descriptors)
+        if self.projection_state is ThesisMatchProjectionState.THESIS_MISSING:
+            if self.thesis_id is not None or has_evidence:
+                raise ValueError("thesis-missing projection cannot bind a thesis or evidence")
+        elif self.thesis_id is None:
+            raise ValueError("non-missing projection requires a bound thesis")
+        elif has_evidence != (
             self.projection_state is ThesisMatchProjectionState.POSSIBLE_INVALIDATION_MATCH
         ):
-            raise ValueError("projection state and evidence set are inconsistent")
+            raise ValueError("projection state and evidence descriptors are inconsistent")
+        validate_checksum(self.evidence_set_checksum, "projection evidence-set checksum")
+        if self.evidence_set_checksum != self.expected_evidence_set_checksum():
+            raise ValueError("projection evidence-set checksum does not match")
         _utc(self.created_at, "thesis match projection creation time")
-        validate_checksum(self.record_checksum, "thesis match projection record checksum")
+        self._validate_record_checksum("thesis match projection")
 
 
 @dataclass(frozen=True)
-class ThesisEvidenceAdjudication(_CanonicalRecord):
-    adjudication_id: int
+class ThesisEvidenceAdjudication(_AuthenticatedRecord):
     fund_code: str
     thesis_id: int
     thesis_fingerprint: str
@@ -452,12 +590,10 @@ class ThesisEvidenceAdjudication(_CanonicalRecord):
     decision: AdjudicationDecision
     superseded_adjudication_id: Optional[int]
     created_at: datetime
-    semantic_identity_checksum: str
     record_checksum: str
 
     def validate(self) -> None:
         _exact_record(self, ThesisEvidenceAdjudication, "thesis evidence adjudication")
-        _positive_int(self.adjudication_id, "adjudication id")
         _fund_code(self.fund_code)
         _positive_int(self.thesis_id, "thesis id")
         validate_checksum(self.thesis_fingerprint, "thesis fingerprint")
@@ -469,18 +605,13 @@ class ThesisEvidenceAdjudication(_CanonicalRecord):
         validate_checksum(self.intelligence_snapshot_checksum, "intelligence snapshot checksum")
         _sorted_identifiers(self.evidence_ids, "adjudication evidence ids", allow_empty=False)
         validate_checksum(self.evidence_set_checksum, "adjudication evidence-set checksum")
-        expected_evidence_checksum = hashlib.sha256(
-            canonical_json_bytes(self.evidence_ids)
-        ).hexdigest()
-        if self.evidence_set_checksum != expected_evidence_checksum:
+        expected = hashlib.sha256(canonical_json_bytes(self.evidence_ids)).hexdigest()
+        if self.evidence_set_checksum != expected:
             raise ValueError("adjudication evidence-set checksum does not match")
         _exact_enum(self.decision, AdjudicationDecision, "adjudication decision")
         _optional_positive_int(self.superseded_adjudication_id, "superseded adjudication id")
-        if self.superseded_adjudication_id == self.adjudication_id:
-            raise ValueError("an adjudication cannot supersede itself")
         _utc(self.created_at, "adjudication creation time")
-        validate_checksum(self.semantic_identity_checksum, "semantic identity checksum")
-        validate_checksum(self.record_checksum, "adjudication record checksum")
+        self._validate_record_checksum("thesis evidence adjudication")
 
 
 @dataclass(frozen=True)
@@ -508,30 +639,6 @@ class EvidenceDelta(_CanonicalRecord):
             or self.reason_codes
         ):
             raise ValueError("unchanged evidence requires closed comparable history")
-
-
-@dataclass(frozen=True)
-class ReviewEvidenceItem(_CanonicalRecord):
-    evidence_id: str
-    source_tier: int
-    lineage_kind: str
-    current: bool
-    graph_closed: bool
-    original_lineage: bool
-    retracted: bool
-    conflicted: bool
-    direct_subject_binding: bool
-
-    def validate(self) -> None:
-        _exact_record(self, ReviewEvidenceItem, "review evidence item")
-        validate_identifier(self.evidence_id, "review evidence id")
-        if type(self.source_tier) is not int or self.source_tier not in (1, 2):
-            raise ValueError("review evidence source tier must be exact 1 or 2")
-        validate_identifier(self.lineage_kind, "review evidence lineage kind")
-        for item in fields(self)[3:]:
-            _exact_bool(getattr(self, item.name), item.name.replace("_", " "))
-        if self.original_lineage != (self.lineage_kind == "original"):
-            raise ValueError("review evidence lineage fields are inconsistent")
 
 
 @dataclass(frozen=True)
@@ -609,15 +716,17 @@ class HoldingReviewInputs(_CanonicalRecord):
         _exact_enum(self.thesis_review_state, ThesisMatchState, "thesis review state")
         if type(self.review_evidence_items) is not tuple:
             raise ValueError("review evidence items must be an exact tuple")
-        evidence_ids = []
+        ids = []
         for item in self.review_evidence_items:
             if type(item) is not ReviewEvidenceItem:
                 raise ValueError("review evidence items must contain exact records")
             item.validate()
-            evidence_ids.append(item.evidence_id)
-        if tuple(evidence_ids) != tuple(sorted(set(evidence_ids))):
+            ids.append(item.evidence_id)
+        if tuple(ids) != tuple(sorted(set(ids))):
             raise ValueError("review evidence item ids must be sorted and unique")
         _enum_tuple(self.official_event_codes, OfficialEventCode, "official event codes")
+        if any(item not in _SUPPORTED_OFFICIAL_EVENTS for item in self.official_event_codes):
+            raise ValueError("holding review input contains an unsupported official event")
         for values, name in (
             (self.omitted_work, "omitted work"),
             (self.intelligence_omitted_work, "intelligence omitted work"),
@@ -683,6 +792,10 @@ class HoldingReviewResult(_CanonicalRecord):
     action_review_source_sufficiency: ActionReviewSourceSufficiency
     hard_event_review: bool
     evidence_ids: Tuple[str, ...]
+    evidence_delta: EvidenceDelta
+    remainder_intent: RemainderIntent
+    exit_reason: ExitReason
+    use_of_proceeds: UseOfProceeds
     policy_version: str
     policy_checksum: str
     created_at: datetime
@@ -705,12 +818,15 @@ class HoldingReviewResult(_CanonicalRecord):
                 ActionReviewSourceSufficiency,
                 "action review source sufficiency",
             ),
+            (self.remainder_intent, RemainderIntent, "remainder intent"),
+            (self.exit_reason, ExitReason, "exit reason"),
+            (self.use_of_proceeds, UseOfProceeds, "use of proceeds"),
         ):
             _exact_enum(value, enum_type, name)
         _enum_tuple(self.triggered_reviews, TriggeredReviewCode, "triggered reviews")
-        canonical_review_order = {item: index for index, item in enumerate(TriggeredReviewCode)}
-        if tuple(canonical_review_order[item] for item in self.triggered_reviews) != tuple(
-            sorted(canonical_review_order[item] for item in self.triggered_reviews)
+        order = {item: index for index, item in enumerate(TriggeredReviewCode)}
+        if tuple(order[item] for item in self.triggered_reviews) != tuple(
+            sorted(order[item] for item in self.triggered_reviews)
         ):
             raise ValueError("triggered reviews must be in canonical order")
         if type(self.redemption_evidence) is not RedemptionEvidence:
@@ -730,36 +846,74 @@ class HoldingReviewResult(_CanonicalRecord):
             (self.hard_event_review, "hard event review"),
         ):
             _exact_bool(value, name)
+        if type(self.evidence_delta) is not EvidenceDelta:
+            raise ValueError("holding review evidence delta must be exact")
+        self.evidence_delta.validate()
+        if self.history_comparability is not self.evidence_delta.history_comparability:
+            raise ValueError("result history comparability and evidence delta differ")
         validate_version(self.policy_version, "policy version")
         validate_checksum(self.policy_checksum, "policy checksum")
         _utc(self.created_at, "review result creation time")
         if self.sell_timing != "insufficient_data" or self.boundary != ReviewBoundary():
             raise ValueError("holding review action boundary is invalid")
         self.boundary.validate()
+        hard_trigger = TriggeredReviewCode.FULL_EXIT_FEASIBILITY_REVIEW in self.triggered_reviews
         if self.review_disposition is ReviewDisposition.CONTINUE_OBSERVING:
             from kunjin.holding_review.policy import HeldFundManualReviewPolicyV1
 
             forbidden = set(self.omitted_work) & set(
                 HeldFundManualReviewPolicyV1().core_omission_prohibition
             )
+            allowed_thesis_states = {
+                ThesisMatchState.NO_MATCHING_EVIDENCE,
+                ThesisMatchState.PRESENTED_MATCH_REJECTED,
+            }
             if (
-                forbidden
+                self.flow_status is not FlowStatus.COMPLETE
+                or self.evidence_readiness is not EvidenceReadiness.READY
+                or self.thesis_review_state not in allowed_thesis_states
+                or self.triggered_reviews
+                or self.hard_event_review
+                or forbidden
                 or not self.official_negative_check_complete
                 or not self.intelligence_schedule_complete
                 or self.intelligence_omitted_work
                 or self.intelligence_degraded_sources
             ):
                 raise ValueError("continue observing evidence is incomplete")
+        if self.hard_event_review != hard_trigger:
+            raise ValueError("hard event review requires an authenticated hard-event trigger")
         if self.review_disposition in {
             ReviewDisposition.REDUCE_REVIEW,
             ReviewDisposition.EXIT_REVIEW,
-        } and (
-            self.action_review_source_sufficiency
-            is not ActionReviewSourceSufficiency.SUFFICIENT
-            and not self.hard_event_review
+        }:
+            if (
+                self.action_review_source_sufficiency
+                is not ActionReviewSourceSufficiency.SUFFICIENT
+                and not hard_trigger
+            ):
+                raise ValueError(
+                    f"{self.review_disposition.value.replace('_', ' ')} source evidence is "
+                    "insufficient; an authenticated hard-event trigger is required"
+                )
+            if (
+                self.thesis_review_state is not ThesisMatchState.PRESENTED_MATCH_CONFIRMED
+                and not hard_trigger
+            ):
+                raise ValueError("action review requires confirmed thesis evidence or a hard event")
+        if self.review_disposition is ReviewDisposition.MANUAL_THESIS_REVIEW_REQUIRED and (
+            self.thesis_review_state
+            not in {
+                ThesisMatchState.MANUAL_REVIEW_PENDING,
+                ThesisMatchState.MANUAL_REVIEW_UNCERTAIN,
+            }
         ):
-            disposition = self.review_disposition.value.replace("_", " ")
-            raise ValueError(f"{disposition} source evidence is insufficient")
+            raise ValueError("manual thesis review disposition requires unresolved thesis evidence")
+        if self.flow_status is FlowStatus.FAILED and (
+            self.review_disposition is not ReviewDisposition.ABSTAIN
+            or self.evidence_readiness is not EvidenceReadiness.INSUFFICIENT_DATA
+        ):
+            raise ValueError("failed review flow must abstain with insufficient evidence")
         if self.review_disposition is ReviewDisposition.REDUCE_REVIEW and (
             self.action is not ActionKind.REDUCE_TO_CASH
         ):
@@ -768,55 +922,195 @@ class HoldingReviewResult(_CanonicalRecord):
             self.action is not ActionKind.FULL_EXIT
         ):
             raise ValueError("exit review requires the full-exit action")
-        if self.redemption_feasibility is RedemptionFeasibility.NOT_REQUESTED and (
-            self.action is not ActionKind.CONTINUE_HOLDING
+        self._validate_redemption_state()
+        self._validate_owner_context()
+
+    def _validate_redemption_state(self) -> None:
+        states = self.redemption_evidence.component_states()
+        all_missing = all(item is RedemptionComponentState.MISSING for item in states)
+        all_usable = all(item is RedemptionComponentState.USABLE for item in states)
+        restricted = (
+            self.redemption_evidence.current_redemption_restriction
+            is RedemptionComponentState.RESTRICTED
+        )
+        restriction_triggered = (
+            TriggeredReviewCode.REDEMPTION_RESTRICTION_REVIEW in self.triggered_reviews
+        )
+        if restricted != restriction_triggered:
+            raise ValueError("redemption restriction requires its authenticated review trigger")
+        if self.action is ActionKind.CONTINUE_HOLDING:
+            valid = (
+                self.redemption_feasibility is RedemptionFeasibility.NOT_REQUESTED
+                and all_missing
+            )
+        elif self.redemption_feasibility is RedemptionFeasibility.RESTRICTED:
+            valid = restricted
+        elif (
+            self.redemption_feasibility
+            is RedemptionFeasibility.EVIDENCE_COMPLETE_NON_AUTHORIZING
         ):
-            raise ValueError("redemption evidence is required for reduction and exit questions")
+            valid = all_usable
+        elif self.redemption_feasibility is RedemptionFeasibility.INSUFFICIENT_DATA:
+            valid = not restricted and not all_usable
+        else:
+            valid = False
+        if not valid:
+            raise ValueError("redemption feasibility does not match its seven components")
+
+    def _validate_owner_context(self) -> None:
+        if self.action is ActionKind.CONTINUE_HOLDING and (
+            self.remainder_intent is not RemainderIntent.UNKNOWN
+            or self.exit_reason is not ExitReason.UNKNOWN
+            or self.use_of_proceeds is not UseOfProceeds.UNKNOWN
+        ):
+            raise ValueError("continue holding rejects reduction and exit context")
+        if self.action is ActionKind.REDUCE_TO_CASH and (
+            self.exit_reason is not ExitReason.UNKNOWN
+            or self.use_of_proceeds is not UseOfProceeds.UNKNOWN
+        ):
+            raise ValueError("partial reduction rejects full-exit context")
+        if (
+            self.action is ActionKind.FULL_EXIT
+            and self.remainder_intent is not RemainderIntent.UNKNOWN
+        ):
+            raise ValueError("full exit rejects remainder intent")
 
 
 @dataclass(frozen=True)
-class HoldingReviewSnapshot(_CanonicalRecord):
-    review_snapshot_id: int
-    result: HoldingReviewResult
+class HoldingReviewSnapshot(_AuthenticatedRecord):
+    fund_code: str
+    action: ActionKind
     brief_request_run_id: int
     brief_snapshot_id: int
     brief_snapshot_checksum: str
     intelligence_request_run_id: int
+    intelligence_snapshot_id: int
     intelligence_snapshot_checksum: str
-    thesis_id: Optional[int]
-    thesis_fingerprint: Optional[str]
+    thesis_match_projection_id: int
+    thesis_match_projection_checksum: str
+    active_thesis_state: BindingState
+    active_thesis_id: Optional[int]
+    active_thesis_fingerprint: Optional[str]
+    adjudication_state: BindingState
     adjudication_id: Optional[int]
-    previous_comparable_review_id: Optional[int]
+    adjudication_checksum: Optional[str]
+    previous_review_id: Optional[int]
+    result: HoldingReviewResult
     result_fingerprint: str
+    policy_version: str
+    policy_checksum: str
+    created_at: datetime
+    semantic_identity_checksum: str
     record_checksum: str
+
+    def expected_semantic_identity_checksum(self) -> str:
+        payload = {
+            "action": self.action,
+            "active_thesis_fingerprint": self.active_thesis_fingerprint,
+            "active_thesis_id": self.active_thesis_id,
+            "active_thesis_state": self.active_thesis_state,
+            "adjudication_checksum": self.adjudication_checksum,
+            "adjudication_id": self.adjudication_id,
+            "adjudication_state": self.adjudication_state,
+            "brief_request_run_id": self.brief_request_run_id,
+            "brief_snapshot_checksum": self.brief_snapshot_checksum,
+            "brief_snapshot_id": self.brief_snapshot_id,
+            "exit_reason": self.result.exit_reason,
+            "fund_code": self.fund_code,
+            "intelligence_request_run_id": self.intelligence_request_run_id,
+            "intelligence_snapshot_checksum": self.intelligence_snapshot_checksum,
+            "intelligence_snapshot_id": self.intelligence_snapshot_id,
+            "policy_checksum": self.policy_checksum,
+            "remainder_intent": self.result.remainder_intent,
+            "result_fingerprint": self.result_fingerprint,
+            "thesis_match_projection_checksum": self.thesis_match_projection_checksum,
+            "thesis_match_projection_id": self.thesis_match_projection_id,
+            "use_of_proceeds": self.result.use_of_proceeds,
+        }
+        return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
     def validate(self) -> None:
         _exact_record(self, HoldingReviewSnapshot, "holding review snapshot")
-        _positive_int(self.review_snapshot_id, "review snapshot id")
-        if type(self.result) is not HoldingReviewResult:
-            raise ValueError("holding review snapshot result must be exact")
-        self.result.validate()
+        _fund_code(self.fund_code)
+        _exact_enum(self.action, ActionKind, "holding review snapshot action")
+        if self.action not in _ALLOWED_ACTIONS:
+            raise ValueError("holding review snapshot action is unsupported")
         for value, name in (
             (self.brief_request_run_id, "brief request run id"),
             (self.brief_snapshot_id, "brief snapshot id"),
             (self.intelligence_request_run_id, "intelligence request run id"),
+            (self.intelligence_snapshot_id, "intelligence snapshot id"),
+            (self.thesis_match_projection_id, "thesis match projection id"),
         ):
             _positive_int(value, name)
-        validate_checksum(self.brief_snapshot_checksum, "brief snapshot checksum")
-        validate_checksum(self.intelligence_snapshot_checksum, "intelligence snapshot checksum")
-        _optional_positive_int(self.thesis_id, "thesis id")
-        if (self.thesis_id is None) != (self.thesis_fingerprint is None):
-            raise ValueError("snapshot thesis id and fingerprint must be present together")
-        if self.thesis_fingerprint is not None:
-            validate_checksum(self.thesis_fingerprint, "thesis fingerprint")
-        _optional_positive_int(self.adjudication_id, "adjudication id")
-        _optional_positive_int(
-            self.previous_comparable_review_id, "previous comparable review id"
+        for value, name in (
+            (self.brief_snapshot_checksum, "brief snapshot checksum"),
+            (self.intelligence_snapshot_checksum, "intelligence snapshot checksum"),
+            (self.thesis_match_projection_checksum, "thesis match projection checksum"),
+        ):
+            validate_checksum(value, name)
+        _exact_enum(self.active_thesis_state, BindingState, "active thesis state")
+        _optional_positive_int(self.active_thesis_id, "active thesis id")
+        if self.active_thesis_fingerprint is not None:
+            validate_checksum(self.active_thesis_fingerprint, "active thesis fingerprint")
+        thesis_present = (
+            self.active_thesis_id is not None and self.active_thesis_fingerprint is not None
         )
+        if thesis_present != (self.active_thesis_state is BindingState.PRESENT):
+            raise ValueError("active thesis state and binding fields are inconsistent")
+        _exact_enum(self.adjudication_state, BindingState, "adjudication state")
+        _optional_positive_int(self.adjudication_id, "adjudication id")
+        if self.adjudication_checksum is not None:
+            validate_checksum(self.adjudication_checksum, "adjudication checksum")
+        adjudication_present = (
+            self.adjudication_id is not None and self.adjudication_checksum is not None
+        )
+        if adjudication_present != (self.adjudication_state is BindingState.PRESENT):
+            raise ValueError("adjudication state and binding fields are inconsistent")
+        if adjudication_present and not thesis_present:
+            raise ValueError("an adjudication requires a present active thesis")
+        _optional_positive_int(self.previous_review_id, "previous review id")
+        if type(self.result) is not HoldingReviewResult:
+            raise ValueError("holding review snapshot result must be exact")
+        self.result.validate()
+        if self.result.flow_status is FlowStatus.FAILED:
+            raise ValueError("failed holding review results cannot be persisted")
+        if self.result.fund_code != self.fund_code or self.result.action is not self.action:
+            raise ValueError("holding review snapshot subject does not match its result")
+        if self.active_thesis_state is BindingState.MISSING:
+            if self.result.thesis_review_state is not ThesisMatchState.THESIS_MISSING:
+                raise ValueError("missing thesis binding requires thesis-missing result state")
+            if self.adjudication_state is not BindingState.MISSING:
+                raise ValueError("missing thesis cannot have an adjudication")
+        elif self.result.thesis_review_state in {
+            ThesisMatchState.THESIS_MISSING,
+            ThesisMatchState.THESIS_BINDING_INVALID,
+        }:
+            raise ValueError("present thesis binding conflicts with the result thesis state")
+        adjudicated_states = {
+            ThesisMatchState.MANUAL_REVIEW_UNCERTAIN,
+            ThesisMatchState.PRESENTED_MATCH_REJECTED,
+            ThesisMatchState.PRESENTED_MATCH_CONFIRMED,
+        }
+        if (self.result.thesis_review_state in adjudicated_states) != adjudication_present:
+            raise ValueError("adjudication binding and result thesis state are inconsistent")
         validate_checksum(self.result_fingerprint, "review result fingerprint")
         if self.result_fingerprint != self.result.checksum():
             raise ValueError("review result fingerprint does not match")
-        validate_checksum(self.record_checksum, "holding review snapshot record checksum")
+        validate_version(self.policy_version, "holding review policy version")
+        validate_checksum(self.policy_checksum, "holding review policy checksum")
+        if (
+            self.result.policy_version != self.policy_version
+            or self.result.policy_checksum != self.policy_checksum
+        ):
+            raise ValueError("snapshot and result policy bindings differ")
+        _utc(self.created_at, "holding review snapshot creation time")
+        if self.created_at < self.result.created_at:
+            raise ValueError("review snapshot cannot precede its result")
+        validate_checksum(self.semantic_identity_checksum, "semantic identity checksum")
+        if self.semantic_identity_checksum != self.expected_semantic_identity_checksum():
+            raise ValueError("holding review semantic identity checksum does not match")
+        self._validate_record_checksum("holding review snapshot")
 
 
 @dataclass(frozen=True)
