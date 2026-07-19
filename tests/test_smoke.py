@@ -3628,7 +3628,8 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             "single_context",
             "single_keychain_child",
             "validate_owner_statuses",
-            "validate_engineering_coverage",
+            "validate_engineering_flow",
+            "project_engineering_evidence",
             "financial_interpretation",
             "prohibited",
         ):
@@ -3684,6 +3685,11 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
                 "automatic_trade=false",
                 "Phase 4.1 adds neither market direction nor candidate-code discovery",
                 "readiness is a local snapshot, not a refresh engine or recommendation",
+                "engineering_flow=pass",
+                "evidence_readiness=ready|partial|insufficient_data",
+                "comparison_evidence_readiness=ready|insufficient_data",
+                "structural_comparability=observed|not_testable",
+                "does not mean comparable, diversified, safe, or recommended",
             ):
                 self.assertIn(phrase, document)
 

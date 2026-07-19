@@ -26,9 +26,10 @@ from scripts.phase41_acceptance import (
     backup_sqlite_read_only,
     load_owner_key_once,
     orchestrate,
+    project_engineering_evidence,
     sanitize_output,
     secure_read_subject_file,
-    validate_engineering_coverage,
+    validate_engineering_flow,
     validate_owner_statuses,
 )
 
@@ -442,66 +443,199 @@ def test_public_maximum_is_five_status_and_twenty_five_ordered_actions() -> None
     assert sum(call[1:3] == ("fund", "shortlist-readiness") for call in calls) == 2
 
 
-def test_engineering_coverage_requires_held_not_comparable_gap_and_partial() -> None:
-    initial = _readiness(
-        actions=(("000001", "sync fund 000001"),),
-        evidence=[{"profile": {"freshness": "stale"}}],
-        blocking=["profile_stale"],
-    )["data"]
-    shortlist = {
-        "candidate_reviews": [{"position_state": "held"}],
-        "comparability": [
-            {"state": "not_comparable", "reason_code": "type_mismatch"}
-        ],
-    }
-    final = _readiness(ready=False, blocking=["formal_nav_missing"])["data"]
-    result = acceptance.OrchestrationResult(
-        action_state_counts={"completed": 1},
-        final_data=final,
+def _orchestration_result(
+    *,
+    actions=(),
+    final_ready=False,
+    final_evidence=None,
+    states=None,
+    outcome="not_run",
+    refresh_calls=0,
+):
+    return acceptance.OrchestrationResult(
+        action_state_counts={} if states is None else states,
+        final_data=_readiness(
+            ready=final_ready,
+            evidence=final_evidence,
+        )["data"],
         final_readiness_calls=1,
-        initial_data=initial,
+        initial_data=_readiness(actions=actions)["data"],
         initial_readiness_calls=1,
-        outcome="partial_once",
-        refresh_action_calls=1,
+        outcome=outcome,
+        refresh_action_calls=refresh_calls,
         source_status_calls=4,
     )
 
-    assert validate_engineering_coverage(result, shortlist) == {
-        "held": True,
-        "initial_missing_or_stale": True,
-        "not_comparable": True,
-        "partial_degradation": True,
-    }
-    for changed_shortlist, changed_result in (
-        (
-            {**shortlist, "candidate_reviews": [{"position_state": "not_held"}]},
-            result,
-        ),
-        ({**shortlist, "comparability": [{"state": "comparable"}]}, result),
-        (
-            {
-                **shortlist,
-                "comparability": [
-                    {
-                        "state": "not_comparable",
-                        "reason_code": "arbitrary_reason",
-                    }
-                ],
-            },
-            result,
-        ),
-        (
-            shortlist,
-            acceptance.OrchestrationResult(
-                **{
-                    **vars(result),
-                    "final_data": _readiness(ready=True)["data"],
-                }
+
+def _candidate_evidence(*, usable=False, held=True, binding_failure=False):
+    return {
+        "source_health": {
+            "fields": [{"resolution": "usable"}] if usable else [],
+        },
+        "profile": {"authenticated": usable},
+        "formal_nav": {"usable": usable},
+        "holdings": {
+            "evidence_level": "verified_fact" if usable else "insufficient_data",
+            "source_document_ids": [1] if usable else [],
+        },
+        "d1": {"classification_present": usable},
+        "portfolio_binding": {
+            "position_state": "held" if held else "not_held",
+            "technical_failure": (
+                "portfolio_projection_failed" if binding_failure else None
             ),
+        },
+        "shortlist_entry": {},
+    }
+
+
+def test_engineering_flow_accepts_already_ready_without_actions() -> None:
+    result = _orchestration_result(final_ready=True, outcome="completed_once")
+
+    assert validate_engineering_flow(result, expected_subject_count=4) == {
+        "engineering_flow": "pass"
+    }
+
+
+@pytest.mark.parametrize(
+    ("states", "final_ready", "outcome", "refresh_calls"),
+    (
+        ({"completed": 1}, True, "completed_once", 1),
+        ({"completed": 1}, False, "partial_once", 1),
+        ({"stopped_by_source_state": 1}, False, "stopped_by_source_state", 0),
+    ),
+)
+def test_engineering_flow_accepts_each_bounded_terminal_state(
+    states, final_ready, outcome, refresh_calls
+) -> None:
+    result = _orchestration_result(
+        actions=(("000001", "sync fund 000001"),),
+        final_ready=final_ready,
+        states=states,
+        outcome=outcome,
+        refresh_calls=refresh_calls,
+    )
+
+    assert validate_engineering_flow(result, expected_subject_count=4) == {
+        "engineering_flow": "pass"
+    }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"action_state_counts": {"completed": 2}},
+        {"action_state_counts": {"retried": 1}},
+        {"source_status_calls": 3},
+        {"final_readiness_calls": 2},
+        {"refresh_action_calls": 2},
+        {"outcome": "completed_once"},
+    ),
+)
+def test_engineering_flow_fails_closed_on_invalid_counts_or_outcome(changes) -> None:
+    result = _orchestration_result(
+        actions=(("000001", "sync fund 000001"),),
+        states={"completed": 1},
+        outcome="partial_once",
+        refresh_calls=1,
+    )
+    invalid = acceptance.OrchestrationResult(**{**vars(result), **changes})
+
+    with pytest.raises(StableFailure, match="engineering_flow_invalid"):
+        validate_engineering_flow(invalid, expected_subject_count=4)
+
+
+def test_partial_real_evidence_is_not_promoted_to_structural_observation() -> None:
+    result = _orchestration_result(
+        actions=(("000001", "sync fund 000001"),),
+        final_evidence=[_candidate_evidence(usable=True)],
+        states={"completed": 1},
+        outcome="partial_once",
+        refresh_calls=1,
+    )
+
+    projection = project_engineering_evidence(
+        result,
+        {
+            "candidate_reviews": [{"position_state": "held"}],
+            "comparability": [
+                {"state": "insufficient_data", "reason_code": "missing_identity"}
+            ],
+        },
+    )
+
+    assert projection == {
+        "evidence_readiness": "partial",
+        "comparison_evidence_readiness": "insufficient_data",
+        "structural_comparability": "not_testable",
+        "usable_component_count": 6,
+        "held_binding_observed": True,
+        "comparison_state_counts": {
+            "comparable": 0,
+            "not_comparable": 0,
+            "insufficient_data": 1,
+        },
+        "comparison_reason_codes": ["missing_identity"],
+    }
+
+
+def test_engineering_evidence_projects_ready_and_zero_component_states() -> None:
+    ready = project_engineering_evidence(
+        _orchestration_result(final_ready=True, outcome="completed_once"),
+        {
+            "candidate_reviews": [{"position_state": "not_held"}],
+            "comparability": [
+                {"state": "comparable", "reason_code": "classification_match"}
+            ],
+        },
+    )
+    missing = project_engineering_evidence(
+        _orchestration_result(
+            final_evidence=[
+                _candidate_evidence(
+                    usable=False,
+                    held=False,
+                    binding_failure=True,
+                )
+            ]
         ),
-    ):
-        with pytest.raises(StableFailure, match="engineering_coverage_not_met"):
-            validate_engineering_coverage(changed_result, changed_shortlist)
+        {
+            "candidate_reviews": [{"position_state": "not_held"}],
+            "comparability": [
+                {
+                    "state": "insufficient_data",
+                    "reason_code": "peer_classification_unavailable",
+                }
+            ],
+        },
+    )
+
+    assert ready["evidence_readiness"] == "ready"
+    assert ready["comparison_evidence_readiness"] == "ready"
+    assert ready["structural_comparability"] == "observed"
+    assert missing["evidence_readiness"] == "insufficient_data"
+    assert missing["comparison_evidence_readiness"] == "insufficient_data"
+    assert missing["structural_comparability"] == "not_testable"
+    assert missing["usable_component_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "pair",
+    (
+        {"state": "comparable", "reason_code": "missing_identity"},
+        {"state": "invalid", "reason_code": "classification_match"},
+        {"state": "insufficient_data", "reason_code": "unsafe-code"},
+    ),
+)
+def test_engineering_evidence_rejects_malformed_pair_state(pair) -> None:
+    with pytest.raises(StableFailure, match="engineering_evidence_invalid"):
+        project_engineering_evidence(
+            _orchestration_result(),
+            {
+                "candidate_reviews": [{"position_state": "not_held"}],
+                "comparability": [pair],
+            },
+        )
 
 
 def _valid_scope():
@@ -797,7 +931,7 @@ def test_owner_controller_uses_one_key_one_context_and_four_safe_calls(
     assert "KUNJIN_STATE_DIR" not in os.environ
 
 
-def test_engineering_controller_requires_real_coverage_and_never_emits_codes(
+def test_engineering_controller_separates_flow_and_evidence_without_codes(
     tmp_path, monkeypatch
 ) -> None:
     runtime = tmp_path / "runtime"
@@ -859,12 +993,13 @@ def test_engineering_controller_requires_real_coverage_and_never_emits_codes(
     summary = acceptance.run_engineering_acceptance()
     encoded = json.dumps(summary, sort_keys=True)
 
-    assert summary["coverage"] == {
-        "held": True,
-        "initial_missing_or_stale": True,
-        "not_comparable": True,
-        "partial_degradation": True,
-    }
+    assert summary["engineering_flow"] == "pass"
+    assert summary["evidence_readiness"] == "insufficient_data"
+    assert summary["comparison_evidence_readiness"] == "insufficient_data"
+    assert summary["structural_comparability"] == "observed"
+    assert summary["held_binding_observed"] is True
+    assert summary["usable_component_count"] == 0
+    assert "coverage" not in summary
     assert not any(code in encoded for code in CODES)
     assert str(subject) not in encoded
     assert source.as_posix() not in encoded

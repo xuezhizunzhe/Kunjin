@@ -483,82 +483,174 @@ def orchestrate(
     )
 
 
-def _contains_missing_or_stale(value: object) -> bool:
-    if type(value) is str:
-        return value in {"missing", "stale", "insufficient_data"} or value.endswith(
-            ("_missing", "_stale")
-        )
-    if type(value) is dict:
-        return any(_contains_missing_or_stale(item) for item in value.values())
-    if type(value) in {list, tuple}:
-        return any(_contains_missing_or_stale(item) for item in value)
-    return False
-
-
-def validate_engineering_coverage(
+def validate_engineering_flow(
     result: OrchestrationResult,
-    shortlist: dict,
-) -> dict:
-    if type(result) is not OrchestrationResult or type(shortlist) is not dict:
-        raise StableFailure("engineering_coverage_not_met")
-    initial = result.initial_data
-    final = result.final_data
-    actions = initial.get("bounded_refresh_actions")
-    action_states = result.action_state_counts
+    *,
+    expected_subject_count: int,
+) -> dict[str, str]:
     if (
-        type(actions) is not list
-        or not actions
-        or type(action_states) is not dict
-        or result.initial_readiness_calls != 1
-        or result.final_readiness_calls != 1
-        or result.source_status_calls != 4
-        or result.refresh_action_calls <= 0
-        or result.outcome not in {"partial_once", "stopped_by_source_state"}
+        type(result) is not OrchestrationResult
+        or type(result.initial_data) is not dict
+        or type(result.final_data) is not dict
+    ):
+        raise StableFailure("engineering_flow_invalid")
+    actions = result.initial_data.get("bounded_refresh_actions")
+    states = result.action_state_counts
+    allowed_states = {
+        "completed",
+        "terminal_failure",
+        "stopped_by_source_state",
+        "dependency_stopped",
+    }
+    if (
+        type(expected_subject_count) is not int
+        or not 2 <= expected_subject_count <= MAX_PUBLIC_SOURCE_STATUS_CALLS
+        or type(actions) is not list
+        or len(actions) > expected_subject_count * len(_ACTION_SPECS)
+        or type(states) is not dict
         or any(
-            key
-            not in {
-                "completed",
-                "terminal_failure",
-                "stopped_by_source_state",
-                "dependency_stopped",
-            }
+            key not in allowed_states
             or type(value) is not int
             or value < 0
-            for key, value in action_states.items()
+            for key, value in states.items()
         )
-        or sum(action_states.values()) != len(actions)
-        or action_states.get("completed", 0)
-        + action_states.get("terminal_failure", 0)
+        or sum(states.values()) != len(actions)
+        or type(result.refresh_action_calls) is not int
+        or result.refresh_action_calls < 0
+        or states.get("completed", 0) + states.get("terminal_failure", 0)
         != result.refresh_action_calls
+        or type(result.initial_readiness_calls) is not int
+        or result.initial_readiness_calls != 1
+        or type(result.final_readiness_calls) is not int
+        or result.final_readiness_calls != 1
+        or type(result.source_status_calls) is not int
+        or result.source_status_calls != expected_subject_count
+        or type(result.outcome) is not str
+        or type(result.final_data.get("comparison_evidence_ready")) is not bool
     ):
-        raise StableFailure("engineering_coverage_not_met")
+        raise StableFailure("engineering_flow_invalid")
+    if states.get("stopped_by_source_state", 0):
+        expected_outcome = "stopped_by_source_state"
+    elif result.final_data["comparison_evidence_ready"] is True:
+        expected_outcome = "completed_once"
+    elif result.refresh_action_calls:
+        expected_outcome = "partial_once"
+    else:
+        expected_outcome = "not_run"
+    if result.outcome != expected_outcome:
+        raise StableFailure("engineering_flow_invalid")
+    return {"engineering_flow": "pass"}
+
+
+def _usable_component_count(candidate_evidence: object) -> int:
+    if type(candidate_evidence) is not list:
+        raise StableFailure("engineering_evidence_invalid")
+    count = 0
+    for candidate in candidate_evidence:
+        if type(candidate) is not dict:
+            raise StableFailure("engineering_evidence_invalid")
+        source = candidate.get("source_health", {})
+        fields = source.get("fields", []) if type(source) is dict else []
+        if type(fields) is not list or any(type(field) is not dict for field in fields):
+            raise StableFailure("engineering_evidence_invalid")
+        count += sum(field.get("resolution") == "usable" for field in fields)
+        profile = candidate.get("profile", {})
+        nav = candidate.get("formal_nav", {})
+        holdings = candidate.get("holdings", {})
+        d1 = candidate.get("d1", {})
+        binding = candidate.get("portfolio_binding", {})
+        if not all(type(item) is dict for item in (profile, nav, holdings, d1, binding)):
+            raise StableFailure("engineering_evidence_invalid")
+        count += profile.get("authenticated") is True
+        count += nav.get("usable") is True
+        count += (
+            holdings.get("evidence_level") == "verified_fact"
+            and type(holdings.get("source_document_ids")) is list
+            and bool(holdings["source_document_ids"])
+        )
+        count += d1.get("classification_present") is True
+        count += (
+            binding.get("position_state") in {"held", "not_held"}
+            and binding.get("technical_failure") is None
+        )
+    return count
+
+
+def project_engineering_evidence(
+    result: OrchestrationResult,
+    shortlist: dict,
+) -> dict[str, object]:
+    if (
+        type(result) is not OrchestrationResult
+        or type(result.final_data) is not dict
+        or type(shortlist) is not dict
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+    comparison_ready = result.final_data.get("comparison_evidence_ready")
+    if type(comparison_ready) is not bool:
+        raise StableFailure("engineering_evidence_invalid")
+    usable_component_count = _usable_component_count(
+        result.final_data.get("candidate_evidence")
+    )
+    evidence_state = (
+        "ready"
+        if comparison_ready
+        else "partial"
+        if usable_component_count
+        else "insufficient_data"
+    )
+    comparison_state = "ready" if comparison_ready else "insufficient_data"
+    pairs = shortlist.get("comparability")
     reviews = shortlist.get("candidate_reviews")
-    comparability = shortlist.get("comparability")
+    if type(pairs) is not list or type(reviews) is not list:
+        raise StableFailure("engineering_evidence_invalid")
+    counts = Counter()
+    reasons = set()
+    observed = False
     structural_reasons = {
         "type_mismatch",
         "management_style_mismatch",
         "benchmark_mismatch",
     }
-    coverage = {
-        "held": type(reviews) is list
-        and any(type(item) is dict and item.get("position_state") == "held" for item in reviews),
-        "initial_missing_or_stale": _contains_missing_or_stale(
-            initial.get("candidate_evidence", [])
+    for pair in pairs:
+        if type(pair) is not dict:
+            raise StableFailure("engineering_evidence_invalid")
+        state = pair.get("state")
+        reason = pair.get("reason_code")
+        if (
+            state not in {"comparable", "not_comparable", "insufficient_data"}
+            or type(reason) is not str
+            or _SAFE_CODE.fullmatch(reason) is None
+            or (state == "comparable" and reason != "classification_match")
+        ):
+            raise StableFailure("engineering_evidence_invalid")
+        counts[state] += 1
+        reasons.add(reason)
+        observed = observed or state == "comparable" or (
+            state == "not_comparable" and reason in structural_reasons
         )
-        or _contains_missing_or_stale(initial.get("blocking_codes", [])),
-        "not_comparable": type(comparability) is list
-        and any(
-            type(item) is dict and item.get("state") == "not_comparable"
-            and item.get("reason_code") in structural_reasons
-            for item in comparability
-        ),
-        "partial_degradation": final.get("comparison_evidence_ready") is False
-        and type(final.get("blocking_codes")) is list
-        and bool(final["blocking_codes"]),
+    if any(
+        type(review) is not dict
+        or review.get("position_state") not in {"held", "not_held"}
+        for review in reviews
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+    held_binding_observed = any(
+        review.get("position_state") == "held" for review in reviews
+    )
+    structural_state = "observed" if observed else "not_testable"
+    return {
+        "evidence_readiness": evidence_state,
+        "comparison_evidence_readiness": comparison_state,
+        "structural_comparability": structural_state,
+        "usable_component_count": usable_component_count,
+        "held_binding_observed": held_binding_observed,
+        "comparison_state_counts": {
+            state: counts.get(state, 0)
+            for state in ("comparable", "not_comparable", "insufficient_data")
+        },
+        "comparison_reason_codes": sorted(reasons),
     }
-    if not all(coverage.values()):
-        raise StableFailure("engineering_coverage_not_met")
-    return coverage
 
 
 def _codes(value: object) -> list:
@@ -1287,7 +1379,11 @@ def run_engineering_acceptance() -> dict:
                     "fund.shortlist",
                     required=True,
                 )
-                coverage = validate_engineering_coverage(result, shortlist_data)
+                flow = validate_engineering_flow(
+                    result,
+                    expected_subject_count=len(ENGINEERING_ROLES),
+                )
+                evidence = project_engineering_evidence(result, shortlist_data)
             finally:
                 children.restore_tracking()
                 children.assert_waited()
@@ -1304,13 +1400,14 @@ def run_engineering_acceptance() -> dict:
         }
     )
     summary = {
+        **flow,
+        **evidence,
         "action_boundary": dict(ACTION_BOUNDARY),
         "action_state_counts": result.action_state_counts,
         "candidate_formation": {
             "status": "research_scope_only",
             "candidate_code_discovery": "not_implemented",
         },
-        "coverage": coverage,
         "financial_interpretation": "prohibited",
         "financial_usability": "not_yet_testable",
         "gap_categories": safe_gaps,
@@ -1487,10 +1584,11 @@ __all__ = [
     "load_owner_key_once",
     "main",
     "orchestrate",
+    "project_engineering_evidence",
     "sanitize_output",
     "sanitize_test_output",
     "secure_read_subject_file",
-    "validate_engineering_coverage",
+    "validate_engineering_flow",
     "validate_owner_statuses",
 ]
 

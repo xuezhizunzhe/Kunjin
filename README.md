@@ -253,6 +253,14 @@ Every legacy command keeps its own runtime and source boundary; in particular,
 `sync fund` and `sync fund-documents` are not inside the Phase 0 90/480-second
 budget.
 
+Engineering acceptance reports `engineering_flow=pass` independently from
+`evidence_readiness=ready|partial|insufficient_data`,
+`comparison_evidence_readiness=ready|insufficient_data`, and
+`structural_comparability=observed|not_testable`. A passing flow proves only
+that the finite commands obeyed their contract. In particular,
+`structural_comparability=not_testable` does not mean comparable, diversified,
+safe, or recommended.
+
 All results remain `action_maturity=evidence_only`,
 `action_authorized=false`, `exact_amount_available=false`, and
 `automatic_trade=false`. With no real owner candidates, acceptance must retain
