@@ -137,7 +137,7 @@ The personal MVP routes its five common questions as follows:
 
 - latest news: `decision route --action fact_research`, then `news recent`;
 - market context or a direction-to-buy question: route `fact_research` and `buy_or_add` when purchase intent exists, then `market overview`; current missing dimensions can require a direction abstention;
-- named candidate: route `fact_research` and `buy_or_add`, then combine `fund intelligence`, fund fact commands, and returned gates; while complete D2 or D3 is missing this is candidate research, not a suitability approval;
+- named candidate: route `fact_research` and `buy_or_add`, resolve names to one unique confirmed code first, refresh bounded evidence outside the shortlist command, then use `fund shortlist` for exactly 2-5 owner-supplied codes; this remains candidate research, not a suitability approval;
 - held-fund daily review: first distinguish partial reduction from full exit, use the matching `fund brief` action, then `fund intelligence` and thesis review; this cannot time a sale;
 - portfolio diagnosis: `status -> sync portfolio -> portfolio diagnose`; refresh stale or missing held-fund disclosures separately when broader observed coverage is needed.
 
@@ -177,6 +177,46 @@ warnings, and both coverage states. The result always remains
 `exact_amount_available=false`. It does not satisfy complete D2, D3, buy or add,
 hold, reduce, or exit, or exact amount gates. Legacy `portfolio analyze` and
 `portfolio overlap` remain available for lower-level inspection.
+
+## Bounded Candidate Shortlist (Phase 4)
+
+After resolving every name to one unique confirmed fund code, compare exactly
+2-5 owner-supplied codes with the local deterministic command:
+
+```bash
+.venv/bin/kunjin --json fund shortlist 000001 000002
+```
+
+For a current personal comparison, use this sequence:
+
+```text
+resolve names to one unique confirmed code first -> status
+-> current portfolio sync when needed
+-> bounded evidence refresh outside the shortlist command
+-> fund shortlist CODE1 CODE2 [...]
+```
+
+The command preserves owner input order only as identity; the conditional
+shortlist is unordered and has no universal score or winner. It compares
+authenticated metric-specific tradeoffs, common aligned formal-NAV intervals,
+manager and fee evidence, disclosed holdings overlap, D1 product evidence, and
+the observed impact on the current portfolio. Every date, source tier, aligned
+NAV interval, D1 state, coverage value, conflict, warning, missing-evidence
+code, and stable reason code remains part of the evidence rather than being
+collapsed into a rank.
+
+The result is amount-free and not a buy signal. It always retains
+`action_maturity=evidence_only`, `action_authorized=false`,
+`exact_amount_available=false`, and `automatic_trade=false`; it does not choose
+a channel, authorize an order, or place a trade. A held candidate does not gain
+an implied add amount. Missing or stale facts remain unknown and may reduce the
+result to `relative_tradeoffs_only`, `not_comparable`, or `insufficient_data`.
+
+Synchronize stale or missing profile, holdings, formal-NAV, peer, or D1 evidence
+with existing bounded commands outside the shortlist command, then rerun it.
+Never develop a source adapter during the query. An unsupported source lowers
+the evidence state and becomes an explicit manual-supplementation gap instead
+of starting an unbounded retry or adapter-development loop.
 
 ## Requirements
 
@@ -667,8 +707,10 @@ The installer creates the plist but does not load it automatically.
   contains those fields or a future authoritative source provides them.
 - Full valuation and earnings research, persistent capital flows, and continuous
   full-history news crawling are not implemented.
-- Broad financial-media ingestion, complete D2 construction, D3 selection, and
-  Phase E mature monitoring or sell timing are not implemented.
+- Broad financial-media ingestion, complete D2 look-through and stress testing,
+  D3 exact-amount/channel authorization, and Phase E mature monitoring or sell
+  timing are not implemented. Phase 4 provides only an unordered bounded
+  candidate shortlist.
 - Peer reports do not provide a universal composite score or automatic trade;
   their metric-specific orderings require the user to choose a horizon and weigh
   opposing evidence.

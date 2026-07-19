@@ -107,7 +107,7 @@ evidence completeness is established; still apply the current route and all gate
 `historical_brief_comparison_unavailable` appears, supported current facts remain usable, but the
 historical brief proves neither "changed" nor "unchanged".
 
-Broad financial-media ingestion, complete D2, D3 selection, and mature Phase E monitoring are not implemented.
+Broad financial-media ingestion, complete D2, D3 exact-amount/channel authorization, and mature Phase E monitoring are not implemented.
 
 ## Apply Each Action Independently
 
@@ -211,9 +211,7 @@ workflow; never build or pull it during fund research. Never execute a trade.
 For fact-only D1 research, Phase B and Phase C are not gates: fact-only D1
 research does not require Phase B or Phase C. Preserve `failure_stage` and
 `failure_reason` exactly when present. Never reconstruct omitted exception text,
-paths, response details, or document content. The Phase 3 diagnosis reuses the minimum D2
-subset and disclosed-overlap engine; complete D2 and D3 product-selection and pre-purchase
-checks are not implemented, so no mature risk-increasing conclusion or amount is available.
+paths, response details, or document content. Phase 3 and Phase 4 reuse the minimum D2 subset and disclosed-overlap engine; complete D2 and D3 product-selection and pre-purchase checks, including transaction authorization, are not implemented, so no mature risk-increasing conclusion or amount is available.
 
 For all workflows:
 
@@ -242,8 +240,8 @@ For all workflows:
 19. For current market form, run `--json sync market` before `--json market sectors`.
 20. For latest peer questions, run `--json fund peers CODE` and inspect its status, data dates, coverage, warnings, errors, and stored-group freshness. Run `--json sync fund-peers CODE` when the group is missing or stale, then read it again.
 21. For an explicit latest comparison, synchronize profile, holdings, and formal NAV for every code before running `--json fund compare CODE1 CODE2`.
-22. For one user-supplied candidate only, run `--json portfolio diagnose --candidate CODE`; never use it to discover or rank candidates.
-23. Preserve aligned NAV dates, manager-team dates, metric-specific orderings, disclosure scope, coverage, source tier, warnings, and errors. Never turn platform directory order into merit.
+22. For one user-supplied candidate only, run `--json portfolio diagnose --candidate CODE`; for exactly 2-5 owner-supplied codes, resolve names to one unique confirmed code first, run bounded evidence refresh outside the shortlist command, then `--json fund shortlist CODE1 CODE2 [...]` without adding candidates. The shortlist is unordered, amount-free, not a buy signal, and always keeps `action_maturity=evidence_only`, `action_authorized=false`, `exact_amount_available=false`, and `automatic_trade=false`. Never develop a source adapter during the query.
+23. Preserve every date, source tier, aligned NAV interval, D1 state, coverage, conflict, stable code, manager-team date, metric-specific ordering, and disclosure scope. Input order is identity only, never merit.
 24. Record a decision thesis only when the user provides a reason, horizon, and invalidation condition.
 25. Use `--json report weekly` for a combined learning-oriented summary.
 
@@ -300,6 +298,7 @@ kunjin --json sync fund-peers 519755
 kunjin --json sync fund-peers 519755 --candidate 000001
 kunjin --json fund peers 519755
 kunjin --json fund compare 519755 000001
+kunjin --json fund shortlist 000001 000002
 kunjin --json sync market
 kunjin --json market sectors
 kunjin --json sync daily
@@ -447,7 +446,7 @@ Route the five personal MVP scenarios without implying unavailable decisions:
 
 - latest news: route `fact_research`, then run `kunjin --json news recent --window recent --mode rapid`;
 - market context or a direction-to-buy question: route `fact_research` and also `buy_or_add` when purchase intent exists, then run `market overview`; expect `direction=insufficient_data` until its missing dimensions are authenticated;
-- named candidate: route `fact_research` and `buy_or_add`, run `fund intelligence` plus the fact commands and returned gates, and label the result candidate facts plus mandatory purchase abstention while complete D2 or D3 is missing;
+- named candidate: route `fact_research` and `buy_or_add`; resolve names uniquely, refresh required bounded evidence outside the shortlist command, then use `fund shortlist` only for 2-5 exact owner-supplied codes and keep mandatory purchase abstention;
 - held-fund daily review: clarify partial reduction versus full exit, use the corresponding `fund brief` action, then `fund intelligence` and `thesis review`; this reviews evidence and does not time a sale; and
 - portfolio diagnosis: run `status -> sync portfolio -> portfolio diagnose`; refresh stale or missing disclosures separately when broader observed coverage is needed.
 
@@ -462,6 +461,7 @@ Treat fund relevance as `disclosed_context`, not current or complete exposure. U
 trigger a sale. Preserve `action_maturity=evidence_only`, `action_authorized=false`, and `exact_amount_available=false`.
 
 `portfolio diagnose` is evidence only. Its optional `--candidate` accepts one user-supplied candidate; it does not satisfy complete D2, D3, buy or add, hold, reduce, or exit, or exact amount gates. Preserve coverage and unknown codes. Legacy `portfolio analyze` and `portfolio overlap` remain lower-level tools.
+`fund shortlist` composes local comparison, D1, personal-gate status, and observed portfolio-impact evidence without network access. Preserve candidate order for identity only and every returned date, source tier, aligned NAV interval, D1 state, coverage, conflict, warning, missing-evidence code, and stable reason code; never call `conditional_shortlist` a recommendation or winner.
 Use read-only browsing only as visibly separate transient `external_context` with its own sources
 and dates. It cannot strengthen persisted evidence or make empty conflicts prove source agreement.
 
@@ -484,8 +484,8 @@ and dates. It cannot strengthen persisted evidence or make empty conflicts prove
   Phase C does not classify a real fund, choose a target, approve an amount, or
   justify a 90% beginner-help claim. D1 classifies public-product evidence only;
   even `verified` is not suitability, allocation, a recommendation, or a buy
-  signal. Only the Phase 1 minimum D2 subset is implemented; complete D2 and D3
-  are not implemented, and Phase E remains unimplemented.
+  signal. Only the minimum D2 subset and bounded Phase 4 shortlist are implemented;
+  complete D2 and D3 exact-amount/channel authorization are not, and Phase E remains unimplemented.
 - Never operate Alipay or modify Yangjibao holdings.
 - Never run `ledger confirm` without explicit confirmation of the displayed draft from the user.
 - Never expose a managed screenshot path. `ledger document delete` removes only KunJin's private managed copy, not the user's original image or the immutable confirmed transaction.

@@ -3527,6 +3527,69 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             self.assertIn(phrase, combined)
         self.assertLessEqual(len(skill.splitlines()), 500)
 
+    def test_phase4_acceptance_declares_private_bounded_shortlist_modes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts/run_phase4_acceptance.sh").read_text(
+            encoding="utf-8"
+        )
+
+        for mode in ("local", "fault", "owner"):
+            self.assertIn(mode, script)
+        for case in (
+            "two_candidate_tradeoffs",
+            "five_candidate_boundary",
+            "conditional_shortlist",
+            "not_comparable",
+            "partial_candidate_isolation",
+            "held_candidate_amount_boundary",
+            "cash_like_not_protected_cash",
+            "privacy_scan",
+            "no_network_dependency",
+            "no_process_residue",
+        ):
+            self.assertIn(case, script)
+
+        self.assertIn("KUNJIN_PHASE4_OWNER_APPROVED", script)
+        self.assertIn("explicit_private_read_only", script)
+        self.assertIn("mode=ro", script)
+        self.assertIn("source.backup(target)", script)
+        self.assertIn('cli, "--json", "fund", "shortlist"', script)
+        self.assertIn("owner_candidates_unavailable", script)
+        self.assertIn('"action_maturity": "evidence_only"', script)
+        self.assertIn('"action_authorized": False', script)
+        self.assertIn('"exact_amount_available": False', script)
+        self.assertIn('"automatic_trade": False', script)
+        self.assertIn("owner fund code leaked", script)
+        self.assertIn("owner private key leaked", script)
+        self.assertIn("owner private path leaked", script)
+        self.assertIn('"shortlist_ran_on_private_copy": True', script)
+        self.assertIn("never_places_trades", script)
+
+    def test_phase4_readme_and_skill_route_exact_unordered_candidates(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        combined = " ".join((readme + "\n" + skill).split())
+
+        self.assertIn("kunjin --json fund shortlist 000001 000002", combined)
+        for phrase in (
+            "exactly 2-5 owner-supplied codes",
+            "resolve names to one unique confirmed code first",
+            "unordered",
+            "not a buy signal",
+            "amount-free",
+            "action_maturity=evidence_only",
+            "action_authorized=false",
+            "exact_amount_available=false",
+            "automatic_trade=false",
+            "outside the shortlist command",
+            "Never develop a source adapter during the query",
+        ):
+            self.assertIn(phrase, combined)
+        self.assertLess(len(skill.splitlines()), 500)
+
 
 if __name__ == "__main__":
     unittest.main()
