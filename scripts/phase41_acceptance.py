@@ -15,6 +15,7 @@ from collections import Counter
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import combinations
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
@@ -30,6 +31,17 @@ MAX_PUBLIC_ACTION_CALLS = 25
 _CODE = re.compile(r"[0-9]{6}")
 _SAFE_CODE = re.compile(r"[a-z][a-z0-9_]*")
 _TERMINAL_SOURCE_STATES = frozenset({"cooldown", "unavailable", "unsupported"})
+_READINESS_SOURCE_FIELDS = (
+    "adjusted_return_series",
+    "current_manager_team",
+    "fees_share_class_relationship",
+    "formal_nav",
+    "holdings_industries",
+    "identity_active_status",
+)
+_SOURCE_RESOLUTIONS = frozenset(
+    {"usable", "partial", "manual_supplement_required"}
+)
 _ACTION_SPECS = (
     (
         "sync_fund",
@@ -483,6 +495,68 @@ def orchestrate(
     )
 
 
+def _readiness_request_codes(
+    data: dict,
+    *,
+    expected_count: Optional[int],
+    failure_code: str,
+) -> Tuple[str, ...]:
+    request = data.get("request")
+    if type(request) is not dict or set(request) != {
+        "candidate_codes",
+        "candidate_count",
+    }:
+        raise StableFailure(failure_code)
+    codes = request.get("candidate_codes")
+    count = request.get("candidate_count")
+    if (
+        type(codes) is not list
+        or type(count) is not int
+        or count != len(codes)
+        or not 2 <= count <= MAX_PUBLIC_SOURCE_STATUS_CALLS
+        or (expected_count is not None and count != expected_count)
+        or any(
+            type(code) is not str
+            or _CODE.fullmatch(code) is None
+            or code == "0" * 6
+            for code in codes
+        )
+        or len(set(codes)) != len(codes)
+    ):
+        raise StableFailure(failure_code)
+    return tuple(codes)
+
+
+def _candidate_rows(
+    data: dict,
+    codes: Sequence[str],
+    *,
+    failure_code: str,
+) -> list:
+    rows = data.get("candidate_evidence")
+    if (
+        type(rows) is not list
+        or len(rows) != len(codes)
+        or any(type(row) is not dict for row in rows)
+        or tuple(row.get("fund_code") for row in rows) != tuple(codes)
+    ):
+        raise StableFailure(failure_code)
+    return rows
+
+
+def _safe_sorted_codes(value: object, *, failure_code: str) -> list:
+    if (
+        type(value) is not list
+        or any(
+            type(item) is not str or _SAFE_CODE.fullmatch(item) is None
+            for item in value
+        )
+        or value != sorted(set(value))
+    ):
+        raise StableFailure(failure_code)
+    return value
+
+
 def validate_engineering_flow(
     result: OrchestrationResult,
     *,
@@ -494,6 +568,32 @@ def validate_engineering_flow(
         or type(result.final_data) is not dict
     ):
         raise StableFailure("engineering_flow_invalid")
+    initial_codes = _readiness_request_codes(
+        result.initial_data,
+        expected_count=expected_subject_count,
+        failure_code="engineering_flow_invalid",
+    )
+    final_codes = _readiness_request_codes(
+        result.final_data,
+        expected_count=expected_subject_count,
+        failure_code="engineering_flow_invalid",
+    )
+    if final_codes != initial_codes:
+        raise StableFailure("engineering_flow_invalid")
+    _candidate_rows(
+        result.initial_data,
+        initial_codes,
+        failure_code="engineering_flow_invalid",
+    )
+    _candidate_rows(
+        result.final_data,
+        final_codes,
+        failure_code="engineering_flow_invalid",
+    )
+    _safe_sorted_codes(
+        result.final_data.get("blocking_codes"),
+        failure_code="engineering_flow_invalid",
+    )
     actions = result.initial_data.get("bounded_refresh_actions")
     states = result.action_state_counts
     allowed_states = {
@@ -529,6 +629,16 @@ def validate_engineering_flow(
         or type(result.final_data.get("comparison_evidence_ready")) is not bool
     ):
         raise StableFailure("engineering_flow_invalid")
+    try:
+        parsed_actions = _parse_actions(
+            result.initial_data,
+            initial_codes,
+            tuple(f"engineering_subject_{index}" for index in range(len(initial_codes))),
+        )
+    except StableFailure:
+        raise StableFailure("engineering_flow_invalid") from None
+    if len(parsed_actions) != len(actions):
+        raise StableFailure("engineering_flow_invalid")
     if states.get("stopped_by_source_state", 0):
         expected_outcome = "stopped_by_source_state"
     elif result.final_data["comparison_evidence_ready"] is True:
@@ -542,36 +652,333 @@ def validate_engineering_flow(
     return {"engineering_flow": "pass"}
 
 
-def _usable_component_count(candidate_evidence: object) -> int:
-    if type(candidate_evidence) is not list:
+def _is_timestamp(value: object) -> bool:
+    if type(value) is not str or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _is_safe_optional_code(value: object) -> bool:
+    return value is None or (
+        type(value) is str and _SAFE_CODE.fullmatch(value) is not None
+    )
+
+
+def _validate_source_component(source: object) -> int:
+    if type(source) is not dict:
+        raise StableFailure("engineering_evidence_invalid")
+    if set(source) == {"technical_failure"}:
+        if source["technical_failure"] != "source_status_load_failed":
+            raise StableFailure("engineering_evidence_invalid")
+        return 0
+    if set(source) != {"evaluated_at", "fields"} or not _is_timestamp(
+        source["evaluated_at"]
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+    fields = source["fields"]
+    if type(fields) is not list or len(fields) != len(_READINESS_SOURCE_FIELDS):
+        raise StableFailure("engineering_evidence_invalid")
+    field_ids = []
+    usable = 0
+    for field in fields:
+        if type(field) is not dict or set(field) != {
+            "acceptable_sources",
+            "field_id",
+            "resolution",
+        }:
+            raise StableFailure("engineering_evidence_invalid")
+        if type(field["acceptable_sources"]) is not list:
+            raise StableFailure("engineering_evidence_invalid")
+        field_id = field["field_id"]
+        resolution = field["resolution"]
+        if (
+            type(field_id) is not str
+            or type(resolution) is not str
+            or resolution not in _SOURCE_RESOLUTIONS
+        ):
+            raise StableFailure("engineering_evidence_invalid")
+        field_ids.append(field_id)
+        usable += resolution == "usable"
+    if tuple(field_ids) != _READINESS_SOURCE_FIELDS:
+        raise StableFailure("engineering_evidence_invalid")
+    return usable
+
+
+def _validate_profile_component(profile: object) -> int:
+    if type(profile) is not dict:
+        raise StableFailure("engineering_evidence_invalid")
+    if set(profile) == {"technical_failure"}:
+        if profile["technical_failure"] != "profile_load_failed":
+            raise StableFailure("engineering_evidence_invalid")
+        return 0
+    if set(profile) != {
+        "authenticated",
+        "benchmarks",
+        "conflicts",
+        "fees",
+        "freshness",
+        "identity",
+        "managers",
+        "missing_sections",
+        "publication_dates",
+        "report_dates",
+        "warnings",
+    }:
+        raise StableFailure("engineering_evidence_invalid")
+    if (
+        type(profile["authenticated"]) is not bool
+        or type(profile["benchmarks"]) is not dict
+        or type(profile["conflicts"]) is not list
+        or type(profile["fees"]) is not dict
+        or type(profile["freshness"]) is not dict
+        or (profile["identity"] is not None and type(profile["identity"]) is not dict)
+        or type(profile["managers"]) is not dict
+        or type(profile["missing_sections"]) is not dict
+        or type(profile["publication_dates"]) is not list
+        or type(profile["report_dates"]) is not list
+        or type(profile["warnings"]) is not list
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+    return int(profile["authenticated"])
+
+
+def _validate_nav_component(nav: object) -> int:
+    if type(nav) is not dict or set(nav) != {
+        "end_date",
+        "future_observation_count",
+        "latest_date",
+        "observation_count",
+        "start_date",
+        "technical_failure",
+        "unique_date_count",
+        "usable",
+    }:
+        raise StableFailure("engineering_evidence_invalid")
+    for name in ("future_observation_count", "observation_count", "unique_date_count"):
+        if type(nav[name]) is not int or nav[name] < 0:
+            raise StableFailure("engineering_evidence_invalid")
+    if (
+        any(
+            nav[name] is not None and type(nav[name]) is not str
+            for name in ("end_date", "latest_date", "start_date")
+        )
+        or (
+            nav["technical_failure"] is not None
+            and nav["technical_failure"] != "formal_nav_load_failed"
+        )
+        or type(nav["usable"]) is not bool
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+    return int(nav["usable"])
+
+
+def _validate_holdings_component(holdings: object) -> int:
+    if type(holdings) is not dict:
+        raise StableFailure("engineering_evidence_invalid")
+    if set(holdings) == {"technical_failure"}:
+        if holdings["technical_failure"] != "holdings_load_failed":
+            raise StableFailure("engineering_evidence_invalid")
+        return 0
+    if set(holdings) != {
+        "conflicts",
+        "disclosed_coverage",
+        "disclosure_scopes",
+        "evidence_level",
+        "freshness",
+        "published_at",
+        "report_period",
+        "source_document_ids",
+        "warnings",
+    }:
+        raise StableFailure("engineering_evidence_invalid")
+    if (
+        type(holdings["conflicts"]) is not list
+        or type(holdings["disclosed_coverage"]) is not str
+        or type(holdings["disclosure_scopes"]) is not list
+        or type(holdings["evidence_level"]) is not str
+        or type(holdings["freshness"]) is not str
+        or (
+            holdings["published_at"] is not None
+            and type(holdings["published_at"]) is not str
+        )
+        or (
+            holdings["report_period"] is not None
+            and type(holdings["report_period"]) is not str
+        )
+        or type(holdings["source_document_ids"]) is not list
+        or any(
+            type(item) is not int or item <= 0
+            for item in holdings["source_document_ids"]
+        )
+        or type(holdings["warnings"]) is not list
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+    return int(
+        holdings["evidence_level"] == "verified_fact"
+        and bool(holdings["source_document_ids"])
+    )
+
+
+def _validate_d1_component(d1: object) -> int:
+    if type(d1) is not dict:
+        raise StableFailure("engineering_evidence_invalid")
+    if d1.get("classification_present") is False:
+        failure = d1.get("technical_failure")
+        if set(d1) != {"classification_present", "technical_failure"} or (
+            failure is not None and failure != "classification_load_failed"
+        ):
+            raise StableFailure("engineering_evidence_invalid")
+        return 0
+    if set(d1) != {
+        "classification_policy_checksum",
+        "classification_present",
+        "classified_at",
+        "conflicts",
+        "evidence_status",
+        "freshness",
+        "mapped_asset_layer",
+        "mapping_reason_code",
+        "missing_evidence",
+        "policy_version",
+        "portfolio_role",
+        "reason_codes",
+        "risk_bucket",
+        "valid_until",
+    }:
+        raise StableFailure("engineering_evidence_invalid")
+    if (
+        d1["classification_present"] is not True
+        or type(d1["classification_policy_checksum"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", d1["classification_policy_checksum"]) is None
+        or not _is_timestamp(d1["classified_at"])
+        or type(d1["conflicts"]) is not list
+        or type(d1["evidence_status"]) is not str
+        or d1["evidence_status"]
+        not in {"verified", "partial", "conflicted", "stale", "unclassified"}
+        or type(d1["freshness"]) is not str
+        or d1["freshness"] not in {"current", "stale"}
+        or not _is_safe_optional_code(d1["mapped_asset_layer"])
+        or (
+            d1["mapped_asset_layer"] is not None
+            and d1["mapped_asset_layer"]
+            not in {"high_quality_fixed_income", "diversified_equity"}
+        )
+        or not _is_safe_optional_code(d1["mapping_reason_code"])
+        or type(d1["missing_evidence"]) is not list
+        or type(d1["policy_version"]) is not str
+        or not d1["policy_version"]
+        or type(d1["portfolio_role"]) is not str
+        or d1["portfolio_role"]
+        not in {
+            "cash_management_candidate",
+            "core_eligible",
+            "active_diversifier_eligible",
+            "satellite_only",
+            "not_eligible",
+        }
+        or type(d1["reason_codes"]) is not list
+        or type(d1["risk_bucket"]) is not str
+        or d1["risk_bucket"]
+        not in {
+            "cash_like_candidate",
+            "high_quality_fixed_income",
+            "diversified_equity",
+            "concentrated_equity",
+            "hybrid_risk",
+            "unclassified",
+        }
+        or not _is_timestamp(d1["valid_until"])
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+    return 1
+
+
+def _validate_binding_component(binding: object) -> Tuple[int, str]:
+    if type(binding) is not dict or set(binding) != {
+        "position_state",
+        "technical_failure",
+    }:
+        raise StableFailure("engineering_evidence_invalid")
+    state = binding["position_state"]
+    failure = binding["technical_failure"]
+    if (
+        type(state) is not str
+        or state not in {"held", "not_held"}
+        or (failure is not None and failure != "portfolio_binding_load_failed")
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+    return int(failure is None), state
+
+
+def _validate_shortlist_entry(entry: object, *, position_state: str) -> None:
+    if type(entry) is not dict or set(entry) != {
+        "d1_conflict_free",
+        "d1_current",
+        "d1_evidence_verified",
+        "mapped_asset_layer",
+        "personal_gate_passes",
+        "portfolio_role_eligible",
+        "position_state",
+    }:
+        raise StableFailure("engineering_evidence_invalid")
+    for name in (
+        "d1_conflict_free",
+        "d1_current",
+        "d1_evidence_verified",
+        "personal_gate_passes",
+        "portfolio_role_eligible",
+    ):
+        if type(entry[name]) is not bool:
+            raise StableFailure("engineering_evidence_invalid")
+    if (
+        not _is_safe_optional_code(entry["mapped_asset_layer"])
+        or (
+            entry["mapped_asset_layer"] is not None
+            and entry["mapped_asset_layer"]
+            not in {"high_quality_fixed_income", "diversified_equity"}
+        )
+        or entry["position_state"] != position_state
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+
+
+def _usable_component_count(candidate_evidence: object, codes: Sequence[str]) -> int:
+    if type(candidate_evidence) is not list or len(candidate_evidence) != len(codes):
         raise StableFailure("engineering_evidence_invalid")
     count = 0
-    for candidate in candidate_evidence:
-        if type(candidate) is not dict:
+    expected_keys = {
+        "fund_code",
+        "source_health",
+        "profile",
+        "formal_nav",
+        "holdings",
+        "d1",
+        "portfolio_binding",
+        "shortlist_entry",
+    }
+    for code, candidate in zip(codes, candidate_evidence):
+        if (
+            type(candidate) is not dict
+            or set(candidate) != expected_keys
+            or candidate["fund_code"] != code
+        ):
             raise StableFailure("engineering_evidence_invalid")
-        source = candidate.get("source_health", {})
-        fields = source.get("fields", []) if type(source) is dict else []
-        if type(fields) is not list or any(type(field) is not dict for field in fields):
-            raise StableFailure("engineering_evidence_invalid")
-        count += sum(field.get("resolution") == "usable" for field in fields)
-        profile = candidate.get("profile", {})
-        nav = candidate.get("formal_nav", {})
-        holdings = candidate.get("holdings", {})
-        d1 = candidate.get("d1", {})
-        binding = candidate.get("portfolio_binding", {})
-        if not all(type(item) is dict for item in (profile, nav, holdings, d1, binding)):
-            raise StableFailure("engineering_evidence_invalid")
-        count += profile.get("authenticated") is True
-        count += nav.get("usable") is True
-        count += (
-            holdings.get("evidence_level") == "verified_fact"
-            and type(holdings.get("source_document_ids")) is list
-            and bool(holdings["source_document_ids"])
+        count += _validate_source_component(candidate["source_health"])
+        count += _validate_profile_component(candidate["profile"])
+        count += _validate_nav_component(candidate["formal_nav"])
+        count += _validate_holdings_component(candidate["holdings"])
+        count += _validate_d1_component(candidate["d1"])
+        binding_count, position_state = _validate_binding_component(
+            candidate["portfolio_binding"]
         )
-        count += d1.get("classification_present") is True
-        count += (
-            binding.get("position_state") in {"held", "not_held"}
-            and binding.get("technical_failure") is None
+        count += binding_count
+        _validate_shortlist_entry(
+            candidate["shortlist_entry"],
+            position_state=position_state,
         )
     return count
 
@@ -586,11 +993,17 @@ def project_engineering_evidence(
         or type(shortlist) is not dict
     ):
         raise StableFailure("engineering_evidence_invalid")
+    readiness_codes = _readiness_request_codes(
+        result.final_data,
+        expected_count=None,
+        failure_code="engineering_evidence_invalid",
+    )
     comparison_ready = result.final_data.get("comparison_evidence_ready")
     if type(comparison_ready) is not bool:
         raise StableFailure("engineering_evidence_invalid")
     usable_component_count = _usable_component_count(
-        result.final_data.get("candidate_evidence")
+        result.final_data.get("candidate_evidence"),
+        readiness_codes,
     )
     evidence_state = (
         "ready"
@@ -602,7 +1015,21 @@ def project_engineering_evidence(
     comparison_state = "ready" if comparison_ready else "insufficient_data"
     pairs = shortlist.get("comparability")
     reviews = shortlist.get("candidate_reviews")
+    shortlist_codes = _readiness_request_codes(
+        shortlist,
+        expected_count=len(readiness_codes),
+        failure_code="engineering_evidence_invalid",
+    )
     if type(pairs) is not list or type(reviews) is not list:
+        raise StableFailure("engineering_evidence_invalid")
+    if shortlist_codes != readiness_codes or (
+        len(reviews) != len(readiness_codes)
+        or any(type(review) is not dict for review in reviews)
+        or tuple(review.get("fund_code") for review in reviews) != readiness_codes
+    ):
+        raise StableFailure("engineering_evidence_invalid")
+    expected_pairs = tuple(combinations(readiness_codes, 2))
+    if len(pairs) != len(expected_pairs):
         raise StableFailure("engineering_evidence_invalid")
     counts = Counter()
     reasons = set()
@@ -612,16 +1039,44 @@ def project_engineering_evidence(
         "management_style_mismatch",
         "benchmark_mismatch",
     }
-    for pair in pairs:
-        if type(pair) is not dict:
+    pair_reasons = {
+        "comparable": {"classification_match"},
+        "not_comparable": structural_reasons,
+        "insufficient_data": {
+            "identity_conflict",
+            "missing_disclosure_bundle",
+            "missing_identity",
+            "peer_classification_ambiguous",
+            "peer_classification_unavailable",
+        },
+    }
+    for expected_pair, pair in zip(expected_pairs, pairs):
+        if type(pair) is not dict or set(pair) != {
+            "left_fund_code",
+            "right_fund_code",
+            "state",
+            "reason_code",
+            "warning_codes",
+        }:
+            raise StableFailure("engineering_evidence_invalid")
+        if (
+            (pair["left_fund_code"], pair["right_fund_code"]) != expected_pair
+            or type(pair["warning_codes"]) is not list
+            or any(
+                type(item) is not str or _SAFE_CODE.fullmatch(item) is None
+                for item in pair["warning_codes"]
+            )
+            or pair["warning_codes"] != sorted(set(pair["warning_codes"]))
+        ):
             raise StableFailure("engineering_evidence_invalid")
         state = pair.get("state")
         reason = pair.get("reason_code")
         if (
-            state not in {"comparable", "not_comparable", "insufficient_data"}
+            type(state) is not str
+            or state not in {"comparable", "not_comparable", "insufficient_data"}
             or type(reason) is not str
             or _SAFE_CODE.fullmatch(reason) is None
-            or (state == "comparable" and reason != "classification_match")
+            or reason not in pair_reasons.get(state, set())
         ):
             raise StableFailure("engineering_evidence_invalid")
         counts[state] += 1
@@ -629,11 +1084,7 @@ def project_engineering_evidence(
         observed = observed or state == "comparable" or (
             state == "not_comparable" and reason in structural_reasons
         )
-    if any(
-        type(review) is not dict
-        or review.get("position_state") not in {"held", "not_held"}
-        for review in reviews
-    ):
+    if any(review.get("position_state") not in {"held", "not_held"} for review in reviews):
         raise StableFailure("engineering_evidence_invalid")
     held_binding_observed = any(
         review.get("position_state") == "held" for review in reviews
@@ -1389,16 +1840,7 @@ def run_engineering_acceptance() -> dict:
                 children.assert_waited()
                 os.environ.pop("KUNJIN_DATA_DIR", None)
                 os.environ.pop("KUNJIN_STATE_DIR", None)
-    gaps = result.final_data.get("blocking_codes", [])
-    if type(gaps) is not list:
-        raise StableFailure("engineering_orchestration_invalid")
-    safe_gaps = sorted(
-        {
-            item
-            for item in gaps
-            if type(item) is str and _SAFE_CODE.fullmatch(item) is not None
-        }
-    )
+    safe_gaps = list(result.final_data["blocking_codes"])
     summary = {
         **flow,
         **evidence,

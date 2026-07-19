@@ -9,6 +9,7 @@ import socket
 import sqlite3
 import subprocess
 import time
+from itertools import combinations
 from pathlib import Path
 
 import pytest
@@ -50,14 +51,26 @@ def _write_subject_file(tmp_path: Path) -> Path:
     return subject
 
 
-def _readiness(actions=(), *, ready=False, evidence=None, blocking=None):
+def _readiness(actions=(), *, ready=False, evidence=None, blocking=None, codes=CODES):
+    candidate_evidence = (
+        [{"fund_code": code} for code in codes]
+        if evidence is None
+        else [
+            {"fund_code": code, **item}
+            for code, item in zip(codes, evidence)
+        ]
+    )
     return {
         "command": "fund.shortlist-readiness",
         "data": {
+            "request": {
+                "candidate_codes": list(codes),
+                "candidate_count": len(codes),
+            },
             "bounded_refresh_actions": [
                 {"fund_code": code, "command": command} for code, command in actions
             ],
-            "candidate_evidence": [] if evidence is None else evidence,
+            "candidate_evidence": candidate_evidence,
             "comparison_evidence_ready": ready,
             "blocking_codes": [] if blocking is None else blocking,
         },
@@ -468,24 +481,150 @@ def _orchestration_result(
 
 
 def _candidate_evidence(*, usable=False, held=True, binding_failure=False):
+    source = (
+        {
+            "evaluated_at": "2026-07-19T08:00:00+00:00",
+            "fields": [
+                {
+                    "acceptable_sources": [],
+                    "field_id": field_id,
+                    "resolution": "usable",
+                }
+                for field_id in (
+                    "adjusted_return_series",
+                    "current_manager_team",
+                    "fees_share_class_relationship",
+                    "formal_nav",
+                    "holdings_industries",
+                    "identity_active_status",
+                )
+            ],
+        }
+        if usable
+        else {"technical_failure": "source_status_load_failed"}
+    )
+    profile = (
+        {
+            "authenticated": True,
+            "benchmarks": {},
+            "conflicts": [],
+            "fees": {},
+            "freshness": {},
+            "identity": {},
+            "managers": {},
+            "missing_sections": {},
+            "publication_dates": [],
+            "report_dates": [],
+            "warnings": [],
+        }
+        if usable
+        else {"technical_failure": "profile_load_failed"}
+    )
+    holdings = (
+        {
+            "conflicts": [],
+            "disclosed_coverage": "1",
+            "disclosure_scopes": ["top_ten"],
+            "evidence_level": "verified_fact",
+            "freshness": "current",
+            "published_at": "2026-07-19T08:00:00+00:00",
+            "report_period": "2026-06-30",
+            "source_document_ids": [1],
+            "warnings": [],
+        }
+        if usable
+        else {"technical_failure": "holdings_load_failed"}
+    )
+    d1 = (
+        {
+            "classification_policy_checksum": "a" * 64,
+            "classification_present": True,
+            "classified_at": "2026-07-19T08:00:00+00:00",
+            "conflicts": [],
+            "evidence_status": "verified",
+            "freshness": "current",
+            "mapped_asset_layer": "diversified_equity",
+            "mapping_reason_code": "verified_diversified_equity",
+            "missing_evidence": [],
+            "policy_version": "1",
+            "portfolio_role": "core_eligible",
+            "reason_codes": [],
+            "risk_bucket": "diversified_equity",
+            "valid_until": "2026-08-19T08:00:00+00:00",
+        }
+        if usable
+        else {
+            "classification_present": False,
+            "technical_failure": "classification_load_failed",
+        }
+    )
     return {
-        "source_health": {
-            "fields": [{"resolution": "usable"}] if usable else [],
+        "source_health": source,
+        "profile": profile,
+        "formal_nav": {
+            "end_date": "2026-07-18" if usable else None,
+            "future_observation_count": 0,
+            "latest_date": "2026-07-18" if usable else None,
+            "observation_count": 2 if usable else 0,
+            "start_date": "2026-07-17" if usable else None,
+            "technical_failure": None if usable else "formal_nav_load_failed",
+            "unique_date_count": 2 if usable else 0,
+            "usable": usable,
         },
-        "profile": {"authenticated": usable},
-        "formal_nav": {"usable": usable},
-        "holdings": {
-            "evidence_level": "verified_fact" if usable else "insufficient_data",
-            "source_document_ids": [1] if usable else [],
-        },
-        "d1": {"classification_present": usable},
+        "holdings": holdings,
+        "d1": d1,
         "portfolio_binding": {
             "position_state": "held" if held else "not_held",
             "technical_failure": (
-                "portfolio_projection_failed" if binding_failure else None
+                "portfolio_binding_load_failed" if binding_failure else None
             ),
         },
-        "shortlist_entry": {},
+        "shortlist_entry": {
+            "d1_conflict_free": usable,
+            "d1_current": usable,
+            "d1_evidence_verified": usable,
+            "mapped_asset_layer": "diversified_equity" if usable else None,
+            "personal_gate_passes": False,
+            "portfolio_role_eligible": usable,
+            "position_state": "held" if held else "not_held",
+        },
+    }
+
+
+def _closed_evidence(*, usable_first=False, binding_failure=False):
+    return [
+        _candidate_evidence(
+            usable=usable_first and index == 0,
+            held=index == 0,
+            binding_failure=binding_failure and index == 0,
+        )
+        for index in range(len(CODES))
+    ]
+
+
+def _shortlist(*, pair_overrides=None):
+    pairs = [
+        {
+            "left_fund_code": left,
+            "right_fund_code": right,
+            "state": "insufficient_data",
+            "reason_code": "missing_identity",
+            "warning_codes": [],
+        }
+        for left, right in combinations(CODES, 2)
+    ]
+    for index, override in (pair_overrides or {}).items():
+        pairs[index] = {**pairs[index], **override}
+    return {
+        "request": {
+            "candidate_codes": list(CODES),
+            "candidate_count": len(CODES),
+        },
+        "candidate_reviews": [
+            {"fund_code": code, "position_state": "held" if index == 0 else "not_held"}
+            for index, code in enumerate(CODES)
+        ],
+        "comparability": pairs,
     }
 
 
@@ -545,10 +684,181 @@ def test_engineering_flow_fails_closed_on_invalid_counts_or_outcome(changes) -> 
         validate_engineering_flow(invalid, expected_subject_count=4)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_request",
+        "final_code_order",
+        "candidate_code_order",
+        "nonsense_action",
+        "action_code_mismatch",
+        "duplicate_gap",
+        "unsorted_gap",
+        "invalid_gap",
+    ),
+)
+def test_engineering_flow_closes_requests_actions_and_gaps(mutation) -> None:
+    result = _orchestration_result(
+        actions=(("000001", "sync fund 000001"),),
+        states={"completed": 1},
+        outcome="partial_once",
+        refresh_calls=1,
+    )
+    initial = json.loads(json.dumps(result.initial_data))
+    final = json.loads(json.dumps(result.final_data))
+    if mutation == "missing_request":
+        initial.pop("request")
+    elif mutation == "final_code_order":
+        final["request"]["candidate_codes"].reverse()
+    elif mutation == "candidate_code_order":
+        final["candidate_evidence"][0]["fund_code"] = "999999"
+    elif mutation == "nonsense_action":
+        initial["bounded_refresh_actions"][0]["command"] = "run arbitrary command"
+    elif mutation == "action_code_mismatch":
+        initial["bounded_refresh_actions"][0]["command"] = "sync fund 999999"
+    elif mutation == "duplicate_gap":
+        final["blocking_codes"] = ["missing_identity", "missing_identity"]
+    elif mutation == "unsorted_gap":
+        final["blocking_codes"] = ["profile_missing", "d1_missing"]
+    else:
+        final["blocking_codes"] = ["unsafe-code"]
+    invalid = acceptance.OrchestrationResult(
+        **{
+            **vars(result),
+            "initial_data": initial,
+            "final_data": final,
+        }
+    )
+
+    with pytest.raises(StableFailure, match="engineering_flow_invalid"):
+        validate_engineering_flow(invalid, expected_subject_count=4)
+
+
+def test_engineering_evidence_rejects_ready_without_closed_candidates() -> None:
+    result = _orchestration_result(final_ready=True, outcome="completed_once")
+    result.final_data["candidate_evidence"] = []
+
+    with pytest.raises(StableFailure, match="engineering_evidence_invalid"):
+        project_engineering_evidence(result, _shortlist())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("single_pair", "duplicate_pair", "foreign_pair_code", "review_code_order"),
+)
+def test_engineering_evidence_requires_closed_shortlist_pairs(mutation) -> None:
+    shortlist = _shortlist()
+    if mutation == "single_pair":
+        shortlist["comparability"] = shortlist["comparability"][:1]
+    elif mutation == "duplicate_pair":
+        shortlist["comparability"][1] = dict(shortlist["comparability"][0])
+    elif mutation == "foreign_pair_code":
+        shortlist["comparability"][0]["right_fund_code"] = "999999"
+    else:
+        shortlist["candidate_reviews"][0]["fund_code"] = "999999"
+
+    with pytest.raises(StableFailure, match="engineering_evidence_invalid"):
+        project_engineering_evidence(
+            _orchestration_result(final_evidence=_closed_evidence()),
+            shortlist,
+        )
+
+
+def test_engineering_evidence_rejects_forged_usable_source_shape() -> None:
+    evidence = _closed_evidence()
+    evidence[0]["source_health"] = {
+        "evaluated_at": "2026-07-19T08:00:00+00:00",
+        "fields": [{"resolution": "usable"}],
+    }
+
+    with pytest.raises(StableFailure, match="engineering_evidence_invalid"):
+        project_engineering_evidence(
+            _orchestration_result(final_evidence=evidence),
+            _shortlist(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("component", "field", "operation"),
+    (
+        ("profile", "authenticated", "remove"),
+        ("formal_nav", "unexpected", "add"),
+        ("holdings", "warnings", "remove"),
+        ("d1", "unexpected", "add"),
+        ("portfolio_binding", "technical_failure", "remove"),
+        ("shortlist_entry", "unexpected", "add"),
+    ),
+)
+def test_engineering_evidence_rejects_nonexact_component_shapes(
+    component, field, operation
+) -> None:
+    evidence = _closed_evidence(usable_first=True)
+    target = evidence[0][component]
+    if operation == "remove":
+        target.pop(field)
+    else:
+        target[field] = "forged"
+
+    with pytest.raises(StableFailure, match="engineering_evidence_invalid"):
+        project_engineering_evidence(
+            _orchestration_result(final_evidence=evidence),
+            _shortlist(),
+        )
+
+
+def test_engineering_projection_accepts_current_public_readiness_shape(
+    tmp_path, monkeypatch
+) -> None:
+    from kunjin.selection.readiness import public_shortlist_readiness_payload
+    from tests.unit.test_selection_readiness import (
+        CODES as READINESS_CODES,
+    )
+    from tests.unit.test_selection_readiness import (
+        _build_service,
+    )
+
+    service, _repository, _calls = _build_service(tmp_path, monkeypatch)
+    payload = public_shortlist_readiness_payload(service.review(READINESS_CODES))
+    result = acceptance.OrchestrationResult(
+        action_state_counts={},
+        final_data=payload,
+        final_readiness_calls=1,
+        initial_data=payload,
+        initial_readiness_calls=1,
+        outcome="completed_once",
+        refresh_action_calls=0,
+        source_status_calls=len(READINESS_CODES),
+    )
+    shortlist = {
+        "request": payload["request"],
+        "candidate_reviews": [
+            {"fund_code": code, "position_state": "not_held"}
+            for code in READINESS_CODES
+        ],
+        "comparability": [
+            {
+                "left_fund_code": READINESS_CODES[0],
+                "right_fund_code": READINESS_CODES[1],
+                "state": "comparable",
+                "reason_code": "classification_match",
+                "warning_codes": [],
+            }
+        ],
+    }
+
+    assert validate_engineering_flow(
+        result,
+        expected_subject_count=len(READINESS_CODES),
+    ) == {"engineering_flow": "pass"}
+    projection = project_engineering_evidence(result, shortlist)
+    assert projection["evidence_readiness"] == "ready"
+    assert projection["structural_comparability"] == "observed"
+
+
 def test_partial_real_evidence_is_not_promoted_to_structural_observation() -> None:
     result = _orchestration_result(
         actions=(("000001", "sync fund 000001"),),
-        final_evidence=[_candidate_evidence(usable=True)],
+        final_evidence=_closed_evidence(usable_first=True),
         states={"completed": 1},
         outcome="partial_once",
         refresh_calls=1,
@@ -556,24 +866,19 @@ def test_partial_real_evidence_is_not_promoted_to_structural_observation() -> No
 
     projection = project_engineering_evidence(
         result,
-        {
-            "candidate_reviews": [{"position_state": "held"}],
-            "comparability": [
-                {"state": "insufficient_data", "reason_code": "missing_identity"}
-            ],
-        },
+        _shortlist(),
     )
 
     assert projection == {
         "evidence_readiness": "partial",
         "comparison_evidence_readiness": "insufficient_data",
         "structural_comparability": "not_testable",
-        "usable_component_count": 6,
+        "usable_component_count": 14,
         "held_binding_observed": True,
         "comparison_state_counts": {
             "comparable": 0,
             "not_comparable": 0,
-            "insufficient_data": 1,
+            "insufficient_data": 6,
         },
         "comparison_reason_codes": ["missing_identity"],
     }
@@ -581,33 +886,28 @@ def test_partial_real_evidence_is_not_promoted_to_structural_observation() -> No
 
 def test_engineering_evidence_projects_ready_and_zero_component_states() -> None:
     ready = project_engineering_evidence(
-        _orchestration_result(final_ready=True, outcome="completed_once"),
-        {
-            "candidate_reviews": [{"position_state": "not_held"}],
-            "comparability": [
-                {"state": "comparable", "reason_code": "classification_match"}
-            ],
-        },
+        _orchestration_result(
+            final_ready=True,
+            final_evidence=_closed_evidence(usable_first=True),
+            outcome="completed_once",
+        ),
+        _shortlist(
+            pair_overrides={
+                0: {"state": "comparable", "reason_code": "classification_match"}
+            }
+        ),
     )
     missing = project_engineering_evidence(
         _orchestration_result(
             final_evidence=[
                 _candidate_evidence(
-                    usable=False,
-                    held=False,
+                    held=index == 0,
                     binding_failure=True,
                 )
+                for index in range(len(CODES))
             ]
         ),
-        {
-            "candidate_reviews": [{"position_state": "not_held"}],
-            "comparability": [
-                {
-                    "state": "insufficient_data",
-                    "reason_code": "peer_classification_unavailable",
-                }
-            ],
-        },
+        _shortlist(),
     )
 
     assert ready["evidence_readiness"] == "ready"
@@ -623,18 +923,22 @@ def test_engineering_evidence_projects_ready_and_zero_component_states() -> None
     "pair",
     (
         {"state": "comparable", "reason_code": "missing_identity"},
+        {"state": "not_comparable", "reason_code": "missing_identity"},
+        {"state": "insufficient_data", "reason_code": "classification_match"},
         {"state": "invalid", "reason_code": "classification_match"},
         {"state": "insufficient_data", "reason_code": "unsafe-code"},
     ),
 )
 def test_engineering_evidence_rejects_malformed_pair_state(pair) -> None:
+    shortlist = _shortlist()
+    shortlist["comparability"][0] = {
+        **shortlist["comparability"][0],
+        **pair,
+    }
     with pytest.raises(StableFailure, match="engineering_evidence_invalid"):
         project_engineering_evidence(
-            _orchestration_result(),
-            {
-                "candidate_reviews": [{"position_state": "not_held"}],
-                "comparability": [pair],
-            },
+            _orchestration_result(final_evidence=_closed_evidence()),
+            shortlist,
         )
 
 
@@ -956,10 +1260,20 @@ def test_engineering_controller_separates_flow_and_evidence_without_codes(
     )
     initial = _readiness(
         actions=(("000001", "sync fund 000001"),),
-        evidence=[{"profile": {"freshness": "stale"}}],
+        evidence=_closed_evidence(),
         blocking=["profile_stale"],
     )["data"]
-    final = _readiness(ready=False, blocking=["formal_nav_missing"])["data"]
+    final = _readiness(
+        ready=False,
+        evidence=[
+            _candidate_evidence(
+                held=index == 0,
+                binding_failure=True,
+            )
+            for index in range(len(CODES))
+        ],
+        blocking=["formal_nav_missing"],
+    )["data"]
     orchestration = acceptance.OrchestrationResult(
         action_state_counts={"terminal_failure": 1},
         final_data=final,
@@ -971,18 +1285,15 @@ def test_engineering_controller_separates_flow_and_evidence_without_codes(
         source_status_calls=4,
     )
     monkeypatch.setattr(acceptance, "orchestrate", lambda *_args: orchestration)
-    shortlist = {
-        "command": "fund.shortlist",
-        "data": {
-            "candidate_reviews": [{"position_state": "held"}],
-            "comparability": [
-                {
-                    "state": "not_comparable",
-                    "reason_code": "management_style_mismatch",
-                }
-            ],
-        },
-    }
+    shortlist_data = _shortlist(
+        pair_overrides={
+            0: {
+                "state": "not_comparable",
+                "reason_code": "management_style_mismatch",
+            }
+        }
+    )
+    shortlist = {"command": "fund.shortlist", "data": shortlist_data}
     monkeypatch.setattr(
         acceptance,
         "_engineering_cli_result",
@@ -999,6 +1310,7 @@ def test_engineering_controller_separates_flow_and_evidence_without_codes(
     assert summary["structural_comparability"] == "observed"
     assert summary["held_binding_observed"] is True
     assert summary["usable_component_count"] == 0
+    assert summary["gap_categories"] == ["formal_nav_missing"]
     assert "coverage" not in summary
     assert not any(code in encoded for code in CODES)
     assert str(subject) not in encoded
