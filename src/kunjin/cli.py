@@ -117,7 +117,18 @@ from kunjin.logging import redact_secrets
 from kunjin.models import InvestmentThesis
 from kunjin.paths import RuntimePaths
 from kunjin.security.keychain import CredentialStoreError, KeychainTokenStore
+from kunjin.selection.readiness import (
+    ShortlistReadinessService,
+    public_shortlist_readiness_payload,
+)
 from kunjin.selection.research import public_shortlist_payload
+from kunjin.selection.scope import (
+    PRODUCT_CATEGORIES,
+    RESEARCH_HORIZONS,
+    RESEARCH_OBJECTIVES,
+    ResearchScopeService,
+    public_research_scope_payload,
+)
 from kunjin.selection.service import ShortlistService
 from kunjin.services.research import ResearchSyncService
 from kunjin.services.sync import PortfolioSyncService, SyncError
@@ -291,6 +302,14 @@ class FundBriefCliError(ValueError):
     code = "fund_brief_failed"
 
 
+class FundResearchScopeCliError(ValueError):
+    code = "fund_research_scope_failed"
+
+
+class FundShortlistReadinessCliError(ValueError):
+    code = "fund_shortlist_readiness_failed"
+
+
 class KunjinArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise CliUsageError(message)
@@ -324,6 +343,8 @@ class ApplicationContext:
     intelligence_service: Optional["IntelligenceService"] = None
     diagnosis_service: Optional[DiagnosisService] = None
     selection_service: Optional[ShortlistService] = None
+    research_scope_service: Optional[ResearchScopeService] = None
+    shortlist_readiness_service: Optional[ShortlistReadinessService] = None
 
 
 def build_context(*, public_acceptance_subject: Optional[str] = None) -> ApplicationContext:
@@ -473,6 +494,18 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
         selection_service=ShortlistService(
             repository,
             fund_disclosure_store,
+            classification_loader=fund_risk_service.current_classification,
+            suitability_status_loader=suitability_service.status,
+            allocation_status_loader=allocation_service.status,
+        ),
+        research_scope_service=ResearchScopeService(
+            suitability_status_loader=suitability_service.status,
+            allocation_status_loader=allocation_service.status,
+        ),
+        shortlist_readiness_service=ShortlistReadinessService(
+            repository,
+            fund_disclosure_store,
+            source_health_service=source_health_service,
             classification_loader=fund_risk_service.current_classification,
             suitability_status_loader=suitability_service.status,
             allocation_status_loader=allocation_service.status,
@@ -661,6 +694,15 @@ def build_parser() -> argparse.ArgumentParser:
     fund_compare.add_argument("fund_codes", nargs="+")
     fund_shortlist = fund_subparsers.add_parser("shortlist")
     fund_shortlist.add_argument("fund_codes", nargs="+")
+    fund_research_scope = fund_subparsers.add_parser("research-scope")
+    fund_research_scope.add_argument("--objective", choices=RESEARCH_OBJECTIVES)
+    fund_research_scope.add_argument("--horizon", choices=RESEARCH_HORIZONS)
+    fund_research_scope.add_argument(
+        "--product-category",
+        choices=PRODUCT_CATEGORIES,
+    )
+    fund_readiness = fund_subparsers.add_parser("shortlist-readiness")
+    fund_readiness.add_argument("fund_codes", nargs="+")
     fund_classify = fund_subparsers.add_parser("classify")
     fund_classify.add_argument("fund_code")
     fund_classification = fund_subparsers.add_parser("classification")
@@ -3340,6 +3382,45 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                 }
             )
         return envelope("fund.shortlist", data, errors=errors)
+
+    if args.command == "fund" and args.fund_command == "research-scope":
+        if not args.json_output:
+            raise CliUsageError("fund research-scope requires JSON mode")
+        if context.research_scope_service is None:
+            raise CliUsageError("fund research-scope service is unavailable")
+        try:
+            result = context.research_scope_service.form(
+                objective=args.objective,
+                horizon=args.horizon,
+                product_category=args.product_category,
+            )
+            data = public_research_scope_payload(result)
+        except Exception:
+            raise FundResearchScopeCliError("fund research-scope failed") from None
+        return envelope("fund.research-scope", data)
+
+    if args.command == "fund" and args.fund_command == "shortlist-readiness":
+        if not args.json_output:
+            raise CliUsageError("fund shortlist-readiness requires JSON mode")
+        fund_codes = _validate_shortlist_codes(args.fund_codes)
+        if context.shortlist_readiness_service is None:
+            raise CliUsageError("fund shortlist-readiness service is unavailable")
+        try:
+            result = context.shortlist_readiness_service.review(fund_codes)
+            data = public_shortlist_readiness_payload(result)
+        except Exception:
+            raise FundShortlistReadinessCliError(
+                "fund shortlist-readiness failed"
+            ) from None
+        errors = []
+        if not result.comparison_evidence_ready:
+            errors.append(
+                {
+                    "code": "insufficient_data",
+                    "message": "Candidate comparison evidence is not ready",
+                }
+            )
+        return envelope("fund.shortlist-readiness", data, errors=errors)
 
     if args.command == "fund" and args.fund_command in {
         "profile",

@@ -97,7 +97,12 @@ from kunjin.models import (
     SyncResult,
 )
 from kunjin.paths import RuntimePaths
-from kunjin.selection.models import ShortlistResult
+from kunjin.selection.models import PersonalGateEvidence, ShortlistResult
+from kunjin.selection.readiness import (
+    CandidateReadinessEvidence,
+    ShortlistReadinessResult,
+)
+from kunjin.selection.scope import ResearchScopeService
 from kunjin.services.research import ResearchSyncResult, ResearchSyncService
 from kunjin.services.sync import PortfolioSyncService
 from kunjin.storage.repository import Repository
@@ -454,6 +459,95 @@ class FakeShortlistService:
         codes = tuple(fund_codes)
         self.calls.append(codes)
         return self.result
+
+
+class FakeResearchScopeService:
+    def __init__(self, *, blocked: bool = False) -> None:
+        suitability = {
+            "state": "fresh",
+            "freshness": "fresh",
+            "status": "blocked" if blocked else "ready_for_allocation",
+            "hard_blocks": ["emergency_reserve_shortfall"] if blocked else [],
+            "constraints": [],
+        }
+        allocation = {
+            "state": "missing" if blocked else "fresh",
+            "freshness": "missing" if blocked else "fresh",
+            "status": None if blocked else "range_available",
+            "binding_constraints": [],
+        }
+        self._delegate = ResearchScopeService(
+            suitability_status_loader=lambda: suitability,
+            allocation_status_loader=lambda: allocation,
+        )
+        self.calls: list[dict[str, str | None]] = []
+
+    def form(self, *, objective, horizon, product_category):
+        self.calls.append(
+            {
+                "objective": objective,
+                "horizon": horizon,
+                "product_category": product_category,
+            }
+        )
+        return self._delegate.form(
+            objective=objective,
+            horizon=horizon,
+            product_category=product_category,
+        )
+
+
+class FakeShortlistReadinessService:
+    def __init__(self, result: ShortlistReadinessResult) -> None:
+        self.result = result
+        self.calls: list[tuple[str, ...]] = []
+
+    def review(self, fund_codes) -> ShortlistReadinessResult:
+        codes = tuple(fund_codes)
+        self.calls.append(codes)
+        return self.result
+
+
+def readiness_result_fixture(*, ready: bool = True) -> ShortlistReadinessResult:
+    codes = ("000002", "000001")
+    personal_gate = PersonalGateEvidence(
+        suitability_state="fresh",
+        suitability_freshness="fresh",
+        suitability_status="ready_for_allocation",
+        allocation_state="fresh",
+        allocation_freshness="fresh",
+        allocation_status="range_available",
+        blocking_codes=(),
+        constraint_codes=(),
+    )
+    evidence = tuple(
+        CandidateReadinessEvidence(
+            fund_code=code,
+            source_health=(),
+            profile=(),
+            formal_nav=(),
+            holdings=(),
+            d1=(),
+            portfolio_binding=(("position_state", "not_held"),),
+            shortlist_entry=(),
+        )
+        for code in codes
+    )
+    result = ShortlistReadinessResult(
+        as_of=datetime(2026, 7, 19, tzinfo=timezone.utc),
+        candidate_codes=codes,
+        personal_gate=personal_gate,
+        candidate_evidence=evidence,
+        comparison_evidence_ready=ready,
+        conditional_shortlist_gate_ready=True,
+        blocking_codes=() if ready else ("formal_nav_missing",),
+        bounded_refresh_actions=()
+        if ready
+        else (("000002", "sync fund 000002"),),
+        manual_supplementation=(),
+    )
+    result.validate()
+    return result
 
 
 class CliIntegrationTest(unittest.TestCase):
@@ -1816,6 +1910,37 @@ class CliIntegrationTest(unittest.TestCase):
         )
         self.assertIs(
             context.selection_service._allocation_status_loader.__self__,
+            context.allocation_service,
+        )
+        self.assertIsNotNone(context.research_scope_service)
+        self.assertIs(
+            context.research_scope_service._suitability_status_loader.__self__,
+            context.suitability_service,
+        )
+        self.assertIs(
+            context.research_scope_service._allocation_status_loader.__self__,
+            context.allocation_service,
+        )
+        self.assertIsNotNone(context.shortlist_readiness_service)
+        self.assertIs(context.shortlist_readiness_service.repository, context.repository)
+        self.assertIs(
+            context.shortlist_readiness_service.disclosure_store,
+            context.fund_disclosure_store,
+        )
+        self.assertIs(
+            context.shortlist_readiness_service.source_health_service,
+            context.source_health_service,
+        )
+        self.assertIs(
+            context.shortlist_readiness_service.classification_loader.__self__,
+            context.fund_risk_service,
+        )
+        self.assertIs(
+            context.shortlist_readiness_service.suitability_status_loader.__self__,
+            context.suitability_service,
+        )
+        self.assertIs(
+            context.shortlist_readiness_service.allocation_status_loader.__self__,
             context.allocation_service,
         )
         for forbidden_dependency in (
@@ -3924,6 +4049,314 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(comparison_exit, 0)
         self.assert_envelope(comparison, "fund.compare")
         self.assertNotIn("conditional_shortlist", comparison["data"])
+
+    def test_research_scope_parser_accepts_only_closed_values(self) -> None:
+        args = build_parser().parse_args([
+            "--json",
+            "fund",
+            "research-scope",
+            "--objective",
+            "learning",
+            "--horizon",
+            "long_term",
+            "--product-category",
+            "broad_index",
+        ])
+        self.assertEqual(args.fund_command, "research-scope")
+        self.assertEqual(args.objective, "learning")
+        self.assertEqual(args.horizon, "long_term")
+        self.assertEqual(args.product_category, "broad_index")
+
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "fund",
+                "research-scope",
+                "--objective",
+                "unknown",
+            ],
+            self.context,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "fund.research-scope")
+        self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
+    def test_research_scope_success_and_missing_choices_are_public(self) -> None:
+        service = FakeResearchScopeService()
+        self.context.research_scope_service = service
+
+        payload, exit_code, json_output = run(
+            [
+                "--json",
+                "fund",
+                "research-scope",
+                "--objective",
+                "learning",
+                "--horizon",
+                "long_term",
+                "--product-category",
+                "broad_index",
+            ],
+            self.context,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "fund.research-scope")
+        self.assertEqual(payload["data"]["request"]["objective"], "learning")
+        self.assertEqual(
+            payload["data"]["candidate_formation"],
+            {
+                "status": "research_scope_only",
+                "candidate_code_discovery": "not_implemented",
+            },
+        )
+
+        missing, missing_exit, _ = run(
+            ["--json", "fund", "research-scope"], self.context
+        )
+        self.assertEqual(missing_exit, 0)
+        self.assertEqual(
+            missing["data"]["missing_inputs"],
+            [
+                "objective_required",
+                "horizon_required",
+                "product_category_required",
+            ],
+        )
+        self.assertEqual(len(missing["data"]["product_category_context"]["choices"]), 6)
+
+    def test_research_scope_blocked_gate_does_not_erase_fact_scope(self) -> None:
+        service = FakeResearchScopeService(blocked=True)
+        self.context.research_scope_service = service
+
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "fund",
+                "research-scope",
+                "--objective",
+                "learning",
+                "--horizon",
+                "short_term",
+                "--product-category",
+                "pure_bond",
+            ],
+            self.context,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["data"]["research_scope"]["product_category"], "pure_bond")
+        self.assertFalse(
+            payload["data"]["research_scope"]["risk_increase_conclusion_allowed"]
+        )
+        self.assertIn(
+            "emergency_reserve_shortfall",
+            payload["data"]["personal_gate"]["blocking_codes"],
+        )
+
+    def test_shortlist_readiness_parser_and_success_preserve_order(self) -> None:
+        args = build_parser().parse_args(
+            ["--json", "fund", "shortlist-readiness", "000002", "000001"]
+        )
+        self.assertEqual(args.fund_command, "shortlist-readiness")
+        self.assertEqual(args.fund_codes, ["000002", "000001"])
+
+        service = FakeShortlistReadinessService(readiness_result_fixture())
+        self.context.shortlist_readiness_service = service
+        payload, exit_code, json_output = run(
+            ["--json", "fund", "shortlist-readiness", "000002", "000001"],
+            self.context,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "fund.shortlist-readiness")
+        self.assertEqual(service.calls, [("000002", "000001")])
+        self.assertTrue(payload["data"]["comparison_evidence_ready"])
+        self.assertEqual(
+            payload["data"]["request"]["candidate_codes"],
+            ["000002", "000001"],
+        )
+
+    def test_shortlist_readiness_insufficient_data_keeps_full_payload(self) -> None:
+        service = FakeShortlistReadinessService(readiness_result_fixture(ready=False))
+        self.context.shortlist_readiness_service = service
+        payload, exit_code, _ = run(
+            ["--json", "fund", "shortlist-readiness", "000002", "000001"],
+            self.context,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assert_envelope(payload, "fund.shortlist-readiness")
+        self.assertEqual(payload["errors"], [
+            {
+                "code": "insufficient_data",
+                "message": "Candidate comparison evidence is not ready",
+            }
+        ])
+        self.assertFalse(payload["data"]["comparison_evidence_ready"])
+        self.assertEqual(payload["data"]["blocking_codes"], ["formal_nav_missing"])
+        self.assertEqual(
+            payload["data"]["bounded_refresh_actions"],
+            [{"fund_code": "000002", "command": "sync fund 000002"}],
+        )
+
+    def test_owner_readiness_commands_validate_mode_and_codes_before_services(self) -> None:
+        scope = FakeResearchScopeService()
+        readiness = FakeShortlistReadinessService(readiness_result_fixture())
+        self.context.research_scope_service = scope
+        self.context.shortlist_readiness_service = readiness
+        invalid_commands = (
+            ["fund", "research-scope"],
+            ["fund", "shortlist-readiness", "000002", "000001"],
+            ["--json", "fund", "shortlist-readiness", "000001"],
+            ["--json", "fund", "shortlist-readiness", "000001", "000001"],
+            ["--json", "fund", "shortlist-readiness", "000000", "000001"],
+            ["--json", "fund", "shortlist-readiness", "000001", "abc123"],
+        )
+        for argv in invalid_commands:
+            with self.subTest(argv=argv):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assertIn(
+                    payload["errors"][0]["code"],
+                    {"invalid_arguments", "invalid_fund_code"},
+                )
+        self.assertEqual(scope.calls, [])
+        self.assertEqual(readiness.calls, [])
+
+    def test_owner_readiness_unavailable_and_technical_errors_are_sanitized(self) -> None:
+        self.context.research_scope_service = None
+        self.context.shortlist_readiness_service = None
+        cases = (
+            (["--json", "fund", "research-scope"], "fund.research-scope"),
+            (
+                ["--json", "fund", "shortlist-readiness", "000002", "000001"],
+                "fund.shortlist-readiness",
+            ),
+        )
+        for argv, command in cases:
+            with self.subTest(command=command):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assert_envelope(payload, command)
+                self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
+        class TechnicalFailure:
+            def form(self, **_kwargs):
+                raise RuntimeError("private-owner-secret")
+
+            def review(self, _codes):
+                raise RuntimeError("private-owner-secret")
+
+        failure = TechnicalFailure()
+        self.context.research_scope_service = failure
+        self.context.shortlist_readiness_service = failure
+        technical_cases = (
+            (
+                ["--json", "fund", "research-scope"],
+                "fund_research_scope_failed",
+            ),
+            (
+                ["--json", "fund", "shortlist-readiness", "000002", "000001"],
+                "fund_shortlist_readiness_failed",
+            ),
+        )
+        for argv, code in technical_cases:
+            with self.subTest(code=code):
+                payload, exit_code, _ = run(argv, self.context)
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(payload["errors"][0]["code"], code)
+                self.assertNotIn("private-owner-secret", json.dumps(payload))
+
+    def test_owner_readiness_preserves_process_interrupts(self) -> None:
+        class InterruptingService:
+            def form(self, **_kwargs):
+                raise SystemExit(19)
+
+            def review(self, _codes):
+                raise KeyboardInterrupt()
+
+        service = InterruptingService()
+        self.context.research_scope_service = service
+        self.context.shortlist_readiness_service = service
+        with self.assertRaisesRegex(SystemExit, "19"):
+            run(["--json", "fund", "research-scope"], self.context)
+        with self.assertRaises(KeyboardInterrupt):
+            run(
+                ["--json", "fund", "shortlist-readiness", "000002", "000001"],
+                self.context,
+            )
+
+    def test_owner_readiness_dispatch_is_isolated_from_legacy_services(self) -> None:
+        class MustNotRun:
+            def review(self, _codes):
+                raise AssertionError("legacy shortlist service must not run")
+
+        self.context.selection_service = MustNotRun()
+        self.context.research_scope_service = FakeResearchScopeService()
+        self.context.shortlist_readiness_service = FakeShortlistReadinessService(
+            readiness_result_fixture()
+        )
+        scope, scope_exit, _ = run(
+            ["--json", "fund", "research-scope"], self.context
+        )
+        readiness, readiness_exit, _ = run(
+            ["--json", "fund", "shortlist-readiness", "000002", "000001"],
+            self.context,
+        )
+        self.assertEqual(scope_exit, 0)
+        self.assertEqual(readiness_exit, 0)
+        self.assert_envelope(scope, "fund.research-scope")
+        self.assert_envelope(readiness, "fund.shortlist-readiness")
+
+        class NewServicesMustNotRun:
+            def form(self, **_kwargs):
+                raise AssertionError("legacy command invoked research scope")
+
+            def review(self, _codes):
+                raise AssertionError("legacy command invoked readiness")
+
+        self.context.research_scope_service = NewServicesMustNotRun()
+        self.context.shortlist_readiness_service = NewServicesMustNotRun()
+        source, source_exit, _ = run(
+            ["--json", "source", "status", "--fund-code", "000001"],
+            self.context,
+        )
+        self.assertEqual(source_exit, 0)
+        self.assert_envelope(source, "source.status")
+
+        self.context.selection_service = FakeShortlistService(shortlist_result_fixture())
+        shortlist, shortlist_exit, _ = run(
+            ["--json", "fund", "shortlist", "000002", "000001"],
+            self.context,
+        )
+        self.assertEqual(shortlist_exit, 0)
+        self.assert_envelope(shortlist, "fund.shortlist")
+
+        diagnosis, diagnosis_exit, _ = run(
+            ["--json", "portfolio", "diagnose"], self.context
+        )
+        self.assertEqual(diagnosis_exit, 1)
+        self.assert_envelope(diagnosis, "portfolio.diagnose")
+
+        self.context.peer_store = FakePeerStore(peer_group("519755", "000001"))
+        self.context.fund_disclosure_store = FakeDisclosureStore(
+            empty_disclosure_bundle()
+        )
+        comparison, comparison_exit, _ = run(
+            ["--json", "fund", "compare", "519755", "000001"], self.context
+        )
+        self.assertEqual(comparison_exit, 0)
+        self.assert_envelope(comparison, "fund.compare")
+
+        suitability, suitability_exit, _ = run(
+            ["--json", "suitability", "status"], self.context
+        )
+        self.assertEqual(suitability_exit, 0)
+        self.assert_envelope(suitability, "suitability.status")
+        allocation, allocation_exit, _ = run(
+            ["--json", "allocation", "status"], self.context
+        )
+        self.assertEqual(allocation_exit, 0)
+        self.assert_envelope(allocation, "allocation.status")
 
     def test_peer_sync_partial_success_keeps_member_errors_in_data(self) -> None:
         result = PeerSyncResult(
