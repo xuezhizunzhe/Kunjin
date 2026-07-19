@@ -356,6 +356,10 @@ def _source_stops(data: Optional[dict], code: str) -> Tuple[bool, frozenset]:
         if resolution == "manual_supplement_required":
             stopped.add(field_id)
             continue
+        if resolution == "usable":
+            continue
+        if resolution != "partial":
+            return True, frozenset()
         primary_state = primary_rows.get((field_id, source_id))
         if primary_state is None:
             return True, frozenset()

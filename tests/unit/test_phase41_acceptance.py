@@ -223,6 +223,40 @@ def test_orchestration_uses_primary_source_not_blocked_alternative() -> None:
     assert result.final_readiness_calls == 1
 
 
+def test_usable_alternative_overrides_terminal_primary_and_action_runs_once() -> None:
+    actions = (("000001", "sync fund 000001"),)
+    readiness_count = 0
+    action_calls = 0
+
+    def invoke(argv):
+        nonlocal action_calls, readiness_count
+        if argv[1:3] == ["fund", "shortlist-readiness"]:
+            readiness_count += 1
+            return CommandResult(
+                1 if readiness_count == 1 else 0,
+                _readiness(actions if readiness_count == 1 else (), ready=True),
+            )
+        if argv[1:3] == ["source", "status"]:
+            return CommandResult(
+                0,
+                _source_status(
+                    argv[-1],
+                    resolution="usable",
+                    primary_state="unavailable",
+                    alternative_state="healthy",
+                ),
+            )
+        action_calls += 1
+        return CommandResult(0, {"command": "sync.fund", "data": {}})
+
+    result = orchestrate(CODES[:2], ROLES[:2], invoke)
+
+    assert action_calls == 1
+    assert result.refresh_action_calls == 1
+    assert result.action_state_counts == {"completed": 1}
+    assert readiness_count == 2
+
+
 @pytest.mark.parametrize("state", ("cooldown", "unavailable", "unsupported"))
 def test_orchestration_stops_action_on_terminal_primary_source(state) -> None:
     calls = []
@@ -236,7 +270,14 @@ def test_orchestration_stops_action_on_terminal_primary_source(state) -> None:
             actions = (("000001", "sync fund 000001"),) if readiness_count == 1 else ()
             return CommandResult(1, _readiness(actions))
         if argv[1:3] == ["source", "status"]:
-            return CommandResult(0, _source_status(argv[-1], primary_state=state))
+            return CommandResult(
+                0,
+                _source_status(
+                    argv[-1],
+                    resolution="partial",
+                    primary_state=state,
+                ),
+            )
         raise AssertionError("stopped action must not execute")
 
     result = orchestrate(CODES[:2], ROLES[:2], invoke)
