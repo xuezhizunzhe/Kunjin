@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -15,6 +16,8 @@ from kunjin.decision.models import (
     RequestMode,
     SourceAttempt,
     SourceAttemptOutcome,
+    SourceErrorCode,
+    SourceFieldRef,
     SourceTier,
 )
 from kunjin.decision.source_registry import SourceRegistryV1
@@ -118,6 +121,145 @@ def test_request_source_attempts_reject_cutoff_outside_request(tmp_path, cutoff)
 
     with pytest.raises(ValueError, match="outside the request lifetime"):
         store.authenticated_request_source_attempts(request_run_id, budget, cutoff)
+
+
+def test_stored_source_histories_use_one_ordered_read_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    repository = _repository(tmp_path)
+    store = DecisionAuditStore(repository)
+    budget = _budget("5" * 32, now=NOW - timedelta(minutes=1))
+    run_id = store.begin_request(budget)
+    first = SourceFieldRef("eastmoney_f10", "identity_active_status")
+    second = SourceFieldRef("eastmoney_f10", "current_manager_team")
+    first_id = store.record_source_attempt(
+        run_id,
+        _attempt(finished_at=NOW - timedelta(seconds=30), response_bytes=1),
+    )
+    second_id = store.record_source_attempt(
+        run_id,
+        replace(
+            _attempt(finished_at=NOW - timedelta(seconds=20), response_bytes=2),
+            field_id=second.field_id,
+        ),
+    )
+    future_budget = _budget("7" * 32, now=NOW)
+    future_run_id = store.begin_request(future_budget)
+    store.record_source_attempt(
+        future_run_id,
+        _attempt(finished_at=NOW + timedelta(seconds=1), response_bytes=3),
+    )
+    original_connect = repository.connect
+    connect_calls = 0
+
+    def counted_connect():
+        nonlocal connect_calls
+        connect_calls += 1
+        return original_connect()
+
+    monkeypatch.setattr(repository, "connect", counted_connect)
+
+    histories = store.stored_source_attempt_histories(
+        (second, first),
+        "fund:123456",
+        NOW,
+    )
+
+    assert connect_calls == 1
+    assert tuple(history.reference for history in histories) == (second, first)
+    assert tuple(item.id for item in histories[0].attempts) == (second_id,)
+    assert tuple(item.id for item in histories[1].attempts) == (first_id,)
+
+
+@pytest.mark.parametrize(
+    ("references", "subject_key", "cutoff_at", "message"),
+    (
+        ([], "fund:123456", NOW, "references"),
+        ((SourceFieldRef("eastmoney_f10", "identity_active_status"),) * 2,
+         "fund:123456", NOW, "duplicates"),
+        ((SourceFieldRef("eastmoney_f10", "identity_active_status"),),
+         "fund:12345", NOW, "subject key"),
+        ((SourceFieldRef("eastmoney_f10", "identity_active_status"),),
+         "fund:123456", NOW.replace(tzinfo=None), "cutoff"),
+    ),
+)
+def test_stored_source_histories_strictly_validate_inputs(
+    tmp_path, references, subject_key, cutoff_at, message
+) -> None:
+    store = DecisionAuditStore(_repository(tmp_path))
+
+    with pytest.raises(ValueError, match=message):
+        store.stored_source_attempt_histories(references, subject_key, cutoff_at)
+
+
+def test_stored_source_histories_filter_before_history_limit(tmp_path) -> None:
+    repository = _repository(tmp_path)
+    store = DecisionAuditStore(repository)
+    reference = SourceFieldRef("eastmoney_f10", "identity_active_status")
+    old_budget = _budget("6" * 32, now=NOW - timedelta(minutes=5))
+    old_run_id = store.begin_request(old_budget)
+    valid_id = store.record_source_attempt(
+        old_run_id,
+        _attempt(finished_at=NOW - timedelta(minutes=4), response_bytes=1),
+    )
+    for index in range(64):
+        if index % 2 == 0:
+            attempt = _attempt(
+                finished_at=NOW + timedelta(seconds=index + 1),
+                response_bytes=2,
+            )
+        else:
+            attempt = replace(
+                _attempt(
+                    finished_at=NOW - timedelta(seconds=64 - index),
+                    response_bytes=0,
+                ),
+                outcome=SourceAttemptOutcome.CANCELLED,
+                data_as_of=None,
+                error_code=SourceErrorCode.REQUEST_CANCELLED,
+            )
+        budget = _budget(
+            f"{index + 100:032x}",
+            now=attempt.started_at - timedelta(seconds=1),
+        )
+        run_id = store.begin_request(budget)
+        store.record_source_attempt(run_id, attempt)
+
+    histories = store.stored_source_attempt_histories(
+        (reference,),
+        "fund:123456",
+        NOW,
+    )
+
+    assert tuple(item.id for item in histories[0].attempts) == (valid_id,)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    (
+        (sqlite3.DatabaseError("database failed"), DecisionAuditStoreError),
+        (RuntimeError("local failure"), RuntimeError),
+        (KeyboardInterrupt(), KeyboardInterrupt),
+        (SystemExit(), SystemExit),
+    ),
+)
+def test_stored_source_histories_propagate_technical_failures_and_interruptions(
+    tmp_path, monkeypatch, error: BaseException, expected: type[BaseException]
+) -> None:
+    repository = _repository(tmp_path)
+    store = DecisionAuditStore(repository)
+
+    def fail_connect():
+        raise error
+
+    monkeypatch.setattr(repository, "connect", fail_connect)
+
+    with pytest.raises(expected):
+        store.stored_source_attempt_histories(
+            (SourceFieldRef("eastmoney_f10", "identity_active_status"),),
+            "fund:123456",
+            NOW,
+        )
 
 
 def test_latest_active_thesis_returns_exact_id_and_deterministic_record(tmp_path) -> None:

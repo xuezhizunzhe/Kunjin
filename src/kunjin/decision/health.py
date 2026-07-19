@@ -308,16 +308,10 @@ class SourceHealthService:
             for source in self.registry.sources
             for field in source.fields
         )
-        histories = tuple(
-            SourceFieldHistory(
-                reference,
-                self.audit_store.source_attempt_history(
-                    reference.source_id,
-                    reference.field_id,
-                    subject_key,
-                ),
-            )
-            for reference in references
+        histories = self.audit_store.stored_source_attempt_histories(
+            references,
+            subject_key,
+            trusted_context.now,
         )
         return self._snapshot_from_histories(
             histories,

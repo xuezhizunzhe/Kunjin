@@ -881,6 +881,88 @@ class DecisionAuditStore:
         except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError):
             raise DecisionAuditStoreError("source attempt authentication failed") from None
 
+    def stored_source_attempt_histories(
+        self,
+        references: Tuple[SourceFieldRef, ...],
+        subject_key: str,
+        cutoff_at: datetime,
+    ) -> Tuple[SourceFieldHistory, ...]:
+        if type(references) is not tuple or not references or len(references) > 128:
+            raise ValueError("references must be a non-empty bounded exact tuple")
+        if len(references) != len(set(references)):
+            raise ValueError("references must not contain duplicates")
+        for reference in references:
+            if type(reference) is not SourceFieldRef:
+                raise ValueError("references must contain exact SourceFieldRef records")
+            reference.validate()
+        if type(subject_key) is not str or _SUBJECT_KEY_PATTERN.fullmatch(subject_key) is None:
+            raise ValueError("subject key must be fund: followed by exactly six digits")
+        validate_aware_datetime(cutoff_at, "source history cutoff")
+        cutoff_text = _utc_text(
+            cutoff_at.astimezone(timezone.utc),
+            "source history cutoff",
+        )
+        predicates = " OR ".join(
+            "(source_attempts.source_id = ? AND source_attempts.field_id = ?)"
+            for _ in references
+        )
+        parameters = tuple(
+            item
+            for reference in references
+            for item in (reference.source_id, reference.field_id)
+        )
+        try:
+            with self.repository.connect() as connection, connection:
+                connection.execute("BEGIN")
+                rows = connection.execute(
+                    f"""
+                    WITH ranked AS (
+                        SELECT source_attempts.*,
+                               request_runs.request_id AS request_id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY source_attempts.source_id,
+                                                source_attempts.field_id
+                                   ORDER BY source_attempts.finished_at DESC,
+                                            source_attempts.id DESC
+                               ) AS history_rank
+                        FROM source_attempts
+                        JOIN request_runs
+                          ON request_runs.id = source_attempts.request_run_id
+                        WHERE source_attempts.subject_key = ?
+                          AND source_attempts.finished_at COLLATE BINARY
+                              <= ? COLLATE BINARY
+                          AND source_attempts.outcome NOT IN (
+                              'cancelled', 'expired', 'skipped_cooldown'
+                          )
+                          AND ({predicates})
+                    )
+                    SELECT * FROM ranked
+                    WHERE history_rank <= ?
+                    ORDER BY source_id, field_id, finished_at DESC, id DESC
+                    """,  # noqa: S608 - placeholders bind every dynamic value
+                    (subject_key, cutoff_text, *parameters, SOURCE_HISTORY_LIMIT),
+                ).fetchall()
+                grouped = {reference: [] for reference in references}
+                for row in rows:
+                    record = _stored_attempt(row)
+                    grouped[
+                        SourceFieldRef(
+                            record.attempt.source_id,
+                            record.attempt.field_id,
+                        )
+                    ].append(record)
+                histories = tuple(
+                    SourceFieldHistory(reference, tuple(grouped[reference]))
+                    for reference in references
+                )
+                for history in histories:
+                    history.validate()
+                return histories
+        except DecisionAuditStoreError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError):
+            raise DecisionAuditStoreError("stored source history read failed") from None
+
     def authenticated_source_attempt(self, attempt_id: int) -> StoredSourceAttempt:
         _positive_id(attempt_id, "source attempt id")
         try:

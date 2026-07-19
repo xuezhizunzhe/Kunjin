@@ -370,18 +370,22 @@ def test_stored_source_status_snapshot_reuses_health_rules_without_writes(
     assert stored.resolutions == audited.resolutions
 
 
-def test_stored_source_status_loads_each_registered_field_once(
+def test_stored_source_status_loads_all_registered_fields_once(
     tmp_path, monkeypatch
 ) -> None:
     harness = _Harness(tmp_path)
-    calls: list[tuple[str, str, str]] = []
-    original = harness.store.source_attempt_history
+    calls: list[tuple[tuple[SourceFieldRef, ...], str, datetime]] = []
+    original = harness.store.stored_source_attempt_histories
 
-    def counted_history(source_id: str, field_id: str, subject_key: str):
-        calls.append((source_id, field_id, subject_key))
-        return original(source_id, field_id, subject_key)
+    def counted_histories(references, subject_key, cutoff_at):
+        calls.append((references, subject_key, cutoff_at))
+        return original(references, subject_key, cutoff_at)
 
-    monkeypatch.setattr(harness.store, "source_attempt_history", counted_history)
+    monkeypatch.setattr(
+        harness.store,
+        "stored_source_attempt_histories",
+        counted_histories,
+    )
     requirement = harness.service.action_requirement(
         PRIMARY[1],
         ActionKind.FACT_RESEARCH,
@@ -395,13 +399,12 @@ def test_stored_source_status_loads_each_registered_field_once(
         (requirement,),
     )
 
-    expected = {
-        (source.source_id, field.field_id, SUBJECT)
+    expected = tuple(
+        SourceFieldRef(source.source_id, field.field_id)
         for source in harness.service.registry.sources
         for field in source.fields
-    }
-    assert len(calls) == len(expected)
-    assert set(calls) == expected
+    )
+    assert calls == [(expected, SUBJECT, NOW)]
 
 
 @pytest.mark.parametrize(
@@ -421,7 +424,7 @@ def test_stored_source_status_propagates_history_failures(
     def fail_history(*_args, **_kwargs):
         raise error
 
-    monkeypatch.setattr(harness.store, "source_attempt_history", fail_history)
+    monkeypatch.setattr(harness.store, "stored_source_attempt_histories", fail_history)
 
     with pytest.raises(type(error), match="database failed" if error.args else None):
         harness.service.stored_source_status_snapshot(
@@ -478,6 +481,100 @@ def test_stored_source_status_requires_exact_requirement_tuple(tmp_path) -> None
             (SourceFieldRef(*PRIMARY),),
             object(),
         )
+
+
+def test_stored_source_status_future_attempts_cannot_evict_past_success(
+    tmp_path,
+) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(
+        identity=PRIMARY,
+        finished_at=NOW - timedelta(minutes=2),
+        data_as_of=NOW - timedelta(days=1),
+    )
+    for offset in range(1, 65):
+        harness.record(
+            identity=PRIMARY,
+            finished_at=NOW + timedelta(minutes=offset),
+            data_as_of=NOW,
+        )
+    requirement = harness.service.action_requirement(
+        PRIMARY[1],
+        ActionKind.FACT_RESEARCH,
+        RiskEffect.INFORMATION,
+    )
+
+    snapshot = harness.service.stored_source_status_snapshot(
+        SUBJECT,
+        FreshnessContext(
+            now=NOW,
+            latest_expected_data_as_of=NOW - timedelta(days=1),
+        ),
+        (SourceFieldRef(*PRIMARY),),
+        (requirement,),
+    )
+    projection = next(
+        item
+        for item in snapshot.projections
+        if item.history.reference == SourceFieldRef(*PRIMARY)
+    )
+
+    assert len(projection.history.attempts) == 1
+    assert projection.state is SourceFieldState.HEALTHY
+
+
+def test_stored_source_status_lifecycle_attempts_cannot_evict_past_success(
+    tmp_path,
+) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(
+        identity=PRIMARY,
+        finished_at=NOW - timedelta(minutes=5),
+        data_as_of=NOW - timedelta(days=1),
+    )
+    lifecycle = (
+        (SourceAttemptOutcome.CANCELLED, SourceErrorCode.REQUEST_CANCELLED, None),
+        (SourceAttemptOutcome.EXPIRED, SourceErrorCode.REQUEST_EXPIRED, None),
+        (
+            SourceAttemptOutcome.SKIPPED_COOLDOWN,
+            SourceErrorCode.COOLDOWN_ACTIVE,
+            NOW + INITIAL_COOLDOWN,
+        ),
+    )
+    for index in range(64):
+        outcome, error_code, cooldown_until = lifecycle[index % len(lifecycle)]
+        harness.record(
+            identity=PRIMARY,
+            outcome=outcome,
+            finished_at=NOW - timedelta(seconds=64 - index),
+            data_as_of=None,
+            error_code=error_code,
+            cooldown_until=cooldown_until,
+            response_bytes=0,
+        )
+    requirement = harness.service.action_requirement(
+        PRIMARY[1],
+        ActionKind.FACT_RESEARCH,
+        RiskEffect.INFORMATION,
+    )
+
+    snapshot = harness.service.stored_source_status_snapshot(
+        SUBJECT,
+        FreshnessContext(
+            now=NOW,
+            latest_expected_data_as_of=NOW - timedelta(days=1),
+        ),
+        (SourceFieldRef(*PRIMARY),),
+        (requirement,),
+    )
+    projection = next(
+        item
+        for item in snapshot.projections
+        if item.history.reference == SourceFieldRef(*PRIMARY)
+    )
+
+    assert len(projection.history.attempts) == 1
+    assert projection.state is SourceFieldState.HEALTHY
 
 
 def test_future_attempts_cannot_evict_past_success_before_history_limit(tmp_path) -> None:
