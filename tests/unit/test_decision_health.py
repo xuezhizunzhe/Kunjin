@@ -285,6 +285,201 @@ def test_source_status_snapshot_uses_one_authenticated_sqlite_snapshot(
     assert snapshot.resolutions == (RequestFieldResolution.PARTIAL,)
 
 
+def test_stored_source_status_snapshot_reuses_health_rules_without_writes(
+    tmp_path,
+) -> None:
+    harness = _Harness(tmp_path)
+    harness.record(identity=PRIMARY, data_as_of=NOW - timedelta(days=1))
+    harness.record(
+        identity=ALTERNATIVE,
+        outcome=SourceAttemptOutcome.UNSUPPORTED,
+        data_as_of=None,
+        error_code=SourceErrorCode.FIELD_UNSUPPORTED,
+        response_bytes=0,
+    )
+    stale = ("eastmoney_f10", "holdings_industries")
+    cooldown = ("eastmoney_market", "market_context")
+    unavailable = ("stcn_fund_news", "fund_media_events")
+    harness.record(identity=stale, data_as_of=NOW - timedelta(days=200))
+    harness.record(
+        identity=cooldown,
+        outcome=SourceAttemptOutcome.TRANSIENT_FAILURE,
+        data_as_of=None,
+        error_code=SourceErrorCode.NETWORK_TIMEOUT,
+        cooldown_until=NOW + INITIAL_COOLDOWN,
+        response_bytes=0,
+    )
+    harness.record(
+        identity=unavailable,
+        outcome=SourceAttemptOutcome.UNAVAILABLE,
+        data_as_of=None,
+        error_code=SourceErrorCode.PARSE_FAILURE,
+        response_bytes=0,
+    )
+    primary = SourceFieldRef(*PRIMARY)
+    requirement = harness.service.action_requirement(
+        PRIMARY[1],
+        ActionKind.FACT_RESEARCH,
+        RiskEffect.INFORMATION,
+    )
+    context = FreshnessContext(
+        now=NOW - timedelta(days=30),
+        request_id="f" * 32,
+        latest_expected_data_as_of=NOW - timedelta(days=1),
+    )
+    with harness.store.repository.connect() as connection:
+        before = (
+            connection.execute("SELECT count(*) FROM request_runs").fetchone()[0],
+            connection.execute("SELECT count(*) FROM source_attempts").fetchone()[0],
+        )
+
+    stored = harness.service.stored_source_status_snapshot(
+        SUBJECT,
+        context,
+        (primary,),
+        (requirement,),
+    )
+
+    with harness.store.repository.connect() as connection:
+        after = (
+            connection.execute("SELECT count(*) FROM request_runs").fetchone()[0],
+            connection.execute("SELECT count(*) FROM source_attempts").fetchone()[0],
+        )
+    request_run_id, budget = harness.begin(started_at=NOW)
+    audited = harness.service.source_status_snapshot(
+        SUBJECT,
+        _context(budget),
+        (primary,),
+        (requirement,),
+        request_run_id=request_run_id,
+        budget=budget,
+    )
+
+    assert after == before
+    assert stored.evaluated_at == NOW
+    states = {
+        projection.history.reference: projection.state
+        for projection in stored.projections
+    }
+    assert states[primary] is SourceFieldState.HEALTHY
+    assert states[SourceFieldRef(*stale)] is SourceFieldState.DEGRADED
+    assert states[SourceFieldRef(*cooldown)] is SourceFieldState.COOLDOWN
+    assert states[SourceFieldRef(*unavailable)] is SourceFieldState.UNAVAILABLE
+    assert states[SourceFieldRef(*ALTERNATIVE)] is SourceFieldState.UNSUPPORTED
+    assert stored.projections == audited.projections
+    assert stored.resolutions == audited.resolutions
+
+
+def test_stored_source_status_loads_each_registered_field_once(
+    tmp_path, monkeypatch
+) -> None:
+    harness = _Harness(tmp_path)
+    calls: list[tuple[str, str, str]] = []
+    original = harness.store.source_attempt_history
+
+    def counted_history(source_id: str, field_id: str, subject_key: str):
+        calls.append((source_id, field_id, subject_key))
+        return original(source_id, field_id, subject_key)
+
+    monkeypatch.setattr(harness.store, "source_attempt_history", counted_history)
+    requirement = harness.service.action_requirement(
+        PRIMARY[1],
+        ActionKind.FACT_RESEARCH,
+        RiskEffect.INFORMATION,
+    )
+
+    harness.service.stored_source_status_snapshot(
+        SUBJECT,
+        FreshnessContext(now=NOW),
+        (SourceFieldRef(*PRIMARY),),
+        (requirement,),
+    )
+
+    expected = {
+        (source.source_id, field.field_id, SUBJECT)
+        for source in harness.service.registry.sources
+        for field in source.fields
+    }
+    assert len(calls) == len(expected)
+    assert set(calls) == expected
+
+
+@pytest.mark.parametrize(
+    "error",
+    (RuntimeError("database failed"), KeyboardInterrupt(), SystemExit()),
+)
+def test_stored_source_status_propagates_history_failures(
+    tmp_path, monkeypatch, error: BaseException
+) -> None:
+    harness = _Harness(tmp_path)
+    requirement = harness.service.action_requirement(
+        PRIMARY[1],
+        ActionKind.FACT_RESEARCH,
+        RiskEffect.INFORMATION,
+    )
+
+    def fail_history(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(harness.store, "source_attempt_history", fail_history)
+
+    with pytest.raises(type(error), match="database failed" if error.args else None):
+        harness.service.stored_source_status_snapshot(
+            SUBJECT,
+            FreshnessContext(now=NOW),
+            (SourceFieldRef(*PRIMARY),),
+            (requirement,),
+        )
+
+
+@pytest.mark.parametrize(
+    ("subject_key", "context", "message"),
+    (
+        ("fund:12345", FreshnessContext(now=NOW), "subject key"),
+        (SUBJECT, object(), "freshness context"),
+        (
+            SUBJECT,
+            FreshnessContext(now=NOW, data_request_id="f" * 32),
+            "data lineage fields",
+        ),
+        (
+            SUBJECT,
+            FreshnessContext(now=NOW, data_trading_day=NOW.date()),
+            "data lineage fields",
+        ),
+    ),
+)
+def test_stored_source_status_strictly_validates_unauthenticated_inputs(
+    tmp_path, subject_key: str, context: object, message: str
+) -> None:
+    harness = _Harness(tmp_path)
+    requirement = harness.service.action_requirement(
+        PRIMARY[1],
+        ActionKind.FACT_RESEARCH,
+        RiskEffect.INFORMATION,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        harness.service.stored_source_status_snapshot(
+            subject_key,
+            context,
+            (SourceFieldRef(*PRIMARY),),
+            (requirement,),
+        )
+
+
+def test_stored_source_status_requires_exact_requirement_tuple(tmp_path) -> None:
+    harness = _Harness(tmp_path)
+
+    with pytest.raises(ValueError, match="requirements must be an exact tuple"):
+        harness.service.stored_source_status_snapshot(
+            SUBJECT,
+            FreshnessContext(now=NOW),
+            (SourceFieldRef(*PRIMARY),),
+            object(),
+        )
+
+
 def test_future_attempts_cannot_evict_past_success_before_history_limit(tmp_path) -> None:
     harness = _Harness(tmp_path)
     harness.record(

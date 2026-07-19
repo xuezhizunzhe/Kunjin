@@ -258,15 +258,89 @@ class SourceHealthService:
         request_run_id: int,
         budget: RequestBudget,
     ) -> SourceStatusSnapshot:
+        self._validate_snapshot_request(primary_references, requirements)
+
+        trusted_context = self._trusted_context(context, budget)
+        references = tuple(
+            SourceFieldRef(source.source_id, field.field_id)
+            for source in self.registry.sources
+            for field in source.fields
+        )
+        histories = self.audit_store.authenticated_source_attempt_histories(
+            request_run_id,
+            budget,
+            references,
+            subject_key,
+            trusted_context.now,
+        )
+        return self._snapshot_from_histories(
+            histories,
+            trusted_context,
+            primary_references,
+            requirements,
+        )
+
+    def stored_source_status_snapshot(
+        self,
+        subject_key: str,
+        context: FreshnessContext,
+        primary_references: tuple[SourceFieldRef, ...],
+        requirements: tuple[ActionEvidenceRequirement, ...],
+    ) -> SourceStatusSnapshot:
+        self._validate_snapshot_request(primary_references, requirements)
+        if (
+            type(subject_key) is not str
+            or _SUBJECT_KEY_PATTERN.fullmatch(subject_key) is None
+        ):
+            raise ValueError("subject key must be fund: followed by exactly six digits")
+        if type(context) is not FreshnessContext:
+            raise ValueError("freshness context must be an exact FreshnessContext")
+        context.validate()
+        if context.data_request_id is not None or context.data_trading_day is not None:
+            raise ValueError("data lineage fields are derived from authenticated attempts")
+        now = validate_aware_datetime(
+            self.wall_clock(),
+            "health wall clock",
+        ).astimezone(timezone.utc)
+        trusted_context = replace(context, now=now, request_id=None)
+        references = tuple(
+            SourceFieldRef(source.source_id, field.field_id)
+            for source in self.registry.sources
+            for field in source.fields
+        )
+        histories = tuple(
+            SourceFieldHistory(
+                reference,
+                self.audit_store.source_attempt_history(
+                    reference.source_id,
+                    reference.field_id,
+                    subject_key,
+                ),
+            )
+            for reference in references
+        )
+        return self._snapshot_from_histories(
+            histories,
+            trusted_context,
+            primary_references,
+            requirements,
+        )
+
+    def _validate_snapshot_request(
+        self,
+        primary_references: tuple[SourceFieldRef, ...],
+        requirements: tuple[ActionEvidenceRequirement, ...],
+    ) -> None:
         if (
             type(primary_references) is not tuple
             or not primary_references
             or len(primary_references) > 128
-            or len(primary_references) != len(requirements)
         ):
             raise ValueError("source status primary references are invalid")
         if type(requirements) is not tuple:
             raise ValueError("source status requirements must be an exact tuple")
+        if len(primary_references) != len(requirements):
+            raise ValueError("source status primary references are invalid")
         for reference, requirement in zip(primary_references, requirements):
             if type(reference) is not SourceFieldRef:
                 raise ValueError("source status primaries must contain exact references")
@@ -285,19 +359,13 @@ class SourceHealthService:
         if len(primary_references) != len(set(primary_references)):
             raise ValueError("source status primaries must be unique")
 
-        trusted_context = self._trusted_context(context, budget)
-        references = tuple(
-            SourceFieldRef(source.source_id, field.field_id)
-            for source in self.registry.sources
-            for field in source.fields
-        )
-        histories = self.audit_store.authenticated_source_attempt_histories(
-            request_run_id,
-            budget,
-            references,
-            subject_key,
-            trusted_context.now,
-        )
+    def _snapshot_from_histories(
+        self,
+        histories: tuple[SourceFieldHistory, ...],
+        trusted_context: FreshnessContext,
+        primary_references: tuple[SourceFieldRef, ...],
+        requirements: tuple[ActionEvidenceRequirement, ...],
+    ) -> SourceStatusSnapshot:
         filtered_histories = tuple(
             SourceFieldHistory(
                 history.reference,
