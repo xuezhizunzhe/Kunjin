@@ -3698,13 +3698,27 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
                 "Never add `--force`, automatically retry, continue in the background, "
                 "or develop an adapter during the request"
             ),
-            "stop the affected field",
-            "`cooldown`, `unavailable`, `unsupported`, or `manual_supplement_required`",
+            "Use aggregate `request_field_resolutions` as authoritative",
+            (
+                "With `resolution=usable`, continue the single planned action even when "
+                "the primary or an unused alternative is terminal"
+            ),
+            "`resolution=manual_supplement_required` stops the affected field",
+            (
+                "`resolution=partial` stops the affected field only when its corresponding "
+                "primary is `cooldown`, `unavailable`, or `unsupported`"
+            ),
+            "A terminal command failure stops only dependent actions",
             "Each legacy command keeps its own independent runtime boundary",
             "`sync fund` and `sync fund-documents` are outside the Phase 0 90/480-second budget",
             "Return the final result as partial when any gap remains",
         ):
             self.assertIn(phrase, normalized_skill)
+        self.assertNotIn(
+            "For `cooldown`, `unavailable`, `unsupported`, or "
+            "`manual_supplement_required`, stop the affected field",
+            normalized_skill,
+        )
         self.assertLessEqual(len(skill.splitlines()), 500)
 
     def test_phase4_readme_and_skill_route_exact_unordered_candidates(self) -> None:
