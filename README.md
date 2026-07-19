@@ -218,6 +218,48 @@ Never develop a source adapter during the query. An unsupported source lowers
 the evidence state and becomes an explicit manual-supplementation gap instead
 of starting an unbounded retry or adapter-development loop.
 
+## Owner Research Scope And Readiness (Phase 4.1)
+
+When the owner has no fund code yet, form a bounded educational research scope
+from an objective, horizon, and product category. When the owner later supplies
+two to five confirmed codes, inspect the stored comparison evidence without
+network access or database writes:
+
+```bash
+.venv/bin/kunjin --json fund research-scope
+.venv/bin/kunjin --json fund research-scope \
+  --objective learning \
+  --horizon long_term \
+  --product-category broad_index
+.venv/bin/kunjin --json fund shortlist-readiness 000001 000002
+```
+
+Research scope is educational and amount-free. Phase B/C may annotate or block
+a risk-increasing conclusion, but never filter, narrow, or erase fact research
+or the research scope. The public residual state is
+`candidate_formation.status=research_scope_only` and
+`candidate_formation.candidate_code_discovery=not_implemented`: KunJin still
+cannot take a beginner from no code to two-to-five codes automatically. Phase
+4.1 adds neither market direction nor candidate-code discovery.
+
+Shortlist readiness is a local snapshot, not a refresh engine or
+recommendation. It preserves component evidence and returns only existing
+commands that may close a gap. For one explicit two-to-five-code request, run
+initial readiness once, source status once per code, only the returned actions
+at most once in dependency order, and final readiness once. Never use
+`--force`, automatically retry, continue in the background, or develop an
+adapter during the request. Return a partial terminal result when gaps remain.
+Every legacy command keeps its own runtime and source boundary; in particular,
+`sync fund` and `sync fund-documents` are not inside the Phase 0 90/480-second
+budget.
+
+All results remain `action_maturity=evidence_only`,
+`action_authorized=false`, `exact_amount_available=false`, and
+`automatic_trade=false`. With no real owner candidates, acceptance must retain
+`owner_candidate_state=owner_candidates_unavailable` and
+`financial_usability=not_yet_testable`; engineering subjects cannot be
+relabelled as purchase candidates or proof of financial usability.
+
 ## Requirements
 
 - macOS
@@ -278,6 +320,9 @@ When PyPI access is available, install terminal QR rendering with:
 .venv/bin/kunjin --json portfolio overlap
 .venv/bin/kunjin --json portfolio diagnose
 .venv/bin/kunjin --json portfolio diagnose --candidate 519755
+.venv/bin/kunjin --json fund research-scope
+.venv/bin/kunjin --json fund research-scope --objective learning --horizon long_term --product-category broad_index
+.venv/bin/kunjin --json fund shortlist-readiness 000001 000002
 .venv/bin/kunjin --json fund brief 519755 --action continue_holding --mode rapid
 .venv/bin/kunjin --json decision route --mode rapid --action fact_research
 .venv/bin/kunjin --json decision route --mode rapid --action fact_research --action buy_or_add

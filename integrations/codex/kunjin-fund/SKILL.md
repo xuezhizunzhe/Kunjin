@@ -173,20 +173,9 @@ these conditions hold together:
 4. Current fees, settlement, availability, and a `transaction_confirmed` local
    transaction or position confirmation support the action.
 
-The authorization is short-lived, revocable, non-persistent by default, and
-expires after that response. The amount and authorization state never enter
-general logs, audit documents, Git, or a later Codex response without a new
-authorization. The output must not reveal the underlying exact profile values.
-Yangjibao holdings, `position_inferred`, inferred cost, and pending-transaction
-observations cannot authorize an exact action amount by themselves; require
-local confirmation or return `insufficient_data`.
+The authorization is short-lived, revocable, non-persistent by default, and expires after that response. The amount and authorization state never enter general logs, audit documents, Git, or a later Codex response without a new authorization. The output must not reveal the underlying exact profile values. Yangjibao holdings, `position_inferred`, inferred cost, and pending-transaction observations cannot authorize an exact action amount by themselves; require local confirmation or return `insufficient_data`.
 
-This proposed-amount restriction does not prohibit showing historical or
-imported ledger evidence. Show an OCR-extracted payment amount as a draft with
-its field evidence under the draft and explicit confirmation contract; do not
-confirm it until the owner explicitly approves the displayed values. Historical,
-imported, or confirmed ledger evidence never becomes a recommendation or
-position size.
+This proposed-amount restriction does not prohibit showing historical or imported ledger evidence. Show an OCR-extracted payment amount as a draft with its field evidence under the draft and explicit confirmation contract; do not confirm it until the owner explicitly approves the displayed values. Historical, imported, or confirmed ledger evidence never becomes a recommendation or position size.
 
 ## Bound Source Work
 
@@ -212,6 +201,22 @@ For fact-only D1 research, Phase B and Phase C are not gates: fact-only D1
 research does not require Phase B or Phase C. Preserve `failure_stage` and
 `failure_reason` exactly when present. Never reconstruct omitted exception text,
 paths, response details, or document content. Phase 3 and Phase 4 reuse the minimum D2 subset and disclosed-overlap engine; complete D2 and D3 product-selection and pre-purchase checks, including transaction authorization, are not implemented, so no mature risk-increasing conclusion or amount is available.
+
+## Form Research Scope And Check Readiness
+
+```bash
+kunjin --json fund research-scope
+kunjin --json fund research-scope --objective learning --horizon long_term --product-category broad_index
+kunjin --json fund shortlist-readiness 000001 000002
+```
+
+Research scope is educational and amount-free. Phase B/C may annotate or block a risk-increasing conclusion, but never filter, narrow, or erase fact research or the research scope. Preserve `candidate_formation.status=research_scope_only` and `candidate_formation.candidate_code_discovery=not_implemented`. Phase 4.1 adds neither market direction nor candidate-code discovery.
+
+Shortlist readiness is a local snapshot, not a refresh engine or recommendation. For one explicit two-to-five-code request, run the initial `fund shortlist-readiness` exactly once, then `source status --fund-code CODE` exactly once per code. Consider only actions returned by the initial readiness result; run each action at most once per code in this dependency order: `sync fund`, `sync fund-profile --mode rapid`, `sync fund-holdings --mode rapid`, `sync fund-documents`, then `fund classify`. Run the final `fund shortlist-readiness` exactly once.
+
+For `cooldown`, `unavailable`, `unsupported`, or `manual_supplement_required`, stop the affected field and preserve the exact source resolution; a terminal command failure also stops its dependent action. Never add `--force`, automatically retry, continue in the background, or develop an adapter during the request. Return the final result as partial when any gap remains. Each legacy command keeps its own independent runtime boundary; `sync fund` and `sync fund-documents` are outside the Phase 0 90/480-second budget.
+
+Without actual owner candidates, preserve `owner_candidate_state=owner_candidates_unavailable` and `financial_usability=not_yet_testable`. All research-scope and readiness results retain `action_maturity=evidence_only`, `action_authorized=false`, `exact_amount_available=false`, and `automatic_trade=false`. Engineering subjects are not candidates or purchase recommendations.
 
 For all workflows:
 
@@ -240,7 +245,7 @@ For all workflows:
 19. For current market form, run `--json sync market` before `--json market sectors`.
 20. For latest peer questions, run `--json fund peers CODE` and inspect its status, data dates, coverage, warnings, errors, and stored-group freshness. Run `--json sync fund-peers CODE` when the group is missing or stale, then read it again.
 21. For an explicit latest comparison, synchronize profile, holdings, and formal NAV for every code before running `--json fund compare CODE1 CODE2`.
-22. For one user-supplied candidate only, run `--json portfolio diagnose --candidate CODE`; for exactly 2-5 owner-supplied codes, resolve names to one unique confirmed code first, run bounded evidence refresh outside the shortlist command, then `--json fund shortlist CODE1 CODE2 [...]` without adding candidates. The shortlist is unordered, amount-free, not a buy signal, and always keeps `action_maturity=evidence_only`, `action_authorized=false`, `exact_amount_available=false`, and `automatic_trade=false`. Never develop a source adapter during the query.
+22. For one user-supplied candidate only, run `--json portfolio diagnose --candidate CODE`; for exactly 2-5 owner-supplied codes, resolve names to one unique confirmed code first, follow the finite readiness orchestration outside the shortlist command, then run `--json fund shortlist CODE1 CODE2 [...]` without adding candidates. The shortlist is unordered, amount-free, not a buy signal, and never develops a source adapter during the query.
 23. Preserve every date, source tier, aligned NAV interval, D1 state, coverage, conflict, stable code, manager-team date, metric-specific ordering, and disclosure scope. Input order is identity only, never merit.
 24. Record a decision thesis only when the user provides a reason, horizon, and invalidation condition.
 25. Use `--json report weekly` for a combined learning-oriented summary.
@@ -271,6 +276,9 @@ kunjin --json status
 kunjin --json portfolio show
 kunjin --json portfolio diagnose
 kunjin --json portfolio diagnose --candidate 519755
+kunjin --json fund research-scope
+kunjin --json fund research-scope --objective learning --horizon long_term --product-category broad_index
+kunjin --json fund shortlist-readiness 000001 000002
 kunjin --json ledger import /absolute/path/to/alipay.jpg --fund-code 519755
 kunjin --json ledger drafts
 kunjin --json ledger confirm 1 --field fund_code=519755
@@ -450,50 +458,27 @@ Route the five personal MVP scenarios without implying unavailable decisions:
 - held-fund daily review: clarify partial reduction versus full exit, use the corresponding `fund brief` action, then `fund intelligence` and `thesis review`; this reviews evidence and does not time a sale; and
 - portfolio diagnosis: run `status -> sync portfolio -> portfolio diagnose`; refresh stale or missing disclosures separately when broader observed coverage is needed.
 
-Preserve source outcome, date, source tier, publication date, `fact` versus `reasoned_inference`,
-lineage, reprint, conflict, partial, cooldown, cap, and manual supplementation fields. A reprint is
-not independent confirmation. At `market_session=unknown`, state `direction=insufficient_data`;
-never turn HTTP retrieval time or `experimental_shadow` into market timing. Source accuracy is not prediction accuracy.
+Preserve source outcome, date, source tier, publication date, `fact` versus `reasoned_inference`, lineage, reprint, conflict, partial, cooldown, cap, and manual supplementation fields. A reprint is not independent confirmation. At `market_session=unknown`, state `direction=insufficient_data`; never turn HTTP retrieval time or `experimental_shadow` into market timing. Source accuracy is not prediction accuracy.
 
-Treat fund relevance as `disclosed_context`, not current or complete exposure. Use `fund profile`,
-`fund fees`, and `fund research` for identity, manager, fee, formal-NAV, and risk facts. A thesis
-`possible_invalidation_match` or `no_matching_evidence` requires manual semantic review and cannot
-trigger a sale. Preserve `action_maturity=evidence_only`, `action_authorized=false`, and `exact_amount_available=false`.
+Treat fund relevance as `disclosed_context`, not current or complete exposure. Use `fund profile`, `fund fees`, and `fund research` for identity, manager, fee, formal-NAV, and risk facts. A thesis `possible_invalidation_match` or `no_matching_evidence` requires manual semantic review and cannot trigger a sale. Preserve `action_maturity=evidence_only`, `action_authorized=false`, and `exact_amount_available=false`.
 
 `portfolio diagnose` is evidence only. Its optional `--candidate` accepts one user-supplied candidate; it does not satisfy complete D2, D3, buy or add, hold, reduce, or exit, or exact amount gates. Preserve coverage and unknown codes. Legacy `portfolio analyze` and `portfolio overlap` remain lower-level tools.
 `fund shortlist` composes local comparison, D1, personal-gate status, and observed portfolio-impact evidence without network access. Preserve candidate order for identity only and every returned date, source tier, aligned NAV interval, D1 state, coverage, conflict, warning, missing-evidence code, and stable reason code; never call `conditional_shortlist` a recommendation or winner.
-Use read-only browsing only as visibly separate transient `external_context` with its own sources
-and dates. It cannot strengthen persisted evidence or make empty conflicts prove source agreement.
+Use read-only browsing only as visibly separate transient `external_context` with its own sources and dates. It cannot strengthen persisted evidence or make empty conflicts prove source agreement.
 
 ## Safety Boundaries
 
 - Use only KunJin's allowlisted read-only Yangjibao operations.
 - Never call a Yangjibao endpoint manually or downgrade HTTPS to HTTP.
 - Never print, log, store, or request the Keychain token.
-- Never request exact income, debt, reserve, asset, goal, or loss-budget values
-  in chat. Direct exact entry to the local interactive `kunjin profile edit`.
-- Treat `profile status` and `profile history` as metadata-only. A missing
-  Keychain profile-encryption key makes the encrypted profile unavailable; do
-  not reveal, reset, overwrite, or silently replace the old profile.
-- Phase A profile presence is not suitability approval. Run the amount-free
-  `--json suitability assess` when a current route requires Phase B for holding
-  or risk-increasing work, not before authorization, evidence capture, factual
-  research, reduction/exit research, or sync work.
-- Treat every Phase B, Phase C, and D1 state as `research_only`.
-  `ready_for_allocation` and `range_available` are not buy recommendations.
-  Phase C does not classify a real fund, choose a target, approve an amount, or
-  justify a 90% beginner-help claim. D1 classifies public-product evidence only;
-  even `verified` is not suitability, allocation, a recommendation, or a buy
-  signal. Only the minimum D2 subset and bounded Phase 4 shortlist are implemented;
-  complete D2 and D3 exact-amount/channel authorization are not, and Phase E remains unimplemented.
+- Never request exact income, debt, reserve, asset, goal, or loss-budget values in chat. Direct exact entry to the local interactive `kunjin profile edit`.
+- Treat `profile status` and `profile history` as metadata-only. A missing Keychain profile-encryption key makes the encrypted profile unavailable; do not reveal, reset, overwrite, or silently replace the old profile.
+- Phase A profile presence is not suitability approval. Run the amount-free `--json suitability assess` when a current route requires Phase B for holding or risk-increasing work, not before authorization, evidence capture, factual research, reduction/exit research, or sync work.
+- Treat every Phase B, Phase C, and D1 state as `research_only`. `ready_for_allocation` and `range_available` are not buy recommendations. Phase C does not classify a real fund, choose a target, approve an amount, or justify a 90% beginner-help claim. D1 classifies public-product evidence only; even `verified` is not suitability, allocation, a recommendation, or a buy signal. Only the minimum D2 subset and bounded Phase 4 shortlist are implemented; complete D2 and D3 exact-amount/channel authorization are not, and Phase E remains unimplemented.
 - Never operate Alipay or modify Yangjibao holdings.
 - Never run `ledger confirm` without explicit confirmation of the displayed draft from the user.
 - Never expose a managed screenshot path. `ledger document delete` removes only KunJin's private managed copy, not the user's original image or the immutable confirmed transaction.
 - Never add automatic trading instructions.
 
 ## Deferred Requests
-Defer valuation/fundamentals, complete D2, D3 exact amount and mature channel
-authorization, mature Phase E monitoring/sell timing, broad official adapters,
-and continuous full-history news crawling. Keep the existing minimum D2 and
-`top10_disclosed_overlap`; identify missing evidence without substituting
-guesses, platform rankings, or unverified snippets.
+Defer valuation/fundamentals, complete D2, D3 exact amount and mature channel authorization, mature Phase E monitoring/sell timing, broad official adapters, and continuous full-history news crawling. Keep the existing minimum D2 and `top10_disclosed_overlap`; identify missing evidence without substituting guesses, platform rankings, or unverified snippets.

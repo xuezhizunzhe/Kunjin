@@ -3660,6 +3660,53 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         self.assertNotIn("ENGINEERING_SUBJECT_CODES", script + helper)
         self.assertNotIn("engineering_subject_codes", script + helper)
 
+    def test_phase41_readme_and_skill_route_bounded_owner_readiness(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        normalized_readme = " ".join(readme.split())
+        normalized_skill = " ".join(skill.split())
+
+        for document in (normalized_readme, normalized_skill):
+            for phrase in (
+                "kunjin --json fund research-scope",
+                "--objective learning --horizon long_term --product-category broad_index",
+                "kunjin --json fund shortlist-readiness 000001 000002",
+                "candidate_formation.status=research_scope_only",
+                "candidate_formation.candidate_code_discovery=not_implemented",
+                "owner_candidate_state=owner_candidates_unavailable",
+                "financial_usability=not_yet_testable",
+                "action_maturity=evidence_only",
+                "action_authorized=false",
+                "exact_amount_available=false",
+                "automatic_trade=false",
+                "Phase 4.1 adds neither market direction nor candidate-code discovery",
+                "readiness is a local snapshot, not a refresh engine or recommendation",
+            ):
+                self.assertIn(phrase, document)
+
+        for phrase in (
+            "initial `fund shortlist-readiness` exactly once",
+            "`source status --fund-code CODE` exactly once per code",
+            "only actions returned by the initial readiness result",
+            "each action at most once per code",
+            "dependency order",
+            "final `fund shortlist-readiness` exactly once",
+            (
+                "Never add `--force`, automatically retry, continue in the background, "
+                "or develop an adapter during the request"
+            ),
+            "stop the affected field",
+            "`cooldown`, `unavailable`, `unsupported`, or `manual_supplement_required`",
+            "Each legacy command keeps its own independent runtime boundary",
+            "`sync fund` and `sync fund-documents` are outside the Phase 0 90/480-second budget",
+            "Return the final result as partial when any gap remains",
+        ):
+            self.assertIn(phrase, normalized_skill)
+        self.assertLessEqual(len(skill.splitlines()), 500)
+
     def test_phase4_readme_and_skill_route_exact_unordered_candidates(self) -> None:
         root = Path(__file__).resolve().parents[1]
         readme = (root / "README.md").read_text(encoding="utf-8")
