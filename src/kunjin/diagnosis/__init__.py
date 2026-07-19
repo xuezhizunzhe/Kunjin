@@ -8,6 +8,7 @@ from kunjin.diagnosis.models import (
 from kunjin.diagnosis.service import (
     build_authenticated_portfolio_binding,
     project_candidate_impact,
+    project_diagnosis_relationship,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "PortfolioDiagnosis",
     "build_authenticated_portfolio_binding",
     "project_candidate_impact",
+    "project_diagnosis_relationship",
 ]

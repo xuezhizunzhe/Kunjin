@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -10,6 +10,7 @@ from kunjin.brief.models import BriefCoverage, BriefEvidenceState, RelationshipE
 from kunjin.diagnosis import (
     build_authenticated_portfolio_binding,
     project_candidate_impact,
+    project_diagnosis_relationship,
 )
 from kunjin.diagnosis.models import PortfolioDiagnosis
 from kunjin.diagnosis.service import DiagnosisService
@@ -57,6 +58,28 @@ def _service(repository: Repository) -> DiagnosisService:
         FundDisclosureStore(repository),
         clock=lambda: NOW,
     )
+
+
+def test_public_relationship_projection_preserves_bounded_d2_evidence() -> None:
+    source = RelationshipEvidence(
+        relationship_id="same_manager_000001_000002",
+        relationship_type="same_manager",
+        fund_codes=("000002", "000001"),
+        evidence_state=BriefEvidenceState.COMPLETE,
+        metrics={"manager_name": "Example Manager"},
+        evidence_ids=("fact_manager",),
+        report_periods=(date(2026, 3, 31), date(2026, 3, 31)),
+        publication_times=(NOW,),
+        warnings=("manager_as_of_differs",),
+    )
+
+    result = project_diagnosis_relationship(source)
+
+    result.validate(NOW)
+    assert result.fund_codes == ("000001", "000002")
+    assert result.evidence_state == "complete"
+    assert result.metrics == (("manager_name", "Example Manager"),)
+    assert result.report_periods == (date(2026, 3, 31),)
 
 
 def test_empty_portfolio_returns_authenticated_insufficient_diagnosis(

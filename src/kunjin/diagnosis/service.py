@@ -156,7 +156,9 @@ def build_authenticated_portfolio_binding(
     return binding
 
 
-def _relationship(source: RelationshipEvidence) -> DiagnosisRelationship:
+def project_diagnosis_relationship(
+    source: RelationshipEvidence,
+) -> DiagnosisRelationship:
     payload = source.to_canonical_dict()
     metrics = payload["metrics"]
     if not isinstance(metrics, dict):
@@ -438,7 +440,7 @@ class DiagnosisService:
         for d2 in d2_results:
             d2.validate()
             for source in d2.relationships:
-                projected = _relationship(source)
+                projected = project_diagnosis_relationship(source)
                 previous = relationship_by_id.setdefault(
                     projected.relationship_id,
                     projected,
