@@ -1,0 +1,350 @@
+from __future__ import annotations
+
+import hashlib
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from kunjin.brief.models import thesis_record_fingerprint
+from kunjin.brief.store import BriefStore
+from kunjin.decision.models import ActionKind, RequestTerminalStatus, canonical_json_bytes
+from kunjin.decision.store import DecisionAuditStore
+from kunjin.holding_review.models import (
+    AdjudicationDecision,
+    BindingState,
+    EvidenceReadiness,
+    FlowStatus,
+    HoldingReviewSnapshot,
+    RedemptionFeasibility,
+    ReviewDisposition,
+    ReviewEvidenceItem,
+    ThesisEvidenceAdjudication,
+    ThesisMatchProjection,
+    ThesisMatchProjectionState,
+    ThesisMatchState,
+)
+from kunjin.holding_review.policy import HeldFundManualReviewPolicyV1
+from kunjin.holding_review.store import HoldingReviewStore, HoldingReviewStoreError
+from kunjin.intelligence.models import IntelligenceWorkflow, LineageKind
+from kunjin.intelligence.store import IntelligenceStore
+from kunjin.models import InvestmentThesis
+from kunjin.storage.repository import Repository
+from tests.unit.test_brief_store import _publish as publish_brief
+from tests.unit.test_holding_review_models_policy import review_result
+from tests.unit.test_intelligence_store import (
+    _seed_request_and_evidence,
+)
+from tests.unit.test_intelligence_store import (
+    _snapshot as intelligence_snapshot,
+)
+
+NOW = datetime(2026, 7, 20, 4, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def context(tmp_path: Path):
+    repository = Repository(tmp_path / "held-review.db")
+    repository.migrate()
+    decision_store = DecisionAuditStore(repository)
+    brief_store = BriefStore(repository, decision_store)
+    brief_run_id, _, brief = publish_brief(
+        decision_store, brief_store, request_id="b" * 32
+    )
+    intelligence_store = IntelligenceStore(repository, decision_store)
+    budget, intelligence_run_id, attempt_id, _item_ids, _items = (
+        _seed_request_and_evidence(repository, intelligence_store)
+    )
+    intelligence = intelligence_store.publish_snapshot(
+        intelligence_run_id,
+        lambda value: replace(
+            intelligence_snapshot(value, budget.request_id),
+            workflow=IntelligenceWorkflow.FUND_INTELLIGENCE,
+            subject_fund_code="123456",
+            source_attempt_ids=(attempt_id,),
+        ),
+        datetime(2026, 7, 18, 6, 0, 4, tzinfo=timezone.utc),
+        RequestTerminalStatus.COMPLETE,
+        (),
+        budget,
+    )
+    thesis = InvestmentThesis(
+        fund_code="123456",
+        rationale="Long-term learning thesis.",
+        horizon="Three years.",
+        invalidation="Policy support is withdrawn.",
+        created_at=NOW - timedelta(days=30),
+    )
+    thesis_id = repository.add_thesis(thesis)
+    return {
+        "repository": repository,
+        "store": HoldingReviewStore(repository),
+        "brief_run_id": brief_run_id,
+        "brief": brief,
+        "intelligence_run_id": intelligence_run_id,
+        "intelligence": intelligence,
+        "thesis_id": thesis_id,
+        "thesis_fingerprint": thesis_record_fingerprint(thesis_id, thesis),
+    }
+
+
+def desired_projection(context, **changes: object) -> ThesisMatchProjection:
+    evidence = ReviewEvidenceItem(
+        evidence_id="item_one",
+        source_tier=1,
+        lineage_kind=LineageKind.ORIGINAL,
+        current=True,
+        graph_closed=True,
+        original_lineage=True,
+        retracted=False,
+        conflicted=False,
+        direct_subject_binding=True,
+    )
+    intelligence = context["intelligence"]
+    value = ThesisMatchProjection(
+        fund_code="123456",
+        thesis_id=context["thesis_id"],
+        thesis_fingerprint=context["thesis_fingerprint"],
+        intelligence_request_run_id=context["intelligence_run_id"],
+        intelligence_snapshot_id=intelligence.id,
+        intelligence_snapshot_checksum=intelligence.result_checksum,
+        matcher_policy_version="1",
+        matcher_policy_checksum="d" * 64,
+        projection_state=ThesisMatchProjectionState.POSSIBLE_INVALIDATION_MATCH,
+        evidence_descriptors=(evidence,),
+        evidence_set_checksum="a" * 64,
+        created_at=NOW,
+        record_checksum="a" * 64,
+    )
+    value = replace(value, **changes)
+    if "evidence_set_checksum" not in changes:
+        value = replace(value, evidence_set_checksum=value.expected_evidence_set_checksum())
+    if "record_checksum" not in changes:
+        value = replace(value, record_checksum=value.expected_record_checksum())
+    return value
+
+
+def desired_adjudication(context, projection, **changes: object):
+    evidence_ids = ("item_one",)
+    value = ThesisEvidenceAdjudication(
+        fund_code="123456",
+        thesis_id=context["thesis_id"],
+        thesis_fingerprint=context["thesis_fingerprint"],
+        thesis_match_projection_id=projection.id,
+        thesis_match_projection_checksum=projection.value.record_checksum,
+        intelligence_request_run_id=context["intelligence_run_id"],
+        intelligence_snapshot_checksum=context["intelligence"].result_checksum,
+        evidence_ids=evidence_ids,
+        evidence_set_checksum=hashlib.sha256(canonical_json_bytes(evidence_ids)).hexdigest(),
+        decision=AdjudicationDecision.PRESENTED_MATCH_REJECTED,
+        superseded_adjudication_id=None,
+        created_at=NOW + timedelta(seconds=1),
+        record_checksum="a" * 64,
+    )
+    value = replace(value, **changes)
+    if "record_checksum" not in changes:
+        value = replace(value, record_checksum=value.expected_record_checksum())
+    return value
+
+
+def desired_review(context, projection, adjudication, **changes: object):
+    policy = HeldFundManualReviewPolicyV1()
+    action = changes.get("action", ActionKind.CONTINUE_HOLDING)
+    result = review_result(
+        action=action,
+        flow_status=FlowStatus.COMPLETE,
+        evidence_readiness=EvidenceReadiness.INSUFFICIENT_DATA,
+        thesis_review_state=ThesisMatchState.PRESENTED_MATCH_REJECTED,
+        review_disposition=ReviewDisposition.ABSTAIN,
+        redemption_feasibility=(
+            RedemptionFeasibility.NOT_REQUESTED
+            if action is ActionKind.CONTINUE_HOLDING
+            else RedemptionFeasibility.INSUFFICIENT_DATA
+        ),
+        official_negative_check_complete=False,
+        evidence_ids=("item_one",),
+        policy_version=policy.version,
+        policy_checksum=policy.checksum(),
+        created_at=NOW + timedelta(seconds=2),
+    )
+    value = HoldingReviewSnapshot(
+        fund_code="123456",
+        action=action,
+        brief_request_run_id=context["brief_run_id"],
+        brief_snapshot_id=context["brief"].id,
+        brief_snapshot_checksum=context["brief"].result_checksum,
+        intelligence_request_run_id=context["intelligence_run_id"],
+        intelligence_snapshot_id=context["intelligence"].id,
+        intelligence_snapshot_checksum=context["intelligence"].result_checksum,
+        thesis_match_projection_id=projection.id,
+        thesis_match_projection_checksum=projection.value.record_checksum,
+        active_thesis_state=BindingState.PRESENT,
+        active_thesis_id=context["thesis_id"],
+        active_thesis_fingerprint=context["thesis_fingerprint"],
+        adjudication_state=BindingState.PRESENT,
+        adjudication_id=adjudication.id,
+        adjudication_checksum=adjudication.value.record_checksum,
+        previous_review_id=None,
+        result=result,
+        result_fingerprint=result.expected_result_fingerprint(),
+        policy_version=policy.version,
+        policy_checksum=policy.checksum(),
+        created_at=NOW + timedelta(seconds=3),
+        semantic_identity_checksum="a" * 64,
+        record_checksum="a" * 64,
+    )
+    value = replace(value, **changes)
+    if "semantic_identity_checksum" not in changes:
+        value = replace(
+            value, semantic_identity_checksum=value.expected_semantic_identity_checksum()
+        )
+    if "record_checksum" not in changes:
+        value = replace(value, record_checksum=value.expected_record_checksum())
+    return value
+
+
+def test_preview_store_has_no_official_publish_api(context) -> None:
+    store = context["store"]
+    assert callable(store.publish_thesis_match)
+    assert callable(store.publish_adjudication)
+    assert callable(store.publish_review)
+    assert not hasattr(store, "publish_announcement_content")
+
+
+def test_projection_round_trip_and_semantic_idempotency(context) -> None:
+    store = context["store"]
+    desired = desired_projection(context)
+    stored = store.publish_thesis_match(desired)
+    later = replace(desired, created_at=desired.created_at + timedelta(minutes=1))
+    later = replace(later, record_checksum=later.expected_record_checksum())
+    assert store.publish_thesis_match(later) == stored
+    assert store.latest_thesis_match("123456", context["intelligence_run_id"]) == stored
+
+
+def test_projection_rejects_wrong_subject_and_checksum_drift(context) -> None:
+    with pytest.raises(HoldingReviewStoreError, match="binding"):
+        context["store"].publish_thesis_match(
+            desired_projection(context, fund_code="654321")
+        )
+    with pytest.raises(HoldingReviewStoreError, match="binding"):
+        context["store"].publish_thesis_match(
+            desired_projection(context, intelligence_snapshot_checksum="f" * 64)
+        )
+
+
+@pytest.mark.parametrize("request_run_id", [True, 0, -1])
+def test_latest_projection_rejects_nonpositive_or_bool_id(context, request_run_id) -> None:
+    with pytest.raises(ValueError, match="positive exact integer"):
+        context["store"].latest_thesis_match("123456", request_run_id)
+
+
+def test_adjudication_round_trip_and_supersession(context) -> None:
+    store = context["store"]
+    projection = store.publish_thesis_match(desired_projection(context))
+    first = store.publish_adjudication(desired_adjudication(context, projection))
+    assert store.publish_adjudication(first.value) == first
+    assert store.current_adjudication(projection.id) == first
+    replacement = store.publish_adjudication(
+        desired_adjudication(
+            context,
+            projection,
+            decision=AdjudicationDecision.PRESENTED_MATCH_CONFIRMED,
+            superseded_adjudication_id=first.id,
+            created_at=NOW + timedelta(seconds=2),
+        )
+    )
+    assert store.current_adjudication(projection.id) == replacement
+    with pytest.raises(HoldingReviewStoreError, match="supersession"):
+        store.publish_adjudication(
+            desired_adjudication(
+                context,
+                projection,
+                decision=AdjudicationDecision.UNCERTAIN,
+                superseded_adjudication_id=first.id,
+                created_at=NOW + timedelta(seconds=3),
+            )
+        )
+
+
+def test_review_round_trip_previous_binding_and_privacy(context) -> None:
+    store = context["store"]
+    projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = store.publish_adjudication(desired_adjudication(context, projection))
+    first = store.publish_review(desired_review(context, projection, adjudication))
+    assert store.publish_review(first.value) == first
+    assert store.latest_comparable_review(
+        "123456",
+        ActionKind.CONTINUE_HOLDING,
+        context["thesis_fingerprint"],
+        HeldFundManualReviewPolicyV1().checksum(),
+    ) == first
+    later_result = replace(
+        first.value.result,
+        omitted_work=("later_check",),
+        created_at=NOW + timedelta(seconds=3),
+    )
+    second_value = desired_review(
+        context,
+        projection,
+        adjudication,
+        previous_review_id=first.id,
+        result=later_result,
+        result_fingerprint=later_result.expected_result_fingerprint(),
+        created_at=NOW + timedelta(seconds=4),
+    )
+    second_value = replace(
+        second_value,
+        semantic_identity_checksum=second_value.expected_semantic_identity_checksum(),
+    )
+    second_value = replace(
+        second_value, record_checksum=second_value.expected_record_checksum()
+    )
+    second = store.publish_review(second_value)
+    assert second.id != first.id
+    with context["repository"].connect() as connection:
+        payload = connection.execute(
+            "SELECT result_json FROM holding_review_snapshots WHERE id=?", (second.id,)
+        ).fetchone()[0]
+        assert "normalized_content" not in payload
+        assert '"amount":' not in payload
+        assert connection.execute(
+            "SELECT count(*) FROM fund_official_announcement_contents"
+        ).fetchone()[0] == 0
+
+
+def test_review_rejects_wrong_action_and_unknown_previous_review(context) -> None:
+    store = context["store"]
+    projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = store.publish_adjudication(desired_adjudication(context, projection))
+    with pytest.raises(HoldingReviewStoreError, match="binding"):
+        store.publish_review(
+            desired_review(
+                context, projection, adjudication, action=ActionKind.FULL_EXIT
+            )
+        )
+    with pytest.raises(HoldingReviewStoreError, match="binding"):
+        store.publish_review(
+            desired_review(context, projection, adjudication, previous_review_id=999)
+        )
+
+
+def test_preview_review_rejects_completed_official_negative_check(context) -> None:
+    store = context["store"]
+    projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = store.publish_adjudication(desired_adjudication(context, projection))
+    value = desired_review(context, projection, adjudication)
+    result = replace(value.result, official_negative_check_complete=True)
+    value = replace(
+        value,
+        result=result,
+        result_fingerprint=result.expected_result_fingerprint(),
+    )
+    value = replace(
+        value,
+        semantic_identity_checksum=value.expected_semantic_identity_checksum(),
+    )
+    value = replace(value, record_checksum=value.expected_record_checksum())
+
+    with pytest.raises(HoldingReviewStoreError, match="preview boundary"):
+        store.publish_review(value)

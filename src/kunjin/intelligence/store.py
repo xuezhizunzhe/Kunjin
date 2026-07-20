@@ -843,31 +843,64 @@ class IntelligenceStore:
                 ).fetchone()
                 if row is None:
                     raise IntelligenceStoreError("intelligence snapshot authentication failed")
-                canonical = _ascii_bytes(row["canonical_snapshot_json"], "snapshot")
-                checksum = _checksum(row["result_checksum"], "snapshot checksum")
-                if hashlib.sha256(canonical).hexdigest() != checksum:
-                    raise IntelligenceStoreError("intelligence snapshot authentication failed")
-                snapshot = _snapshot_from_dict(_json_object(canonical, "snapshot"))
-                if snapshot.canonical_json() != canonical:
-                    raise IntelligenceStoreError("intelligence snapshot authentication failed")
-                if (
-                    snapshot.request_run_id != row["request_run_id"]
-                    or snapshot.workflow.value != row["workflow"]
-                    or snapshot.created_at != _stored_utc(row["created_at"])
-                ):
-                    raise IntelligenceStoreError("intelligence snapshot authentication failed")
-                try:
-                    self._authenticate_or_insert_policy(connection)
-                    self._authenticate_snapshot_graph(connection, row, snapshot)
-                except IntelligenceStoreError:
-                    raise IntelligenceStoreError(
-                        "intelligence snapshot authentication failed"
-                    ) from None
-                return StoredIntelligenceSnapshot(int(row["id"]), snapshot, checksum)
+                return self._authenticated_snapshot_row(connection, row)
         except IntelligenceStoreError:
             raise
         except (sqlite3.DatabaseError, TypeError, ValueError, UnicodeError, KeyError):
             raise IntelligenceStoreError("intelligence snapshot authentication failed") from None
+
+    def authenticated_snapshot_by_request_run_id(
+        self,
+        request_run_id: int,
+    ) -> StoredIntelligenceSnapshot:
+        _positive_id(request_run_id, "request run id")
+        try:
+            with self.repository.connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM intelligence_snapshots WHERE request_run_id=?",
+                    (request_run_id,),
+                ).fetchone()
+                if row is None:
+                    raise IntelligenceStoreError(
+                        "intelligence request snapshot authentication failed"
+                    )
+                stored = self._authenticated_snapshot_row(connection, row)
+                if stored.snapshot.request_run_id != request_run_id:
+                    raise IntelligenceStoreError(
+                        "intelligence request snapshot authentication failed"
+                    )
+                return stored
+        except IntelligenceStoreError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, UnicodeError, KeyError):
+            raise IntelligenceStoreError(
+                "intelligence request snapshot authentication failed"
+            ) from None
+
+    def _authenticated_snapshot_row(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> StoredIntelligenceSnapshot:
+        canonical = _ascii_bytes(row["canonical_snapshot_json"], "snapshot")
+        checksum = _checksum(row["result_checksum"], "snapshot checksum")
+        if hashlib.sha256(canonical).hexdigest() != checksum:
+            raise IntelligenceStoreError("intelligence snapshot authentication failed")
+        snapshot = _snapshot_from_dict(_json_object(canonical, "snapshot"))
+        if snapshot.canonical_json() != canonical:
+            raise IntelligenceStoreError("intelligence snapshot authentication failed")
+        if (
+            snapshot.request_run_id != row["request_run_id"]
+            or snapshot.workflow.value != row["workflow"]
+            or snapshot.created_at != _stored_utc(row["created_at"])
+        ):
+            raise IntelligenceStoreError("intelligence snapshot authentication failed")
+        try:
+            self._authenticate_or_insert_policy(connection)
+            self._authenticate_snapshot_graph(connection, row, snapshot)
+        except IntelligenceStoreError:
+            raise IntelligenceStoreError("intelligence snapshot authentication failed") from None
+        return StoredIntelligenceSnapshot(int(row["id"]), snapshot, checksum)
 
     @staticmethod
     def _configure_connection(

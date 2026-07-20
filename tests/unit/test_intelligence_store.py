@@ -651,6 +651,37 @@ def test_authenticated_snapshot_rejects_relational_tampering(
         store.authenticated_snapshot(stored.id)
 
 
+def test_authenticated_intelligence_snapshot_by_request_never_scans_history(
+    repository: Repository,
+    store: IntelligenceStore,
+) -> None:
+    budget, run_id, attempt_id, _item_ids, _items = _seed_request_and_evidence(
+        repository, store
+    )
+    wanted = store.publish_snapshot(
+        run_id,
+        lambda value: replace(
+            _snapshot(value, budget.request_id),
+            source_attempt_ids=(attempt_id,),
+        ),
+        NOW + timedelta(seconds=4),
+        RequestTerminalStatus.COMPLETE,
+        (),
+        budget,
+    )
+
+    assert store.authenticated_snapshot_by_request_run_id(run_id) == wanted
+
+
+@pytest.mark.parametrize("request_run_id", [True, 0, -1])
+def test_authenticated_intelligence_request_lookup_requires_positive_exact_id(
+    store: IntelligenceStore,
+    request_run_id,
+) -> None:
+    with pytest.raises(ValueError, match="positive exact integer"):
+        store.authenticated_snapshot_by_request_run_id(request_run_id)
+
+
 @pytest.mark.parametrize("reference_kind", ("event_role", "lineage_endpoint"))
 def test_snapshot_rejects_evidence_graph_items_omitted_from_item_ids(
     repository: Repository,

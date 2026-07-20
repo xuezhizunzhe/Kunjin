@@ -1351,3 +1351,30 @@ def test_direct_sql_rejects_oversized_policy_snapshot_and_summary(tmp_path) -> N
             canonical_snapshot_json=too_many_json,
             overrides={"triggered_reviews_json": json.dumps(identifiers, separators=(",", ":"))},
         )
+
+
+def test_authenticated_snapshot_by_request_run_id_never_falls_back_to_history(tmp_path) -> None:
+    _, decision_store, brief_store = _stores(tmp_path)
+    wanted_run_id, _, wanted = _publish(
+        decision_store,
+        brief_store,
+        request_id="a" * 32,
+    )
+    _publish(
+        decision_store,
+        brief_store,
+        request_id="b" * 32,
+        created_at=NOW + timedelta(minutes=1),
+    )
+
+    assert brief_store.authenticated_snapshot_by_request_run_id(wanted_run_id) == wanted
+
+
+@pytest.mark.parametrize("request_run_id", [True, 0, -1])
+def test_authenticated_brief_request_lookup_requires_positive_exact_id(
+    tmp_path,
+    request_run_id,
+) -> None:
+    _, _, brief_store = _stores(tmp_path)
+    with pytest.raises(ValueError, match="positive exact integer"):
+        brief_store.authenticated_snapshot_by_request_run_id(request_run_id)

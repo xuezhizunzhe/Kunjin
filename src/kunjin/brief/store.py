@@ -244,6 +244,36 @@ class BriefStore:
         ):
             raise BriefStoreError("brief history authentication failed") from None
 
+    def authenticated_snapshot_by_request_run_id(
+        self,
+        request_run_id: int,
+    ) -> StoredBriefSnapshot:
+        _positive_id(request_run_id, "request run id")
+        try:
+            with self.repository.connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM fund_brief_snapshots WHERE request_run_id = ?",
+                    (request_run_id,),
+                ).fetchone()
+                if row is None:
+                    raise BriefStoreError("brief request snapshot authentication failed")
+                policy = self._load_policy(connection)
+                stored = self._stored_snapshot(row, policy, connection)
+                if stored.snapshot.request_run_id != request_run_id:
+                    raise BriefStoreError("brief request snapshot authentication failed")
+                return stored
+        except BriefStoreError:
+            raise
+        except (
+            sqlite3.DatabaseError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            UnicodeError,
+            RecursionError,
+        ):
+            raise BriefStoreError("brief request snapshot authentication failed") from None
+
     def latest_history_comparable(self, fund_code: str) -> bool:
         _fund_code(fund_code)
         try:
