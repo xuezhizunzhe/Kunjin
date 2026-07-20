@@ -4,11 +4,13 @@ import hashlib
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from kunjin.decision.models import (
     ActionKind,
+    RequestMode,
     SourceAttempt,
     SourceAttemptOutcome,
     SourceErrorCode,
@@ -27,6 +29,7 @@ from kunjin.holding_review.service import (
     HoldingReviewServiceError,
     _fund_intelligence_schedule,
 )
+from kunjin.holding_review.store import StoredHoldingReviewSnapshot
 from kunjin.holding_review.thesis import ThesisReviewService
 from kunjin.intelligence.policy import IntelligencePolicyV1
 from kunjin.models import InvestmentThesis
@@ -152,6 +155,25 @@ def _replace_brief(context, **changes: object) -> None:
     ].brief_store.authenticated_snapshot_by_request_run_id(context["brief_run_id"])
 
 
+def _deep_brief_service(monkeypatch, context) -> HoldingReviewService:
+    service = _service(context)
+    deep_brief = replace(
+        context["brief"],
+        snapshot=replace(context["brief"].snapshot, mode=RequestMode.DEEP),
+    )
+    monkeypatch.setattr(
+        service.brief_store,
+        "authenticated_snapshot_by_request_run_id",
+        lambda _request_run_id: deep_brief,
+    )
+    monkeypatch.setattr(
+        context["store"],
+        "publish_review",
+        lambda snapshot: StoredHoldingReviewSnapshot(999, snapshot),
+    )
+    return service
+
+
 def _review_count(context) -> int:
     with context["repository"].connect() as connection:
         return int(
@@ -184,6 +206,79 @@ def test_preview_is_network_free_and_fixed_closed(monkeypatch, context) -> None:
         outcome.review_snapshot.result.omitted_work
     )
     assert outcome.review_snapshot.result.boundary == ReviewBoundary()
+
+
+def test_deep_without_closure_stays_at_manual_confirmation(
+    monkeypatch, context
+) -> None:
+    _project_and_reject(context)
+    service = _deep_brief_service(monkeypatch, context)
+
+    outcome = service.review(
+        "123456",
+        action=ActionKind.CONTINUE_HOLDING,
+        brief_request_run_id=context["brief_run_id"],
+        intelligence_request_run_id=context["intelligence_run_id"],
+    )
+
+    result = outcome.review_snapshot.result
+    assert result.official_negative_check_complete is False
+    assert result.official_event_evidence == ()
+    assert "official_deep_confirmation_deferred" in result.omitted_work
+
+
+@pytest.mark.parametrize(
+    "complete,gaps,expected_omission",
+    (
+        (True, (), None),
+        (
+            False,
+            ("official_listing_timeout",),
+            "official_confirmation_required",
+        ),
+    ),
+)
+def test_deep_projects_only_authenticated_closure_state_into_engine(
+    monkeypatch,
+    context,
+    complete,
+    gaps,
+    expected_omission,
+) -> None:
+    _project_and_reject(context)
+    service = _deep_brief_service(monkeypatch, context)
+    store = context["store"]
+    monkeypatch.setattr(
+        store,
+        "authenticated_official_check_closure",
+        lambda _request_run_id, _fund_code: SimpleNamespace(
+            value=SimpleNamespace(
+                official_negative_check_complete=complete,
+                gap_codes=gaps,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        store,
+        "authenticated_official_event_references",
+        lambda _request_run_id, _fund_code: (),
+    )
+
+    outcome = service.review(
+        "123456",
+        action=ActionKind.CONTINUE_HOLDING,
+        brief_request_run_id=context["brief_run_id"],
+        intelligence_request_run_id=context["intelligence_run_id"],
+    )
+
+    result = outcome.review_snapshot.result
+    assert result.official_negative_check_complete is complete
+    assert "official_deep_confirmation_deferred" not in result.omitted_work
+    if expected_omission is None:
+        assert "official_confirmation_required" not in result.omitted_work
+    else:
+        assert expected_omission in result.omitted_work
+        assert gaps[0] in result.omitted_work
 
 
 def test_missing_exact_snapshot_is_transient_and_not_persisted(context) -> None:

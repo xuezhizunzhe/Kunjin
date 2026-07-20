@@ -552,8 +552,8 @@ def test_v21_is_additive_and_preserves_v20_bytes(tmp_path: Path) -> None:
             row["name"]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-    assert SCHEMA_VERSION == 21
-    assert versions == tuple(range(1, 22))
+    assert SCHEMA_VERSION == 22
+    assert versions == tuple(range(1, 23))
     assert EXPECTED_PHASE5_TABLES <= tables
     assert _legacy_bytes(repository) == before
 
@@ -568,7 +568,7 @@ def test_every_prior_version_migrates_to_v21(tmp_path: Path, starting_version: i
             row["version"]
             for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         )
-    assert versions == tuple(range(1, 22))
+    assert versions == tuple(range(1, 23))
     assert _legacy_bytes(repository) == before
 
 

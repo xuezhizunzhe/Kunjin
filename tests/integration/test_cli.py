@@ -2091,6 +2091,17 @@ class CliIntegrationTest(unittest.TestCase):
         )
         self.assertIs(context.brief_service._risk_store, context.fund_risk_store)
         self.assertIsNone(context.brief_service._announcement_content_loader)
+        deep_official = context.brief_service._deep_official_confirmation_service
+        self.assertIsNotNone(deep_official)
+        self.assertIs(deep_official.disclosure_store, context.fund_disclosure_store)
+        self.assertIs(
+            deep_official.audit_store,
+            context.source_health_service.audit_store,
+        )
+        self.assertIs(
+            deep_official.review_store,
+            context.holding_review_service.holding_review_store,
+        )
         self.assertIsNotNone(context.selection_service)
         self.assertIs(context.selection_service._repository, context.repository)
         self.assertIs(
@@ -2170,6 +2181,34 @@ class CliIntegrationTest(unittest.TestCase):
         )
         status.assert_not_called()
         self.assertIs(context.fund_risk_service._legacy_converter, converter)
+
+    def test_build_context_keeps_official_confirmation_deep_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = RuntimePaths(root / "kunjin.db", root / "snapshots", root / "logs")
+            with patch("kunjin.cli.RuntimePaths.from_environment", return_value=paths):
+                context = build_context()
+
+        brief = context.brief_service
+        deep_official = brief._deep_official_confirmation_service
+        request_context = SimpleNamespace()
+        omitted: list[str] = []
+        with patch.object(deep_official, "confirm") as confirm:
+            brief._confirm_deep_official_events(
+                "123456",
+                request_context,
+                RequestMode.RAPID,
+                omitted,
+            )
+            confirm.assert_not_called()
+
+            brief._confirm_deep_official_events(
+                "123456",
+                request_context,
+                RequestMode.DEEP,
+                omitted,
+            )
+            confirm.assert_called_once_with("123456", request_context)
 
     def test_build_context_unset_or_invalid_converter_id_does_not_query_docker(self) -> None:
         for image_id in (None, "latest-or-private-host-path"):

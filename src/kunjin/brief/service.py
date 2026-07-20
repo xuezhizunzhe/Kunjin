@@ -106,6 +106,7 @@ class HeldFundBriefService:
         source_registry: Optional[SourceRegistryV1] = None,
         brief_policy: Optional[HeldFundBriefPolicyV1] = None,
         risk_store: object = None,
+        deep_official_confirmation_service: object = None,
         announcement_content_loader: Optional[
             Callable[[object, SourceRequestContext], Tuple[AuthenticatedAnnouncementContent, ...]]
         ] = None,
@@ -208,6 +209,12 @@ class HeldFundBriefService:
             raise ValueError("brief policy must be an exact HeldFundBriefPolicyV1")
         if announcement_content_loader is not None and not callable(announcement_content_loader):
             raise ValueError("announcement content loader must be callable or None")
+        if deep_official_confirmation_service is not None and not callable(
+            getattr(deep_official_confirmation_service, "confirm", None)
+        ):
+            raise ValueError(
+                "Deep official confirmation service must expose confirm or be None"
+            )
         if not callable(now) or not callable(monotonic):
             raise ValueError("brief clocks must be callable")
         evidence_policy.validate()
@@ -228,6 +235,7 @@ class HeldFundBriefService:
         self._source_registry = source_registry
         self._brief_policy = brief_policy
         self._risk_store = risk_store
+        self._deep_official_confirmation_service = deep_official_confirmation_service
         self._announcement_content_loader = announcement_content_loader
         self._now = now
         self._monotonic = monotonic
@@ -371,6 +379,12 @@ class HeldFundBriefService:
             as_of = self._current_time(budget)
             action_ids = tuple(item.action_id for item in route.actions)
             target_bundle = self._disclosure_store.load_bundle(fund_code)
+            self._confirm_deep_official_events(
+                fund_code,
+                context,
+                mode,
+                omitted,
+            )
             announcement_contents = self._announcement_contents(
                 target_bundle,
                 context,
@@ -505,6 +519,25 @@ class HeldFundBriefService:
                 self._remaining_omissions(completed, omitted),
             )
             raise HeldFundBriefServiceError("held fund brief failed") from None
+
+    def _confirm_deep_official_events(
+        self,
+        fund_code: str,
+        context: SourceRequestContext,
+        mode: RequestMode,
+        omitted: list[str],
+    ) -> None:
+        service = self._deep_official_confirmation_service
+        if mode is not RequestMode.DEEP or service is None:
+            return
+        try:
+            service.confirm(fund_code, context)
+        except BudgetExpired:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._add_omitted(omitted, "official_deep_confirmation_failed")
 
     @staticmethod
     def _validate_request(

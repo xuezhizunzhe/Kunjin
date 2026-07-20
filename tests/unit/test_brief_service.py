@@ -274,6 +274,7 @@ def _service(
     system_exit_at: str | None = None,
     monotonic=None,
     all_sources_complete: bool = False,
+    deep_official_confirmation_service: object = None,
 ):
     from kunjin.brief.service import HeldFundBriefService
 
@@ -296,11 +297,78 @@ def _service(
         audit_store=audit_store,
         now=lambda: NOW,
         monotonic=(lambda: 1.0) if monotonic is None else monotonic,
+        deep_official_confirmation_service=deep_official_confirmation_service,
         announcement_content_loader=(
             (lambda _bundle, _context: ()) if all_sources_complete else None
         ),
     )
     return repository, audit_store, script, service
+
+
+class _DeepOfficialConfirmationSpy:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls = []
+
+    def confirm(self, fund_code, context) -> None:
+        self.calls.append((fund_code, context))
+        if self.fail:
+            raise RuntimeError("synthetic official confirmation failure")
+
+
+def test_rapid_never_calls_deep_official_confirmation(tmp_path: Path) -> None:
+    official = _DeepOfficialConfirmationSpy()
+    _repository, _audit, _script, service = _service(
+        tmp_path,
+        deep_official_confirmation_service=official,
+    )
+
+    service.brief(
+        FUND_CODE,
+        action=ActionKind.CONTINUE_HOLDING,
+        mode=RequestMode.RAPID,
+    )
+
+    assert official.calls == []
+
+
+def test_deep_calls_official_confirmation_once_with_exact_request_context(
+    tmp_path: Path,
+) -> None:
+    official = _DeepOfficialConfirmationSpy()
+    _repository, _audit, _script, service = _service(
+        tmp_path,
+        deep_official_confirmation_service=official,
+    )
+
+    report = service.brief(
+        FUND_CODE,
+        action=ActionKind.CONTINUE_HOLDING,
+        mode=RequestMode.DEEP,
+    )
+
+    assert len(official.calls) == 1
+    fund_code, context = official.calls[0]
+    assert fund_code == FUND_CODE
+    assert context.request_run_id == report.snapshot.request_run_id
+    assert context.budget.mode is RequestMode.DEEP
+
+
+def test_deep_official_failure_keeps_partial_brief_without_retry(tmp_path: Path) -> None:
+    official = _DeepOfficialConfirmationSpy(fail=True)
+    _repository, _audit, _script, service = _service(
+        tmp_path,
+        deep_official_confirmation_service=official,
+    )
+
+    outcome = service.brief_outcome(
+        FUND_CODE,
+        action=ActionKind.CONTINUE_HOLDING,
+        mode=RequestMode.DEEP,
+    )
+
+    assert len(official.calls) == 1
+    assert "official_deep_confirmation_failed" in outcome.omitted_work
 
 
 @pytest.mark.parametrize("mode", (RequestMode.RAPID, RequestMode.DEEP))

@@ -8,9 +8,10 @@ from pathlib import Path
 import pytest
 
 import kunjin.holding_review.store as holding_store_module
-from kunjin.brief.models import thesis_record_fingerprint
+from kunjin.brief.models import OfficialEventCode, thesis_record_fingerprint
 from kunjin.brief.store import BriefStore
 from kunjin.decision.models import ActionKind, RequestTerminalStatus, canonical_json_bytes
+from kunjin.decision.source_registry import SourceRegistryV1
 from kunjin.decision.store import DecisionAuditStore
 from kunjin.holding_review.models import (
     ActionReviewSourceSufficiency,
@@ -18,7 +19,14 @@ from kunjin.holding_review.models import (
     BindingState,
     EvidenceReadiness,
     FlowStatus,
+    HeldReviewOfficialEventProjection,
     HoldingReviewSnapshot,
+    OfficialAnnouncementContent,
+    OfficialCheckClosure,
+    OfficialEventEvidenceReference,
+    OfficialListingPageEvidence,
+    OfficialListingTerminalState,
+    OfficialManagerIdentityState,
     RedemptionFeasibility,
     ReviewDisposition,
     ReviewEvidenceItem,
@@ -26,9 +34,20 @@ from kunjin.holding_review.models import (
     ThesisMatchProjection,
     ThesisMatchProjectionState,
     ThesisMatchState,
+    TriggeredReviewCode,
 )
-from kunjin.holding_review.policy import HeldFundManualReviewPolicyV1
-from kunjin.holding_review.store import HoldingReviewStore, HoldingReviewStoreError
+from kunjin.holding_review.official import OfficialListingItem
+from kunjin.holding_review.policy import (
+    HeldFundManualReviewPolicyV1,
+    OfficialCheckPolicyV1,
+)
+from kunjin.holding_review.store import (
+    AuthenticatedOfficialManagerIdentity,
+    HoldingReviewStore,
+    HoldingReviewStoreError,
+    StoredOfficialCheckClosure,
+    _manager_identity_fingerprint,
+)
 from kunjin.intelligence.models import (
     EventConfidenceState,
     EventType,
@@ -51,6 +70,383 @@ from tests.unit.test_intelligence_store import (
 )
 
 NOW = datetime(2026, 7, 20, 4, 0, tzinfo=timezone.utc)
+
+
+def _official_context(tmp_path: Path, *, mode: str, request_id: str):
+    repository = Repository(tmp_path / "held-review-official.db")
+    repository.migrate()
+    started_at = NOW - timedelta(minutes=5)
+    deadline_at = NOW + timedelta(minutes=25)
+    published_at = NOW - timedelta(days=1)
+    publisher = "\u4ea4\u94f6\u65bd\u7f57\u5fb7\u57fa\u91d1\u7ba1\u7406\u6709\u9650\u516c\u53f8"
+    announcement_url = "https://www.fund001.com/fund/123456/notice.html"
+    source_registry = SourceRegistryV1()
+    with repository.connect() as connection, connection:
+        request_run_id = int(
+            connection.execute(
+                """
+                INSERT INTO request_runs(
+                    request_id, mode, status, started_at, deadline_at, finished_at,
+                    omitted_work_json
+                ) VALUES (?, ?, 'running', ?, ?, NULL, '[]')
+                """,
+                (request_id, mode, started_at.isoformat(), deadline_at.isoformat()),
+            ).lastrowid
+        )
+        source_attempt_id = int(
+            connection.execute(
+                """
+                INSERT INTO source_attempts(
+                    request_run_id, source_id, field_id, subject_key, attempt_number,
+                    outcome, started_at, finished_at, data_as_of, error_code,
+                    cooldown_until, force_actor, force_reason, registry_version,
+                    registry_checksum, response_byte_count, authorization_id
+                ) VALUES (?, 'fund_manager_official_documents',
+                          'fund_manager_product_announcement', 'fund:123456', 1,
+                          'success', ?, ?, ?, NULL, NULL, NULL, NULL, '1', ?, 100, NULL)
+                """,
+                (
+                    request_run_id,
+                    started_at.isoformat(),
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                    source_registry.checksum(),
+                ),
+            ).lastrowid
+        )
+        source_document_id = int(
+            connection.execute(
+                """
+                INSERT INTO fund_source_documents(
+                    fund_code, document_kind, title, url, source_name, source_tier,
+                    publisher, published_at, retrieved_at, checksum
+                ) VALUES (
+                    '123456', 'announcement', '\u516c\u544a\u5217\u8868',
+                    'https://www.fund001.com/fund/123456/sxxpl.shtml',
+                    'fund_manager_official_documents', 1, ?, ?, ?, ?
+                )
+                """,
+                (
+                    publisher,
+                    published_at.isoformat(),
+                    NOW.isoformat(),
+                    "2" * 64,
+                ),
+            ).lastrowid
+        )
+        manager_source_document_id = int(
+            connection.execute(
+                """
+                INSERT INTO fund_source_documents(
+                    fund_code, document_kind, title, url, source_name, source_tier,
+                    publisher, published_at, retrieved_at, checksum
+                ) VALUES (
+                    '123456', 'basic_profile', 'basic profile',
+                    'https://fundf10.eastmoney.com/jbgk_123456.html',
+                    'eastmoney_f10', 2, '东方财富', ?, ?, ?
+                )
+                """,
+                (published_at.isoformat(), NOW.isoformat(), "3" * 64),
+            ).lastrowid
+        )
+        manager_identity_row_id = int(
+            connection.execute(
+                """
+                INSERT INTO fund_identities(
+                    fund_code, record_key, fund_name, status, fund_type,
+                    established_date, manager_name, source_document_id
+                ) VALUES (
+                    '123456', 'identity', '测试基金', 'active', 'mixed', NULL, ?, ?
+                )
+                """,
+                (publisher, manager_source_document_id),
+            ).lastrowid
+        )
+        connection.execute(
+            """
+            INSERT INTO fund_section_syncs(
+                fund_code, section, state, current_source_document_id,
+                last_attempted_at, last_success_at, warning, error_code, error_message
+            ) VALUES (
+                '123456', 'basic_profile', 'success', ?, ?, ?, NULL, NULL, NULL
+            )
+            """,
+            (manager_source_document_id, NOW.isoformat(), NOW.isoformat()),
+        )
+        announcement_row_id = int(
+            connection.execute(
+                """
+                INSERT INTO fund_announcements(
+                    fund_code, record_key, title, category, publisher, published_at,
+                    url, source_tier, source_document_id
+                ) VALUES (
+                    '123456', 'manager_change_1',
+                    '\u57fa\u91d1\u7ecf\u7406\u53d8\u66f4\u516c\u544a', 'manager_change',
+                    ?, ?, ?, 1, ?
+                )
+                """,
+                (
+                    publisher,
+                    published_at.isoformat(),
+                    announcement_url,
+                    source_document_id,
+                ),
+            ).lastrowid
+        )
+    return {
+        "repository": repository,
+        "store": HoldingReviewStore(repository),
+        "request_run_id": request_run_id,
+        "source_attempt_id": source_attempt_id,
+        "source_document_id": source_document_id,
+        "manager_source_document_id": manager_source_document_id,
+        "manager_identity_row_id": manager_identity_row_id,
+        "manager_source_document_checksum": "3" * 64,
+        "fund_name": "测试基金",
+        "announcement_row_id": announcement_row_id,
+        "announcement_url": announcement_url,
+        "announcement_published_at": published_at,
+        "publisher": publisher,
+    }
+
+
+@pytest.fixture
+def official_context(tmp_path: Path):
+    return _official_context(tmp_path, mode="deep", request_id="d" * 32)
+
+
+@pytest.fixture
+def rapid_official_context(tmp_path: Path):
+    return _official_context(tmp_path, mode="rapid", request_id="e" * 32)
+
+
+def desired_official_content(official_context, **changes: object):
+    content = "\u672c\u57fa\u91d1\u57fa\u91d1\u7ecf\u7406\u53d1\u751f\u53d8\u66f4\u3002"
+    value = OfficialAnnouncementContent(
+        brief_request_run_id=official_context["request_run_id"],
+        source_attempt_id=official_context["source_attempt_id"],
+        fund_code="123456",
+        listing_source_document_id=official_context["source_document_id"],
+        canonical_announcement_url=official_context["announcement_url"],
+        announcement_title="\u57fa\u91d1\u7ecf\u7406\u53d8\u66f4\u516c\u544a",
+        announcement_published_at=official_context["announcement_published_at"],
+        publisher=official_context["publisher"],
+        normalized_content=content,
+        normalized_content_bytes=len(content.encode("utf-8")),
+        normalized_content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        original_source_id="fund_manager_official_documents",
+        quoted_source_id=None,
+        integrity_status="active",
+        integrity_checked_at=NOW,
+        retrieved_at=NOW,
+        record_checksum="0" * 64,
+    )
+    value = replace(value, **changes)
+    return replace(value, record_checksum=value.expected_record_checksum())
+
+
+def desired_official_event(official_context, content_id: int, **changes: object):
+    policy = HeldFundManualReviewPolicyV1()
+    value = HeldReviewOfficialEventProjection(
+        brief_request_run_id=official_context["request_run_id"],
+        fund_code="123456",
+        announcement_row_id=official_context["announcement_row_id"],
+        announcement_content_id=content_id,
+        event_code=OfficialEventCode.MANAGER_CHANGE_NOTICE,
+        triggered_review_code=TriggeredReviewCode.MANAGER_CHANGE_REVIEW,
+        policy_version=policy.version,
+        policy_checksum=policy.checksum(),
+        record_checksum="0" * 64,
+    )
+    value = replace(value, **changes)
+    return replace(value, record_checksum=value.expected_record_checksum())
+
+
+def desired_official_closure(
+    official_context,
+    *,
+    listing_title: str = "基金经理变更公告",
+    candidate_count: int = 1,
+    authenticated_body_count: int = 1,
+    projected_event_count: int = 1,
+    **changes: object,
+) -> OfficialCheckClosure:
+    page_item = OfficialListingItem(
+        registration_id="fund001",
+        page_number=1,
+        page_local_index=1,
+        title=listing_title,
+        canonical_url=official_context["announcement_url"],
+        publisher=official_context["publisher"],
+        published_at=official_context["announcement_published_at"],
+    )
+    page = OfficialListingPageEvidence(
+        registration_id="fund001",
+        page_number=1,
+        reported_total_pages=1,
+        canonical_page_url="https://www.fund001.com/fund/123456/sxxpl.shtml",
+        raw_byte_count=100,
+        raw_sha256="2" * 64,
+        retrieved_at=NOW,
+        parsed_item_count=1,
+        parsed_items_sha256=hashlib.sha256(
+            canonical_json_bytes([page_item.to_canonical_dict()])
+        ).hexdigest(),
+        terminal_state=OfficialListingTerminalState.SOURCE_FINAL_PAGE,
+        source_document_id=official_context["source_document_id"],
+    )
+    manual_policy = HeldFundManualReviewPolicyV1()
+    official_policy = OfficialCheckPolicyV1()
+    fingerprint = _manager_identity_fingerprint(
+        fund_code="123456",
+        identity_row_id=official_context["manager_identity_row_id"],
+        fund_name=official_context["fund_name"],
+        manager_name=official_context["publisher"],
+        source_document_id=official_context["manager_source_document_id"],
+        source_document_checksum=official_context["manager_source_document_checksum"],
+    )
+    value = OfficialCheckClosure(
+        brief_request_run_id=official_context["request_run_id"],
+        fund_code="123456",
+        listing_source_attempt_id=official_context["source_attempt_id"],
+        official_registry_version=official_policy.official_registry_version,
+        official_registry_checksum=official_policy.official_registry_checksum,
+        source_registration_ids=("fund001",),
+        manager_identity_state=OfficialManagerIdentityState.PRESENT,
+        manager_identity_row_id=official_context["manager_identity_row_id"],
+        manager_identity_source_document_id=official_context[
+            "manager_source_document_id"
+        ],
+        manager_identity_source_document_checksum=official_context[
+            "manager_source_document_checksum"
+        ],
+        manager_identity_normalized_name=official_context["publisher"],
+        manager_identity_fingerprint=fingerprint,
+        listing_page_evidence=(page,),
+        window_start=NOW - timedelta(days=180),
+        window_end=NOW,
+        listing_count=1,
+        candidate_count=candidate_count,
+        authenticated_body_count=authenticated_body_count,
+        projected_event_count=projected_event_count,
+        listing_truncated=False,
+        candidate_cap_reached=False,
+        body_cap_reached=False,
+        gap_codes=(),
+        official_negative_check_complete=True,
+        policy_version=manual_policy.version,
+        policy_checksum=manual_policy.checksum(),
+        official_check_policy_version=official_policy.version,
+        official_check_policy_checksum=official_policy.checksum(),
+        created_at=NOW,
+        record_checksum="0" * 64,
+    )
+    value = replace(value, **changes)
+    return replace(value, record_checksum=value.expected_record_checksum())
+
+
+def add_second_official_candidate(official_context) -> dict[str, object]:
+    title = "关于测试基金调整管理费率公告"
+    url = "https://www.fund001.com/fund/123456/fee-change.html"
+    published_at = NOW - timedelta(days=2)
+    with official_context["repository"].connect() as connection, connection:
+        row_id = int(
+            connection.execute(
+                """
+                INSERT INTO fund_announcements(
+                    fund_code, record_key, title, category, publisher, published_at,
+                    url, source_tier, source_document_id
+                ) VALUES (
+                    '123456', 'fee_change_2', ?, 'fee_change', ?, ?, ?, 1, ?
+                )
+                """,
+                (
+                    title,
+                    official_context["publisher"],
+                    published_at.isoformat(),
+                    url,
+                    official_context["source_document_id"],
+                ),
+            ).lastrowid
+        )
+    return {"row_id": row_id, "title": title, "url": url, "published_at": published_at}
+
+
+def desired_two_candidate_closure(
+    official_context,
+    second: dict[str, object],
+) -> OfficialCheckClosure:
+    closure = desired_official_closure(
+        official_context,
+        candidate_count=2,
+        authenticated_body_count=2,
+        projected_event_count=2,
+    )
+    items = (
+        OfficialListingItem(
+            registration_id="fund001",
+            page_number=1,
+            page_local_index=1,
+            title="基金经理变更公告",
+            canonical_url=official_context["announcement_url"],
+            publisher=official_context["publisher"],
+            published_at=official_context["announcement_published_at"],
+        ),
+        OfficialListingItem(
+            registration_id="fund001",
+            page_number=1,
+            page_local_index=2,
+            title=str(second["title"]),
+            canonical_url=str(second["url"]),
+            publisher=official_context["publisher"],
+            published_at=second["published_at"],
+        ),
+    )
+    page = replace(
+        closure.listing_page_evidence[0],
+        parsed_item_count=2,
+        parsed_items_sha256=hashlib.sha256(
+            canonical_json_bytes([item.to_canonical_dict() for item in items])
+        ).hexdigest(),
+    )
+    closure = replace(
+        closure,
+        listing_page_evidence=(page,),
+        listing_count=2,
+    )
+    return replace(closure, record_checksum=closure.expected_record_checksum())
+
+
+def publish_two_official_candidates(official_context, second: dict[str, object]):
+    store = official_context["store"]
+    first_content_id = store.publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    first_event_id = store.publish_official_event(
+        desired_official_event(official_context, first_content_id)
+    )
+    second_content = desired_official_content(
+        official_context,
+        canonical_announcement_url=second["url"],
+        announcement_title=second["title"],
+        announcement_published_at=second["published_at"],
+        normalized_content="本基金调整管理费率。",
+        normalized_content_bytes=len("本基金调整管理费率。".encode()),
+        normalized_content_sha256=hashlib.sha256(
+            "本基金调整管理费率。".encode()
+        ).hexdigest(),
+    )
+    second_content_id = store.publish_announcement_content(second_content)
+    second_event_id = store.publish_official_event(
+        desired_official_event(
+            official_context,
+            second_content_id,
+            announcement_row_id=second["row_id"],
+            event_code=OfficialEventCode.FEE_CHANGE_NOTICE,
+            triggered_review_code=TriggeredReviewCode.FEE_CHANGE_REVIEW,
+        )
+    )
+    return first_content_id, first_event_id, second_content_id, second_event_id
 
 
 @pytest.fixture
@@ -248,12 +644,558 @@ def review_with_result(value: HoldingReviewSnapshot, **changes: object):
     return replace(updated, record_checksum=updated.expected_record_checksum())
 
 
-def test_preview_store_has_no_official_publish_api(context) -> None:
-    store = context["store"]
-    assert callable(store.publish_thesis_match)
-    assert callable(store.publish_adjudication)
-    assert callable(store.publish_review)
-    assert not hasattr(store, "publish_announcement_content")
+def test_deep_official_records_round_trip_and_return_authenticated_references(
+    official_context,
+) -> None:
+    store = official_context["store"]
+    content = desired_official_content(official_context)
+
+    content_id = store.publish_announcement_content(content)
+    assert content_id > 0
+    assert store.publish_announcement_content(content) == content_id
+
+    event = desired_official_event(official_context, content_id)
+    event_id = store.publish_official_event(event)
+    assert event_id > 0
+    assert store.publish_official_event(event) == event_id
+    expected = (
+        OfficialEventEvidenceReference(
+            projection_id=event_id,
+            projection_checksum=event.record_checksum,
+            event_code=event.event_code,
+            triggered_review_code=event.triggered_review_code,
+        ),
+    )
+    assert store.authenticated_official_event_references(
+        official_context["request_run_id"], "123456"
+    ) == expected
+    with official_context["repository"].connect() as connection, connection:
+        connection.execute(
+            "UPDATE request_runs SET status='complete', finished_at=? WHERE id=?",
+            (NOW.isoformat(), official_context["request_run_id"]),
+        )
+    assert store.authenticated_official_event_references(
+        official_context["request_run_id"], "123456"
+    ) == expected
+
+
+def test_empty_official_references_still_require_same_fund_attempt(
+    official_context,
+) -> None:
+    with pytest.raises(HoldingReviewStoreError, match="fund binding"):
+        official_context["store"].authenticated_official_event_references(
+            official_context["request_run_id"], "654321"
+        )
+
+
+def test_complete_official_closure_round_trip_reauthenticates_exact_evidence(
+    official_context,
+) -> None:
+    store = official_context["store"]
+    content_id = store.publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    store.publish_official_event(
+        desired_official_event(official_context, content_id)
+    )
+    closure = desired_official_closure(official_context)
+
+    stored = store.publish_official_check_closure(closure)
+
+    assert type(stored) is StoredOfficialCheckClosure
+    assert stored.id > 0
+    assert stored.value == closure
+    assert store.authenticated_official_check_closure(
+        official_context["request_run_id"], "123456"
+    ) == stored
+
+
+def test_official_closure_publish_rejects_creation_after_request_deadline(
+    official_context,
+) -> None:
+    store = official_context["store"]
+    content_id = store.publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    store.publish_official_event(
+        desired_official_event(official_context, content_id)
+    )
+    closure = desired_official_closure(
+        official_context,
+        created_at=NOW + timedelta(minutes=26),
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="binding|deadline|authentication"):
+        store.publish_official_check_closure(closure)
+
+
+def test_official_closure_read_rejects_creation_after_request_deadline(
+    official_context,
+) -> None:
+    store = official_context["store"]
+    content_id = store.publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    store.publish_official_event(
+        desired_official_event(official_context, content_id)
+    )
+    stored = store.publish_official_check_closure(
+        desired_official_closure(official_context)
+    )
+    late = replace(stored.value, created_at=NOW + timedelta(minutes=26))
+    late = replace(late, record_checksum=late.expected_record_checksum())
+    with official_context["repository"].connect() as connection, connection:
+        connection.execute("DROP TRIGGER held_review_official_check_closure_no_update")
+        connection.execute(
+            """
+            UPDATE held_review_official_check_closures
+            SET created_at=?, record_checksum=? WHERE id=?
+            """,
+            (late.created_at.isoformat(), late.record_checksum, stored.id),
+        )
+
+    with pytest.raises(HoldingReviewStoreError, match="binding|deadline|authentication"):
+        store.authenticated_official_check_closure(
+            official_context["request_run_id"], "123456"
+        )
+
+
+def test_official_manager_identity_loader_is_shared_and_exact(official_context) -> None:
+    identity = official_context["store"].authenticated_official_manager_identity(
+        "123456",
+        NOW,
+    )
+
+    assert type(identity) is AuthenticatedOfficialManagerIdentity
+    assert identity.state is OfficialManagerIdentityState.PRESENT
+    assert identity.row_id == official_context["manager_identity_row_id"]
+    assert identity.source_document_id == official_context["manager_source_document_id"]
+    assert identity.normalized_name == official_context["publisher"]
+    assert identity.fingerprint == desired_official_closure(
+        official_context
+    ).manager_identity_fingerprint
+
+
+@pytest.mark.parametrize("state", ("missing", "stale", "conflicted"))
+def test_official_manager_identity_loader_fails_closed_by_state(
+    official_context,
+    state: str,
+) -> None:
+    with official_context["repository"].connect() as connection, connection:
+        if state == "missing":
+            connection.execute(
+                "DELETE FROM fund_section_syncs WHERE fund_code='123456' "
+                "AND section='basic_profile'"
+            )
+        elif state == "stale":
+            connection.execute(
+                "UPDATE fund_source_documents SET retrieved_at=? WHERE id=?",
+                (
+                    (NOW - timedelta(days=31)).isoformat(),
+                    official_context["manager_source_document_id"],
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                INSERT INTO fund_identities(
+                    fund_code, record_key, fund_name, status, fund_type,
+                    established_date, manager_name, source_document_id
+                ) VALUES (
+                    '123456', 'identity_conflict', '测试基金', 'active', 'mixed',
+                    NULL, '另一基金管理人', ?
+                )
+                """,
+                (official_context["manager_source_document_id"],),
+            )
+
+    identity = official_context["store"].authenticated_official_manager_identity(
+        "123456",
+        NOW,
+    )
+
+    assert identity.state.value == state
+    assert identity.row_id is None
+    assert identity.source_document_id is None
+    assert identity.normalized_name is None
+    assert identity.fingerprint is None
+
+
+def test_complete_zero_candidate_closure_is_authenticated(official_context) -> None:
+    ordinary_title = "2026年第二季度报告"
+    with official_context["repository"].connect() as connection, connection:
+        connection.execute(
+            "UPDATE fund_announcements SET title=? WHERE id=?",
+            (ordinary_title, official_context["announcement_row_id"]),
+        )
+    closure = desired_official_closure(
+        official_context,
+        listing_title=ordinary_title,
+        candidate_count=0,
+        authenticated_body_count=0,
+        projected_event_count=0,
+    )
+
+    stored = official_context["store"].publish_official_check_closure(closure)
+
+    assert stored.value.official_negative_check_complete is True
+    assert stored.value.projected_event_count == 0
+
+
+def test_empty_event_set_without_closure_never_authenticates(official_context) -> None:
+    with pytest.raises(HoldingReviewStoreError, match="closure"):
+        official_context["store"].authenticated_official_check_closure(
+            official_context["request_run_id"], "123456"
+        )
+
+
+def test_closure_recomputes_candidates_and_rolls_back_failed_publish(
+    official_context,
+) -> None:
+    closure = desired_official_closure(
+        official_context,
+        candidate_count=0,
+        authenticated_body_count=0,
+        projected_event_count=0,
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="candidate|authentication"):
+        official_context["store"].publish_official_check_closure(closure)
+    with official_context["repository"].connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM held_review_official_check_closures"
+        ).fetchone()[0] == 0
+
+
+def test_closure_uses_attempt_capture_time_when_raw_document_is_reused(
+    official_context,
+) -> None:
+    store = official_context["store"]
+    content_id = store.publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    store.publish_official_event(
+        desired_official_event(official_context, content_id)
+    )
+    with official_context["repository"].connect() as connection, connection:
+        connection.execute(
+            "UPDATE fund_source_documents SET retrieved_at=? WHERE id=?",
+            (
+                (NOW - timedelta(days=30)).isoformat(),
+                official_context["source_document_id"],
+            ),
+        )
+
+    stored = store.publish_official_check_closure(
+        desired_official_closure(official_context)
+    )
+
+    assert stored.value.listing_page_evidence[0].retrieved_at == NOW
+
+
+def test_closure_rejects_page_capture_outside_exact_attempt(official_context) -> None:
+    closure = desired_official_closure(official_context)
+    bad_page = replace(
+        closure.listing_page_evidence[0],
+        retrieved_at=NOW - timedelta(minutes=6),
+    )
+    closure = replace(closure, listing_page_evidence=(bad_page,))
+    closure = replace(closure, record_checksum=closure.expected_record_checksum())
+
+    with pytest.raises(HoldingReviewStoreError, match="binding|authentication"):
+        official_context["store"].publish_official_check_closure(closure)
+
+
+@pytest.mark.parametrize(
+    "gap_code",
+    ("announcement_body_limit", "official_announcement_total_limit"),
+)
+def test_incomplete_closure_authenticates_body_cap_independently_from_candidate_cap(
+    official_context,
+    gap_code,
+) -> None:
+    closure = desired_official_closure(
+        official_context,
+        authenticated_body_count=0,
+        projected_event_count=0,
+        body_cap_reached=True,
+        gap_codes=(gap_code,),
+        official_negative_check_complete=False,
+    )
+
+    stored = official_context["store"].publish_official_check_closure(closure)
+
+    assert stored.value.candidate_cap_reached is False
+    assert stored.value.body_cap_reached is True
+
+
+def test_incomplete_closure_preserves_missing_date_page_gap(official_context) -> None:
+    store = official_context["store"]
+    content_id = store.publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    store.publish_official_event(
+        desired_official_event(official_context, content_id)
+    )
+    closure = desired_official_closure(official_context)
+    page = replace(
+        closure.listing_page_evidence[0],
+        parsed_item_count=2,
+        parsed_items_sha256="f" * 64,
+    )
+    closure = replace(
+        closure,
+        listing_page_evidence=(page,),
+        gap_codes=("official_listing_publication_date_missing",),
+        official_negative_check_complete=False,
+    )
+    closure = replace(closure, record_checksum=closure.expected_record_checksum())
+
+    stored = store.publish_official_check_closure(closure)
+
+    assert stored.value.official_negative_check_complete is False
+    assert stored.value.gap_codes == ("official_listing_publication_date_missing",)
+
+
+def test_closure_rejects_noncanonical_source_attempt_registry(official_context) -> None:
+    with official_context["repository"].connect() as connection, connection:
+        connection.execute("DROP TRIGGER source_attempt_no_update")
+        connection.execute(
+            "UPDATE source_attempts SET registry_checksum=? WHERE id=?",
+            ("f" * 64, official_context["source_attempt_id"]),
+        )
+
+    with pytest.raises(HoldingReviewStoreError, match="binding|attempt"):
+        official_context["store"].publish_official_check_closure(
+            desired_official_closure(official_context)
+        )
+
+
+def test_two_candidate_closure_requires_exact_one_to_one_mapping(official_context) -> None:
+    second = add_second_official_candidate(official_context)
+    publish_two_official_candidates(official_context, second)
+
+    stored = official_context["store"].publish_official_check_closure(
+        desired_two_candidate_closure(official_context, second)
+    )
+
+    assert stored.value.candidate_count == 2
+    assert stored.value.authenticated_body_count == 2
+    assert stored.value.projected_event_count == 2
+
+
+def test_two_candidate_swapped_event_mapping_is_rejected_on_read(official_context) -> None:
+    second = add_second_official_candidate(official_context)
+    first_content_id, first_event_id, _, _ = publish_two_official_candidates(
+        official_context,
+        second,
+    )
+    official_context["store"].publish_official_check_closure(
+        desired_two_candidate_closure(official_context, second)
+    )
+    swapped = desired_official_event(
+        official_context,
+        first_content_id,
+        announcement_row_id=second["row_id"],
+    )
+    with official_context["repository"].connect() as connection, connection:
+        connection.execute("DROP TRIGGER held_review_official_event_projection_no_update")
+        connection.execute(
+            """
+            UPDATE held_review_official_event_projections
+            SET announcement_row_id=?, record_checksum=? WHERE id=?
+            """,
+            (second["row_id"], swapped.record_checksum, first_event_id),
+        )
+
+    with pytest.raises(HoldingReviewStoreError, match="binding|cross-event"):
+        official_context["store"].authenticated_official_check_closure(
+            official_context["request_run_id"], "123456"
+        )
+
+
+def test_two_candidate_duplicate_body_is_rejected(official_context) -> None:
+    second = add_second_official_candidate(official_context)
+    publish_two_official_candidates(official_context, second)
+    duplicate_text = "本基金基金经理发生变更。补充"
+    official_context["store"].publish_announcement_content(
+        desired_official_content(
+            official_context,
+            normalized_content=duplicate_text,
+            normalized_content_bytes=len(duplicate_text.encode("utf-8")),
+            normalized_content_sha256=hashlib.sha256(
+                duplicate_text.encode("utf-8")
+            ).hexdigest(),
+            integrity_checked_at=NOW + timedelta(seconds=1),
+        )
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="binding|body"):
+        official_context["store"].publish_official_check_closure(
+            desired_two_candidate_closure(official_context, second)
+        )
+
+
+def test_two_candidate_missing_body_is_rejected(official_context) -> None:
+    second = add_second_official_candidate(official_context)
+    first_content_id = official_context["store"].publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    official_context["store"].publish_official_event(
+        desired_official_event(official_context, first_content_id)
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="binding|count|mapping"):
+        official_context["store"].publish_official_check_closure(
+            desired_two_candidate_closure(official_context, second)
+        )
+
+
+def test_two_candidate_body_without_event_is_rejected(official_context) -> None:
+    second = add_second_official_candidate(official_context)
+    first_content_id = official_context["store"].publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    official_context["store"].publish_official_event(
+        desired_official_event(official_context, first_content_id)
+    )
+    official_context["store"].publish_announcement_content(
+        desired_official_content(
+            official_context,
+            canonical_announcement_url=second["url"],
+            announcement_title=second["title"],
+            announcement_published_at=second["published_at"],
+        )
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="binding|count|mapping"):
+        official_context["store"].publish_official_check_closure(
+            desired_two_candidate_closure(official_context, second)
+        )
+
+
+def test_two_candidate_extra_projection_is_rejected(official_context) -> None:
+    second = add_second_official_candidate(official_context)
+    first_content_id, _, _, _ = publish_two_official_candidates(official_context, second)
+    official_context["store"].publish_official_event(
+        desired_official_event(
+            official_context,
+            first_content_id,
+            event_code=OfficialEventCode.BENCHMARK_CHANGE_NOTICE,
+            triggered_review_code=TriggeredReviewCode.BENCHMARK_CHANGE_REVIEW,
+        )
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="binding|count|event"):
+        official_context["store"].publish_official_check_closure(
+            desired_two_candidate_closure(official_context, second)
+        )
+
+
+def test_rapid_request_cannot_publish_or_read_official_bodies(
+    rapid_official_context,
+) -> None:
+    store = rapid_official_context["store"]
+    with pytest.raises(HoldingReviewStoreError, match="Deep"):
+        store.publish_announcement_content(
+            desired_official_content(rapid_official_context)
+        )
+    with pytest.raises(HoldingReviewStoreError, match="Deep"):
+        store.authenticated_official_event_references(
+            rapid_official_context["request_run_id"], "123456"
+        )
+
+
+def test_official_content_rejects_cross_request_source_attempt(official_context) -> None:
+    value = desired_official_content(
+        official_context,
+        source_attempt_id=official_context["source_attempt_id"] + 999,
+    )
+    with pytest.raises(HoldingReviewStoreError, match="binding"):
+        official_context["store"].publish_announcement_content(value)
+
+
+def test_official_event_rejects_noncanonical_policy(official_context) -> None:
+    store = official_context["store"]
+    content_id = store.publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    event = desired_official_event(
+        official_context,
+        content_id,
+        policy_checksum="f" * 64,
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="policy"):
+        store.publish_official_event(event)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"fund_code": "654321"},
+        {"announcement_row_id": 999},
+    ),
+)
+def test_official_event_requires_same_fund_content_and_listing_row(
+    official_context,
+    changes: dict[str, object],
+) -> None:
+    store = official_context["store"]
+    content_id = store.publish_announcement_content(
+        desired_official_content(official_context)
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="binding"):
+        store.publish_official_event(
+            desired_official_event(official_context, content_id, **changes)
+        )
+
+
+def test_official_reference_authentication_detects_projection_tampering(
+    official_context,
+) -> None:
+    store = official_context["store"]
+    content_id = store.publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    event_id = store.publish_official_event(
+        desired_official_event(official_context, content_id)
+    )
+    with official_context["repository"].connect() as connection, connection:
+        connection.execute("DROP TRIGGER held_review_official_event_projection_no_update")
+        connection.execute(
+            "UPDATE held_review_official_event_projections "
+            "SET policy_checksum=? WHERE id=?",
+            ("e" * 64, event_id),
+        )
+
+    with pytest.raises(HoldingReviewStoreError, match="authentication"):
+        store.authenticated_official_event_references(
+            official_context["request_run_id"], "123456"
+        )
+
+
+def test_official_reference_authentication_detects_body_tampering(
+    official_context,
+) -> None:
+    store = official_context["store"]
+    content_id = store.publish_announcement_content(
+        desired_official_content(official_context)
+    )
+    store.publish_official_event(desired_official_event(official_context, content_id))
+    with official_context["repository"].connect() as connection, connection:
+        connection.execute("DROP TRIGGER fund_official_announcement_content_no_update")
+        connection.execute(
+            "UPDATE fund_official_announcement_contents "
+            "SET record_checksum=? WHERE id=?",
+            ("e" * 64, content_id),
+        )
+
+    with pytest.raises(HoldingReviewStoreError, match="authentication"):
+        store.authenticated_official_event_references(
+            official_context["request_run_id"], "123456"
+        )
 
 
 def test_projection_round_trip_and_semantic_idempotency(context) -> None:

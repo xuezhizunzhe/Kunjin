@@ -25,7 +25,11 @@ from kunjin.holding_review.models import (
     HoldingReviewResult,
     HoldingReviewSnapshot,
     OfficialAnnouncementContent,
+    OfficialCheckClosure,
     OfficialEventEvidenceReference,
+    OfficialListingPageEvidence,
+    OfficialListingTerminalState,
+    OfficialManagerIdentityState,
     RedemptionComponentState,
     RedemptionEvidence,
     RedemptionFeasibility,
@@ -44,12 +48,71 @@ from kunjin.holding_review.models import (
 )
 from kunjin.holding_review.policy import (
     HELD_FUND_MANUAL_REVIEW_POLICY_V1_GOLDEN_CHECKSUM,
+    OFFICIAL_CHECK_POLICY_V1_GOLDEN_CHECKSUM,
     HeldFundManualReviewPolicyV1,
+    OfficialCheckPolicyV1,
 )
 from kunjin.intelligence.models import LineageKind
 
 NOW = datetime(2026, 7, 19, 4, 0, tzinfo=timezone.utc)
 CHECKSUM = "a" * 64
+
+
+def official_page(**changes: object) -> OfficialListingPageEvidence:
+    values: dict[str, object] = {
+        "registration_id": "fund001",
+        "page_number": 1,
+        "reported_total_pages": 1,
+        "canonical_page_url": "https://www.fund001.com/fund/123456/sxxpl.shtml",
+        "raw_byte_count": 100,
+        "raw_sha256": "b" * 64,
+        "retrieved_at": NOW,
+        "parsed_item_count": 0,
+        "parsed_items_sha256": "c" * 64,
+        "terminal_state": OfficialListingTerminalState.SOURCE_FINAL_PAGE,
+        "source_document_id": 9,
+    }
+    values.update(changes)
+    return OfficialListingPageEvidence(**values)  # type: ignore[arg-type]
+
+
+def official_closure(**changes: object) -> OfficialCheckClosure:
+    policy = OfficialCheckPolicyV1()
+    values: dict[str, object] = {
+        "brief_request_run_id": 3,
+        "fund_code": "123456",
+        "listing_source_attempt_id": 4,
+        "official_registry_version": policy.official_registry_version,
+        "official_registry_checksum": policy.official_registry_checksum,
+        "source_registration_ids": ("fund001",),
+        "manager_identity_state": OfficialManagerIdentityState.PRESENT,
+        "manager_identity_row_id": 7,
+        "manager_identity_source_document_id": 8,
+        "manager_identity_source_document_checksum": "d" * 64,
+        "manager_identity_normalized_name": "交银施罗德基金管理有限公司",
+        "manager_identity_fingerprint": "e" * 64,
+        "listing_page_evidence": (official_page(),),
+        "window_start": NOW - timedelta(days=180),
+        "window_end": NOW,
+        "listing_count": 0,
+        "candidate_count": 0,
+        "authenticated_body_count": 0,
+        "projected_event_count": 0,
+        "listing_truncated": False,
+        "candidate_cap_reached": False,
+        "body_cap_reached": False,
+        "gap_codes": (),
+        "official_negative_check_complete": True,
+        "policy_version": "1",
+        "policy_checksum": HELD_FUND_MANUAL_REVIEW_POLICY_V1_GOLDEN_CHECKSUM,
+        "official_check_policy_version": policy.version,
+        "official_check_policy_checksum": policy.checksum(),
+        "created_at": NOW,
+        "record_checksum": "0" * 64,
+    }
+    values.update(changes)
+    value = OfficialCheckClosure(**values)  # type: ignore[arg-type]
+    return replace(value, record_checksum=value.expected_record_checksum())
 
 
 def redemption_evidence() -> RedemptionEvidence:
@@ -221,6 +284,131 @@ def test_review_boundary_is_permanently_non_authorizing() -> None:
     assert boundary.automatic_trade is False
 
 
+def test_official_check_policy_v1_is_frozen_and_does_not_change_manual_policy() -> None:
+    manual = HeldFundManualReviewPolicyV1()
+    policy = OfficialCheckPolicyV1()
+    policy.validate()
+    assert manual.checksum() == HELD_FUND_MANUAL_REVIEW_POLICY_V1_GOLDEN_CHECKSUM
+    assert policy.version == "1"
+    assert policy.query_window_days == 180
+    assert policy.manager_identity_maximum_age_days == 30
+    assert policy.maximum_listing_pages == 10
+    assert policy.maximum_listing_items == 1_000
+    assert policy.maximum_listing_page_bytes == 2 * 1024 * 1024
+    assert policy.maximum_candidates == 20
+    assert policy.maximum_bodies == 20
+    assert policy.automatic_retry is False
+    assert policy.candidate_detector_version == "1"
+    assert policy.positive_projector_version == "1"
+    assert {
+        "重大事项",
+        "重要事项",
+        "有关事项",
+        "聘任",
+        "离任",
+        "恢复赎回",
+        "恢复大额赎回",
+        "暂停大额赎回",
+        "旗下基金",
+        "部分基金",
+        "多只基金",
+    }.issubset(policy.candidate_lexemes)
+    assert policy.checksum() == OFFICIAL_CHECK_POLICY_V1_GOLDEN_CHECKSUM
+
+
+def test_official_listing_page_evidence_is_exact_and_canonical() -> None:
+    page = official_page()
+    page.validate()
+    assert page.to_canonical_dict()["terminal_state"] == "source_final_page"
+    with pytest.raises(ValueError, match="page number"):
+        official_page(page_number=True).validate()
+    with pytest.raises(ValueError, match="canonical public HTTPS URL"):
+        official_page(canonical_page_url="https://www.fund001.com/a/../b").validate()
+
+
+def test_complete_official_closure_is_canonical_and_authenticated_by_checksum() -> None:
+    value = official_closure()
+    value.validate()
+    assert value.official_negative_check_complete is True
+    assert value.candidate_count == value.authenticated_body_count
+    assert value.authenticated_body_count == value.projected_event_count
+    assert value.record_checksum == value.expected_record_checksum()
+
+
+@pytest.mark.parametrize(
+    "changes,match",
+    (
+        ({"gap_codes": ("source_failed",)}, "complete official check"),
+        ({"listing_truncated": True}, "complete official check"),
+        ({"candidate_count": 1}, "counts are inconsistent"),
+        (
+            {
+                "manager_identity_state": OfficialManagerIdentityState.MISSING,
+                "manager_identity_row_id": None,
+                "manager_identity_source_document_id": None,
+                "manager_identity_source_document_checksum": None,
+                "manager_identity_normalized_name": None,
+                "manager_identity_fingerprint": None,
+            },
+            "complete official check",
+        ),
+        ({"source_registration_ids": ()}, "source set"),
+        ({"listing_page_evidence": ()}, "complete official check"),
+    ),
+)
+def test_complete_official_closure_rejects_each_incomplete_state(changes, match) -> None:
+    value = official_closure(**changes)
+    with pytest.raises(ValueError, match=match):
+        value.validate()
+
+
+def test_incomplete_official_closure_requires_null_identity_fields_when_missing() -> None:
+    value = official_closure(
+        manager_identity_state=OfficialManagerIdentityState.MISSING,
+        manager_identity_row_id=None,
+        manager_identity_source_document_id=None,
+        manager_identity_source_document_checksum=None,
+        manager_identity_normalized_name=None,
+        manager_identity_fingerprint=None,
+        source_registration_ids=(),
+        listing_page_evidence=(),
+        gap_codes=("official_manager_identity_unavailable",),
+        official_negative_check_complete=False,
+    )
+    value.validate()
+    with pytest.raises(ValueError, match="identity binding"):
+        official_closure(
+            manager_identity_state=OfficialManagerIdentityState.MISSING,
+            official_negative_check_complete=False,
+            gap_codes=("official_manager_identity_unavailable",),
+        ).validate()
+
+
+def test_official_closure_rejects_noncanonical_page_manifest() -> None:
+    first = official_page(
+        page_number=1,
+        reported_total_pages=2,
+        terminal_state=None,
+        canonical_page_url="https://www.fund001.com/fund/123456/pages/1",
+        raw_sha256="1" * 64,
+        parsed_items_sha256="2" * 64,
+        source_document_id=10,
+    )
+    second = official_page(
+        page_number=2,
+        reported_total_pages=2,
+        canonical_page_url="https://www.fund001.com/fund/123456/pages/2",
+        raw_sha256="3" * 64,
+        parsed_items_sha256="4" * 64,
+        source_document_id=11,
+    )
+    official_closure(listing_page_evidence=(first, second)).validate()
+    with pytest.raises(ValueError, match="canonical page order"):
+        official_closure(listing_page_evidence=(second, first)).validate()
+    with pytest.raises(ValueError, match="incomplete evidence"):
+        official_closure(
+            listing_page_evidence=(first, replace(second, terminal_state=None))
+        ).validate()
 @pytest.mark.parametrize(
     "omitted",
     (

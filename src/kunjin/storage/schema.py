@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -4743,4 +4743,410 @@ BEGIN SELECT RAISE(ABORT, 'holding review snapshots are immutable'); END;
 CREATE TRIGGER holding_review_snapshot_no_delete
 BEFORE DELETE ON holding_review_snapshots
 BEGIN SELECT RAISE(ABORT, 'holding review snapshots are immutable'); END;
+"""
+
+SCHEMA_V22 = """
+CREATE TABLE held_review_official_check_closures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id)='integer' AND id>0),
+    brief_request_run_id INTEGER NOT NULL CHECK(
+        typeof(brief_request_run_id)='integer' AND brief_request_run_id>0
+    ) REFERENCES request_runs(id) ON DELETE RESTRICT,
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code)='text' AND length(CAST(fund_code AS BLOB))=6
+        AND fund_code NOT GLOB '*[^0-9]*' AND fund_code<>'000000'
+    ),
+    listing_source_attempt_id INTEGER NOT NULL CHECK(
+        typeof(listing_source_attempt_id)='integer' AND listing_source_attempt_id>0
+    ) REFERENCES source_attempts(id) ON DELETE RESTRICT,
+    official_registry_version TEXT NOT NULL CHECK(official_registry_version='1'),
+    official_registry_checksum TEXT NOT NULL CHECK(
+        official_registry_checksum=
+        '557cac191734fbdd214ff24dabfc5afa8e3c99c1ab8ac30f230a846684c3fc9e'
+    ),
+    source_registration_ids_json TEXT NOT NULL CHECK(
+        typeof(source_registration_ids_json)='text'
+        AND json_valid(source_registration_ids_json)
+        AND json_type(source_registration_ids_json)='array'
+        AND source_registration_ids_json=json(source_registration_ids_json)
+        AND json_array_length(source_registration_ids_json)<=10
+        AND length(CAST(source_registration_ids_json AS BLOB))<=4096
+    ),
+    manager_identity_state TEXT NOT NULL CHECK(
+        manager_identity_state IN ('present','missing','stale','conflicted')
+    ),
+    manager_identity_row_id INTEGER REFERENCES fund_identities(id) ON DELETE RESTRICT,
+    manager_identity_source_document_id INTEGER
+        REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    manager_identity_source_document_checksum TEXT CHECK(
+        manager_identity_source_document_checksum IS NULL OR (
+            typeof(manager_identity_source_document_checksum)='text'
+            AND length(CAST(manager_identity_source_document_checksum AS BLOB))=64
+            AND manager_identity_source_document_checksum NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    manager_identity_normalized_name TEXT CHECK(
+        manager_identity_normalized_name IS NULL OR (
+            typeof(manager_identity_normalized_name)='text'
+            AND length(manager_identity_normalized_name) BETWEEN 1 AND 256
+            AND instr(manager_identity_normalized_name, char(0))=0
+        )
+    ),
+    manager_identity_fingerprint TEXT CHECK(
+        manager_identity_fingerprint IS NULL OR (
+            typeof(manager_identity_fingerprint)='text'
+            AND length(CAST(manager_identity_fingerprint AS BLOB))=64
+            AND manager_identity_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    listing_page_evidence_json TEXT NOT NULL CHECK(
+        typeof(listing_page_evidence_json)='text'
+        AND json_valid(listing_page_evidence_json)
+        AND json_type(listing_page_evidence_json)='array'
+        AND listing_page_evidence_json=json(listing_page_evidence_json)
+        AND json_array_length(listing_page_evidence_json)<=10
+        AND length(CAST(listing_page_evidence_json AS BLOB))<=131072
+    ),
+    window_start TEXT NOT NULL CHECK(
+        typeof(window_start)='text' AND julianday(window_start) IS NOT NULL
+        AND substr(window_start,-6)='+00:00' AND substr(window_start,11,1)='T'
+    ),
+    window_end TEXT NOT NULL CHECK(
+        typeof(window_end)='text' AND julianday(window_end) IS NOT NULL
+        AND substr(window_end,-6)='+00:00' AND substr(window_end,11,1)='T'
+        AND window_end COLLATE BINARY>window_start COLLATE BINARY
+    ),
+    listing_count INTEGER NOT NULL CHECK(
+        typeof(listing_count)='integer' AND listing_count BETWEEN 0 AND 1000
+    ),
+    candidate_count INTEGER NOT NULL CHECK(
+        typeof(candidate_count)='integer' AND candidate_count BETWEEN 0 AND 20
+    ),
+    authenticated_body_count INTEGER NOT NULL CHECK(
+        typeof(authenticated_body_count)='integer'
+        AND authenticated_body_count BETWEEN 0 AND 20
+    ),
+    projected_event_count INTEGER NOT NULL CHECK(
+        typeof(projected_event_count)='integer' AND projected_event_count BETWEEN 0 AND 20
+    ),
+    listing_truncated INTEGER NOT NULL CHECK(listing_truncated IN (0,1)),
+    candidate_cap_reached INTEGER NOT NULL CHECK(candidate_cap_reached IN (0,1)),
+    body_cap_reached INTEGER NOT NULL CHECK(body_cap_reached IN (0,1)),
+    gap_codes_json TEXT NOT NULL CHECK(
+        typeof(gap_codes_json)='text' AND json_valid(gap_codes_json)
+        AND json_type(gap_codes_json)='array' AND gap_codes_json=json(gap_codes_json)
+        AND json_array_length(gap_codes_json)<=64
+        AND length(CAST(gap_codes_json AS BLOB))<=8192
+    ),
+    official_negative_check_complete INTEGER NOT NULL CHECK(
+        official_negative_check_complete IN (0,1)
+    ),
+    policy_version TEXT NOT NULL CHECK(policy_version='1'),
+    policy_checksum TEXT NOT NULL CHECK(
+        policy_checksum='a78f01681f5b45dcbc9a264cfbdb2ee9805c30c7dab8583903ee60a83956fc46'
+    ),
+    official_check_policy_version TEXT NOT NULL CHECK(official_check_policy_version='1'),
+    official_check_policy_checksum TEXT NOT NULL CHECK(
+        typeof(official_check_policy_checksum)='text'
+        AND length(CAST(official_check_policy_checksum AS BLOB))=64
+        AND official_check_policy_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL CHECK(
+        typeof(created_at)='text' AND julianday(created_at) IS NOT NULL
+        AND substr(created_at,-6)='+00:00' AND substr(created_at,11,1)='T'
+        AND created_at COLLATE BINARY>=window_end COLLATE BINARY
+    ),
+    record_checksum TEXT NOT NULL CHECK(
+        typeof(record_checksum)='text' AND length(CAST(record_checksum AS BLOB))=64
+        AND record_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    UNIQUE(brief_request_run_id, fund_code),
+    CHECK(projected_event_count<=authenticated_body_count),
+    CHECK(authenticated_body_count<=candidate_count),
+    CHECK(candidate_count<=listing_count),
+    CHECK(abs((julianday(window_end)-julianday(window_start))-180.0)<0.00000001),
+    CHECK(
+        (manager_identity_state='present'
+         AND manager_identity_row_id IS NOT NULL
+         AND manager_identity_source_document_id IS NOT NULL
+         AND manager_identity_source_document_checksum IS NOT NULL
+         AND manager_identity_normalized_name IS NOT NULL
+         AND manager_identity_fingerprint IS NOT NULL)
+        OR (manager_identity_state<>'present'
+            AND manager_identity_row_id IS NULL
+            AND manager_identity_source_document_id IS NULL
+            AND manager_identity_source_document_checksum IS NULL
+            AND manager_identity_normalized_name IS NULL
+            AND manager_identity_fingerprint IS NULL)
+    ),
+    CHECK(
+        official_negative_check_complete=0 OR (
+            manager_identity_state='present'
+            AND source_registration_ids_json<>'[]'
+            AND listing_page_evidence_json<>'[]'
+            AND listing_truncated=0 AND candidate_cap_reached=0 AND body_cap_reached=0
+            AND gap_codes_json='[]'
+            AND projected_event_count=authenticated_body_count
+            AND authenticated_body_count=candidate_count
+        )
+    )
+);
+
+CREATE TRIGGER held_review_official_check_closure_no_replace
+BEFORE INSERT ON held_review_official_check_closures
+WHEN EXISTS(
+    SELECT 1 FROM held_review_official_check_closures
+    WHERE id=NEW.id OR (
+        brief_request_run_id=NEW.brief_request_run_id AND fund_code=NEW.fund_code
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'official check closures cannot be replaced'); END;
+
+CREATE TRIGGER held_review_official_check_closure_insert_guard
+BEFORE INSERT ON held_review_official_check_closures
+WHEN NOT EXISTS(
+    SELECT 1
+    FROM request_runs AS run
+    JOIN source_attempts AS attempt ON attempt.id=NEW.listing_source_attempt_id
+    WHERE run.id=NEW.brief_request_run_id AND run.mode='deep' AND run.status='running'
+      AND attempt.request_run_id=run.id
+      AND attempt.subject_key='fund:' || NEW.fund_code
+      AND attempt.source_id='fund_manager_official_documents'
+      AND attempt.field_id='fund_manager_product_announcement'
+      AND attempt.attempt_number=1
+      AND attempt.force_actor IS NULL AND attempt.force_reason IS NULL
+      AND attempt.authorization_id IS NULL
+      AND attempt.registry_version='1'
+      AND attempt.registry_checksum=
+          'c876085a132026afab288a0a7022b7b29389fe36de4bcf9dba85a204c986953e'
+      AND attempt.started_at COLLATE BINARY>=run.started_at COLLATE BINARY
+      AND attempt.finished_at COLLATE BINARY<=run.deadline_at COLLATE BINARY
+      AND NEW.created_at COLLATE BINARY<=run.deadline_at COLLATE BINARY
+      AND attempt.response_byte_count=COALESCE((
+          SELECT sum(CAST(json_extract(page.value,'$.raw_byte_count') AS INTEGER))
+          FROM json_each(NEW.listing_page_evidence_json) AS page
+      ),0)
+      AND (
+          NEW.official_negative_check_complete=0
+          OR attempt.outcome IN ('success','cache_hit')
+      )
+      AND (SELECT count(*) FROM source_attempts AS exact_attempt
+           WHERE exact_attempt.request_run_id=run.id
+             AND exact_attempt.source_id=attempt.source_id
+             AND exact_attempt.field_id=attempt.field_id
+             AND exact_attempt.subject_key=attempt.subject_key)=1
+)
+OR NEW.official_check_policy_checksum<>
+   '93722946c100518229531c79cabf606c23cf169536bd5c1d3213e3bf5836cb1b'
+OR EXISTS(
+    SELECT 1 FROM json_each(NEW.source_registration_ids_json)
+    WHERE type<>'text' OR value<>'fund001'
+)
+OR EXISTS(
+    SELECT 1 FROM json_each(NEW.source_registration_ids_json) AS current
+    JOIN json_each(NEW.source_registration_ids_json) AS prior
+      ON CAST(prior.key AS INTEGER)<CAST(current.key AS INTEGER)
+    WHERE prior.value>=current.value
+)
+OR (
+    NEW.manager_identity_state='present' AND NOT EXISTS(
+        SELECT 1
+        FROM fund_identities AS identity
+        JOIN fund_source_documents AS document
+          ON document.id=NEW.manager_identity_source_document_id
+        JOIN fund_section_syncs AS sync
+          ON sync.fund_code=NEW.fund_code AND sync.section='basic_profile'
+        WHERE identity.id=NEW.manager_identity_row_id
+          AND identity.fund_code=NEW.fund_code AND identity.status='active'
+          AND identity.source_document_id=document.id
+          AND identity.manager_name=NEW.manager_identity_normalized_name
+          AND document.fund_code=NEW.fund_code AND document.document_kind='basic_profile'
+          AND document.source_tier IN (1,2)
+          AND document.checksum=NEW.manager_identity_source_document_checksum
+          AND sync.state='success' AND sync.current_source_document_id=document.id
+          AND julianday(document.retrieved_at)<=julianday(NEW.created_at)
+          AND julianday(document.retrieved_at)>=julianday(NEW.created_at,'-30 days')
+          AND (
+              NEW.source_registration_ids_json='[]'
+              OR NEW.manager_identity_normalized_name IN (
+                  '交银施罗德基金管理有限公司','交银施罗德基金'
+              )
+          )
+    )
+)
+OR EXISTS(
+    SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS page
+    WHERE page.type<>'object'
+       OR (SELECT count(*) FROM json_each(page.value))<>11
+       OR EXISTS(
+          SELECT 1 FROM json_each(page.value) AS field
+          WHERE field.key NOT IN (
+              'registration_id','page_number','reported_total_pages',
+              'canonical_page_url','raw_byte_count','raw_sha256','retrieved_at',
+              'parsed_item_count','parsed_items_sha256','terminal_state',
+              'source_document_id'
+          )
+       )
+       OR json_type(page.value,'$.registration_id')<>'text'
+       OR json_extract(page.value,'$.registration_id')<>'fund001'
+       OR json_type(page.value,'$.page_number')<>'integer'
+       OR json_extract(page.value,'$.page_number') NOT BETWEEN 1 AND 10
+       OR json_type(page.value,'$.reported_total_pages')<>'integer'
+       OR json_extract(page.value,'$.reported_total_pages')<
+          json_extract(page.value,'$.page_number')
+       OR json_type(page.value,'$.canonical_page_url')<>'text'
+       OR json_extract(page.value,'$.canonical_page_url') NOT GLOB 'https://www.fund001.com/*'
+       OR json_type(page.value,'$.raw_byte_count')<>'integer'
+       OR json_extract(page.value,'$.raw_byte_count') NOT BETWEEN 1 AND 2097152
+       OR json_type(page.value,'$.raw_sha256')<>'text'
+       OR length(CAST(json_extract(page.value,'$.raw_sha256') AS BLOB))<>64
+       OR json_extract(page.value,'$.raw_sha256') GLOB '*[^0-9a-f]*'
+       OR json_type(page.value,'$.retrieved_at')<>'text'
+       OR julianday(json_extract(page.value,'$.retrieved_at')) IS NULL
+       OR substr(json_extract(page.value,'$.retrieved_at'),-6)<>'+00:00'
+       OR json_type(page.value,'$.parsed_item_count')<>'integer'
+       OR json_extract(page.value,'$.parsed_item_count') NOT BETWEEN 0 AND 1000
+       OR json_type(page.value,'$.parsed_items_sha256')<>'text'
+       OR length(CAST(json_extract(page.value,'$.parsed_items_sha256') AS BLOB))<>64
+       OR json_extract(page.value,'$.parsed_items_sha256') GLOB '*[^0-9a-f]*'
+       OR json_type(page.value,'$.terminal_state') NOT IN ('null','text')
+       OR COALESCE(json_extract(page.value,'$.terminal_state'),'') NOT IN (
+          '','source_final_page','window_boundary_reached'
+       )
+       OR json_type(page.value,'$.source_document_id')<>'integer'
+       OR json_extract(page.value,'$.source_document_id')<=0
+       OR page.value<>json_object(
+          'canonical_page_url',json_extract(page.value,'$.canonical_page_url'),
+          'page_number',json_extract(page.value,'$.page_number'),
+          'parsed_item_count',json_extract(page.value,'$.parsed_item_count'),
+          'parsed_items_sha256',json_extract(page.value,'$.parsed_items_sha256'),
+          'raw_byte_count',json_extract(page.value,'$.raw_byte_count'),
+          'raw_sha256',json_extract(page.value,'$.raw_sha256'),
+          'registration_id',json_extract(page.value,'$.registration_id'),
+          'reported_total_pages',json_extract(page.value,'$.reported_total_pages'),
+          'retrieved_at',json_extract(page.value,'$.retrieved_at'),
+          'source_document_id',json_extract(page.value,'$.source_document_id'),
+          'terminal_state',json_extract(page.value,'$.terminal_state')
+       )
+)
+OR EXISTS(
+    SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS page
+    WHERE NOT EXISTS(
+        SELECT 1 FROM json_each(NEW.source_registration_ids_json) AS registration
+        WHERE registration.value=json_extract(page.value,'$.registration_id')
+    )
+       OR NOT EXISTS(
+          SELECT 1 FROM fund_source_documents AS document
+          WHERE document.id=json_extract(page.value,'$.source_document_id')
+            AND document.fund_code=NEW.fund_code
+            AND document.document_kind='announcement' AND document.source_tier=1
+            AND document.source_name='fund_manager_official_documents'
+            AND document.url=json_extract(page.value,'$.canonical_page_url')
+            AND document.checksum=json_extract(page.value,'$.raw_sha256')
+            AND document.publisher IN (
+                '交银施罗德基金管理有限公司','交银施罗德基金'
+            )
+            AND EXISTS(
+                SELECT 1 FROM source_attempts AS capture
+                WHERE capture.id=NEW.listing_source_attempt_id
+                  AND julianday(json_extract(page.value,'$.retrieved_at'))
+                      >=julianday(capture.started_at)
+                  AND julianday(json_extract(page.value,'$.retrieved_at'))
+                      <=julianday(capture.finished_at)
+            )
+       )
+)
+OR EXISTS(
+    SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS current
+    JOIN json_each(NEW.listing_page_evidence_json) AS prior
+      ON CAST(prior.key AS INTEGER)<CAST(current.key AS INTEGER)
+    WHERE json_extract(prior.value,'$.registration_id')>
+          json_extract(current.value,'$.registration_id')
+       OR (
+          json_extract(prior.value,'$.registration_id')=
+          json_extract(current.value,'$.registration_id')
+          AND json_extract(prior.value,'$.page_number')>=
+              json_extract(current.value,'$.page_number')
+       )
+       OR json_extract(prior.value,'$.canonical_page_url')=
+          json_extract(current.value,'$.canonical_page_url')
+       OR json_extract(prior.value,'$.raw_sha256')=
+          json_extract(current.value,'$.raw_sha256')
+       OR json_extract(prior.value,'$.source_document_id')=
+          json_extract(current.value,'$.source_document_id')
+)
+OR (
+    NEW.official_negative_check_complete=1 AND (
+        EXISTS(
+            SELECT 1 FROM json_each(NEW.source_registration_ids_json) AS registration
+            WHERE NOT EXISTS(
+                SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS first_page
+                WHERE json_extract(first_page.value,'$.registration_id')=registration.value
+                  AND json_extract(first_page.value,'$.page_number')=1
+            )
+               OR NOT EXISTS(
+                SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS terminal
+                WHERE json_extract(terminal.value,'$.registration_id')=registration.value
+                  AND json_extract(terminal.value,'$.terminal_state') IS NOT NULL
+                  AND json_extract(terminal.value,'$.page_number')=(
+                      SELECT max(json_extract(candidate.value,'$.page_number'))
+                      FROM json_each(NEW.listing_page_evidence_json) AS candidate
+                      WHERE json_extract(candidate.value,'$.registration_id')=registration.value
+                  )
+            )
+        )
+        OR EXISTS(
+            SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS page
+            WHERE json_extract(page.value,'$.page_number')>1
+              AND NOT EXISTS(
+                  SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS previous
+                  WHERE json_extract(previous.value,'$.registration_id')=
+                        json_extract(page.value,'$.registration_id')
+                    AND json_extract(previous.value,'$.page_number')=
+                        json_extract(page.value,'$.page_number')-1
+              )
+        )
+        OR EXISTS(
+            SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS page
+            WHERE json_extract(page.value,'$.terminal_state') IS NOT NULL
+              AND json_extract(page.value,'$.page_number')<>(
+                  SELECT max(json_extract(candidate.value,'$.page_number'))
+                  FROM json_each(NEW.listing_page_evidence_json) AS candidate
+                  WHERE json_extract(candidate.value,'$.registration_id')=
+                        json_extract(page.value,'$.registration_id')
+              )
+        )
+        OR EXISTS(
+            SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS page
+            WHERE json_extract(page.value,'$.terminal_state')='source_final_page'
+              AND json_extract(page.value,'$.page_number')<>
+                  json_extract(page.value,'$.reported_total_pages')
+        )
+        OR EXISTS(
+            SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS page
+            WHERE EXISTS(
+                SELECT 1 FROM json_each(NEW.listing_page_evidence_json) AS other
+                WHERE json_extract(other.value,'$.registration_id')=
+                      json_extract(page.value,'$.registration_id')
+                  AND json_extract(other.value,'$.reported_total_pages')<>
+                      json_extract(page.value,'$.reported_total_pages')
+            )
+        )
+        OR (SELECT count(*) FROM fund_official_announcement_contents
+            WHERE brief_request_run_id=NEW.brief_request_run_id
+              AND fund_code=NEW.fund_code AND integrity_status='active')
+           <>NEW.authenticated_body_count
+        OR (SELECT count(*) FROM held_review_official_event_projections
+            WHERE brief_request_run_id=NEW.brief_request_run_id
+              AND fund_code=NEW.fund_code)<>NEW.projected_event_count
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'official check closure binding failed'); END;
+
+CREATE TRIGGER held_review_official_check_closure_no_update
+BEFORE UPDATE ON held_review_official_check_closures
+BEGIN SELECT RAISE(ABORT, 'official check closures are immutable'); END;
+
+CREATE TRIGGER held_review_official_check_closure_no_delete
+BEFORE DELETE ON held_review_official_check_closures
+BEGIN SELECT RAISE(ABORT, 'official check closures are immutable'); END;
 """

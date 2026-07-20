@@ -48,6 +48,7 @@ from kunjin.storage.schema import (
     SCHEMA_V19,
     SCHEMA_V20,
     SCHEMA_V21,
+    SCHEMA_V22,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -139,6 +140,7 @@ _HELD_REVIEW_TABLES = {
     "thesis_match_projections",
     "thesis_evidence_adjudications",
     "holding_review_snapshots",
+    "held_review_official_check_closures",
 }
 _HELD_REVIEW_OBJECT_PREFIXES = (
     "fund_official_announcement_content",
@@ -146,6 +148,7 @@ _HELD_REVIEW_OBJECT_PREFIXES = (
     "thesis_match_projection",
     "thesis_evidence_adjudication",
     "holding_review_snapshot",
+    "held_review_official_check_closure",
 )
 _DECISION_AUDIT_OBJECT_NAMESPACES = (
     "request_run_",
@@ -239,6 +242,7 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (19, SCHEMA_V19),
         (20, SCHEMA_V20),
         (21, SCHEMA_V21),
+        (22, SCHEMA_V22),
     )
 
 
@@ -1007,14 +1011,16 @@ def _validate_applied_schema(
     )
     if 21 not in applied_versions:
         return
+    held_review_version = 22 if 22 in applied_versions else 21
+    held_review_error = f"held review schema does not match V{held_review_version}"
     if _owned_held_review_objects(actual) != _owned_held_review_objects(expected):
-        raise sqlite3.DatabaseError("held review schema does not match V21")
+        raise sqlite3.DatabaseError(held_review_error)
     _reject_unexpected_schema_dependencies(
         connection,
         expected,
         actual,
         protected_tables=_HELD_REVIEW_TABLES,
-        error_message="held review schema does not match V21",
+        error_message=held_review_error,
     )
 
 

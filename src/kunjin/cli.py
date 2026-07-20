@@ -378,6 +378,11 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
         load_public_acceptance_capability,
     )
     from kunjin.brief.service import HeldFundBriefService
+    from kunjin.holding_review.deep import DeepOfficialConfirmationService
+    from kunjin.holding_review.official import (
+        OfficialAnnouncementHttpFetcher,
+        OfficialListingHttpFetcher,
+    )
     from kunjin.holding_review.service import HoldingReviewService
     from kunjin.holding_review.store import HoldingReviewStore
     from kunjin.holding_review.thesis import ThesisReviewService
@@ -460,6 +465,21 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
             public_acceptance,
         )
     )
+    holding_review_store = HoldingReviewStore(repository)
+    deep_official_confirmation_service = DeepOfficialConfirmationService(
+        disclosure_store=fund_disclosure_store,
+        audit_store=decision_audit_store,
+        review_store=holding_review_store,
+        listing_fetch_factory=lambda deadline_at: OfficialListingHttpFetcher(
+            deadline_at=deadline_at,
+        ),
+        announcement_fetch_factory=lambda rows, deadline_at: (
+            OfficialAnnouncementHttpFetcher(
+                rows=rows,
+                deadline_at=deadline_at,
+            )
+        ),
+    )
     brief_service = HeldFundBriefService(
         repository=repository,
         suitability_service=suitability_service,
@@ -471,9 +491,9 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
         evidence_policy=evidence_policy,
         source_registry=source_registry,
         risk_store=fund_risk_store,
+        deep_official_confirmation_service=deep_official_confirmation_service,
     )
     intelligence_store = IntelligenceStore(repository, decision_audit_store)
-    holding_review_store = HoldingReviewStore(repository)
     return ApplicationContext(
         paths=paths,
         repository=repository,

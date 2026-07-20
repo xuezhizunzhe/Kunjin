@@ -1,9 +1,18 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+from kunjin.decision.budget import RequestBudget
+from kunjin.decision.models import (
+    RequestMode,
+    SourceAttempt,
+    SourceAttemptOutcome,
+)
+from kunjin.decision.source_registry import SOURCE_REGISTRY_V1_CHECKSUM
+from kunjin.decision.store import DecisionAuditStore
 from kunjin.funds.models import (
     AssetType,
     DocumentKind,
@@ -19,7 +28,11 @@ from kunjin.funds.models import (
     FundSizeObservation,
     SourceDocument,
 )
-from kunjin.funds.store import FundDisclosureStore, make_record_key
+from kunjin.funds.store import (
+    FundDisclosureStore,
+    OfficialListingRequestContext,
+    make_record_key,
+)
 from kunjin.storage.repository import Repository
 
 
@@ -72,6 +85,298 @@ class FundDisclosureStoreTest(unittest.TestCase):
             retrieved_at=self.now,
             checksum=checksum_character * 64,
         )
+
+    def official_request(
+        self,
+        *,
+        request_id: str = "d" * 32,
+        mode: RequestMode = RequestMode.DEEP,
+        response_bytes: int = 300,
+    ):
+        budget = RequestBudget.create(
+            mode,
+            request_id=request_id,
+            monotonic=lambda: 10.0,
+            wall_clock=lambda: self.now,
+        )
+        decision_store = DecisionAuditStore(self.repository)
+        request_run_id = decision_store.begin_request(budget)
+        attempt = SourceAttempt(
+            source_id="fund_manager_official_documents",
+            field_id="fund_manager_product_announcement",
+            subject_key="fund:519755",
+            attempt_number=1,
+            outcome=SourceAttemptOutcome.SUCCESS,
+            started_at=self.now,
+            finished_at=self.now + timedelta(seconds=2),
+            data_as_of=self.now + timedelta(seconds=1),
+            error_code=None,
+            cooldown_until=None,
+            force_actor=None,
+            force_reason=None,
+            registry_version="1",
+            registry_checksum=SOURCE_REGISTRY_V1_CHECKSUM,
+            response_bytes=response_bytes,
+        )
+        context = OfficialListingRequestContext(
+            request_run_id=request_run_id,
+            request_id=request_id,
+            fund_code="519755",
+            source_set_complete=True,
+            window_complete=True,
+            terminal_query_complete=True,
+            gap_codes=(),
+            deadline_at=budget.deadline_at,
+        )
+        return attempt, context
+
+    def official_page(self, page: int, checksum_character: str) -> SourceDocument:
+        return SourceDocument(
+            id=None,
+            fund_code="519755",
+            document_kind=DocumentKind.ANNOUNCEMENT,
+            title=f"\u5b98\u65b9\u516c\u544a\u5217\u8868\u7b2c{page}\u9875",
+            url=f"https://www.fund001.com/fund/519755/notices/page/{page}",
+            source_name="fund_manager_official_documents",
+            source_tier=1,
+            publisher="\u4ea4\u94f6\u65bd\u7f57\u5fb7\u57fa\u91d1\u7ba1\u7406\u6709\u9650\u516c\u53f8",
+            published_at=None,
+            retrieved_at=self.now + timedelta(seconds=1),
+            checksum=checksum_character * 64,
+        )
+
+    def official_announcement(
+        self,
+        suffix: str,
+        published_at: datetime,
+    ) -> FundAnnouncement:
+        return FundAnnouncement(
+            fund_code="519755",
+            title=f"\u57fa\u91d1\u516c\u544a{suffix}",
+            category="\u5b98\u65b9\u516c\u544a",
+            publisher="\u4ea4\u94f6\u65bd\u7f57\u5fb7\u57fa\u91d1\u7ba1\u7406\u6709\u9650\u516c\u53f8",
+            published_at=published_at,
+            url=f"https://www.fund001.com/fund/519755/notice/{suffix}.html",
+            source_tier=1,
+            source_document_id=None,
+        )
+
+    def test_official_listing_publishes_pages_atomically_without_pointer_update(self) -> None:
+        attempt, context = self.official_request()
+        pages = (self.official_page(1, "a"), self.official_page(2, "b"))
+        announcements = (
+            (self.official_announcement("one", self.now - timedelta(days=1)),),
+            (self.official_announcement("two", self.now - timedelta(days=10)),),
+        )
+
+        result = self.store.publish_official_announcement_listing(
+            "519755", pages, announcements, attempt, context
+        )
+
+        self.assertEqual([item.id for item in result.rows], [1, 2])
+        self.assertGreater(result.source_attempt_id, 0)
+        self.assertEqual(
+            [item.value.source_document_id for item in result.rows],
+            [result.page_evidence[0].id, result.page_evidence[1].id],
+        )
+        self.assertEqual([item.checksum for item in result.page_evidence], ["a" * 64, "b" * 64])
+        self.assertFalse(result.truncated)
+        with self.repository.connect() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM fund_section_syncs "
+                    "WHERE fund_code='519755' AND section='announcement'"
+                ).fetchone()
+            )
+
+    def test_official_listing_load_uses_explicit_half_open_window(self) -> None:
+        attempt, context = self.official_request()
+        inside = self.now - timedelta(days=1)
+        boundary = self.now - timedelta(days=180)
+        self.store.publish_official_announcement_listing(
+            "519755",
+            (self.official_page(1, "a"), self.official_page(2, "b")),
+            (
+                (self.official_announcement("inside", inside),),
+                (self.official_announcement("boundary", boundary),),
+            ),
+            attempt,
+            context,
+        )
+
+        loaded = self.store.load_official_announcement_rows_with_ids(
+            "519755", (boundary + timedelta(microseconds=1), self.now)
+        )
+
+        self.assertEqual(
+            [item.value.title for item in loaded.rows],
+            ["\u57fa\u91d1\u516c\u544ainside"],
+        )
+        self.assertEqual(len(loaded.page_evidence), 1)
+        self.assertFalse(loaded.truncated)
+
+    def test_official_listing_reuses_unchanged_raw_page_across_deep_requests(self) -> None:
+        first_attempt, first_context = self.official_request(request_id="a" * 32)
+        first_page = self.official_page(1, "a")
+        announcement = self.official_announcement(
+            "stable", self.now - timedelta(days=1)
+        )
+        first = self.store.publish_official_announcement_listing(
+            "519755", (first_page,), ((announcement,),), first_attempt, first_context
+        )
+
+        self.now += timedelta(hours=1)
+        second_attempt, second_context = self.official_request(request_id="b" * 32)
+        second_page = self.official_page(1, "a")
+        second = self.store.publish_official_announcement_listing(
+            "519755", (second_page,), ((announcement,),), second_attempt, second_context
+        )
+
+        self.assertEqual(second.page_evidence[0].id, first.page_evidence[0].id)
+        self.assertEqual(second.page_evidence[0].retrieved_at, first_page.retrieved_at)
+        self.assertNotEqual(second.source_attempt_id, first.source_attempt_id)
+
+    def test_official_listing_rejects_attempt_started_before_request(self) -> None:
+        attempt, context = self.official_request()
+        attempt = replace(
+            attempt,
+            started_at=self.now - timedelta(microseconds=1),
+        )
+
+        with self.assertRaisesRegex(ValueError, "request context binding"):
+            self.store.publish_official_announcement_listing(
+                "519755",
+                (self.official_page(1, "a"),),
+                ((self.official_announcement("one", self.now - timedelta(days=1)),),),
+                attempt,
+                context,
+            )
+
+    def test_ordinary_tier_two_announcement_never_satisfies_official_listing(self) -> None:
+        ordinary = FundAnnouncement(
+            fund_code="519755",
+            title="\u5e73\u53f0\u805a\u5408\u516c\u544a",
+            category="\u5e73\u53f0\u516c\u544a",
+            publisher="\u4e1c\u65b9\u8d22\u5bcc",
+            published_at=self.now - timedelta(days=1),
+            url="https://fundf10.eastmoney.com/notice/519755.html",
+            source_tier=2,
+            source_document_id=None,
+        )
+        self.store.publish_section(
+            "519755",
+            DocumentKind.ANNOUNCEMENT,
+            self.section_source(DocumentKind.ANNOUNCEMENT, "a"),
+            (ordinary,),
+            "success",
+        )
+
+        loaded = self.store.load_official_announcement_rows_with_ids(
+            "519755", (self.now - timedelta(days=180), self.now)
+        )
+
+        self.assertEqual(loaded.rows, ())
+        self.assertEqual(loaded.page_evidence, ())
+        self.assertFalse(loaded.truncated)
+
+    def test_official_listing_rejects_rapid_cross_request_and_zero_byte_attempts(self) -> None:
+        rapid, rapid_context = self.official_request(mode=RequestMode.RAPID)
+        with self.assertRaisesRegex(ValueError, "Deep"):
+            self.store.publish_official_announcement_listing(
+                "519755",
+                (self.official_page(1, "a"),),
+                ((self.official_announcement("rapid", self.now),),),
+                rapid,
+                rapid_context,
+            )
+
+        attempt, context = self.official_request(request_id="e" * 32)
+        with self.assertRaisesRegex(ValueError, "request"):
+            self.store.publish_official_announcement_listing(
+                "519755",
+                (self.official_page(1, "b"),),
+                ((self.official_announcement("cross", self.now),),),
+                attempt,
+                replace(context, request_run_id=context.request_run_id + 999),
+            )
+
+        empty, empty_context = self.official_request(
+            request_id="f" * 32,
+            response_bytes=0,
+        )
+        with self.assertRaisesRegex(ValueError, "byte"):
+            self.store.publish_official_announcement_listing(
+                "519755",
+                (self.official_page(1, "c"),),
+                ((self.official_announcement("empty", self.now),),),
+                empty,
+                empty_context,
+            )
+
+    def test_official_listing_rejects_cross_fund_and_unregistered_publisher(self) -> None:
+        attempt, context = self.official_request()
+        wrong_fund = replace(self.official_page(1, "a"), fund_code="519706")
+        with self.assertRaisesRegex(ValueError, "fund"):
+            self.store.publish_official_announcement_listing(
+                "519755",
+                (wrong_fund,),
+                ((self.official_announcement("wrong-fund", self.now),),),
+                attempt,
+                context,
+            )
+
+        wrong_publisher = replace(
+            self.official_page(1, "b"),
+            publisher="\u5176\u4ed6\u57fa\u91d1\u7ba1\u7406\u4eba",
+        )
+        with self.assertRaisesRegex(ValueError, "publisher|manager"):
+            self.store.publish_official_announcement_listing(
+                "519755",
+                (wrong_publisher,),
+                ((self.official_announcement("wrong-manager", self.now),),),
+                attempt,
+                context,
+            )
+
+    def test_official_listing_failure_rolls_back_all_pages_and_rows(self) -> None:
+        attempt, context = self.official_request()
+        with self.repository.connect() as connection, connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_second_official_listing_row
+                BEFORE INSERT ON fund_announcements
+                WHEN NEW.title='\u57fa\u91d1\u516c\u544atwo'
+                BEGIN SELECT RAISE(ABORT, 'forced official listing failure'); END
+                """
+            )
+
+        with self.assertRaisesRegex(Exception, "forced official listing failure"):
+            self.store.publish_official_announcement_listing(
+                "519755",
+                (self.official_page(1, "a"), self.official_page(2, "b")),
+                (
+                    (self.official_announcement("one", self.now),),
+                    (self.official_announcement("two", self.now - timedelta(days=1)),),
+                ),
+                attempt,
+                context,
+            )
+
+        with self.repository.connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM fund_source_documents"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("SELECT count(*) FROM fund_announcements").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("SELECT count(*) FROM source_attempts").fetchone()[0],
+                0,
+            )
 
     def test_record_key_is_stable_and_excludes_source_document_id(self) -> None:
         first = self.manager("张三", date(2025, 1, 1))

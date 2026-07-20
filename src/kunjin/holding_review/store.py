@@ -5,12 +5,24 @@ import json
 import sqlite3
 import unicodedata
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Mapping, Optional
+from urllib.parse import urlsplit
 
 from kunjin.brief.models import OfficialEventCode, thesis_record_fingerprint
 from kunjin.brief.store import BriefStore, BriefStoreError, StoredBriefSnapshot
-from kunjin.decision.models import ActionKind, SourceTier, canonical_json_bytes
+from kunjin.decision.models import (
+    ActionKind,
+    RequestMode,
+    SourceTier,
+    canonical_json_bytes,
+)
+from kunjin.decision.source_registry import SourceRegistryV1
+from kunjin.funds.official_domains import (
+    OFFICIAL_SOURCE_REGISTRATIONS,
+    OFFICIAL_SOURCE_REGISTRY_VERSION,
+    official_source_registry_checksum,
+)
 from kunjin.holding_review.models import (
     ActionReviewSourceSufficiency,
     AdjudicationDecision,
@@ -19,10 +31,16 @@ from kunjin.holding_review.models import (
     EvidenceReadiness,
     ExitReason,
     FlowStatus,
+    HeldReviewOfficialEventProjection,
     HistoryComparability,
     HoldingReviewResult,
     HoldingReviewSnapshot,
+    OfficialAnnouncementContent,
+    OfficialCheckClosure,
     OfficialEventEvidenceReference,
+    OfficialListingPageEvidence,
+    OfficialListingTerminalState,
+    OfficialManagerIdentityState,
     RedemptionComponentState,
     RedemptionEvidence,
     RedemptionFeasibility,
@@ -37,7 +55,15 @@ from kunjin.holding_review.models import (
     TriggeredReviewCode,
     UseOfProceeds,
 )
-from kunjin.holding_review.policy import HeldFundManualReviewPolicyV1
+from kunjin.holding_review.official import (
+    OfficialListingItem,
+    classify_official_listing_title,
+)
+from kunjin.holding_review.policy import (
+    OFFICIAL_MAXIMUM_CANDIDATES,
+    HeldFundManualReviewPolicyV1,
+    OfficialCheckPolicyV1,
+)
 from kunjin.intelligence.models import (
     DimensionState,
     EventConfidenceState,
@@ -109,6 +135,51 @@ class StoredHoldingReviewSnapshot:
     value: HoldingReviewSnapshot
 
 
+@dataclass(frozen=True)
+class StoredOfficialCheckClosure:
+    id: int
+    value: OfficialCheckClosure
+
+
+@dataclass(frozen=True)
+class AuthenticatedOfficialManagerIdentity:
+    fund_code: str
+    state: OfficialManagerIdentityState
+    row_id: Optional[int]
+    source_document_id: Optional[int]
+    source_document_checksum: Optional[str]
+    normalized_name: Optional[str]
+    fingerprint: Optional[str]
+    fund_name: Optional[str]
+
+    def validate(self) -> None:
+        _fund_code(self.fund_code)
+        if type(self.state) is not OfficialManagerIdentityState:
+            raise ValueError("official manager identity state must be exact")
+        values = (
+            self.row_id,
+            self.source_document_id,
+            self.source_document_checksum,
+            self.normalized_name,
+            self.fingerprint,
+            self.fund_name,
+        )
+        present = all(item is not None for item in values)
+        if present != (self.state is OfficialManagerIdentityState.PRESENT):
+            raise ValueError("official manager identity fields must be all-or-none")
+        if present:
+            _positive_id(self.row_id, "manager identity row id")
+            _positive_id(self.source_document_id, "manager identity source document id")
+            _checksum(
+                self.source_document_checksum,
+                "manager identity source document checksum",
+            )
+            _checksum(self.fingerprint, "manager identity fingerprint")
+            if self.normalized_name != _normalized_identity(self.normalized_name):
+                raise ValueError("official manager identity name is not normalized")
+            _normalized_identity(self.fund_name)
+
+
 class HoldingReviewStore:
     def __init__(self, repository: Repository) -> None:
         if not isinstance(repository, Repository):
@@ -118,6 +189,415 @@ class HoldingReviewStore:
         self.intelligence_store = IntelligenceStore(repository)
         self.policy = HeldFundManualReviewPolicyV1()
         self.policy.validate()
+        self.official_policy = OfficialCheckPolicyV1()
+        self.official_policy.validate()
+        self.source_registry = SourceRegistryV1()
+        self.source_registry.validate()
+
+    def publish_announcement_content(self, value: OfficialAnnouncementContent) -> int:
+        if type(value) is not OfficialAnnouncementContent:
+            raise ValueError("official announcement content must be exact")
+        value.validate()
+        try:
+            with self.repository.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._authenticate_announcement_content_references(
+                        connection, value, require_running=True
+                    )
+                    existing = connection.execute(
+                        """
+                        SELECT * FROM fund_official_announcement_contents
+                        WHERE listing_source_document_id=?
+                          AND canonical_announcement_url=?
+                          AND normalized_content_sha256=?
+                          AND integrity_checked_at=?
+                        """,
+                        (
+                            value.listing_source_document_id,
+                            value.canonical_announcement_url,
+                            value.normalized_content_sha256,
+                            _utc_text(value.integrity_checked_at),
+                        ),
+                    ).fetchone()
+                    if existing is not None:
+                        content_id, stored = self._stored_announcement_content(existing)
+                        self._authenticate_announcement_content_references(
+                            connection, stored, require_running=True
+                        )
+                        if stored != value:
+                            raise HoldingReviewStoreError(
+                                "official announcement content authentication failed"
+                            )
+                        connection.commit()
+                        return content_id
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO fund_official_announcement_contents(
+                            brief_request_run_id, source_attempt_id, fund_code,
+                            listing_source_document_id, canonical_announcement_url,
+                            announcement_title, announcement_published_at, publisher,
+                            normalized_content, normalized_content_bytes,
+                            normalized_content_sha256, original_source_id,
+                            quoted_source_id, integrity_status, integrity_checked_at,
+                            retrieved_at, record_checksum
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            value.brief_request_run_id,
+                            value.source_attempt_id,
+                            value.fund_code,
+                            value.listing_source_document_id,
+                            value.canonical_announcement_url,
+                            value.announcement_title,
+                            _utc_text(value.announcement_published_at),
+                            value.publisher,
+                            value.normalized_content,
+                            value.normalized_content_bytes,
+                            value.normalized_content_sha256,
+                            value.original_source_id,
+                            value.quoted_source_id,
+                            value.integrity_status,
+                            _utc_text(value.integrity_checked_at),
+                            _utc_text(value.retrieved_at),
+                            value.record_checksum,
+                        ),
+                    )
+                    row = connection.execute(
+                        "SELECT * FROM fund_official_announcement_contents WHERE id=?",
+                        (int(cursor.lastrowid),),
+                    ).fetchone()
+                    if row is None:
+                        raise HoldingReviewStoreError(
+                            "official announcement content reload failed"
+                        )
+                    content_id, stored = self._stored_announcement_content(row)
+                    self._authenticate_announcement_content_references(
+                        connection, stored, require_running=True
+                    )
+                    if stored != value:
+                        raise HoldingReviewStoreError(
+                            "official announcement content byte comparison failed"
+                        )
+                    connection.commit()
+                    return content_id
+                except BaseException:
+                    connection.rollback()
+                    raise
+        except HoldingReviewStoreError:
+            raise
+        except sqlite3.DatabaseError:
+            raise HoldingReviewStoreError(
+                "official announcement content binding failed"
+            ) from None
+        except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
+            raise HoldingReviewStoreError(
+                "official announcement content authentication failed"
+            ) from None
+
+    def publish_official_event(self, value: HeldReviewOfficialEventProjection) -> int:
+        if type(value) is not HeldReviewOfficialEventProjection:
+            raise ValueError("official event projection must be exact")
+        value.validate()
+        try:
+            with self.repository.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._authenticate_official_event_references(
+                        connection, value, require_running=True
+                    )
+                    existing = connection.execute(
+                        """
+                        SELECT * FROM held_review_official_event_projections
+                        WHERE brief_request_run_id=? AND announcement_content_id=?
+                          AND event_code=?
+                        """,
+                        (
+                            value.brief_request_run_id,
+                            value.announcement_content_id,
+                            value.event_code.value,
+                        ),
+                    ).fetchone()
+                    if existing is not None:
+                        projection_id, stored = self._stored_official_event(existing)
+                        self._authenticate_official_event_references(
+                            connection, stored, require_running=True
+                        )
+                        if stored != value:
+                            raise HoldingReviewStoreError(
+                                "official event projection authentication failed"
+                            )
+                        connection.commit()
+                        return projection_id
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO held_review_official_event_projections(
+                            brief_request_run_id, fund_code, announcement_row_id,
+                            announcement_content_id, event_code, triggered_review_code,
+                            policy_version, policy_checksum, record_checksum
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            value.brief_request_run_id,
+                            value.fund_code,
+                            value.announcement_row_id,
+                            value.announcement_content_id,
+                            value.event_code.value,
+                            value.triggered_review_code.value,
+                            value.policy_version,
+                            value.policy_checksum,
+                            value.record_checksum,
+                        ),
+                    )
+                    row = connection.execute(
+                        "SELECT * FROM held_review_official_event_projections WHERE id=?",
+                        (int(cursor.lastrowid),),
+                    ).fetchone()
+                    if row is None:
+                        raise HoldingReviewStoreError(
+                            "official event projection reload failed"
+                        )
+                    projection_id, stored = self._stored_official_event(row)
+                    self._authenticate_official_event_references(
+                        connection, stored, require_running=True
+                    )
+                    if stored != value:
+                        raise HoldingReviewStoreError(
+                            "official event projection byte comparison failed"
+                        )
+                    connection.commit()
+                    return projection_id
+                except BaseException:
+                    connection.rollback()
+                    raise
+        except HoldingReviewStoreError:
+            raise
+        except sqlite3.DatabaseError:
+            raise HoldingReviewStoreError("official event projection binding failed") from None
+        except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
+            raise HoldingReviewStoreError(
+                "official event projection authentication failed"
+            ) from None
+
+    def authenticated_official_event_references(
+        self,
+        brief_request_run_id: int,
+        fund_code: str,
+    ) -> tuple[OfficialEventEvidenceReference, ...]:
+        _positive_id(brief_request_run_id, "brief request run id")
+        _fund_code(fund_code)
+        try:
+            with self.repository.connect() as connection:
+                self._authenticate_deep_request(
+                    connection, brief_request_run_id, require_running=False
+                )
+                attempt = connection.execute(
+                    """
+                    SELECT 1 FROM source_attempts
+                    WHERE request_run_id=?
+                      AND source_id='fund_manager_official_documents'
+                      AND field_id='fund_manager_product_announcement'
+                      AND subject_key=?
+                    LIMIT 1
+                    """,
+                    (brief_request_run_id, f"fund:{fund_code}"),
+                ).fetchone()
+                if attempt is None:
+                    raise HoldingReviewStoreError(
+                        "official event reference fund binding failed"
+                    )
+                rows = connection.execute(
+                    """
+                    SELECT * FROM held_review_official_event_projections
+                    WHERE brief_request_run_id=? AND fund_code=? ORDER BY id
+                    """,
+                    (brief_request_run_id, fund_code),
+                ).fetchall()
+                if len(rows) > self.policy.maximum_announcement_candidates:
+                    raise HoldingReviewStoreError(
+                        "official event reference candidate bound failed"
+                    )
+                references = []
+                for row in rows:
+                    projection_id, value = self._stored_official_event(row)
+                    self._authenticate_official_event_references(
+                        connection, value, require_running=False
+                    )
+                    references.append(
+                        OfficialEventEvidenceReference(
+                            projection_id=projection_id,
+                            projection_checksum=value.record_checksum,
+                            event_code=value.event_code,
+                            triggered_review_code=value.triggered_review_code,
+                        )
+                    )
+                result = tuple(references)
+                for reference in result:
+                    reference.validate()
+                return result
+        except HoldingReviewStoreError:
+            raise
+        except sqlite3.DatabaseError:
+            raise HoldingReviewStoreError(
+                "official event reference binding failed"
+            ) from None
+        except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
+            raise HoldingReviewStoreError(
+                "official event reference authentication failed"
+            ) from None
+
+    def publish_official_check_closure(
+        self,
+        value: OfficialCheckClosure,
+    ) -> StoredOfficialCheckClosure:
+        if type(value) is not OfficialCheckClosure:
+            raise ValueError("official check closure must be exact")
+        value.validate()
+        try:
+            with self.repository.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    existing = connection.execute(
+                        """
+                        SELECT * FROM held_review_official_check_closures
+                        WHERE brief_request_run_id=? AND fund_code=?
+                        """,
+                        (value.brief_request_run_id, value.fund_code),
+                    ).fetchone()
+                    if existing is not None:
+                        stored = self._stored_official_check_closure(existing)
+                        self._authenticate_official_check_closure(
+                            connection,
+                            stored,
+                            require_running=True,
+                        )
+                        if stored.value != value:
+                            raise HoldingReviewStoreError(
+                                "official check closure authentication failed"
+                            )
+                        connection.commit()
+                        return stored
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO held_review_official_check_closures(
+                            brief_request_run_id, fund_code, listing_source_attempt_id,
+                            official_registry_version, official_registry_checksum,
+                            source_registration_ids_json, manager_identity_state,
+                            manager_identity_row_id,
+                            manager_identity_source_document_id,
+                            manager_identity_source_document_checksum,
+                            manager_identity_normalized_name,
+                            manager_identity_fingerprint,
+                            listing_page_evidence_json, window_start, window_end,
+                            listing_count, candidate_count, authenticated_body_count,
+                            projected_event_count, listing_truncated,
+                            candidate_cap_reached, body_cap_reached, gap_codes_json,
+                            official_negative_check_complete, policy_version,
+                            policy_checksum, official_check_policy_version,
+                            official_check_policy_checksum, created_at, record_checksum
+                        ) VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                        """,
+                        _official_closure_sql_values(value),
+                    )
+                    row = connection.execute(
+                        "SELECT * FROM held_review_official_check_closures WHERE id=?",
+                        (int(cursor.lastrowid),),
+                    ).fetchone()
+                    if row is None:
+                        raise HoldingReviewStoreError(
+                            "official check closure reload failed"
+                        )
+                    stored = self._stored_official_check_closure(row)
+                    if stored.value != value:
+                        raise HoldingReviewStoreError(
+                            "official check closure byte comparison failed"
+                        )
+                    self._authenticate_official_check_closure(
+                        connection,
+                        stored,
+                        require_running=True,
+                    )
+                    connection.commit()
+                    return stored
+                except BaseException:
+                    connection.rollback()
+                    raise
+        except HoldingReviewStoreError:
+            raise
+        except sqlite3.DatabaseError:
+            raise HoldingReviewStoreError(
+                "official check closure binding failed"
+            ) from None
+        except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
+            raise HoldingReviewStoreError(
+                "official check closure authentication failed"
+            ) from None
+
+    def authenticated_official_manager_identity(
+        self,
+        fund_code: str,
+        as_of: datetime,
+    ) -> AuthenticatedOfficialManagerIdentity:
+        _fund_code(fund_code)
+        _utc_text(as_of)
+        try:
+            with self.repository.connect() as connection:
+                return self._resolve_official_manager_identity(
+                    connection,
+                    fund_code,
+                    as_of,
+                )
+        except HoldingReviewStoreError:
+            raise
+        except sqlite3.DatabaseError:
+            raise HoldingReviewStoreError(
+                "official manager identity binding failed"
+            ) from None
+        except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
+            raise HoldingReviewStoreError(
+                "official manager identity authentication failed"
+            ) from None
+
+    def authenticated_official_check_closure(
+        self,
+        brief_request_run_id: int,
+        fund_code: str,
+    ) -> StoredOfficialCheckClosure:
+        _positive_id(brief_request_run_id, "brief request run id")
+        _fund_code(fund_code)
+        try:
+            with self.repository.connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM held_review_official_check_closures
+                    WHERE brief_request_run_id=? AND fund_code=? ORDER BY id
+                    """,
+                    (brief_request_run_id, fund_code),
+                ).fetchall()
+                if len(rows) != 1:
+                    raise HoldingReviewStoreError(
+                        "official check closure is missing or ambiguous"
+                    )
+                stored = self._stored_official_check_closure(rows[0])
+                self._authenticate_official_check_closure(
+                    connection,
+                    stored,
+                    require_running=False,
+                )
+                return stored
+        except HoldingReviewStoreError:
+            raise
+        except sqlite3.DatabaseError:
+            raise HoldingReviewStoreError(
+                "official check closure binding failed"
+            ) from None
+        except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
+            raise HoldingReviewStoreError(
+                "official check closure authentication failed"
+            ) from None
 
     def publish_thesis_match(
         self,
@@ -631,6 +1111,773 @@ class HoldingReviewStore:
                 "holding review evidence descriptor authentication failed"
             ) from None
 
+    @staticmethod
+    def _authenticate_deep_request(
+        connection: sqlite3.Connection,
+        request_run_id: int,
+        *,
+        require_running: bool,
+    ) -> None:
+        row = connection.execute(
+            "SELECT mode, status FROM request_runs WHERE id=?", (request_run_id,)
+        ).fetchone()
+        if row is None or row["mode"] != "deep":
+            raise HoldingReviewStoreError("Deep official request binding failed")
+        allowed_statuses = {"running"} if require_running else {"running", "complete", "partial"}
+        if row["status"] not in allowed_statuses:
+            raise HoldingReviewStoreError("official request terminal binding failed")
+
+    def _authenticate_official_check_closure(
+        self,
+        connection: sqlite3.Connection,
+        stored: StoredOfficialCheckClosure,
+        *,
+        require_running: bool,
+    ) -> None:
+        _positive_id(stored.id, "official check closure id")
+        value = stored.value
+        value.validate()
+        self._authenticate_deep_request(
+            connection,
+            value.brief_request_run_id,
+            require_running=require_running,
+        )
+        if (
+            value.policy_version != self.policy.version
+            or value.policy_checksum != self.policy.checksum()
+            or value.official_check_policy_version != self.official_policy.version
+            or value.official_check_policy_checksum != self.official_policy.checksum()
+            or value.official_registry_version != OFFICIAL_SOURCE_REGISTRY_VERSION
+            or value.official_registry_checksum != official_source_registry_checksum()
+        ):
+            raise HoldingReviewStoreError(
+                "official check closure policy authentication failed"
+            )
+        attempt = connection.execute(
+            "SELECT * FROM source_attempts WHERE id=?",
+            (value.listing_source_attempt_id,),
+        ).fetchone()
+        run = connection.execute(
+            "SELECT * FROM request_runs WHERE id=?",
+            (value.brief_request_run_id,),
+        ).fetchone()
+        same_attempt_count = connection.execute(
+            """
+            SELECT count(*) FROM source_attempts
+            WHERE request_run_id=?
+              AND source_id='fund_manager_official_documents'
+              AND field_id='fund_manager_product_announcement'
+              AND subject_key=?
+            """,
+            (value.brief_request_run_id, f"fund:{value.fund_code}"),
+        ).fetchone()[0]
+        if (
+            attempt is None
+            or run is None
+            or attempt["request_run_id"] != value.brief_request_run_id
+            or attempt["source_id"] != "fund_manager_official_documents"
+            or attempt["field_id"] != "fund_manager_product_announcement"
+            or attempt["subject_key"] != f"fund:{value.fund_code}"
+            or attempt["attempt_number"] != 1
+            or attempt["force_actor"] is not None
+            or attempt["force_reason"] is not None
+            or attempt["authorization_id"] is not None
+            or attempt["registry_version"] != self.source_registry.version
+            or attempt["registry_checksum"] != self.source_registry.checksum()
+            or same_attempt_count != 1
+            or _stored_utc(attempt["started_at"]) < _stored_utc(run["started_at"])
+            or _stored_utc(attempt["finished_at"]) > _stored_utc(run["deadline_at"])
+            or value.created_at > _stored_utc(run["deadline_at"])
+            or _stored_utc(attempt["finished_at"]) > value.created_at
+            or (
+                value.official_negative_check_complete
+                and attempt["outcome"] not in {"success", "cache_hit"}
+            )
+        ):
+            raise HoldingReviewStoreError(
+                "official check closure source attempt binding failed"
+            )
+        manager_identity = self._authenticate_official_manager_identity(connection, value)
+        normalized_manager = manager_identity.normalized_name
+        registrations = tuple(
+            item
+            for item in OFFICIAL_SOURCE_REGISTRATIONS
+            if normalized_manager is not None and item.matches_identity(normalized_manager)
+        )
+        expected_registration_ids = tuple(item.registration_id for item in registrations)
+        if value.source_registration_ids != expected_registration_ids:
+            raise HoldingReviewStoreError(
+                "official check closure source registration binding failed"
+            )
+        registration_by_id = {item.registration_id: item for item in registrations}
+        candidate_rows, manifest_complete = self._authenticate_official_listing_manifest(
+            connection,
+            value,
+            attempt,
+            registration_by_id,
+            manager_identity.fund_name,
+        )
+        self._authenticate_official_candidate_closure(
+            connection,
+            value,
+            candidate_rows,
+            require_running=require_running,
+        )
+        if value.official_negative_check_complete and not manifest_complete:
+            raise HoldingReviewStoreError(
+                "official check closure page manifest authentication failed"
+            )
+
+    def _authenticate_official_manager_identity(
+        self,
+        connection: sqlite3.Connection,
+        value: OfficialCheckClosure,
+    ) -> AuthenticatedOfficialManagerIdentity:
+        observed = self._resolve_official_manager_identity(
+            connection,
+            value.fund_code,
+            value.created_at,
+        )
+        if observed.state is not value.manager_identity_state:
+            raise HoldingReviewStoreError(
+                "official check closure manager identity state authentication failed"
+            )
+        if observed.state is not OfficialManagerIdentityState.PRESENT:
+            if value.source_registration_ids or value.listing_page_evidence:
+                raise HoldingReviewStoreError(
+                    "official check closure non-present identity has listing evidence"
+                )
+            return observed
+        if (
+            value.manager_identity_row_id != observed.row_id
+            or value.manager_identity_source_document_id != observed.source_document_id
+            or value.manager_identity_source_document_checksum
+            != observed.source_document_checksum
+            or value.manager_identity_normalized_name != observed.normalized_name
+            or value.manager_identity_fingerprint != observed.fingerprint
+        ):
+            raise HoldingReviewStoreError(
+                "official check closure manager identity binding failed"
+            )
+        return observed
+
+    def _resolve_official_manager_identity(
+        self,
+        connection: sqlite3.Connection,
+        fund_code: str,
+        as_of: datetime,
+    ) -> AuthenticatedOfficialManagerIdentity:
+        rows = connection.execute(
+            """
+            SELECT identity.*, document.checksum AS source_document_checksum,
+                   document.retrieved_at AS source_document_retrieved_at,
+                   document.document_kind AS source_document_kind,
+                   document.source_tier AS source_document_tier
+            FROM fund_section_syncs AS sync
+            JOIN fund_source_documents AS document
+              ON document.id=sync.current_source_document_id
+            JOIN fund_identities AS identity
+              ON identity.fund_code=sync.fund_code
+             AND identity.source_document_id=document.id
+            WHERE sync.fund_code=? AND sync.section='basic_profile'
+              AND sync.state='success'
+            ORDER BY identity.id
+            """,
+            (fund_code,),
+        ).fetchall()
+        row = None if len(rows) != 1 else rows[0]
+        if not rows or (row is not None and row["manager_name"] is None):
+            state = OfficialManagerIdentityState.MISSING
+        elif len(rows) != 1:
+            state = OfficialManagerIdentityState.CONFLICTED
+        else:
+            retrieved_at = _stored_utc(row["source_document_retrieved_at"])
+            if (
+                retrieved_at > as_of
+                or row["status"] != "active"
+                or row["source_document_kind"] != "basic_profile"
+                or row["source_document_tier"] not in {1, 2}
+            ):
+                state = OfficialManagerIdentityState.CONFLICTED
+            elif retrieved_at < as_of - timedelta(
+                days=self.official_policy.manager_identity_maximum_age_days
+            ):
+                state = OfficialManagerIdentityState.STALE
+            else:
+                state = OfficialManagerIdentityState.PRESENT
+        if state is not OfficialManagerIdentityState.PRESENT:
+            result = AuthenticatedOfficialManagerIdentity(
+                fund_code=fund_code,
+                state=state,
+                row_id=None,
+                source_document_id=None,
+                source_document_checksum=None,
+                normalized_name=None,
+                fingerprint=None,
+                fund_name=None,
+            )
+            result.validate()
+            return result
+        assert row is not None
+        normalized_name = _normalized_identity(str(row["manager_name"]))
+        fingerprint = _manager_identity_fingerprint(
+            fund_code=fund_code,
+            identity_row_id=int(row["id"]),
+            fund_name=str(row["fund_name"]),
+            manager_name=normalized_name,
+            source_document_id=int(row["source_document_id"]),
+            source_document_checksum=str(row["source_document_checksum"]),
+        )
+        result = AuthenticatedOfficialManagerIdentity(
+            fund_code=fund_code,
+            state=state,
+            row_id=int(row["id"]),
+            source_document_id=int(row["source_document_id"]),
+            source_document_checksum=str(row["source_document_checksum"]),
+            normalized_name=normalized_name,
+            fingerprint=fingerprint,
+            fund_name=str(row["fund_name"]),
+        )
+        result.validate()
+        return result
+
+    def _authenticate_official_listing_manifest(
+        self,
+        connection: sqlite3.Connection,
+        value: OfficialCheckClosure,
+        attempt: Mapping[str, object],
+        registrations: Mapping[str, object],
+        product_name: Optional[str],
+    ) -> tuple[tuple[tuple[int, OfficialListingItem], ...], bool]:
+        attempt_started = _stored_utc(attempt["started_at"])
+        attempt_finished = _stored_utc(attempt["finished_at"])
+        if sum(page.raw_byte_count for page in value.listing_page_evidence) != int(
+            attempt["response_byte_count"]
+        ):
+            raise HoldingReviewStoreError(
+                "official check closure page byte binding failed"
+            )
+        item_rows: list[tuple[int, OfficialListingItem]] = []
+        seen_item_urls: set[str] = set()
+        manifest_complete = bool(registrations)
+        prior_oldest_by_registration: dict[str, datetime] = {}
+        for page in value.listing_page_evidence:
+            registration = registrations.get(page.registration_id)
+            if registration is None:
+                raise HoldingReviewStoreError(
+                    "official check closure page registration binding failed"
+                )
+            if not attempt_started <= page.retrieved_at <= attempt_finished:
+                raise HoldingReviewStoreError(
+                    "official check closure page capture binding failed"
+                )
+            document = connection.execute(
+                "SELECT * FROM fund_source_documents WHERE id=?",
+                (page.source_document_id,),
+            ).fetchone()
+            host = (urlsplit(page.canonical_page_url).hostname or "").lower().rstrip(".")
+            if (
+                document is None
+                or document["fund_code"] != value.fund_code
+                or document["document_kind"] != "announcement"
+                or document["source_name"] != "fund_manager_official_documents"
+                or document["source_tier"] != 1
+                or document["url"] != page.canonical_page_url
+                or document["checksum"] != page.raw_sha256
+                or host not in registration.accepted_hosts
+                or not registration.matches_identity(str(document["publisher"]))
+            ):
+                raise HoldingReviewStoreError(
+                    "official check closure page document binding failed"
+                )
+            rows = connection.execute(
+                """
+                SELECT * FROM fund_announcements
+                WHERE fund_code=? AND source_document_id=?
+                ORDER BY id
+                """,
+                (value.fund_code, page.source_document_id),
+            ).fetchall()
+            page_items: list[OfficialListingItem] = []
+            page_pairs: list[tuple[int, OfficialListingItem]] = []
+            for index, row in enumerate(rows, start=1):
+                item = OfficialListingItem(
+                    registration_id=page.registration_id,
+                    page_number=page.page_number,
+                    page_local_index=index,
+                    title=str(row["title"]),
+                    canonical_url=str(row["url"]),
+                    publisher=str(row["publisher"]),
+                    published_at=_stored_utc(row["published_at"]),
+                )
+                item.validate()
+                if (
+                    row["source_tier"] != 1
+                    or item.publisher != document["publisher"]
+                    or item.canonical_url in seen_item_urls
+                ):
+                    raise HoldingReviewStoreError(
+                        "official check closure listing row binding failed"
+                    )
+                seen_item_urls.add(item.canonical_url)
+                page_items.append(item)
+                page_pairs.append((int(row["id"]), item))
+            page_checksum = hashlib.sha256(
+                canonical_json_bytes([item.to_canonical_dict() for item in page_items])
+            ).hexdigest()
+            if len(page_items) != page.parsed_item_count:
+                missing_date_gap = "official_listing_publication_date_missing" in set(
+                    value.gap_codes
+                )
+                if (
+                    value.official_negative_check_complete
+                    or len(page_items) > page.parsed_item_count
+                    or not missing_date_gap
+                ):
+                    raise HoldingReviewStoreError(
+                        "official check closure parsed page authentication failed"
+                    )
+                manifest_complete = False
+            elif page_checksum != page.parsed_items_sha256:
+                raise HoldingReviewStoreError(
+                    "official check closure parsed page authentication failed"
+                )
+            dates = tuple(item.published_at for item in page_items)
+            if any(left < right for left, right in zip(dates, dates[1:])):
+                manifest_complete = False
+            prior_oldest = prior_oldest_by_registration.get(page.registration_id)
+            if dates and prior_oldest is not None and dates[0] > prior_oldest:
+                manifest_complete = False
+            if dates:
+                prior_oldest_by_registration[page.registration_id] = dates[-1]
+            if (
+                page.terminal_state is OfficialListingTerminalState.WINDOW_BOUNDARY_REACHED
+                and (not dates or dates[-1] >= value.window_start)
+            ):
+                manifest_complete = False
+            for pair in page_pairs:
+                published_at = pair[1].published_at
+                if (
+                    published_at is not None
+                    and value.window_start <= published_at < value.window_end
+                ):
+                    item_rows.append(pair)
+                elif published_at is not None and published_at >= value.window_end:
+                    manifest_complete = False
+        for registration_id in registrations:
+            pages = tuple(
+                page
+                for page in value.listing_page_evidence
+                if page.registration_id == registration_id
+            )
+            if (
+                not pages
+                or tuple(page.page_number for page in pages)
+                != tuple(range(1, len(pages) + 1))
+                or len({page.reported_total_pages for page in pages}) != 1
+                or pages[-1].terminal_state is None
+                or any(page.terminal_state is not None for page in pages[:-1])
+                or (
+                    pages[-1].terminal_state
+                    is OfficialListingTerminalState.SOURCE_FINAL_PAGE
+                    and pages[-1].page_number != pages[-1].reported_total_pages
+                )
+            ):
+                manifest_complete = False
+        if len(item_rows) != value.listing_count:
+            raise HoldingReviewStoreError(
+                "official check closure listing count authentication failed"
+            )
+        if product_name is None and item_rows:
+            raise HoldingReviewStoreError(
+                "official check closure product identity authentication failed"
+            )
+        all_candidates = tuple(
+            pair
+            for pair in item_rows
+            if product_name is not None
+            and classify_official_listing_title(
+                pair[1].title,
+                product_name,
+                self.official_policy,
+            )
+            != "ordinary"
+        )
+        candidates = all_candidates[:OFFICIAL_MAXIMUM_CANDIDATES]
+        cap_reached = len(all_candidates) > OFFICIAL_MAXIMUM_CANDIDATES
+        body_limit_gap = bool(
+            {"announcement_body_limit", "official_announcement_total_limit"}
+            .intersection(value.gap_codes)
+        )
+        expected_body_cap = cap_reached or body_limit_gap
+        if (
+            len(candidates) != value.candidate_count
+            or value.candidate_cap_reached != cap_reached
+            or value.body_cap_reached != expected_body_cap
+            or (
+                body_limit_gap
+                and value.authenticated_body_count >= value.candidate_count
+            )
+        ):
+            raise HoldingReviewStoreError(
+                "official check closure candidate authentication failed"
+            )
+        return candidates, manifest_complete
+
+    def _authenticate_official_candidate_closure(
+        self,
+        connection: sqlite3.Connection,
+        value: OfficialCheckClosure,
+        candidate_rows: tuple[tuple[int, OfficialListingItem], ...],
+        *,
+        require_running: bool,
+    ) -> None:
+        candidates_by_id = {row_id: item for row_id, item in candidate_rows}
+        contents_by_candidate: dict[int, tuple[int, OfficialAnnouncementContent]] = {}
+        content_rows = connection.execute(
+            """
+            SELECT * FROM fund_official_announcement_contents
+            WHERE brief_request_run_id=? AND fund_code=? ORDER BY id
+            """,
+            (value.brief_request_run_id, value.fund_code),
+        ).fetchall()
+        for row in content_rows:
+            content_id, content = self._stored_announcement_content(row)
+            self._authenticate_announcement_content_references(
+                connection,
+                content,
+                require_running=require_running,
+            )
+            matches = tuple(
+                candidate_id
+                for candidate_id, candidate in candidate_rows
+                if content.listing_source_document_id
+                == _announcement_source_document_id(connection, candidate_id)
+                and content.canonical_announcement_url == candidate.canonical_url
+                and content.announcement_title == candidate.title
+                and content.announcement_published_at == candidate.published_at
+                and content.publisher == candidate.publisher
+            )
+            if len(matches) != 1 or matches[0] in contents_by_candidate:
+                raise HoldingReviewStoreError(
+                    "official check closure duplicate or extra body binding failed"
+                )
+            contents_by_candidate[matches[0]] = (content_id, content)
+        active_contents = {
+            candidate_id: stored
+            for candidate_id, stored in contents_by_candidate.items()
+            if stored[1].integrity_status == "active"
+        }
+        event_rows = connection.execute(
+            """
+            SELECT * FROM held_review_official_event_projections
+            WHERE brief_request_run_id=? AND fund_code=? ORDER BY id
+            """,
+            (value.brief_request_run_id, value.fund_code),
+        ).fetchall()
+        events_by_candidate: dict[int, int] = {}
+        for row in event_rows:
+            projection_id, event = self._stored_official_event(row)
+            self._authenticate_official_event_references(
+                connection,
+                event,
+                require_running=require_running,
+            )
+            active = active_contents.get(event.announcement_row_id)
+            if (
+                event.announcement_row_id not in candidates_by_id
+                or active is None
+                or event.announcement_content_id != active[0]
+                or event.announcement_row_id in events_by_candidate
+            ):
+                raise HoldingReviewStoreError(
+                    "official check closure extra or cross-event binding failed"
+                )
+            events_by_candidate[event.announcement_row_id] = projection_id
+        if (
+            value.authenticated_body_count != len(active_contents)
+            or value.projected_event_count != len(events_by_candidate)
+        ):
+            raise HoldingReviewStoreError(
+                "official check closure body/event count authentication failed"
+            )
+        expected_candidate_ids = set(candidates_by_id)
+        if value.official_negative_check_complete and (
+            set(active_contents) != expected_candidate_ids
+            or set(events_by_candidate) != expected_candidate_ids
+        ):
+            raise HoldingReviewStoreError(
+                "official check closure candidate mapping authentication failed"
+            )
+
+    def _authenticate_announcement_content_references(
+        self,
+        connection: sqlite3.Connection,
+        value: OfficialAnnouncementContent,
+        *,
+        require_running: bool,
+    ) -> None:
+        self._authenticate_deep_request(
+            connection,
+            value.brief_request_run_id,
+            require_running=require_running,
+        )
+        attempt = connection.execute(
+            "SELECT * FROM source_attempts WHERE id=?", (value.source_attempt_id,)
+        ).fetchone()
+        if (
+            attempt is None
+            or attempt["request_run_id"] != value.brief_request_run_id
+            or attempt["source_id"] != value.original_source_id
+            or attempt["field_id"] != "fund_manager_product_announcement"
+            or attempt["subject_key"] != f"fund:{value.fund_code}"
+            or attempt["outcome"] not in {"success", "cache_hit"}
+        ):
+            raise HoldingReviewStoreError("official announcement content binding failed")
+        document = connection.execute(
+            "SELECT * FROM fund_source_documents WHERE id=?",
+            (value.listing_source_document_id,),
+        ).fetchone()
+        if (
+            document is None
+            or document["fund_code"] != value.fund_code
+            or document["document_kind"] != "announcement"
+            or document["source_name"] != value.original_source_id
+            or document["source_tier"] != 1
+            or document["publisher"] != value.publisher
+        ):
+            raise HoldingReviewStoreError("official announcement content binding failed")
+        announcements = connection.execute(
+            """
+            SELECT id FROM fund_announcements
+            WHERE source_document_id=? AND fund_code=? AND url=? AND title=?
+              AND published_at=? AND publisher=? AND source_tier=1
+            ORDER BY id LIMIT 2
+            """,
+            (
+                value.listing_source_document_id,
+                value.fund_code,
+                value.canonical_announcement_url,
+                value.announcement_title,
+                _utc_text(value.announcement_published_at),
+                value.publisher,
+            ),
+        ).fetchall()
+        if len(announcements) != 1:
+            raise HoldingReviewStoreError("official announcement content binding failed")
+
+    def _authenticate_official_event_references(
+        self,
+        connection: sqlite3.Connection,
+        value: HeldReviewOfficialEventProjection,
+        *,
+        require_running: bool,
+    ) -> None:
+        self._authenticate_deep_request(
+            connection,
+            value.brief_request_run_id,
+            require_running=require_running,
+        )
+        if (
+            value.policy_version != self.policy.version
+            or value.policy_checksum != self.policy.checksum()
+        ):
+            raise HoldingReviewStoreError("official event policy authentication failed")
+        content_row = connection.execute(
+            "SELECT * FROM fund_official_announcement_contents WHERE id=?",
+            (value.announcement_content_id,),
+        ).fetchone()
+        if content_row is None:
+            raise HoldingReviewStoreError("official event projection binding failed")
+        content_id, content = self._stored_announcement_content(content_row)
+        self._authenticate_announcement_content_references(
+            connection, content, require_running=require_running
+        )
+        if (
+            content_id != value.announcement_content_id
+            or content.brief_request_run_id != value.brief_request_run_id
+            or content.fund_code != value.fund_code
+            or content.integrity_status != "active"
+        ):
+            raise HoldingReviewStoreError("official event projection binding failed")
+        announcement = connection.execute(
+            "SELECT * FROM fund_announcements WHERE id=?",
+            (value.announcement_row_id,),
+        ).fetchone()
+        if (
+            announcement is None
+            or announcement["fund_code"] != value.fund_code
+            or announcement["source_document_id"] != content.listing_source_document_id
+            or announcement["url"] != content.canonical_announcement_url
+            or announcement["title"] != content.announcement_title
+            or _stored_utc(announcement["published_at"])
+            != content.announcement_published_at
+            or announcement["publisher"] != content.publisher
+            or announcement["source_tier"] != 1
+        ):
+            raise HoldingReviewStoreError("official event projection binding failed")
+
+    @staticmethod
+    def _stored_announcement_content(
+        row: Mapping[str, object],
+    ) -> tuple[int, OfficialAnnouncementContent]:
+        value = OfficialAnnouncementContent(
+            brief_request_run_id=_positive_id(
+                row["brief_request_run_id"], "brief request run id"
+            ),
+            source_attempt_id=_positive_id(row["source_attempt_id"], "source attempt id"),
+            fund_code=_fund_code(row["fund_code"]),
+            listing_source_document_id=_positive_id(
+                row["listing_source_document_id"], "listing source document id"
+            ),
+            canonical_announcement_url=str(row["canonical_announcement_url"]),
+            announcement_title=str(row["announcement_title"]),
+            announcement_published_at=_stored_utc(row["announcement_published_at"]),
+            publisher=str(row["publisher"]),
+            normalized_content=str(row["normalized_content"]),
+            normalized_content_bytes=_positive_id(
+                row["normalized_content_bytes"], "normalized content byte count"
+            ),
+            normalized_content_sha256=_checksum(
+                row["normalized_content_sha256"], "normalized content checksum"
+            ),
+            original_source_id=str(row["original_source_id"]),
+            quoted_source_id=_optional_text(row["quoted_source_id"]),
+            integrity_status=str(row["integrity_status"]),
+            integrity_checked_at=_stored_utc(row["integrity_checked_at"]),
+            retrieved_at=_stored_utc(row["retrieved_at"]),
+            record_checksum=_checksum(row["record_checksum"], "record checksum"),
+        )
+        value.validate()
+        return _positive_id(row["id"], "announcement content id"), value
+
+    @staticmethod
+    def _stored_official_event(
+        row: Mapping[str, object],
+    ) -> tuple[int, HeldReviewOfficialEventProjection]:
+        value = HeldReviewOfficialEventProjection(
+            brief_request_run_id=_positive_id(
+                row["brief_request_run_id"], "brief request run id"
+            ),
+            fund_code=_fund_code(row["fund_code"]),
+            announcement_row_id=_positive_id(
+                row["announcement_row_id"], "announcement row id"
+            ),
+            announcement_content_id=_positive_id(
+                row["announcement_content_id"], "announcement content id"
+            ),
+            event_code=OfficialEventCode(str(row["event_code"])),
+            triggered_review_code=TriggeredReviewCode(str(row["triggered_review_code"])),
+            policy_version=str(row["policy_version"]),
+            policy_checksum=_checksum(row["policy_checksum"], "policy checksum"),
+            record_checksum=_checksum(row["record_checksum"], "record checksum"),
+        )
+        value.validate()
+        return _positive_id(row["id"], "official event projection id"), value
+
+    @staticmethod
+    def _stored_official_check_closure(
+        row: Mapping[str, object],
+    ) -> StoredOfficialCheckClosure:
+        page_values = _json_value(row["listing_page_evidence_json"], list)
+        pages = tuple(
+            OfficialListingPageEvidence(
+                registration_id=str(item["registration_id"]),
+                page_number=int(item["page_number"]),
+                reported_total_pages=int(item["reported_total_pages"]),
+                canonical_page_url=str(item["canonical_page_url"]),
+                raw_byte_count=int(item["raw_byte_count"]),
+                raw_sha256=_checksum(item["raw_sha256"], "raw page checksum"),
+                retrieved_at=_stored_utc(item["retrieved_at"]),
+                parsed_item_count=int(item["parsed_item_count"]),
+                parsed_items_sha256=_checksum(
+                    item["parsed_items_sha256"], "parsed item checksum"
+                ),
+                terminal_state=(
+                    None
+                    if item["terminal_state"] is None
+                    else OfficialListingTerminalState(str(item["terminal_state"]))
+                ),
+                source_document_id=_positive_id(
+                    item["source_document_id"], "listing source document id"
+                ),
+            )
+            for item in page_values
+        )
+        value = OfficialCheckClosure(
+            brief_request_run_id=_positive_id(
+                row["brief_request_run_id"], "brief request run id"
+            ),
+            fund_code=_fund_code(row["fund_code"]),
+            listing_source_attempt_id=_positive_id(
+                row["listing_source_attempt_id"], "listing source attempt id"
+            ),
+            official_registry_version=str(row["official_registry_version"]),
+            official_registry_checksum=_checksum(
+                row["official_registry_checksum"], "official registry checksum"
+            ),
+            source_registration_ids=tuple(
+                str(item)
+                for item in _json_value(row["source_registration_ids_json"], list)
+            ),
+            manager_identity_state=OfficialManagerIdentityState(
+                str(row["manager_identity_state"])
+            ),
+            manager_identity_row_id=_optional_id(row["manager_identity_row_id"]),
+            manager_identity_source_document_id=_optional_id(
+                row["manager_identity_source_document_id"]
+            ),
+            manager_identity_source_document_checksum=(
+                None
+                if row["manager_identity_source_document_checksum"] is None
+                else _checksum(
+                    row["manager_identity_source_document_checksum"],
+                    "manager identity source document checksum",
+                )
+            ),
+            manager_identity_normalized_name=_optional_text(
+                row["manager_identity_normalized_name"]
+            ),
+            manager_identity_fingerprint=(
+                None
+                if row["manager_identity_fingerprint"] is None
+                else _checksum(
+                    row["manager_identity_fingerprint"],
+                    "manager identity fingerprint",
+                )
+            ),
+            listing_page_evidence=pages,
+            window_start=_stored_utc(row["window_start"]),
+            window_end=_stored_utc(row["window_end"]),
+            listing_count=int(row["listing_count"]),
+            candidate_count=int(row["candidate_count"]),
+            authenticated_body_count=int(row["authenticated_body_count"]),
+            projected_event_count=int(row["projected_event_count"]),
+            listing_truncated=bool(row["listing_truncated"]),
+            candidate_cap_reached=bool(row["candidate_cap_reached"]),
+            body_cap_reached=bool(row["body_cap_reached"]),
+            gap_codes=tuple(
+                str(item) for item in _json_value(row["gap_codes_json"], list)
+            ),
+            official_negative_check_complete=bool(
+                row["official_negative_check_complete"]
+            ),
+            policy_version=str(row["policy_version"]),
+            policy_checksum=_checksum(row["policy_checksum"], "policy checksum"),
+            official_check_policy_version=str(row["official_check_policy_version"]),
+            official_check_policy_checksum=_checksum(
+                row["official_check_policy_checksum"],
+                "official check policy checksum",
+            ),
+            created_at=_stored_utc(row["created_at"]),
+            record_checksum=_checksum(row["record_checksum"], "record checksum"),
+        )
+        value.validate()
+        return StoredOfficialCheckClosure(
+            id=_positive_id(row["id"], "official check closure id"),
+            value=value,
+        )
+
     def _authenticate_projection_references(
         self,
         connection: sqlite3.Connection,
@@ -722,11 +1969,6 @@ class HoldingReviewStore:
         *,
         require_current_adjudication: bool = True,
     ) -> None:
-        if (
-            value.result.official_negative_check_complete
-            or value.result.official_event_evidence
-        ):
-            raise HoldingReviewStoreError("holding review preview boundary failed")
         brief = self._brief_by_request(connection, value.brief_request_run_id)
         if (
             brief.id != value.brief_snapshot_id
@@ -735,6 +1977,52 @@ class HoldingReviewStore:
             or value.action.value not in brief.snapshot.action_ids
         ):
             raise HoldingReviewStoreError("holding review snapshot binding failed")
+        closure_rows = connection.execute(
+            "SELECT * FROM held_review_official_check_closures "
+            "WHERE brief_request_run_id=? AND fund_code=? ORDER BY id",
+            (value.brief_request_run_id, value.fund_code),
+        ).fetchall()
+        if brief.snapshot.mode is RequestMode.RAPID:
+            if (
+                closure_rows
+                or value.result.official_negative_check_complete
+                or value.result.official_event_evidence
+            ):
+                raise HoldingReviewStoreError("holding review preview boundary failed")
+        elif brief.snapshot.mode is RequestMode.DEEP:
+            if len(closure_rows) > 1:
+                raise HoldingReviewStoreError(
+                    "holding review official closure binding failed"
+                )
+            if not closure_rows:
+                if (
+                    value.result.official_negative_check_complete
+                    or value.result.official_event_evidence
+                ):
+                    raise HoldingReviewStoreError(
+                        "holding review official closure binding failed"
+                    )
+            else:
+                closure = self._stored_official_check_closure(closure_rows[0])
+                self._authenticate_official_check_closure(
+                    connection,
+                    closure,
+                    require_running=False,
+                )
+                expected_references = self.authenticated_official_event_references(
+                    value.brief_request_run_id,
+                    value.fund_code,
+                )
+                if (
+                    value.result.official_negative_check_complete
+                    is not closure.value.official_negative_check_complete
+                    or value.result.official_event_evidence != expected_references
+                ):
+                    raise HoldingReviewStoreError(
+                        "holding review official evidence binding failed"
+                    )
+        else:
+            raise HoldingReviewStoreError("holding review request mode binding failed")
         intelligence = self._intelligence_by_request(
             connection, value.intelligence_request_run_id
         )
@@ -1404,6 +2692,89 @@ def _reviews_comparable(
         and previous.policy_version == current.policy_version
         and previous.policy_checksum == current.policy_checksum
     )
+
+
+def _official_closure_sql_values(value: OfficialCheckClosure) -> tuple[object, ...]:
+    return (
+        value.brief_request_run_id,
+        value.fund_code,
+        value.listing_source_attempt_id,
+        value.official_registry_version,
+        value.official_registry_checksum,
+        _json_text(list(value.source_registration_ids)),
+        value.manager_identity_state.value,
+        value.manager_identity_row_id,
+        value.manager_identity_source_document_id,
+        value.manager_identity_source_document_checksum,
+        value.manager_identity_normalized_name,
+        value.manager_identity_fingerprint,
+        _json_text([page.to_canonical_dict() for page in value.listing_page_evidence]),
+        _utc_text(value.window_start),
+        _utc_text(value.window_end),
+        value.listing_count,
+        value.candidate_count,
+        value.authenticated_body_count,
+        value.projected_event_count,
+        int(value.listing_truncated),
+        int(value.candidate_cap_reached),
+        int(value.body_cap_reached),
+        _json_text(list(value.gap_codes)),
+        int(value.official_negative_check_complete),
+        value.policy_version,
+        value.policy_checksum,
+        value.official_check_policy_version,
+        value.official_check_policy_checksum,
+        _utc_text(value.created_at),
+        value.record_checksum,
+    )
+
+
+def _normalized_identity(value: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise ValueError("manager identity must be non-empty text")
+    return "".join(unicodedata.normalize("NFKC", value).split())
+
+
+def _manager_identity_fingerprint(
+    *,
+    fund_code: str,
+    identity_row_id: int,
+    fund_name: str,
+    manager_name: str,
+    source_document_id: int,
+    source_document_checksum: str,
+) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "fund_code": _fund_code(fund_code),
+                "fund_name": _normalized_identity(fund_name),
+                "identity_row_id": _positive_id(identity_row_id, "manager identity row id"),
+                "manager_name": _normalized_identity(manager_name),
+                "source_document_checksum": _checksum(
+                    source_document_checksum,
+                    "manager identity source document checksum",
+                ),
+                "source_document_id": _positive_id(
+                    source_document_id,
+                    "manager identity source document id",
+                ),
+            }
+        )
+    ).hexdigest()
+
+
+def _announcement_source_document_id(
+    connection: sqlite3.Connection,
+    announcement_row_id: int,
+) -> int:
+    row = connection.execute(
+        "SELECT source_document_id FROM fund_announcements WHERE id=?",
+        (announcement_row_id,),
+    ).fetchone()
+    if row is None:
+        raise HoldingReviewStoreError("official announcement row binding failed")
+    return _positive_id(row["source_document_id"], "announcement source document id")
 
 
 def _fund_code(value: object) -> str:

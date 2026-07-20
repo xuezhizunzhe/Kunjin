@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, fields
 from types import MappingProxyType
@@ -7,6 +9,10 @@ from typing import Mapping, Tuple
 from urllib.parse import urlparse
 
 FUND_CODE_PATTERN = re.compile(r"^\d{6}$")
+OFFICIAL_SOURCE_REGISTRY_VERSION = "1"
+OFFICIAL_SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM = (
+    "557cac191734fbdd214ff24dabfc5afa8e3c99c1ab8ac30f230a846684c3fc9e"
+)
 
 
 @dataclass(frozen=True)
@@ -144,3 +150,44 @@ OFFICIAL_SOURCE_REGISTRATIONS: Tuple[OfficialSourceRegistration, ...] = (
         requires_publication_date=True,
     ),
 )
+
+
+def _canonical_registration(value: OfficialSourceRegistration) -> dict:
+    if type(value) is not OfficialSourceRegistration:
+        raise ValueError("official source registry entries must be exact")
+    value.validate()
+    return {
+        "accepted_hosts": list(value.accepted_hosts),
+        "binds_fund_identity": value.binds_fund_identity,
+        "document_index_url_template": value.document_index_url_template,
+        "identity": value.identity,
+        "identity_aliases": list(value.identity_aliases),
+        "registration_id": value.registration_id,
+        "requires_publication_date": value.requires_publication_date,
+        "source_kind": value.source_kind,
+    }
+
+
+def official_source_registry_checksum(
+    registrations: Tuple[OfficialSourceRegistration, ...] = OFFICIAL_SOURCE_REGISTRATIONS,
+) -> str:
+    if type(registrations) is not tuple:
+        raise ValueError("official source registry must be an exact tuple")
+    identities = tuple(item.registration_id for item in registrations)
+    if identities != tuple(sorted(set(identities))):
+        raise ValueError("official source registry must be in canonical unique order")
+    payload = {
+        "registrations": [_canonical_registration(item) for item in registrations],
+        "version": OFFICIAL_SOURCE_REGISTRY_VERSION,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+if official_source_registry_checksum() != OFFICIAL_SOURCE_REGISTRY_V1_GOLDEN_CHECKSUM:
+    raise RuntimeError("official source registry V1 checksum drifted")

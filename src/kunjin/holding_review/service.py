@@ -8,6 +8,7 @@ from typing import Callable, Optional
 from kunjin.brief.store import BriefStore, BriefStoreError
 from kunjin.decision.models import (
     ActionKind,
+    RequestMode,
     RequestTerminalStatus,
     SourceAttemptOutcome,
     StoredSourceAttempt,
@@ -243,12 +244,48 @@ class HoldingReviewService:
             )
             if interpretation is None:
                 raise HoldingReviewServiceError("review action binding failed")
+            official_event_evidence = ()
+            official_negative_check_complete = False
+            if brief.snapshot.mode is RequestMode.DEEP:
+                try:
+                    closure = (
+                        self.holding_review_store.authenticated_official_check_closure(
+                            brief_request_run_id,
+                            fund_code,
+                        )
+                    )
+                except HoldingReviewStoreError as exc:
+                    if self._official_closure_exists(brief_request_run_id, fund_code):
+                        raise HoldingReviewServiceError(
+                            "official check closure authentication failed"
+                        ) from exc
+                    official_omitted = ("official_deep_confirmation_deferred",)
+                else:
+                    official_event_evidence = (
+                        self.holding_review_store.authenticated_official_event_references(
+                            brief_request_run_id,
+                            fund_code,
+                        )
+                    )
+                    official_negative_check_complete = (
+                        closure.value.official_negative_check_complete
+                    )
+                    official_omitted = (
+                        ()
+                        if official_negative_check_complete
+                        else _canonical_union(
+                            closure.value.gap_codes,
+                            ("official_confirmation_required",),
+                        )
+                    )
+            else:
+                official_omitted = ("official_deep_confirmation_deferred",)
             brief_omitted = _canonical_union(
                 brief_terminal.omitted_work,
                 brief.snapshot.missing_fields,
                 brief.snapshot.conflicts,
                 interpretation.missing_fields,
-                ("official_deep_confirmation_deferred",),
+                official_omitted,
             )
             upstream_boundary = _canonical_union(
                 brief.snapshot.blocking_codes,
@@ -279,9 +316,9 @@ class HoldingReviewService:
                 intelligence_request_run_id=intelligence_request_run_id,
                 thesis_review_state=thesis_state,
                 review_evidence_items=projection.value.evidence_descriptors,
-                official_event_evidence=(),
+                official_event_evidence=official_event_evidence,
                 omitted_work=brief_omitted,
-                official_negative_check_complete=False,
+                official_negative_check_complete=official_negative_check_complete,
                 intelligence_schedule_complete=(
                     intelligence_terminal.status is RequestTerminalStatus.COMPLETE
                     and not intelligence_terminal.omitted_work
@@ -374,6 +411,20 @@ class HoldingReviewService:
             return row is not None
         except (sqlite3.DatabaseError, OSError, TypeError, ValueError):
             raise HoldingReviewServiceError("snapshot existence check failed") from None
+
+    def _official_closure_exists(self, request_run_id: int, fund_code: str) -> bool:
+        try:
+            with self.repository.connect() as connection:
+                row = connection.execute(
+                    "SELECT 1 FROM held_review_official_check_closures "
+                    "WHERE brief_request_run_id=? AND fund_code=?",
+                    (request_run_id, fund_code),
+                ).fetchone()
+            return row is not None
+        except (sqlite3.DatabaseError, OSError, TypeError, ValueError):
+            raise HoldingReviewServiceError(
+                "official closure existence check failed"
+            ) from None
 
     def _authenticate_request_bindings(
         self, fund_code, action, brief_snapshot, intelligence_snapshot

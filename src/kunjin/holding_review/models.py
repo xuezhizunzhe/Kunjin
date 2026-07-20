@@ -24,6 +24,13 @@ from kunjin.decision.models import (
     validate_version,
 )
 from kunjin.funds.official_domains import FUND_COMPANY_DOMAINS
+from kunjin.holding_review.policy import (
+    OFFICIAL_MAXIMUM_BODIES,
+    OFFICIAL_MAXIMUM_CANDIDATES,
+    OFFICIAL_MAXIMUM_LISTING_ITEMS,
+    OFFICIAL_MAXIMUM_LISTING_PAGE_BYTES,
+    OFFICIAL_MAXIMUM_LISTING_PAGES,
+)
 from kunjin.intelligence.models import (
     LineageKind,
     _freeze_public_tree,
@@ -38,7 +45,13 @@ _PUBLIC_TEXT_CHUNK_OVERLAP = 128
 _ALLOWED_ACTIONS = frozenset(
     (ActionKind.CONTINUE_HOLDING, ActionKind.REDUCE_TO_CASH, ActionKind.FULL_EXIT)
 )
-_REVIEWED_PUBLIC_BOUNDARY_KEYS = frozenset(("exact_amount_available",))
+_REVIEWED_PUBLIC_BOUNDARY_KEYS = frozenset(
+    (
+        "exact_amount_available",
+        "raw_byte_count",
+        "raw_sha256",
+    )
+)
 _SUPPORTED_OFFICIAL_EVENTS = frozenset(
     (
         OfficialEventCode.FUND_LIQUIDATION_NOTICE,
@@ -221,6 +234,18 @@ class ConditionalReviewUsability(str, Enum):
 class BindingState(str, Enum):
     PRESENT = "present"
     MISSING = "missing"
+
+
+class OfficialManagerIdentityState(str, Enum):
+    PRESENT = "present"
+    MISSING = "missing"
+    STALE = "stale"
+    CONFLICTED = "conflicted"
+
+
+class OfficialListingTerminalState(str, Enum):
+    SOURCE_FINAL_PAGE = "source_final_page"
+    WINDOW_BOUNDARY_REACHED = "window_boundary_reached"
 
 
 def _exact_record(value: object, expected: type, name: str) -> None:
@@ -635,6 +660,250 @@ class HeldReviewOfficialEventProjection(_AuthenticatedRecord):
         validate_version(self.policy_version, "official event policy version")
         validate_checksum(self.policy_checksum, "official event policy checksum")
         self._validate_record_checksum("official event projection")
+
+
+@dataclass(frozen=True)
+class OfficialListingPageEvidence(_CanonicalRecord):
+    registration_id: str
+    page_number: int
+    reported_total_pages: int
+    canonical_page_url: str
+    raw_byte_count: int
+    raw_sha256: str
+    retrieved_at: datetime
+    parsed_item_count: int
+    parsed_items_sha256: str
+    terminal_state: Optional[OfficialListingTerminalState]
+    source_document_id: int
+
+    def validate(self) -> None:
+        _exact_record(self, OfficialListingPageEvidence, "official listing page evidence")
+        validate_identifier(self.registration_id, "official registration id")
+        if (
+            type(self.page_number) is not int
+            or not 1 <= self.page_number <= OFFICIAL_MAXIMUM_LISTING_PAGES
+        ):
+            raise ValueError("official listing page number must be between 1 and 10")
+        if (
+            type(self.reported_total_pages) is not int
+            or self.reported_total_pages < self.page_number
+        ):
+            raise ValueError("official listing reported total pages are invalid")
+        _validate_public_https_url(self.canonical_page_url, "official listing page URL")
+        parsed = urlsplit(self.canonical_page_url)
+        _validate_canonical_url_path(parsed.path, "official listing page URL")
+        if "//" in parsed.path or any(part in {".", ".."} for part in parsed.path.split("/")):
+            raise ValueError("official listing page URL must be a canonical public HTTPS URL")
+        if (
+            type(self.raw_byte_count) is not int
+            or not 1 <= self.raw_byte_count <= OFFICIAL_MAXIMUM_LISTING_PAGE_BYTES
+        ):
+            raise ValueError("official listing raw byte count is invalid")
+        validate_checksum(self.raw_sha256, "official listing raw checksum")
+        _utc(self.retrieved_at, "official listing retrieval time")
+        if (
+            type(self.parsed_item_count) is not int
+            or not 0 <= self.parsed_item_count <= OFFICIAL_MAXIMUM_LISTING_ITEMS
+        ):
+            raise ValueError("official listing parsed item count is invalid")
+        validate_checksum(self.parsed_items_sha256, "official listing item-set checksum")
+        if self.terminal_state is not None:
+            _exact_enum(
+                self.terminal_state,
+                OfficialListingTerminalState,
+                "official listing terminal state",
+            )
+        _positive_int(self.source_document_id, "official listing source document id")
+
+
+@dataclass(frozen=True)
+class OfficialCheckClosure(_AuthenticatedRecord):
+    brief_request_run_id: int
+    fund_code: str
+    listing_source_attempt_id: int
+    official_registry_version: str
+    official_registry_checksum: str
+    source_registration_ids: Tuple[str, ...]
+    manager_identity_state: OfficialManagerIdentityState
+    manager_identity_row_id: Optional[int]
+    manager_identity_source_document_id: Optional[int]
+    manager_identity_source_document_checksum: Optional[str]
+    manager_identity_normalized_name: Optional[str]
+    manager_identity_fingerprint: Optional[str]
+    listing_page_evidence: Tuple[OfficialListingPageEvidence, ...]
+    window_start: datetime
+    window_end: datetime
+    listing_count: int
+    candidate_count: int
+    authenticated_body_count: int
+    projected_event_count: int
+    listing_truncated: bool
+    candidate_cap_reached: bool
+    body_cap_reached: bool
+    gap_codes: Tuple[str, ...]
+    official_negative_check_complete: bool
+    policy_version: str
+    policy_checksum: str
+    official_check_policy_version: str
+    official_check_policy_checksum: str
+    created_at: datetime
+    record_checksum: str
+
+    def validate(self) -> None:
+        _exact_record(self, OfficialCheckClosure, "official check closure")
+        _positive_int(self.brief_request_run_id, "brief request run id")
+        _fund_code(self.fund_code)
+        _positive_int(self.listing_source_attempt_id, "listing source attempt id")
+        validate_version(self.official_registry_version, "official registry version")
+        validate_checksum(self.official_registry_checksum, "official registry checksum")
+        registration_ids = _sorted_identifiers(
+            self.source_registration_ids,
+            "official source registration ids",
+        )
+        _exact_enum(
+            self.manager_identity_state,
+            OfficialManagerIdentityState,
+            "official manager identity state",
+        )
+        identity_values = (
+            self.manager_identity_row_id,
+            self.manager_identity_source_document_id,
+            self.manager_identity_source_document_checksum,
+            self.manager_identity_normalized_name,
+            self.manager_identity_fingerprint,
+        )
+        identity_present = all(item is not None for item in identity_values)
+        if identity_present != (
+            self.manager_identity_state is OfficialManagerIdentityState.PRESENT
+        ):
+            raise ValueError("official manager identity binding is inconsistent")
+        if any(item is not None for item in identity_values) != identity_present:
+            raise ValueError("official manager identity binding must be all-or-none")
+        if identity_present:
+            _positive_int(self.manager_identity_row_id, "manager identity row id")
+            _positive_int(
+                self.manager_identity_source_document_id,
+                "manager identity source document id",
+            )
+            validate_checksum(
+                self.manager_identity_source_document_checksum,
+                "manager identity source document checksum",
+            )
+            validate_public_text(
+                self.manager_identity_normalized_name,
+                "manager identity normalized name",
+            )
+            if (
+                unicodedata.normalize("NFKC", self.manager_identity_normalized_name)
+                != self.manager_identity_normalized_name
+                or "".join(self.manager_identity_normalized_name.split())
+                != self.manager_identity_normalized_name
+            ):
+                raise ValueError("manager identity normalized name is not canonical")
+            validate_checksum(self.manager_identity_fingerprint, "manager identity fingerprint")
+
+        if type(self.listing_page_evidence) is not tuple or len(
+            self.listing_page_evidence
+        ) > OFFICIAL_MAXIMUM_LISTING_PAGES:
+            raise ValueError("official listing page evidence must be a bounded exact tuple")
+        for page in self.listing_page_evidence:
+            if type(page) is not OfficialListingPageEvidence:
+                raise ValueError("official listing page evidence must contain exact records")
+            page.validate()
+            if page.registration_id not in registration_ids:
+                raise ValueError("official listing page registration is not in the source set")
+        expected_order = tuple(
+            sorted(
+                self.listing_page_evidence,
+                key=lambda item: (item.registration_id, item.page_number),
+            )
+        )
+        if self.listing_page_evidence != expected_order:
+            raise ValueError("official listing manifest is not in canonical page order")
+        urls = tuple(item.canonical_page_url for item in self.listing_page_evidence)
+        digests = tuple(item.raw_sha256 for item in self.listing_page_evidence)
+        document_ids = tuple(item.source_document_id for item in self.listing_page_evidence)
+        if any(len(values) != len(set(values)) for values in (urls, digests, document_ids)):
+            raise ValueError("official listing page identities must be unique")
+
+        complete_manifest = bool(registration_ids)
+        for registration_id in registration_ids:
+            pages = tuple(
+                item
+                for item in self.listing_page_evidence
+                if item.registration_id == registration_id
+            )
+            if tuple(item.page_number for item in pages) != tuple(range(1, len(pages) + 1)):
+                complete_manifest = False
+                continue
+            if not pages:
+                complete_manifest = False
+                continue
+            if len({item.reported_total_pages for item in pages}) != 1:
+                complete_manifest = False
+                continue
+            terminal_pages = tuple(item for item in pages if item.terminal_state is not None)
+            if len(terminal_pages) != 1 or terminal_pages[0] is not pages[-1]:
+                complete_manifest = False
+                continue
+            final = pages[-1]
+            if (
+                final.terminal_state is OfficialListingTerminalState.SOURCE_FINAL_PAGE
+                and final.page_number != final.reported_total_pages
+            ):
+                complete_manifest = False
+
+        start = _utc(self.window_start, "official check window start")
+        end = _utc(self.window_end, "official check window end")
+        if start >= end:
+            raise ValueError("official check window must be a non-empty half-open interval")
+        created = _utc(self.created_at, "official check closure creation time")
+        if created < end:
+            raise ValueError("official check closure cannot precede its window end")
+        counts = (
+            (self.listing_count, OFFICIAL_MAXIMUM_LISTING_ITEMS, "listing count"),
+            (self.candidate_count, OFFICIAL_MAXIMUM_CANDIDATES, "candidate count"),
+            (
+                self.authenticated_body_count,
+                OFFICIAL_MAXIMUM_BODIES,
+                "authenticated body count",
+            ),
+            (self.projected_event_count, OFFICIAL_MAXIMUM_BODIES, "projected event count"),
+        )
+        for value, maximum, name in counts:
+            if type(value) is not int or not 0 <= value <= maximum:
+                raise ValueError(f"official {name} is invalid")
+        if not (
+            self.projected_event_count
+            <= self.authenticated_body_count
+            <= self.candidate_count
+            <= self.listing_count
+        ):
+            raise ValueError("official check counts are inconsistent")
+        for value, name in (
+            (self.listing_truncated, "listing truncated"),
+            (self.candidate_cap_reached, "candidate cap reached"),
+            (self.body_cap_reached, "body cap reached"),
+            (self.official_negative_check_complete, "official negative check complete"),
+        ):
+            _exact_bool(value, name)
+        gaps = _sorted_identifiers(self.gap_codes, "official check gap codes")
+        validate_version(self.policy_version, "holding review policy version")
+        validate_checksum(self.policy_checksum, "holding review policy checksum")
+        validate_version(self.official_check_policy_version, "official check policy version")
+        validate_checksum(self.official_check_policy_checksum, "official check policy checksum")
+        if self.official_negative_check_complete and (
+            self.manager_identity_state is not OfficialManagerIdentityState.PRESENT
+            or not registration_ids
+            or not complete_manifest
+            or self.listing_truncated
+            or self.candidate_cap_reached
+            or self.body_cap_reached
+            or gaps
+            or self.projected_event_count != self.candidate_count
+        ):
+            raise ValueError("complete official check has incomplete evidence")
+        self._validate_record_checksum("official check closure")
 
 
 @dataclass(frozen=True)
