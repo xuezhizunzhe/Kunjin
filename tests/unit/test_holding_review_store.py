@@ -12,6 +12,7 @@ from kunjin.brief.store import BriefStore
 from kunjin.decision.models import ActionKind, RequestTerminalStatus, canonical_json_bytes
 from kunjin.decision.store import DecisionAuditStore
 from kunjin.holding_review.models import (
+    ActionReviewSourceSufficiency,
     AdjudicationDecision,
     BindingState,
     EvidenceReadiness,
@@ -27,7 +28,14 @@ from kunjin.holding_review.models import (
 )
 from kunjin.holding_review.policy import HeldFundManualReviewPolicyV1
 from kunjin.holding_review.store import HoldingReviewStore, HoldingReviewStoreError
-from kunjin.intelligence.models import IntelligenceWorkflow, LineageKind
+from kunjin.intelligence.models import (
+    EventConfidenceState,
+    EventType,
+    IntegrityState,
+    IntelligenceWorkflow,
+    LineageKind,
+    NewsEvent,
+)
 from kunjin.intelligence.store import IntelligenceStore
 from kunjin.models import InvestmentThesis
 from kunjin.storage.repository import Repository
@@ -56,6 +64,23 @@ def context(tmp_path: Path):
     budget, intelligence_run_id, attempt_id, _item_ids, _items = (
         _seed_request_and_evidence(repository, intelligence_store)
     )
+    conflict_event = NewsEvent(
+        event_id="event_conflict",
+        event_type=EventType.POLICY,
+        normalized_title="Conflicting policy event",
+        supporting_item_ids=("item_one",),
+        opposing_item_ids=("item_two",),
+        correction_item_ids=(),
+        retraction_item_ids=(),
+        confidence_state=EventConfidenceState.CONFLICTED,
+        earliest_published_at=datetime(2026, 7, 18, 5, 0, tzinfo=timezone.utc),
+        latest_published_at=datetime(2026, 7, 18, 5, 0, tzinfo=timezone.utc),
+        integrity_state=IntegrityState.ACTIVE,
+        superseded_by_event_id=None,
+        invalidation_conditions=("Resolve the conflict.",),
+    )
+    with repository.connect() as connection, connection:
+        intelligence_store.save_lineage_and_events((), (conflict_event,), connection)
     intelligence = intelligence_store.publish_snapshot(
         intelligence_run_id,
         lambda value: replace(
@@ -63,6 +88,7 @@ def context(tmp_path: Path):
             workflow=IntelligenceWorkflow.FUND_INTELLIGENCE,
             subject_fund_code="123456",
             source_attempt_ids=(attempt_id,),
+            event_ids=(conflict_event.event_id,),
         ),
         datetime(2026, 7, 18, 6, 0, 4, tzinfo=timezone.utc),
         RequestTerminalStatus.COMPLETE,
@@ -91,15 +117,15 @@ def context(tmp_path: Path):
 
 def desired_projection(context, **changes: object) -> ThesisMatchProjection:
     evidence = ReviewEvidenceItem(
-        evidence_id="item_one",
+        evidence_id="item_two",
         source_tier=1,
-        lineage_kind=LineageKind.ORIGINAL,
+        lineage_kind=LineageKind.DIRECT_QUOTE,
         current=True,
         graph_closed=True,
-        original_lineage=True,
+        original_lineage=False,
         retracted=False,
-        conflicted=False,
-        direct_subject_binding=True,
+        conflicted=True,
+        direct_subject_binding=False,
     )
     intelligence = context["intelligence"]
     value = ThesisMatchProjection(
@@ -126,7 +152,7 @@ def desired_projection(context, **changes: object) -> ThesisMatchProjection:
 
 
 def desired_adjudication(context, projection, **changes: object):
-    evidence_ids = ("item_one",)
+    evidence_ids = ("item_two",)
     value = ThesisEvidenceAdjudication(
         fund_code="123456",
         thesis_id=context["thesis_id"],
@@ -163,7 +189,7 @@ def desired_review(context, projection, adjudication, **changes: object):
             else RedemptionFeasibility.INSUFFICIENT_DATA
         ),
         official_negative_check_complete=False,
-        evidence_ids=("item_one",),
+        evidence_ids=("item_two",),
         policy_version=policy.version,
         policy_checksum=policy.checksum(),
         created_at=NOW + timedelta(seconds=2),
@@ -233,6 +259,27 @@ def test_projection_rejects_wrong_subject_and_checksum_drift(context) -> None:
         )
 
 
+def test_projection_rejects_contradictory_clean_direct_and_original_claims(context) -> None:
+    valid = desired_projection(context)
+    evidence = valid.evidence_descriptors[0]
+    contradictory = (
+        replace(evidence, conflicted=False),
+        replace(evidence, direct_subject_binding=True),
+        replace(evidence, current=False),
+        replace(
+            evidence,
+            lineage_kind=LineageKind.ORIGINAL,
+            original_lineage=True,
+        ),
+    )
+    for descriptor in contradictory:
+        value = replace(valid, evidence_descriptors=(descriptor,))
+        value = replace(value, evidence_set_checksum=value.expected_evidence_set_checksum())
+        value = replace(value, record_checksum=value.expected_record_checksum())
+        with pytest.raises(HoldingReviewStoreError, match="evidence descriptor"):
+            context["store"].publish_thesis_match(value)
+
+
 @pytest.mark.parametrize("request_run_id", [True, 0, -1])
 def test_latest_projection_rejects_nonpositive_or_bool_id(context, request_run_id) -> None:
     with pytest.raises(ValueError, match="positive exact integer"):
@@ -265,6 +312,24 @@ def test_adjudication_round_trip_and_supersession(context) -> None:
                 created_at=NOW + timedelta(seconds=3),
             )
         )
+
+
+def test_review_rejects_superseded_adjudication(context) -> None:
+    store = context["store"]
+    projection = store.publish_thesis_match(desired_projection(context))
+    first = store.publish_adjudication(desired_adjudication(context, projection))
+    store.publish_adjudication(
+        desired_adjudication(
+            context,
+            projection,
+            decision=AdjudicationDecision.PRESENTED_MATCH_CONFIRMED,
+            superseded_adjudication_id=first.id,
+            created_at=NOW + timedelta(seconds=2),
+        )
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="current adjudication"):
+        store.publish_review(desired_review(context, projection, first))
 
 
 def test_review_round_trip_previous_binding_and_privacy(context) -> None:
@@ -311,6 +376,168 @@ def test_review_round_trip_previous_binding_and_privacy(context) -> None:
         assert connection.execute(
             "SELECT count(*) FROM fund_official_announcement_contents"
         ).fetchone()[0] == 0
+
+
+def test_review_rejects_skipped_comparable_history_and_pointer_conflict(context) -> None:
+    store = context["store"]
+    projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = store.publish_adjudication(desired_adjudication(context, projection))
+    first = store.publish_review(desired_review(context, projection, adjudication))
+
+    pointer_conflict = replace(first.value, previous_review_id=first.id)
+    pointer_conflict = replace(
+        pointer_conflict, record_checksum=pointer_conflict.expected_record_checksum()
+    )
+    with pytest.raises(HoldingReviewStoreError, match="semantic identity"):
+        store.publish_review(pointer_conflict)
+
+    second_result = replace(
+        first.value.result,
+        omitted_work=("second_check",),
+        created_at=NOW + timedelta(seconds=3),
+    )
+    second = desired_review(
+        context,
+        projection,
+        adjudication,
+        previous_review_id=first.id,
+        result=second_result,
+        result_fingerprint=second_result.expected_result_fingerprint(),
+        created_at=NOW + timedelta(seconds=4),
+    )
+    second = replace(
+        second,
+        semantic_identity_checksum=second.expected_semantic_identity_checksum(),
+    )
+    second = replace(second, record_checksum=second.expected_record_checksum())
+    store.publish_review(second)
+
+    third_result = replace(
+        first.value.result,
+        omitted_work=("third_check",),
+        created_at=NOW + timedelta(seconds=5),
+    )
+    skipped = desired_review(
+        context,
+        projection,
+        adjudication,
+        previous_review_id=first.id,
+        result=third_result,
+        result_fingerprint=third_result.expected_result_fingerprint(),
+        created_at=NOW + timedelta(seconds=6),
+    )
+    skipped = replace(
+        skipped, semantic_identity_checksum=skipped.expected_semantic_identity_checksum()
+    )
+    skipped = replace(skipped, record_checksum=skipped.expected_record_checksum())
+    with pytest.raises(HoldingReviewStoreError, match="latest comparable"):
+        store.publish_review(skipped)
+
+
+def test_review_rejects_cross_thesis_previous_pointer(context) -> None:
+    store = context["store"]
+    first_projection = store.publish_thesis_match(desired_projection(context))
+    first_adjudication = store.publish_adjudication(
+        desired_adjudication(context, first_projection)
+    )
+    first = store.publish_review(
+        desired_review(context, first_projection, first_adjudication)
+    )
+    thesis = InvestmentThesis(
+        fund_code="123456",
+        rationale="Replacement long-term thesis.",
+        horizon="Five years.",
+        invalidation="The replacement condition fails.",
+        created_at=NOW - timedelta(days=1),
+    )
+    thesis_id = context["repository"].add_thesis(thesis)
+    fingerprint = thesis_record_fingerprint(thesis_id, thesis)
+    second_projection = store.publish_thesis_match(
+        desired_projection(
+            context,
+            thesis_id=thesis_id,
+            thesis_fingerprint=fingerprint,
+            created_at=NOW + timedelta(seconds=4),
+        )
+    )
+    second_adjudication_value = replace(
+        desired_adjudication(context, second_projection),
+        thesis_id=thesis_id,
+        thesis_fingerprint=fingerprint,
+        created_at=NOW + timedelta(seconds=5),
+        record_checksum="a" * 64,
+    )
+    second_adjudication_value = replace(
+        second_adjudication_value,
+        record_checksum=second_adjudication_value.expected_record_checksum(),
+    )
+    second_adjudication = store.publish_adjudication(second_adjudication_value)
+    second = desired_review(
+        context,
+        second_projection,
+        second_adjudication,
+        active_thesis_id=thesis_id,
+        active_thesis_fingerprint=fingerprint,
+        previous_review_id=first.id,
+        created_at=NOW + timedelta(seconds=6),
+    )
+    second = replace(
+        second,
+        semantic_identity_checksum=second.expected_semantic_identity_checksum(),
+    )
+    second = replace(second, record_checksum=second.expected_record_checksum())
+    assert second_adjudication_value.thesis_id == thesis_id
+
+    with pytest.raises(HoldingReviewStoreError, match="comparable"):
+        store.publish_review(second)
+
+
+def test_latest_comparable_review_supports_missing_thesis(context) -> None:
+    store = context["store"]
+    projection_value = desired_projection(
+        context,
+        thesis_id=None,
+        thesis_fingerprint=None,
+        projection_state=ThesisMatchProjectionState.THESIS_MISSING,
+        evidence_descriptors=(),
+    )
+    projection = store.publish_thesis_match(projection_value)
+    regular_projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = store.publish_adjudication(
+        desired_adjudication(context, regular_projection)
+    )
+    value = desired_review(context, regular_projection, adjudication)
+    result = replace(
+        value.result,
+        thesis_review_state=ThesisMatchState.THESIS_MISSING,
+        evidence_ids=(),
+        action_review_source_sufficiency=(
+            ActionReviewSourceSufficiency.INSUFFICIENT_DATA
+        ),
+    )
+    value = replace(
+        value,
+        thesis_match_projection_id=projection.id,
+        thesis_match_projection_checksum=projection.value.record_checksum,
+        active_thesis_state=BindingState.MISSING,
+        active_thesis_id=None,
+        active_thesis_fingerprint=None,
+        adjudication_state=BindingState.MISSING,
+        adjudication_id=None,
+        adjudication_checksum=None,
+        result=result,
+        result_fingerprint=result.expected_result_fingerprint(),
+    )
+    value = replace(value, semantic_identity_checksum=value.expected_semantic_identity_checksum())
+    value = replace(value, record_checksum=value.expected_record_checksum())
+    stored = store.publish_review(value)
+
+    assert store.latest_comparable_review(
+        "123456",
+        ActionKind.CONTINUE_HOLDING,
+        None,
+        HeldFundManualReviewPolicyV1().checksum(),
+    ) == stored
 
 
 def test_review_rejects_wrong_action_and_unknown_previous_review(context) -> None:

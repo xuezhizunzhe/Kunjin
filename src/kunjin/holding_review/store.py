@@ -8,7 +8,7 @@ from typing import Mapping, Optional
 
 from kunjin.brief.models import OfficialEventCode, thesis_record_fingerprint
 from kunjin.brief.store import BriefStore, BriefStoreError, StoredBriefSnapshot
-from kunjin.decision.models import ActionKind, canonical_json_bytes
+from kunjin.decision.models import ActionKind, SourceTier, canonical_json_bytes
 from kunjin.holding_review.models import (
     ActionReviewSourceSufficiency,
     AdjudicationDecision,
@@ -36,7 +36,14 @@ from kunjin.holding_review.models import (
     UseOfProceeds,
 )
 from kunjin.holding_review.policy import HeldFundManualReviewPolicyV1
-from kunjin.intelligence.models import IntelligenceWorkflow, LineageKind
+from kunjin.intelligence.models import (
+    DimensionState,
+    EventConfidenceState,
+    EventEntityRelationship,
+    IntegrityState,
+    IntelligenceWorkflow,
+    LineageKind,
+)
 from kunjin.intelligence.store import (
     IntelligenceStore,
     IntelligenceStoreError,
@@ -334,8 +341,13 @@ class HoldingReviewStore:
                     ).fetchone()
                     if existing is not None:
                         stored = self._stored_review(existing)
+                        if stored.value.previous_review_id != value.previous_review_id:
+                            raise HoldingReviewStoreError(
+                                "holding review semantic identity has a different previous pointer"
+                            )
                         connection.commit()
                         return stored
+                    self._authenticate_latest_comparable_previous(connection, value)
                     cursor = connection.execute(
                         """
                         INSERT INTO holding_review_snapshots(
@@ -407,29 +419,45 @@ class HoldingReviewStore:
         self,
         fund_code: str,
         action: ActionKind,
-        thesis_fingerprint: str,
+        thesis_fingerprint: Optional[str],
         policy_checksum: str,
     ) -> Optional[StoredHoldingReviewSnapshot]:
         _fund_code(fund_code)
         if type(action) is not ActionKind:
             raise ValueError("action must be an exact ActionKind")
-        _checksum(thesis_fingerprint, "thesis fingerprint")
+        if thesis_fingerprint is not None:
+            _checksum(thesis_fingerprint, "thesis fingerprint")
         _checksum(policy_checksum, "policy checksum")
         try:
             with self.repository.connect() as connection:
-                row = connection.execute(
-                    """
-                    SELECT * FROM holding_review_snapshots
-                    WHERE fund_code=? AND action=? AND active_thesis_fingerprint=?
-                      AND policy_checksum=?
-                    ORDER BY created_at DESC, id DESC LIMIT 1
-                    """,
-                    (fund_code, action.value, thesis_fingerprint, policy_checksum),
-                ).fetchone()
+                if thesis_fingerprint is None:
+                    row = connection.execute(
+                        """
+                        SELECT * FROM holding_review_snapshots
+                        WHERE fund_code=? AND action=? AND active_thesis_state='missing'
+                          AND active_thesis_fingerprint IS NULL AND policy_checksum=?
+                        ORDER BY created_at DESC, id DESC LIMIT 1
+                        """,
+                        (fund_code, action.value, policy_checksum),
+                    ).fetchone()
+                else:
+                    row = connection.execute(
+                        """
+                        SELECT * FROM holding_review_snapshots
+                        WHERE fund_code=? AND action=? AND active_thesis_state='present'
+                          AND active_thesis_fingerprint=? AND policy_checksum=?
+                        ORDER BY created_at DESC, id DESC LIMIT 1
+                        """,
+                        (fund_code, action.value, thesis_fingerprint, policy_checksum),
+                    ).fetchone()
                 if row is None:
                     return None
                 stored = self._stored_review(row)
-                self._authenticate_review_references(connection, stored.value)
+                self._authenticate_review_references(
+                    connection,
+                    stored.value,
+                    require_current_adjudication=False,
+                )
                 return stored
         except HoldingReviewStoreError:
             raise
@@ -458,9 +486,24 @@ class HoldingReviewStore:
                 or thesis_record_fingerprint(value.thesis_id, thesis) != value.thesis_fingerprint
             ):
                 raise HoldingReviewStoreError("thesis match projection binding failed")
+        derived = self._derived_evidence_descriptors(connection, intelligence)
+        try:
+            expected = tuple(derived[item.evidence_id] for item in value.evidence_descriptors)
+        except KeyError:
+            raise HoldingReviewStoreError(
+                "thesis match projection evidence descriptor authentication failed"
+            ) from None
+        if expected != value.evidence_descriptors:
+            raise HoldingReviewStoreError(
+                "thesis match projection evidence descriptor authentication failed"
+            )
 
     def _authenticate_review_references(
-        self, connection: sqlite3.Connection, value: HoldingReviewSnapshot
+        self,
+        connection: sqlite3.Connection,
+        value: HoldingReviewSnapshot,
+        *,
+        require_current_adjudication: bool = True,
     ) -> None:
         if (
             value.result.official_negative_check_complete
@@ -514,6 +557,13 @@ class HoldingReviewStore:
                 or adjudication.value.thesis_match_projection_id != projection.id
             ):
                 raise HoldingReviewStoreError("holding review snapshot binding failed")
+            self._authenticate_adjudication_projection(adjudication.value, projection)
+            if require_current_adjudication:
+                current = self._current_adjudication_row(connection, projection.id)
+                if current is None or int(current["id"]) != adjudication.id:
+                    raise HoldingReviewStoreError(
+                        "holding review requires the unique current adjudication"
+                    )
         if value.previous_review_id is not None:
             row = connection.execute(
                 "SELECT * FROM holding_review_snapshots WHERE id=?",
@@ -523,16 +573,150 @@ class HoldingReviewStore:
                 raise HoldingReviewStoreError("holding review snapshot binding failed")
             previous = self._stored_review(row)
             if (
-                previous.value.fund_code != value.fund_code
-                or previous.value.action is not value.action
+                not _reviews_comparable(previous.value, value)
                 or previous.value.created_at > value.created_at
             ):
-                raise HoldingReviewStoreError("holding review snapshot binding failed")
+                raise HoldingReviewStoreError(
+                    "holding review previous row is not exactly comparable"
+                )
+            self._authenticate_review_references(
+                connection,
+                previous.value,
+                require_current_adjudication=False,
+            )
         if (
             value.policy_version != self.policy.version
             or value.policy_checksum != self.policy.checksum()
         ):
             raise HoldingReviewStoreError("holding review snapshot policy authentication failed")
+
+    def _authenticate_latest_comparable_previous(
+        self,
+        connection: sqlite3.Connection,
+        value: HoldingReviewSnapshot,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT * FROM holding_review_snapshots
+            WHERE fund_code=? AND action=?
+              AND active_thesis_state=? AND active_thesis_id IS ?
+              AND active_thesis_fingerprint IS ?
+              AND policy_version=? AND policy_checksum=?
+            ORDER BY created_at DESC, id DESC LIMIT 1
+            """,
+            (
+                value.fund_code,
+                value.action.value,
+                value.active_thesis_state.value,
+                value.active_thesis_id,
+                value.active_thesis_fingerprint,
+                value.policy_version,
+                value.policy_checksum,
+            ),
+        ).fetchone()
+        latest_id = None if row is None else _positive_id(row["id"], "previous review id")
+        if latest_id != value.previous_review_id:
+            raise HoldingReviewStoreError(
+                "holding review must bind the latest comparable previous row"
+            )
+        if row is not None:
+            stored = self._stored_review(row)
+            if not _reviews_comparable(stored.value, value):
+                raise HoldingReviewStoreError(
+                    "holding review latest comparable authentication failed"
+                )
+
+    def _derived_evidence_descriptors(
+        self,
+        connection: sqlite3.Connection,
+        intelligence: StoredIntelligenceSnapshot,
+    ) -> dict[str, ReviewEvidenceItem]:
+        snapshot = intelligence.snapshot
+        run = connection.execute(
+            "SELECT status FROM request_runs WHERE id=?",
+            (snapshot.request_run_id,),
+        ).fetchone()
+        graph_complete = run is not None and run["status"] == "complete"
+        incoming: dict[str, list[LineageKind]] = {
+            item_id: [] for item_id in snapshot.item_ids
+        }
+        for edge_id in snapshot.lineage_edge_ids:
+            row = connection.execute(
+                "SELECT * FROM intelligence_lineage_edges WHERE edge_key=?",
+                (edge_id,),
+            ).fetchone()
+            if row is None:
+                raise HoldingReviewStoreError(
+                    "thesis match projection evidence descriptor authentication failed"
+                )
+            edge = self.intelligence_store._lineage_from_authenticated_row(connection, row)
+            if edge.to_item_id in incoming:
+                incoming[edge.to_item_id].append(edge.kind)
+
+        conflicted_ids = set(snapshot.conflicts)
+        for event_id in snapshot.event_ids:
+            event = self.intelligence_store._authenticate_event_row(connection, event_id)
+            event_items = {
+                *event.supporting_item_ids,
+                *event.opposing_item_ids,
+                *event.correction_item_ids,
+                *event.retraction_item_ids,
+            }
+            if (
+                event.confidence_state is EventConfidenceState.CONFLICTED
+                or event.event_id in snapshot.conflicts
+            ):
+                conflicted_ids.update(event_items)
+        for observation in snapshot.market_state.dimensions:
+            if (
+                observation.state is DimensionState.CONFLICTED
+                or observation.conflict_ids
+                or observation.observation_id in snapshot.conflicts
+            ):
+                conflicted_ids.update(observation.evidence_ids)
+
+        relevant_links = set(snapshot.fund_relevance_link_ids)
+        entities = {item.entity_id: item for item in snapshot.entities}
+        subject_entity_id = f"fund_{snapshot.subject_fund_code}"
+        direct_ids = {
+            evidence_id
+            for link in snapshot.event_entity_links
+            if link.link_id in relevant_links
+            and link.relationship is EventEntityRelationship.SUBJECT
+            and link.entity_id == subject_entity_id
+            and entities[link.entity_id].entity_type == "fund"
+            for evidence_id in link.evidence_ids
+        }
+        result = {}
+        for item_id in snapshot.item_ids:
+            row = connection.execute(
+                "SELECT id FROM intelligence_news_items WHERE item_key=?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise HoldingReviewStoreError(
+                    "thesis match projection evidence descriptor authentication failed"
+                )
+            item = self.intelligence_store._authenticated_item(connection, int(row["id"]))
+            incoming_kinds = incoming[item_id]
+            closed = (
+                graph_complete
+                and len(incoming_kinds) == 1
+                and incoming_kinds[0] is not LineageKind.UNKNOWN
+            )
+            lineage_kind = incoming_kinds[0] if closed else LineageKind.UNKNOWN
+            result[item_id] = ReviewEvidenceItem(
+                evidence_id=item_id,
+                source_tier=(1 if item.source_tier is SourceTier.TIER_1 else 2),
+                lineage_kind=lineage_kind,
+                current=item.integrity_state is IntegrityState.ACTIVE,
+                graph_closed=closed,
+                original_lineage=lineage_kind is LineageKind.ORIGINAL,
+                retracted=item.integrity_state is IntegrityState.RETRACTED,
+                conflicted=item_id in conflicted_ids,
+                direct_subject_binding=item_id in direct_ids,
+            )
+        return result
 
     def _brief_by_request(
         self, connection: sqlite3.Connection, request_run_id: int
@@ -837,6 +1021,21 @@ def _without_times_and_checksum(value):
         value,
         created_at=datetime(2000, 1, 1, tzinfo=timezone.utc),
         record_checksum="0" * 64,
+    )
+
+
+def _reviews_comparable(
+    previous: HoldingReviewSnapshot,
+    current: HoldingReviewSnapshot,
+) -> bool:
+    return (
+        previous.fund_code == current.fund_code
+        and previous.action is current.action
+        and previous.active_thesis_state is current.active_thesis_state
+        and previous.active_thesis_id == current.active_thesis_id
+        and previous.active_thesis_fingerprint == current.active_thesis_fingerprint
+        and previous.policy_version == current.policy_version
+        and previous.policy_checksum == current.policy_checksum
     )
 
 
