@@ -70,44 +70,55 @@ reuse a historical route after profile, portfolio, policy, or evidence changes.
 For Phase B and Phase C, preserve every exact block, binding-constraint, and
 profile-conflict codes plus their local correction conditions.
 
-## Use One Held-Fund Brief
+## Run One Held-Fund Preview
 
-For one currently held fund question, run the aggregate command once only when
-the request includes `continue_holding`, `reduce_to_cash`, `full_exit`, or
-`switch_funds`:
+For one currently held fund question, select one owner-selected held fund and
+one action: `continue_holding`, `reduce_to_cash`, or `full_exit`. A switch must
+still be split into its reduction and purchase legs. Run this finite route:
 
 ```bash
-kunjin --json fund brief 519755 --action continue_holding --mode rapid
+kunjin --json fund brief CODE --action ACTION --mode rapid
+kunjin --json fund intelligence CODE --window recent --mode rapid
+kunjin --json thesis match-project CODE --intelligence-request-run-id INTELLIGENCE_REQUEST_RUN_ID
+kunjin --json thesis adjudicate CODE --thesis-match-projection-id PROJECTION_ID --decision DECISION
+kunjin --json fund holding-review CODE --action ACTION --brief-request-run-id BRIEF_REQUEST_RUN_ID --intelligence-request-run-id INTELLIGENCE_REQUEST_RUN_ID
 ```
 
-Use `continue_holding`, `reduce_to_cash`, `full_exit`, or `switch_funds` for the
-owner action; `fact_research` is always added internally. `fund brief` owns the
-90/480-second budget. Never orchestrate legacy commands in its place or claim
-their separate runtimes are part of that budget.
+The order is `fund brief exactly once -> fund intelligence exactly once -> thesis
+match-project exactly once -> thesis adjudicate at most once -> fund holding-review
+exactly once`. Read each brief/intelligence `data.request.request_run_id` and the
+projection `data.id`; never substitute latest/history records. Run `thesis
+adjudicate` only after the owner explicitly confirms the exact projected evidence.
+An acceptance token is not owner adjudication. Otherwise skip adjudication.
 
+`fund holding-review` is local and network-free. Each command keeps its own
+independent budget. Rapid intelligence owns its own 90-second budget. Never retry
+automatically. Never run Deep automatically. Never develop an adapter during the
+request. Stop after the review and present every gap.
+
+Rapid title candidates cannot prove that a high-impact official event is absent.
+Deep official confirmation is deferred. The preview fixes
+`official_negative_check_complete=false`, requires `official_confirmation_required`,
+allows only `review_disposition=abstain|manual_thesis_review_required`, and keeps
+`sell_timing=insufficient_data`, `action_authorized=false`,
+`exact_amount_available=false`, and `automatic_trade=false`. Never turn it into a
+sale date, amount, order, or 90% beginner-help claim.
+
+Use the brief when the request includes `continue_holding`, `reduce_to_cash`,
+`full_exit`, or `switch_funds`; `fact_research` is always added internally.
 Fact-only questions stay on the standalone `fact_research` route. Any buy or add
-request, including an already-held fund, stays on standalone `buy_or_add`; the
-brief may supply separate facts but never replaces the risk-increasing gate.
-
-Read `terminal_status`, `sync_status`, and `decision_evidence_status`
-separately. `terminal_status=complete` means no scheduled work was omitted; it
-is not a financial conclusion, proof of complete evidence, or action
-authorization. Preserve every fact's source tier and data date; keep a Tier 2
-fact labeled Tier 2. Explain the minimum D2 subset through
-`minimum_relationship_coverage` and `disclosed_holdings_coverage`, retaining
-unknown relationships as unknown. This minimum subset never satisfies the
-complete D2 gate required for buy/add or the purchase leg of a switch.
-Official events cover only audited fund, product, and manager announcements.
-Keep the result conditional and preserve `exact_amount_available=false`.
-
-If any of `identity_profile`, `personal_position_observation`, `formal_nav`, `manager_fee_profile`,
-`holdings_industries`, or `official_announcements` is in `omitted_work`, show every omitted code and
-do not conclude hold, reduce, exit, `no_add`, watch, or "no change". With none omitted, only core
-evidence completeness is established; still apply the current route and all gates. When
-`historical_brief_comparison_unavailable` appears, supported current facts remain usable, but the
-historical brief proves neither "changed" nor "unchanged".
-
-Broad financial-media ingestion, complete D2, D3 exact-amount/channel authorization, and mature Phase E monitoring are not implemented.
+request, including an already-held fund, stays on standalone `buy_or_add`.
+`fund brief` owns the 90/480-second budget. Never orchestrate legacy commands in
+its place. Read `terminal_status`, `sync_status`, and `decision_evidence_status` separately.
+`terminal_status=complete` means no scheduled work was omitted; it is not a
+financial conclusion. Preserve source tier, data date, and Tier 2 labels. The
+minimum D2 subset uses `minimum_relationship_coverage` and
+`disclosed_holdings_coverage`, retains unknown relationships as unknown, and
+never satisfies the complete D2 gate. Keep every `omitted_work` code visible;
+even no core omission does not authorize hold, reduce, exit, or "no change".
+`historical_brief_comparison_unavailable` proves neither changed nor unchanged.
+Broad financial-media ingestion, complete D2, D3 exact-amount/channel
+authorization, and mature Phase E monitoring are not implemented.
 
 ## Apply Each Action Independently
 

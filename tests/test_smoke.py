@@ -3924,6 +3924,73 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             self.assertIn(phrase, combined)
         self.assertLess(len(skill.splitlines()), 500)
 
+    def test_phase5_readme_and_skill_route_authenticated_preview_once(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        normalized_documents = tuple(
+            " ".join(document.split()) for document in (readme, skill)
+        )
+
+        required_phrases = (
+            "one owner-selected held fund",
+            "fund brief exactly once",
+            "fund intelligence exactly once",
+            "thesis match-project exactly once",
+            "thesis adjudicate at most once",
+            "fund holding-review exactly once",
+            "local and network-free",
+            "Rapid title candidates cannot prove that a high-impact official event is absent",
+            "Deep official confirmation is deferred",
+            "official_negative_check_complete=false",
+            "official_confirmation_required",
+            "review_disposition=abstain|manual_thesis_review_required",
+            "sell_timing=insufficient_data",
+            "action_authorized=false",
+            "exact_amount_available=false",
+            "automatic_trade=false",
+            "Each command keeps its own independent budget",
+            "Never retry automatically",
+            "Never develop an adapter during the request",
+            "Never run Deep automatically",
+            "An acceptance token is not owner adjudication",
+            "Stop after the review and present every gap",
+        )
+        for document in normalized_documents:
+            for phrase in required_phrases:
+                self.assertIn(phrase, document)
+
+        for command in (
+            "kunjin --json fund brief CODE --action ACTION --mode rapid",
+            "kunjin --json fund intelligence CODE --window recent --mode rapid",
+            (
+                "kunjin --json thesis match-project CODE "
+                "--intelligence-request-run-id INTELLIGENCE_REQUEST_RUN_ID"
+            ),
+            (
+                "kunjin --json thesis adjudicate CODE "
+                "--thesis-match-projection-id PROJECTION_ID --decision DECISION"
+            ),
+            (
+                "kunjin --json fund holding-review CODE --action ACTION "
+                "--brief-request-run-id BRIEF_REQUEST_RUN_ID "
+                "--intelligence-request-run-id INTELLIGENCE_REQUEST_RUN_ID"
+            ),
+        ):
+            self.assertIn(command, skill)
+
+        normalized_skill = normalized_documents[1]
+        self.assertIn("only after the owner explicitly confirms", normalized_skill)
+        for unsupported_claim in (
+            "未发现公告就表示没有重大风险",
+            "provides 90% beginner help",
+            "guarantees 90% beginner help",
+        ):
+            self.assertNotIn(unsupported_claim, normalized_skill)
+        self.assertLess(len(skill.splitlines()), 500)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -90,6 +90,38 @@ Broad financial-media ingestion, complete D2 portfolio construction, D3
 candidate selection and pre-purchase checks, and Phase E mature monitoring and
 sell timing are not implemented.
 
+## Held-Fund Review Preview (Phase 5)
+
+For one owner-selected held fund, first distinguish `continue_holding`,
+`reduce_to_cash`, or `full_exit`. Then use the authenticated preview route:
+
+```text
+fund brief exactly once
+-> fund intelligence exactly once
+-> thesis match-project exactly once
+-> optional thesis adjudicate at most once
+-> fund holding-review exactly once
+-> stop
+```
+
+The final review is local and network-free: it authenticates the exact stored
+brief and intelligence request-run IDs and does not fetch new evidence. Each
+command keeps its own independent budget. Never retry automatically. Never run
+Deep automatically. Never develop an adapter during the request. Stop after the
+review and present every gap.
+
+Run adjudication only after the owner explicitly confirms the meaning of the
+specific projected evidence. An acceptance token is not owner adjudication.
+Rapid title candidates cannot prove that a high-impact official event is absent.
+Deep official confirmation is deferred until the separately approved Deep
+stage. Therefore this preview fixes
+`official_negative_check_complete=false`, returns
+`official_confirmation_required`, permits only
+`review_disposition=abstain|manual_thesis_review_required`, and preserves
+`sell_timing=insufficient_data`, `action_authorized=false`,
+`exact_amount_available=false`, and `automatic_trade=false`. It cannot provide a
+sale date, amount, order, or a claim of 90% beginner help.
+
 ## Pragmatic News And Market Intelligence MVP
 
 Use the three bounded, JSON-only public-intelligence commands after a current
