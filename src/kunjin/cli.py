@@ -108,6 +108,15 @@ from kunjin.funds.service import (
 )
 from kunjin.funds.sources import FundTextClient
 from kunjin.funds.store import FundDisclosureStore
+from kunjin.holding_review.models import (
+    AdjudicationDecision,
+    ExitReason,
+    RemainderIntent,
+    UseOfProceeds,
+)
+from kunjin.holding_review.research import public_holding_review_payload
+from kunjin.holding_review.service import HoldingReviewServiceError
+from kunjin.holding_review.thesis import ThesisReviewError
 from kunjin.ledger.alipay import AlipayPaymentParser, requires_confirmation
 from kunjin.ledger.ocr import OcrError, VisionOcrClient
 from kunjin.ledger.reconcile import reconcile_fund
@@ -156,6 +165,8 @@ from kunjin.suitability.store import (
 
 if TYPE_CHECKING:
     from kunjin.brief.service import HeldFundBriefService
+    from kunjin.holding_review.service import HoldingReviewService
+    from kunjin.holding_review.thesis import ThesisReviewService
     from kunjin.intelligence.service import IntelligenceService
 
 _FUND_CODE = re.compile(r"^[0-9]{6}$")
@@ -315,6 +326,16 @@ class KunjinArgumentParser(argparse.ArgumentParser):
         raise CliUsageError(message)
 
 
+def _positive_cli_id(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("ID must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("ID must be a positive integer")
+    return parsed
+
+
 def _request_finish_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -345,6 +366,8 @@ class ApplicationContext:
     selection_service: Optional[ShortlistService] = None
     research_scope_service: Optional[ResearchScopeService] = None
     shortlist_readiness_service: Optional[ShortlistReadinessService] = None
+    thesis_review_service: Optional["ThesisReviewService"] = None
+    holding_review_service: Optional["HoldingReviewService"] = None
 
 
 def build_context(*, public_acceptance_subject: Optional[str] = None) -> ApplicationContext:
@@ -355,6 +378,9 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
         load_public_acceptance_capability,
     )
     from kunjin.brief.service import HeldFundBriefService
+    from kunjin.holding_review.service import HoldingReviewService
+    from kunjin.holding_review.store import HoldingReviewStore
+    from kunjin.holding_review.thesis import ThesisReviewService
     from kunjin.intelligence.service import IntelligenceService
     from kunjin.intelligence.store import IntelligenceStore
 
@@ -446,6 +472,8 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
         source_registry=source_registry,
         risk_store=fund_risk_store,
     )
+    intelligence_store = IntelligenceStore(repository, decision_audit_store)
+    holding_review_store = HoldingReviewStore(repository)
     return ApplicationContext(
         paths=paths,
         repository=repository,
@@ -486,7 +514,7 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
         intelligence_service=IntelligenceService(
             repository,
             decision_audit_store,
-            IntelligenceStore(repository, decision_audit_store),
+            intelligence_store,
             source_health_service,
             fund_disclosure_store,
         ),
@@ -509,6 +537,15 @@ def build_context(*, public_acceptance_subject: Optional[str] = None) -> Applica
             classification_loader=fund_risk_service.current_classification,
             suitability_status_loader=suitability_service.status,
             allocation_status_loader=allocation_service.status,
+        ),
+        thesis_review_service=ThesisReviewService(
+            repository,
+            holding_review_store=holding_review_store,
+        ),
+        holding_review_service=HoldingReviewService(
+            repository,
+            holding_review_store=holding_review_store,
+            intelligence_store=intelligence_store,
         ),
     )
 
@@ -716,6 +753,38 @@ def build_parser() -> argparse.ArgumentParser:
     fund_intelligence = fund_subparsers.add_parser("intelligence")
     fund_intelligence.add_argument("fund_code")
     _add_intelligence_arguments(fund_intelligence)
+    holding_review = fund_subparsers.add_parser("holding-review")
+    holding_review.add_argument("fund_code")
+    holding_review.add_argument(
+        "--action",
+        choices=[
+            ActionKind.CONTINUE_HOLDING.value,
+            ActionKind.REDUCE_TO_CASH.value,
+            ActionKind.FULL_EXIT.value,
+        ],
+        required=True,
+    )
+    holding_review.add_argument(
+        "--brief-request-run-id", type=_positive_cli_id, required=True
+    )
+    holding_review.add_argument(
+        "--intelligence-request-run-id", type=_positive_cli_id, required=True
+    )
+    holding_review.add_argument(
+        "--remainder-intent",
+        choices=[item.value for item in RemainderIntent],
+        default=RemainderIntent.UNKNOWN.value,
+    )
+    holding_review.add_argument(
+        "--exit-reason",
+        choices=[item.value for item in ExitReason],
+        default=ExitReason.UNKNOWN.value,
+    )
+    holding_review.add_argument(
+        "--use-of-proceeds",
+        choices=[item.value for item in UseOfProceeds],
+        default=UseOfProceeds.UNKNOWN.value,
+    )
 
     market = subparsers.add_parser("market")
     market_subparsers = market.add_subparsers(dest="market_command", required=True)
@@ -739,6 +808,22 @@ def build_parser() -> argparse.ArgumentParser:
     thesis_list.add_argument("--fund-code")
     thesis_review = thesis_subparsers.add_parser("review")
     thesis_review.add_argument("fund_code")
+    thesis_match_project = thesis_subparsers.add_parser("match-project")
+    thesis_match_project.add_argument("fund_code")
+    thesis_match_project.add_argument(
+        "--intelligence-request-run-id", type=_positive_cli_id, required=True
+    )
+    thesis_adjudicate = thesis_subparsers.add_parser("adjudicate")
+    thesis_adjudicate.add_argument("fund_code")
+    thesis_adjudicate.add_argument(
+        "--thesis-match-projection-id", type=_positive_cli_id, required=True
+    )
+    thesis_adjudicate.add_argument(
+        "--decision",
+        choices=[item.value for item in AdjudicationDecision],
+        required=True,
+    )
+    thesis_adjudicate.add_argument("--supersedes", type=_positive_cli_id)
 
     report = subparsers.add_parser("report")
     report_subparsers = report.add_subparsers(dest="report_command", required=True)
@@ -2789,6 +2874,58 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             ),
         )
 
+    if args.command == "fund" and args.fund_command == "holding-review":
+        if not args.json_output:
+            raise CliUsageError("fund holding-review requires JSON mode")
+        if context.holding_review_service is None:
+            raise CliUsageError("fund holding-review service is unavailable")
+        _validate_fund_code(args.fund_code)
+        outcome = context.holding_review_service.review(
+            args.fund_code,
+            action=ActionKind(args.action),
+            brief_request_run_id=args.brief_request_run_id,
+            intelligence_request_run_id=args.intelligence_request_run_id,
+            remainder_intent=RemainderIntent(args.remainder_intent),
+            exit_reason=ExitReason(args.exit_reason),
+            use_of_proceeds=UseOfProceeds(args.use_of_proceeds),
+        )
+        return envelope(
+            "fund.holding-review",
+            public_holding_review_payload(outcome),
+        )
+
+    if args.command == "thesis" and args.thesis_command == "match-project":
+        if not args.json_output:
+            raise CliUsageError("thesis match-project requires JSON mode")
+        if context.thesis_review_service is None:
+            raise CliUsageError("thesis review service is unavailable")
+        _validate_fund_code(args.fund_code)
+        stored = context.thesis_review_service.match_project(
+            args.fund_code,
+            args.intelligence_request_run_id,
+        )
+        return envelope(
+            "thesis.match-project",
+            {"id": stored.id, "projection": stored.value.to_canonical_dict()},
+        )
+
+    if args.command == "thesis" and args.thesis_command == "adjudicate":
+        if not args.json_output:
+            raise CliUsageError("thesis adjudicate requires JSON mode")
+        if context.thesis_review_service is None:
+            raise CliUsageError("thesis review service is unavailable")
+        _validate_fund_code(args.fund_code)
+        stored = context.thesis_review_service.adjudicate(
+            args.fund_code,
+            args.thesis_match_projection_id,
+            AdjudicationDecision(args.decision),
+            supersedes_id=args.supersedes,
+        )
+        return envelope(
+            "thesis.adjudicate",
+            {"id": stored.id, "adjudication": stored.value.to_canonical_dict()},
+        )
+
     if (
         (args.command == "news" and args.news_command == "recent")
         or (args.command == "market" and args.market_command == "overview")
@@ -3573,6 +3710,8 @@ def run(
         AllocationCalculationError,
         EncryptedProfileUnavailableError,
         RiskServiceError,
+        HoldingReviewServiceError,
+        ThesisReviewError,
         CliUsageError,
         ValueError,
     ) as exc:
@@ -3623,7 +3762,18 @@ def run(
 
 
 def _preflight_before_context(args: argparse.Namespace) -> None:
+    if args.command == "thesis" and args.thesis_command in {
+        "match-project",
+        "adjudicate",
+    }:
+        if not args.json_output:
+            raise CliUsageError(f"thesis {args.thesis_command} requires JSON mode")
+        return
     if args.command != "fund":
+        return
+    if args.fund_command == "holding-review":
+        if not args.json_output:
+            raise CliUsageError("fund holding-review requires JSON mode")
         return
     if args.fund_command == "research-scope":
         if not args.json_output:

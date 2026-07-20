@@ -35,6 +35,7 @@ from kunjin.holding_review.policy import (
     HELD_FUND_MANUAL_REVIEW_POLICY_V1_GOLDEN_CHECKSUM,
     HeldFundManualReviewPolicyV1,
 )
+from kunjin.holding_review.research import public_holding_review_payload
 
 __all__ = (
     "ActionReviewSourceSufficiency",
@@ -70,4 +71,5 @@ __all__ = (
     "TransientHoldingReviewOutcome",
     "TriggeredReviewCode",
     "UseOfProceeds",
+    "public_holding_review_payload",
 )

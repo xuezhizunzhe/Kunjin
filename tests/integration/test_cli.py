@@ -678,6 +678,203 @@ class CliIntegrationTest(unittest.TestCase):
             {"schema_version", "command", "as_of", "data", "warnings", "errors"},
         )
 
+    def test_holding_review_preview_commands_require_json_and_positive_ids(self) -> None:
+        parsed = build_parser().parse_args(
+            [
+                "--json",
+                "fund",
+                "holding-review",
+                "123456",
+                "--action",
+                "full_exit",
+                "--brief-request-run-id",
+                "11",
+                "--intelligence-request-run-id",
+                "12",
+                "--exit-reason",
+                "risk_reduction",
+                "--use-of-proceeds",
+                "cash_reserve",
+            ]
+        )
+        self.assertEqual(parsed.fund_command, "holding-review")
+        self.assertEqual(parsed.brief_request_run_id, 11)
+
+        for argv in (
+            ["thesis", "match-project", "123456", "--intelligence-request-run-id", "12"],
+            [
+                "thesis",
+                "adjudicate",
+                "123456",
+                "--thesis-match-projection-id",
+                "1",
+                "--decision",
+                "uncertain",
+            ],
+            [
+                "fund",
+                "holding-review",
+                "123456",
+                "--action",
+                "continue_holding",
+                "--brief-request-run-id",
+                "11",
+                "--intelligence-request-run-id",
+                "12",
+            ],
+        ):
+            payload, exit_code, _ = run(argv, self.context)
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "thesis",
+                "match-project",
+                "123456",
+                "--intelligence-request-run-id",
+                "0",
+            ],
+            self.context,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
+    def test_holding_review_preview_services_are_explicit_and_fail_closed(self) -> None:
+        payload, exit_code, _ = run(
+            [
+                "--json",
+                "thesis",
+                "match-project",
+                "123456",
+                "--intelligence-request-run-id",
+                "12",
+            ],
+            self.context,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
+    def test_holding_review_cli_passes_explicit_action_context(self) -> None:
+        from types import SimpleNamespace
+
+        from kunjin.holding_review.models import FlowStatus, TransientHoldingReviewOutcome
+
+        calls = []
+
+        class FakeHoldingReviewService:
+            def review(self, fund_code, **kwargs):
+                calls.append((fund_code, kwargs))
+                return TransientHoldingReviewOutcome(
+                    flow_status=FlowStatus.PARTIAL,
+                    review_snapshot=None,
+                    missing_snapshot_codes=("brief_snapshot_missing",),
+                )
+
+        self.context.holding_review_service = FakeHoldingReviewService()
+        self.context.thesis_review_service = SimpleNamespace()
+        payload, exit_code, json_output = run(
+            [
+                "--json",
+                "fund",
+                "holding-review",
+                "123456",
+                "--action",
+                "reduce_to_cash",
+                "--brief-request-run-id",
+                "11",
+                "--intelligence-request-run-id",
+                "12",
+                "--remainder-intent",
+                "retain_some",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(json_output)
+        self.assertEqual(payload["command"], "fund.holding-review")
+        self.assertFalse(payload["data"]["review_boundary"]["action_authorized"])
+        self.assertEqual(calls[0][0], "123456")
+        self.assertEqual(calls[0][1]["brief_request_run_id"], 11)
+        self.assertEqual(calls[0][1]["remainder_intent"].value, "retain_some")
+
+    def test_thesis_preview_cli_projects_then_adjudicates_only_explicitly(self) -> None:
+        from types import SimpleNamespace
+
+        calls = []
+
+        class PublicRecord:
+            def __init__(self, state):
+                self.state = state
+
+            def to_canonical_dict(self):
+                return {"state": self.state}
+
+        class FakeThesisReviewService:
+            def match_project(self, fund_code, request_run_id):
+                calls.append(("match", fund_code, request_run_id))
+                return SimpleNamespace(
+                    id=31,
+                    value=PublicRecord("possible_invalidation_match"),
+                )
+
+            def adjudicate(self, fund_code, projection_id, decision, supersedes_id=None):
+                calls.append(
+                    (
+                        "adjudicate",
+                        fund_code,
+                        projection_id,
+                        decision.value,
+                        supersedes_id,
+                    )
+                )
+                return SimpleNamespace(
+                    id=41,
+                    value=PublicRecord(decision.value),
+                )
+
+        self.context.thesis_review_service = FakeThesisReviewService()
+        matched, match_exit, _ = run(
+            [
+                "--json",
+                "thesis",
+                "match-project",
+                "123456",
+                "--intelligence-request-run-id",
+                "12",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(match_exit, 0)
+        self.assertEqual(matched["data"]["id"], 31)
+        self.assertEqual(calls, [("match", "123456", 12)])
+
+        adjudicated, adjudication_exit, _ = run(
+            [
+                "--json",
+                "thesis",
+                "adjudicate",
+                "123456",
+                "--thesis-match-projection-id",
+                "31",
+                "--decision",
+                "presented_match_rejected",
+                "--supersedes",
+                "40",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(adjudication_exit, 0)
+        self.assertEqual(adjudicated["data"]["id"], 41)
+        self.assertEqual(
+            calls[-1],
+            ("adjudicate", "123456", 31, "presented_match_rejected", 40),
+        )
+
     def test_pragmatic_intelligence_parser_and_thin_json_dispatch(self) -> None:
         self.assertEqual(
             build_parser().parse_args(["--json", "news", "recent"]).news_command,
