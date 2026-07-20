@@ -3607,6 +3607,178 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         self.assertIn("tests/unit/test_selection_service.py", script)
         self.assertIn("tests/unit/test_selection_research.py", script)
 
+    def test_phase5_acceptance_is_local_fault_only_and_non_authorizing(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts/run_phase5_acceptance.sh").read_text(
+            encoding="utf-8"
+        )
+        helper = (root / "scripts/phase5_acceptance.py").read_text(encoding="utf-8")
+        combined = script + "\n" + helper
+
+        self.assertIn("local|fault", script)
+        self.assertNotIn("engineering|owner", script)
+        self.assertIn('readonly PATH="/usr/bin:/bin"', script)
+        self.assertIn("unset PYTHONHOME PYTHONPATH", script)
+        self.assertIn("umask 077", script)
+        self.assertIn("mktemp -d /private/tmp/kunjin-phase5-acceptance", script)
+        self.assertIn("run_tracked", script)
+        self.assertIn("kill_process_group", script)
+        self.assertIn("sanitize_encoded_output", helper)
+        self.assertIn('"${PYTHON}" "${HELPER}" produce "${MODE}"', script)
+        self.assertIn('"${PYTHON}" "${HELPER}" validate "${MODE}"', script)
+        self.assertIn("MAX_CAPTURE_BYTES", script)
+        for phrase in (
+            '"official_negative_check_complete": False',
+            '"action_authorized": False',
+            '"exact_amount_available": False',
+            '"automatic_trade": False',
+            '"sell_timing": "insufficient_data"',
+            '"network_retries": 0',
+        ):
+            self.assertIn(phrase, combined)
+
+    def test_phase5_acceptance_declares_complete_fault_inventory(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        helper = (root / "scripts/phase5_acceptance.py").read_text(encoding="utf-8")
+
+        for fault in (
+            "fund_binding_mismatch",
+            "snapshot_corruption",
+            "brief_snapshot_missing",
+            "intelligence_snapshot_missing",
+            "thesis_missing",
+            "official_confirmation_missing",
+            "redemption_evidence_missing",
+            "tier_two_only",
+            "same_lineage_reprint",
+            "source_failed",
+            "coverage_reduced",
+            "stale_adjudication",
+            "history_corruption",
+            "repeated_request",
+            "privacy_shape",
+            "interrupt_cleanup",
+            "unexpected_exit",
+        ):
+            self.assertIn(fault, helper)
+
+    def test_phase5_acceptance_rejects_private_modes_before_python(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            scripts = repository / "scripts"
+            venv = repository / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            venv.mkdir(parents=True)
+            wrapper = scripts / "run_phase5_acceptance.sh"
+            shutil.copy2(root / "scripts/run_phase5_acceptance.sh", wrapper)
+            shutil.copy2(root / "scripts/phase5_acceptance.py", scripts)
+            wrapper.chmod(0o755)
+            marker = repository / "python-started"
+            fake_python = venv / "python"
+            fake_python.write_text(
+                "#!/bin/bash\nprintf started > \"${PHASE5_MARKER}\"\nexit 70\n",
+                encoding="ascii",
+            )
+            fake_python.chmod(0o755)
+            env = {**os.environ, "PHASE5_MARKER": str(marker)}
+
+            for mode in ("engineering", "owner", "deep"):
+                completed = subprocess.run(
+                    [str(wrapper), mode],
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=5,
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn(b"local|fault", completed.stderr)
+                self.assertFalse(marker.exists())
+
+    def test_phase5_acceptance_rejects_unexpected_child_exit(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            scripts = repository / "scripts"
+            venv = repository / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            venv.mkdir(parents=True)
+            wrapper = scripts / "run_phase5_acceptance.sh"
+            shutil.copy2(root / "scripts/run_phase5_acceptance.sh", wrapper)
+            shutil.copy2(root / "scripts/phase5_acceptance.py", scripts)
+            wrapper.chmod(0o755)
+            fake_python = venv / "python"
+            fake_python.write_text("#!/bin/bash\nexit 23\n", encoding="ascii")
+            fake_python.chmod(0o755)
+
+            completed = subprocess.run(
+                [str(wrapper), "fault"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5,
+            )
+
+            self.assertEqual(completed.returncode, 70)
+            self.assertEqual(completed.stdout, b"")
+            self.assertIn(b"phase5_acceptance_tests_failed", completed.stderr)
+
+    def test_phase5_acceptance_interrupt_cleans_process_group(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            scripts = repository / "scripts"
+            venv = repository / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            venv.mkdir(parents=True)
+            wrapper = scripts / "run_phase5_acceptance.sh"
+            shutil.copy2(root / "scripts/run_phase5_acceptance.sh", wrapper)
+            shutil.copy2(root / "scripts/phase5_acceptance.py", scripts)
+            wrapper.chmod(0o755)
+            marker = repository / "children.txt"
+            fake_python = venv / "python"
+            fake_python.write_text(
+                "#!/bin/bash\n"
+                "trap '' TERM INT HUP\n"
+                "printf '%s\\n' \"$$\" > \"${PHASE5_SIGNAL_MARKER}\"\n"
+                "/bin/bash -c 'trap \"\" TERM INT HUP; printf \"%s\\n\" \"$$\" >> "
+                "\"${PHASE5_SIGNAL_MARKER}\"; while :; do /bin/sleep 1; done' &\n"
+                "while :; do /bin/sleep 1; done\n",
+                encoding="ascii",
+            )
+            fake_python.chmod(0o755)
+            env = {**os.environ, "PHASE5_SIGNAL_MARKER": str(marker)}
+            process = subprocess.Popen(
+                [str(wrapper), "fault"],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(marker.exists())
+            process.send_signal(signal.SIGTERM)
+            process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 130)
+            child_pids = [int(value) for value in marker.read_text().splitlines()]
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if all(not self._process_exists(pid) for pid in child_pids):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(all(not self._process_exists(pid) for pid in child_pids))
+
+    @staticmethod
+    def _process_exists(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
     def test_phase41_acceptance_owner_and_private_file_contract_fail_closed(self) -> None:
         root = Path(__file__).resolve().parents[1]
         script = (root / "scripts/run_phase41_acceptance.sh").read_text(
