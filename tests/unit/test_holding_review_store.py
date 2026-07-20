@@ -101,7 +101,7 @@ def context(tmp_path: Path):
         fund_code="123456",
         rationale="Long-term learning thesis.",
         horizon="Three years.",
-        invalidation="Policy support is withdrawn.",
+        invalidation="Authenticated excerpt item_one",
         created_at=NOW - timedelta(days=30),
     )
     thesis_id = repository.add_thesis(thesis)
@@ -138,7 +138,9 @@ def desired_projection(context, **changes: object) -> ThesisMatchProjection:
         intelligence_snapshot_id=intelligence.id,
         intelligence_snapshot_checksum=intelligence.result_checksum,
         matcher_policy_version="1",
-        matcher_policy_checksum="d" * 64,
+        matcher_policy_checksum=hashlib.sha256(
+            canonical_json_bytes({"version": "1"})
+        ).hexdigest(),
         projection_state=ThesisMatchProjectionState.POSSIBLE_INVALIDATION_MATCH,
         evidence_descriptors=(evidence,),
         evidence_set_checksum="a" * 64,
@@ -262,6 +264,15 @@ def test_projection_round_trip_and_semantic_idempotency(context) -> None:
     later = replace(later, record_checksum=later.expected_record_checksum())
     assert store.publish_thesis_match(later) == stored
     assert store.latest_thesis_match("123456", context["intelligence_run_id"]) == stored
+
+
+def test_authenticated_thesis_match_reads_exact_positive_id(context) -> None:
+    store = context["store"]
+    stored = store.publish_thesis_match(desired_projection(context))
+
+    assert store.authenticated_thesis_match(stored.id) == stored
+    with pytest.raises(HoldingReviewStoreError, match="authentication failed"):
+        store.authenticated_thesis_match(stored.id + 1)
 
 
 def test_projection_rejects_wrong_subject_and_checksum_drift(context) -> None:
@@ -661,7 +672,7 @@ def test_review_rejects_cross_thesis_previous_pointer(context) -> None:
         fund_code="123456",
         rationale="Replacement long-term thesis.",
         horizon="Five years.",
-        invalidation="The replacement condition fails.",
+        invalidation="Authenticated excerpt item_one",
         created_at=NOW - timedelta(days=1),
     )
     thesis_id = context["repository"].add_thesis(thesis)

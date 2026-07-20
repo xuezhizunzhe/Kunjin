@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Mapping, Optional
@@ -44,6 +46,7 @@ from kunjin.intelligence.models import (
     IntelligenceWorkflow,
     LineageEdge,
     LineageKind,
+    NewsItem,
 )
 from kunjin.intelligence.store import (
     IntelligenceStore,
@@ -91,6 +94,13 @@ class StoredThesisMatchProjection:
 class StoredThesisEvidenceAdjudication:
     id: int
     value: ThesisEvidenceAdjudication
+
+
+@dataclass(frozen=True)
+class AuthenticatedThesisProjectionInputs:
+    intelligence: StoredIntelligenceSnapshot
+    items: tuple[NewsItem, ...]
+    evidence_descriptors: tuple[ReviewEvidenceItem, ...]
 
 
 @dataclass(frozen=True)
@@ -233,6 +243,70 @@ class HoldingReviewStore:
         except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
             raise HoldingReviewStoreError("thesis match projection authentication failed") from None
 
+    def authenticated_thesis_match(
+        self,
+        projection_id: int,
+    ) -> StoredThesisMatchProjection:
+        _positive_id(projection_id, "projection id")
+        try:
+            with self.repository.connect() as connection:
+                stored = self._projection_by_id(connection, projection_id)
+                self._authenticate_projection_references(connection, stored.value)
+                return stored
+        except HoldingReviewStoreError:
+            raise
+        except (BriefStoreError, IntelligenceStoreError, sqlite3.DatabaseError):
+            raise HoldingReviewStoreError(
+                "thesis match projection authentication failed"
+            ) from None
+        except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
+            raise HoldingReviewStoreError(
+                "thesis match projection authentication failed"
+            ) from None
+
+    def authenticated_thesis_projection_inputs(
+        self,
+        request_run_id: int,
+    ) -> AuthenticatedThesisProjectionInputs:
+        _positive_id(request_run_id, "request run id")
+        try:
+            with self.repository.connect() as connection:
+                intelligence = self._intelligence_by_request(connection, request_run_id)
+                descriptors = self._derived_evidence_descriptors(connection, intelligence)
+                items = []
+                for item_id in intelligence.snapshot.item_ids:
+                    row = connection.execute(
+                        "SELECT id FROM intelligence_news_items WHERE item_key=?",
+                        (item_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise HoldingReviewStoreError(
+                            "thesis projection input authentication failed"
+                        )
+                    items.append(
+                        self.intelligence_store._authenticated_item(
+                            connection, int(row["id"])
+                        )
+                    )
+                ordered_descriptors = tuple(
+                    descriptors[item_id] for item_id in intelligence.snapshot.item_ids
+                )
+                return AuthenticatedThesisProjectionInputs(
+                    intelligence=intelligence,
+                    items=tuple(items),
+                    evidence_descriptors=ordered_descriptors,
+                )
+        except HoldingReviewStoreError:
+            raise
+        except (BriefStoreError, IntelligenceStoreError, sqlite3.DatabaseError):
+            raise HoldingReviewStoreError(
+                "thesis projection input authentication failed"
+            ) from None
+        except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
+            raise HoldingReviewStoreError(
+                "thesis projection input authentication failed"
+            ) from None
+
     def publish_adjudication(
         self,
         value: ThesisEvidenceAdjudication,
@@ -249,6 +323,18 @@ class HoldingReviewStore:
                     )
                     self._authenticate_projection_references(connection, projection.value)
                     self._authenticate_adjudication_projection(value, projection)
+                    current = self._current_adjudication_row(
+                        connection, value.thesis_match_projection_id
+                    )
+                    if current is not None:
+                        current_stored = self._stored_adjudication(current)
+                        if (
+                            current_stored.value.decision is value.decision
+                            and value.superseded_adjudication_id
+                            in (None, current_stored.id)
+                        ):
+                            connection.commit()
+                            return current_stored
                     existing = self._adjudication_identity_row(connection, value)
                     if existing is not None:
                         stored = self._stored_adjudication(existing)
@@ -258,11 +344,15 @@ class HoldingReviewStore:
                             raise HoldingReviewStoreError(
                                 "thesis evidence adjudication authentication failed"
                             )
+                        current = self._current_adjudication_row(
+                            connection, value.thesis_match_projection_id
+                        )
+                        if current is None or int(current["id"]) != stored.id:
+                            raise HoldingReviewStoreError(
+                                "thesis evidence adjudication supersession failed"
+                            )
                         connection.commit()
                         return stored
-                    current = self._current_adjudication_row(
-                        connection, value.thesis_match_projection_id
-                    )
                     if value.superseded_adjudication_id is None:
                         if current is not None:
                             raise HoldingReviewStoreError(
@@ -506,6 +596,7 @@ class HoldingReviewStore:
             or intelligence.snapshot.subject_fund_code != value.fund_code
         ):
             raise HoldingReviewStoreError("thesis match projection binding failed")
+        thesis = None
         if value.thesis_id is not None:
             thesis = _authenticated_thesis(
                 connection,
@@ -524,16 +615,53 @@ class HoldingReviewStore:
         elif require_active_thesis:
             _authenticate_no_active_thesis(connection, value.fund_code)
         derived = self._derived_evidence_descriptors(connection, intelligence)
+        items = self._authenticated_projection_items(connection, intelligence)
+        expected_policy_checksum = _thesis_matcher_policy_v1_checksum()
+        if (
+            value.matcher_policy_version != "1"
+            or value.matcher_policy_checksum != expected_policy_checksum
+        ):
+            raise HoldingReviewStoreError("thesis matcher policy authentication failed")
+        matched_ids = () if thesis is None else _v1_thesis_match_item_ids(thesis, items)
+        expected_state = (
+            ThesisMatchProjectionState.THESIS_MISSING
+            if thesis is None
+            else (
+                ThesisMatchProjectionState.POSSIBLE_INVALIDATION_MATCH
+                if matched_ids
+                else ThesisMatchProjectionState.NO_MATCHING_EVIDENCE
+            )
+        )
         try:
-            expected = tuple(derived[item.evidence_id] for item in value.evidence_descriptors)
+            expected = tuple(derived[item_id] for item_id in matched_ids)
         except KeyError:
             raise HoldingReviewStoreError(
                 "thesis match projection evidence descriptor authentication failed"
             ) from None
-        if expected != value.evidence_descriptors:
+        if expected_state is not value.projection_state or expected != value.evidence_descriptors:
             raise HoldingReviewStoreError(
                 "thesis match projection evidence descriptor authentication failed"
             )
+
+    def _authenticated_projection_items(
+        self,
+        connection: sqlite3.Connection,
+        intelligence: StoredIntelligenceSnapshot,
+    ) -> tuple[NewsItem, ...]:
+        items = []
+        for item_id in intelligence.snapshot.item_ids:
+            row = connection.execute(
+                "SELECT id FROM intelligence_news_items WHERE item_key=?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise HoldingReviewStoreError(
+                    "thesis projection input authentication failed"
+                )
+            items.append(
+                self.intelligence_store._authenticated_item(connection, int(row["id"]))
+            )
+        return tuple(items)
 
     def _authenticate_review_references(
         self,
@@ -1110,6 +1238,17 @@ def _authenticated_thesis(
     value.validate()
     if require_active and not value.active:
         raise HoldingReviewStoreError("active thesis authentication failed")
+    if require_active:
+        latest = connection.execute(
+            """
+            SELECT id FROM investment_theses
+            WHERE fund_code=? AND active=1
+            ORDER BY created_at DESC, id DESC LIMIT 1
+            """,
+            (value.fund_code,),
+        ).fetchone()
+        if latest is None or int(latest["id"]) != thesis_id:
+            raise HoldingReviewStoreError("latest active thesis authentication failed")
     return value
 
 
@@ -1123,6 +1262,29 @@ def _authenticate_no_active_thesis(
     ).fetchone()
     if row is None or type(row["count"]) is not int or row["count"] != 0:
         raise HoldingReviewStoreError("active thesis absence authentication failed")
+
+
+def _thesis_matcher_policy_v1_checksum() -> str:
+    return hashlib.sha256(canonical_json_bytes({"version": "1"})).hexdigest()
+
+
+def _v1_thesis_match_item_ids(
+    thesis: InvestmentThesis,
+    items: tuple[NewsItem, ...],
+) -> tuple[str, ...]:
+    needle = _normalized_match_text(thesis.invalidation)
+    return tuple(
+        sorted(
+            item.item_id
+            for item in items
+            if needle
+            in _normalized_match_text(f"{item.title} {item.excerpt or ''}")
+        )
+    )
+
+
+def _normalized_match_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).split())
 
 
 def _derive_lineage_states(
