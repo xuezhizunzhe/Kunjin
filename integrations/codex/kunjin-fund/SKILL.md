@@ -74,7 +74,9 @@ profile-conflict codes plus their local correction conditions.
 
 For one currently held fund question, select one owner-selected held fund and
 one action: `continue_holding`, `reduce_to_cash`, or `full_exit`. A switch must
-still be split into its reduction and purchase legs. Run this finite route:
+still be split into its reduction and purchase legs.
+For `continue_holding` only, run JSON suitability status exactly once before fund brief. If both state and freshness are fresh, continue; if either is missing or stale, run JSON suitability assess exactly once from the existing encrypted local profile.
+Do not rerun suitability status. If suitability status or assessment fails, do not retry; continue to the single brief. Never run non-JSON `suitability assess`, request profile amounts, or ask the owner to refill a still-fresh profile. reduce_to_cash and full_exit skip this Phase B preflight. Run this finite route:
 
 ```bash
 kunjin --json fund brief CODE --action ACTION --mode rapid

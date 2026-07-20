@@ -3983,6 +3983,17 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
 
         normalized_skill = normalized_documents[1]
         self.assertIn("only after the owner explicitly confirms", normalized_skill)
+        for required in (
+            "suitability status exactly once before fund brief",
+            "suitability assess exactly once",
+            "Do not rerun suitability status",
+            "reduce_to_cash and full_exit skip this Phase B preflight",
+            (
+                "If suitability status or assessment fails, do not retry; "
+                "continue to the single brief"
+            ),
+        ):
+            self.assertIn(required, normalized_skill)
         for unsupported_claim in (
             "未发现公告就表示没有重大风险",
             "provides 90% beginner help",
