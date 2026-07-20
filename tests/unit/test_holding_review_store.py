@@ -232,6 +232,20 @@ def desired_review(context, projection, adjudication, **changes: object):
     return value
 
 
+def review_with_result(value: HoldingReviewSnapshot, **changes: object):
+    result = replace(value.result, **changes)
+    updated = replace(
+        value,
+        result=result,
+        result_fingerprint=result.expected_result_fingerprint(),
+    )
+    updated = replace(
+        updated,
+        semantic_identity_checksum=updated.expected_semantic_identity_checksum(),
+    )
+    return replace(updated, record_checksum=updated.expected_record_checksum())
+
+
 def test_preview_store_has_no_official_publish_api(context) -> None:
     store = context["store"]
     assert callable(store.publish_thesis_match)
@@ -372,6 +386,76 @@ def test_review_rejects_superseded_adjudication(context) -> None:
 
     with pytest.raises(HoldingReviewStoreError, match="current adjudication"):
         store.publish_review(desired_review(context, projection, first))
+
+
+@pytest.mark.parametrize(
+    "forged_state",
+    (
+        ThesisMatchState.PRESENTED_MATCH_CONFIRMED,
+        ThesisMatchState.MANUAL_REVIEW_UNCERTAIN,
+    ),
+)
+def test_review_rejects_thesis_state_forged_from_rejected_adjudication(
+    context,
+    forged_state,
+) -> None:
+    store = context["store"]
+    projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = store.publish_adjudication(desired_adjudication(context, projection))
+    forged = review_with_result(
+        desired_review(context, projection, adjudication),
+        thesis_review_state=forged_state,
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="thesis review state"):
+        store.publish_review(forged)
+
+
+def test_review_rejects_projection_state_forged_without_adjudication(context) -> None:
+    store = context["store"]
+    projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = holding_store_module.StoredThesisEvidenceAdjudication(
+        id=999,
+        value=desired_adjudication(context, projection),
+    )
+    forged = desired_review(
+        context,
+        projection,
+        adjudication,
+        adjudication_state=BindingState.MISSING,
+        adjudication_id=None,
+        adjudication_checksum=None,
+    )
+    forged = review_with_result(
+        forged,
+        thesis_review_state=ThesisMatchState.NO_MATCHING_EVIDENCE,
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="thesis review state"):
+        store.publish_review(forged)
+
+
+def test_review_rejects_missing_bound_and_unknown_evidence(context) -> None:
+    store = context["store"]
+    projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = store.publish_adjudication(desired_adjudication(context, projection))
+    value = desired_review(context, projection, adjudication)
+    missing_bound = review_with_result(
+        value,
+        evidence_ids=(),
+        action_review_source_sufficiency=(
+            ActionReviewSourceSufficiency.INSUFFICIENT_DATA
+        ),
+    )
+    unknown = review_with_result(
+        value,
+        evidence_ids=("item_one", "unknown_evidence"),
+    )
+
+    with pytest.raises(HoldingReviewStoreError, match="bound evidence"):
+        store.publish_review(missing_bound)
+    with pytest.raises(HoldingReviewStoreError, match="authenticated evidence"):
+        store.publish_review(unknown)
 
 
 def test_legacy_drifted_projection_fails_on_every_decision_read_path(context) -> None:

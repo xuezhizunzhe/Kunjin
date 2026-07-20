@@ -57,6 +57,24 @@ MAX_REVIEW_JSON_BYTES = 4 * 1024 * 1024
 _ORIGIN_PROVING_LINEAGE_KINDS = frozenset(
     (LineageKind.DIRECT_QUOTE, LineageKind.REPRINT)
 )
+_ADJUDICATION_REVIEW_STATES = {
+    AdjudicationDecision.PRESENTED_MATCH_CONFIRMED: (
+        ThesisMatchState.PRESENTED_MATCH_CONFIRMED
+    ),
+    AdjudicationDecision.PRESENTED_MATCH_REJECTED: (
+        ThesisMatchState.PRESENTED_MATCH_REJECTED
+    ),
+    AdjudicationDecision.UNCERTAIN: ThesisMatchState.MANUAL_REVIEW_UNCERTAIN,
+}
+_PROJECTION_REVIEW_STATES = {
+    ThesisMatchProjectionState.THESIS_MISSING: ThesisMatchState.THESIS_MISSING,
+    ThesisMatchProjectionState.NO_MATCHING_EVIDENCE: (
+        ThesisMatchState.NO_MATCHING_EVIDENCE
+    ),
+    ThesisMatchProjectionState.POSSIBLE_INVALIDATION_MATCH: (
+        ThesisMatchState.MANUAL_REVIEW_PENDING
+    ),
+}
 
 
 class HoldingReviewStoreError(RuntimeError):
@@ -579,6 +597,7 @@ class HoldingReviewStore:
                 raise HoldingReviewStoreError("holding review snapshot binding failed")
         elif require_current_adjudication:
             _authenticate_no_active_thesis(connection, value.fund_code)
+        adjudication_value = None
         if value.adjudication_id is not None:
             row = connection.execute(
                 "SELECT * FROM thesis_evidence_adjudications WHERE id=?",
@@ -587,6 +606,7 @@ class HoldingReviewStore:
             if row is None:
                 raise HoldingReviewStoreError("holding review snapshot binding failed")
             adjudication = self._stored_adjudication(row)
+            adjudication_value = adjudication.value
             if (
                 adjudication.value.record_checksum != value.adjudication_checksum
                 or adjudication.value.thesis_match_projection_id != projection.id
@@ -599,6 +619,42 @@ class HoldingReviewStore:
                     raise HoldingReviewStoreError(
                         "holding review requires the unique current adjudication"
                     )
+        elif require_current_adjudication and (
+            self._current_adjudication_row(connection, projection.id) is not None
+        ):
+            raise HoldingReviewStoreError(
+                "holding review omitted the current adjudication"
+            )
+        expected_thesis_state = (
+            _PROJECTION_REVIEW_STATES[projection.value.projection_state]
+            if adjudication_value is None
+            else _ADJUDICATION_REVIEW_STATES[adjudication_value.decision]
+        )
+        if value.result.thesis_review_state is not expected_thesis_state:
+            raise HoldingReviewStoreError(
+                "holding review thesis review state authentication failed"
+            )
+        authenticated_evidence = self._derived_evidence_descriptors(
+            connection,
+            intelligence,
+        )
+        bound_evidence_ids = set(projection.value.evidence_ids)
+        if adjudication_value is not None:
+            bound_evidence_ids.update(adjudication_value.evidence_ids)
+        result_evidence_ids = set(value.result.evidence_ids)
+        if not bound_evidence_ids.issubset(result_evidence_ids):
+            raise HoldingReviewStoreError(
+                "holding review result omits bound evidence"
+            )
+        official_support_ids = {
+            reference.support_evidence_id
+            for reference in value.result.official_event_evidence
+        }
+        non_official_ids = result_evidence_ids.difference(official_support_ids)
+        if not non_official_ids.issubset(authenticated_evidence):
+            raise HoldingReviewStoreError(
+                "holding review result contains unauthenticated evidence"
+            )
         if value.previous_review_id is not None:
             row = connection.execute(
                 "SELECT * FROM holding_review_snapshots WHERE id=?",
