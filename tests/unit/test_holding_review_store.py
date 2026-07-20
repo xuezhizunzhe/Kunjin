@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import kunjin.holding_review.store as holding_store_module
 from kunjin.brief.models import thesis_record_fingerprint
 from kunjin.brief.store import BriefStore
 from kunjin.decision.models import ActionKind, RequestTerminalStatus, canonical_json_bytes
@@ -33,6 +34,7 @@ from kunjin.intelligence.models import (
     EventType,
     IntegrityState,
     IntelligenceWorkflow,
+    LineageEdge,
     LineageKind,
     NewsEvent,
 )
@@ -117,7 +119,7 @@ def context(tmp_path: Path):
 
 def desired_projection(context, **changes: object) -> ThesisMatchProjection:
     evidence = ReviewEvidenceItem(
-        evidence_id="item_two",
+        evidence_id="item_one",
         source_tier=1,
         lineage_kind=LineageKind.DIRECT_QUOTE,
         current=True,
@@ -152,7 +154,7 @@ def desired_projection(context, **changes: object) -> ThesisMatchProjection:
 
 
 def desired_adjudication(context, projection, **changes: object):
-    evidence_ids = ("item_two",)
+    evidence_ids = ("item_one",)
     value = ThesisEvidenceAdjudication(
         fund_code="123456",
         thesis_id=context["thesis_id"],
@@ -189,7 +191,7 @@ def desired_review(context, projection, adjudication, **changes: object):
             else RedemptionFeasibility.INSUFFICIENT_DATA
         ),
         official_negative_check_complete=False,
-        evidence_ids=("item_two",),
+        evidence_ids=("item_one",),
         policy_version=policy.version,
         policy_checksum=policy.checksum(),
         created_at=NOW + timedelta(seconds=2),
@@ -280,6 +282,36 @@ def test_projection_rejects_contradictory_clean_direct_and_original_claims(conte
             context["store"].publish_thesis_match(value)
 
 
+def test_lineage_direction_requires_structural_proof() -> None:
+    edge = LineageEdge(
+        edge_id="edge_reprint",
+        from_item_id="derivative",
+        to_item_id="source",
+        kind=LineageKind.REPRINT,
+        evidence_ids=("derivative", "source"),
+    )
+    ambiguous_one = replace(edge, edge_id="edge_one", to_item_id="source_one")
+    ambiguous_two = replace(edge, edge_id="edge_two", to_item_id="source_two")
+
+    derived = holding_store_module._derive_lineage_states(
+        ("derivative", "isolated", "source"),
+        (edge,),
+        graph_complete=True,
+    )
+    ambiguous = holding_store_module._derive_lineage_states(
+        ("derivative", "source_one", "source_two"),
+        (ambiguous_one, ambiguous_two),
+        graph_complete=True,
+    )
+
+    assert derived["derivative"] == (LineageKind.REPRINT, True)
+    assert derived["source"] == (LineageKind.ORIGINAL, True)
+    assert derived["isolated"] == (LineageKind.UNKNOWN, False)
+    assert ambiguous["derivative"] == (LineageKind.UNKNOWN, False)
+    assert ambiguous["source_one"] == (LineageKind.UNKNOWN, False)
+    assert ambiguous["source_two"] == (LineageKind.UNKNOWN, False)
+
+
 @pytest.mark.parametrize("request_run_id", [True, 0, -1])
 def test_latest_projection_rejects_nonpositive_or_bool_id(context, request_run_id) -> None:
     with pytest.raises(ValueError, match="positive exact integer"):
@@ -330,6 +362,94 @@ def test_review_rejects_superseded_adjudication(context) -> None:
 
     with pytest.raises(HoldingReviewStoreError, match="current adjudication"):
         store.publish_review(desired_review(context, projection, first))
+
+
+def test_legacy_drifted_projection_fails_on_every_decision_read_path(context) -> None:
+    store = context["store"]
+    evidence = desired_projection(context).evidence_descriptors[0]
+    drifted_evidence = replace(evidence, direct_subject_binding=True)
+    drifted = replace(
+        desired_projection(context),
+        evidence_descriptors=(drifted_evidence,),
+        evidence_set_checksum="a" * 64,
+        record_checksum="a" * 64,
+    )
+    drifted = replace(drifted, evidence_set_checksum=drifted.expected_evidence_set_checksum())
+    drifted = replace(drifted, record_checksum=drifted.expected_record_checksum())
+    with context["repository"].connect() as connection, connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO thesis_match_projections(
+                fund_code, thesis_id, thesis_fingerprint,
+                intelligence_request_run_id, intelligence_snapshot_id,
+                intelligence_snapshot_checksum, matcher_policy_version,
+                matcher_policy_checksum, projection_state, evidence_ids_json,
+                evidence_descriptors_json, evidence_set_checksum, created_at,
+                record_checksum
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                drifted.fund_code,
+                drifted.thesis_id,
+                drifted.thesis_fingerprint,
+                drifted.intelligence_request_run_id,
+                drifted.intelligence_snapshot_id,
+                drifted.intelligence_snapshot_checksum,
+                drifted.matcher_policy_version,
+                drifted.matcher_policy_checksum,
+                drifted.projection_state.value,
+                canonical_json_bytes(drifted.evidence_ids).decode("ascii"),
+                canonical_json_bytes(
+                    tuple(item.to_canonical_dict() for item in drifted.evidence_descriptors)
+                ).decode("ascii"),
+                drifted.evidence_set_checksum,
+                drifted.created_at.isoformat(),
+                drifted.record_checksum,
+            ),
+        )
+        projection_row = connection.execute(
+            "SELECT * FROM thesis_match_projections WHERE id=?", (int(cursor.lastrowid),)
+        ).fetchone()
+        projection = store._stored_projection(projection_row)
+        adjudication = desired_adjudication(context, projection)
+        adjudication_cursor = connection.execute(
+            """
+            INSERT INTO thesis_evidence_adjudications(
+                fund_code, thesis_id, thesis_fingerprint,
+                thesis_match_projection_id, thesis_match_projection_checksum,
+                intelligence_request_run_id, intelligence_snapshot_checksum,
+                evidence_ids_json, evidence_set_checksum, decision,
+                superseded_adjudication_id, created_at, record_checksum
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                adjudication.fund_code,
+                adjudication.thesis_id,
+                adjudication.thesis_fingerprint,
+                adjudication.thesis_match_projection_id,
+                adjudication.thesis_match_projection_checksum,
+                adjudication.intelligence_request_run_id,
+                adjudication.intelligence_snapshot_checksum,
+                canonical_json_bytes(adjudication.evidence_ids).decode("ascii"),
+                adjudication.evidence_set_checksum,
+                adjudication.decision.value,
+                adjudication.superseded_adjudication_id,
+                adjudication.created_at.isoformat(),
+                adjudication.record_checksum,
+            ),
+        )
+        adjudication_row = connection.execute(
+            "SELECT * FROM thesis_evidence_adjudications WHERE id=?",
+            (int(adjudication_cursor.lastrowid),),
+        ).fetchone()
+        stored_adjudication = store._stored_adjudication(adjudication_row)
+
+    with pytest.raises(HoldingReviewStoreError, match="evidence descriptor"):
+        store.current_adjudication(projection.id)
+    with pytest.raises(HoldingReviewStoreError, match="evidence descriptor"):
+        store.publish_review(
+            desired_review(context, projection, stored_adjudication)
+        )
 
 
 def test_review_round_trip_previous_binding_and_privacy(context) -> None:
@@ -538,6 +658,45 @@ def test_latest_comparable_review_supports_missing_thesis(context) -> None:
         None,
         HeldFundManualReviewPolicyV1().checksum(),
     ) == stored
+
+
+def test_historical_review_survives_adjudication_supersession_and_thesis_replacement(
+    context,
+) -> None:
+    store = context["store"]
+    projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = store.publish_adjudication(desired_adjudication(context, projection))
+    review = store.publish_review(desired_review(context, projection, adjudication))
+    store.publish_adjudication(
+        desired_adjudication(
+            context,
+            projection,
+            decision=AdjudicationDecision.PRESENTED_MATCH_CONFIRMED,
+            superseded_adjudication_id=adjudication.id,
+            created_at=NOW + timedelta(seconds=4),
+        )
+    )
+    with context["repository"].connect() as connection, connection:
+        connection.execute(
+            "UPDATE investment_theses SET active=0 WHERE id=?",
+            (context["thesis_id"],),
+        )
+    context["repository"].add_thesis(
+        InvestmentThesis(
+            fund_code="123456",
+            rationale="Replacement thesis.",
+            horizon="Five years.",
+            invalidation="Replacement invalidation.",
+            created_at=NOW,
+        )
+    )
+
+    assert store.latest_comparable_review(
+        "123456",
+        ActionKind.CONTINUE_HOLDING,
+        context["thesis_fingerprint"],
+        HeldFundManualReviewPolicyV1().checksum(),
+    ) == review
 
 
 def test_review_rejects_wrong_action_and_unknown_previous_review(context) -> None:

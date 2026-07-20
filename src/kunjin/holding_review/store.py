@@ -42,6 +42,7 @@ from kunjin.intelligence.models import (
     EventEntityRelationship,
     IntegrityState,
     IntelligenceWorkflow,
+    LineageEdge,
     LineageKind,
 )
 from kunjin.intelligence.store import (
@@ -313,6 +314,7 @@ class HoldingReviewStore:
                     return None
                 stored = self._stored_adjudication(row)
                 projection = self._projection_by_id(connection, projection_id)
+                self._authenticate_projection_references(connection, projection.value)
                 self._authenticate_adjudication_projection(stored.value, projection)
                 return stored
         except HoldingReviewStoreError:
@@ -467,7 +469,11 @@ class HoldingReviewStore:
             raise HoldingReviewStoreError("holding review snapshot authentication failed") from None
 
     def _authenticate_projection_references(
-        self, connection: sqlite3.Connection, value: ThesisMatchProjection
+        self,
+        connection: sqlite3.Connection,
+        value: ThesisMatchProjection,
+        *,
+        require_active_thesis: bool = True,
     ) -> None:
         intelligence = self._intelligence_by_request(
             connection, value.intelligence_request_run_id
@@ -480,10 +486,18 @@ class HoldingReviewStore:
         ):
             raise HoldingReviewStoreError("thesis match projection binding failed")
         if value.thesis_id is not None:
-            thesis = _active_thesis(connection, value.thesis_id)
+            thesis = _authenticated_thesis(
+                connection,
+                value.thesis_id,
+                require_active=require_active_thesis,
+            )
+            fingerprint_thesis = (
+                thesis if require_active_thesis else replace(thesis, active=True)
+            )
             if (
                 thesis.fund_code != value.fund_code
-                or thesis_record_fingerprint(value.thesis_id, thesis) != value.thesis_fingerprint
+                or thesis_record_fingerprint(value.thesis_id, fingerprint_thesis)
+                != value.thesis_fingerprint
             ):
                 raise HoldingReviewStoreError("thesis match projection binding failed")
         derived = self._derived_evidence_descriptors(connection, intelligence)
@@ -529,6 +543,11 @@ class HoldingReviewStore:
         ):
             raise HoldingReviewStoreError("holding review snapshot binding failed")
         projection = self._projection_by_id(connection, value.thesis_match_projection_id)
+        self._authenticate_projection_references(
+            connection,
+            projection.value,
+            require_active_thesis=require_current_adjudication,
+        )
         if (
             projection.value.record_checksum != value.thesis_match_projection_checksum
             or projection.value.fund_code != value.fund_code
@@ -537,10 +556,19 @@ class HoldingReviewStore:
         ):
             raise HoldingReviewStoreError("holding review snapshot binding failed")
         if value.active_thesis_id is not None:
-            thesis = _active_thesis(connection, value.active_thesis_id)
+            thesis = _authenticated_thesis(
+                connection,
+                value.active_thesis_id,
+                require_active=require_current_adjudication,
+            )
+            fingerprint_thesis = (
+                thesis
+                if require_current_adjudication
+                else replace(thesis, active=True)
+            )
             if (
                 thesis.fund_code != value.fund_code
-                or thesis_record_fingerprint(value.active_thesis_id, thesis)
+                or thesis_record_fingerprint(value.active_thesis_id, fingerprint_thesis)
                 != value.active_thesis_fingerprint
             ):
                 raise HoldingReviewStoreError("holding review snapshot binding failed")
@@ -637,9 +665,7 @@ class HoldingReviewStore:
             (snapshot.request_run_id,),
         ).fetchone()
         graph_complete = run is not None and run["status"] == "complete"
-        incoming: dict[str, list[LineageKind]] = {
-            item_id: [] for item_id in snapshot.item_ids
-        }
+        edges = []
         for edge_id in snapshot.lineage_edge_ids:
             row = connection.execute(
                 "SELECT * FROM intelligence_lineage_edges WHERE edge_key=?",
@@ -650,8 +676,12 @@ class HoldingReviewStore:
                     "thesis match projection evidence descriptor authentication failed"
                 )
             edge = self.intelligence_store._lineage_from_authenticated_row(connection, row)
-            if edge.to_item_id in incoming:
-                incoming[edge.to_item_id].append(edge.kind)
+            edges.append(edge)
+        lineage_states = _derive_lineage_states(
+            snapshot.item_ids,
+            tuple(edges),
+            graph_complete=graph_complete,
+        )
 
         conflicted_ids = set(snapshot.conflicts)
         for event_id in snapshot.event_ids:
@@ -698,13 +728,7 @@ class HoldingReviewStore:
                     "thesis match projection evidence descriptor authentication failed"
                 )
             item = self.intelligence_store._authenticated_item(connection, int(row["id"]))
-            incoming_kinds = incoming[item_id]
-            closed = (
-                graph_complete
-                and len(incoming_kinds) == 1
-                and incoming_kinds[0] is not LineageKind.UNKNOWN
-            )
-            lineage_kind = incoming_kinds[0] if closed else LineageKind.UNKNOWN
+            lineage_kind, closed = lineage_states[item_id]
             result[item_id] = ReviewEvidenceItem(
                 evidence_id=item_id,
                 source_tier=(1 if item.source_tier is SourceTier.TIER_1 else 2),
@@ -998,12 +1022,20 @@ def _review_evidence_item(value: dict) -> ReviewEvidenceItem:
     )
 
 
-def _active_thesis(connection: sqlite3.Connection, thesis_id: int) -> InvestmentThesis:
+def _authenticated_thesis(
+    connection: sqlite3.Connection,
+    thesis_id: int,
+    *,
+    require_active: bool,
+) -> InvestmentThesis:
+    if type(require_active) is not bool:
+        raise ValueError("active thesis requirement must be an exact boolean")
     row = connection.execute(
-        "SELECT * FROM investment_theses WHERE id=? AND active=1", (thesis_id,)
+        "SELECT * FROM investment_theses WHERE id=?",
+        (thesis_id,),
     ).fetchone()
     if row is None:
-        raise HoldingReviewStoreError("active thesis authentication failed")
+        raise HoldingReviewStoreError("thesis identity authentication failed")
     value = InvestmentThesis(
         fund_code=str(row["fund_code"]),
         rationale=str(row["rationale"]),
@@ -1013,7 +1045,51 @@ def _active_thesis(connection: sqlite3.Connection, thesis_id: int) -> Investment
         active=bool(row["active"]),
     )
     value.validate()
+    if require_active and not value.active:
+        raise HoldingReviewStoreError("active thesis authentication failed")
     return value
+
+
+def _derive_lineage_states(
+    item_ids: tuple[str, ...],
+    edges: tuple[LineageEdge, ...],
+    *,
+    graph_complete: bool,
+) -> dict[str, tuple[LineageKind, bool]]:
+    if type(item_ids) is not tuple or type(edges) is not tuple:
+        raise ValueError("lineage derivation inputs must be exact tuples")
+    if type(graph_complete) is not bool:
+        raise ValueError("lineage graph completeness must be an exact boolean")
+    item_set = set(item_ids)
+    if len(item_set) != len(item_ids):
+        raise ValueError("lineage derivation item ids must be unique")
+    outgoing: dict[str, list[LineageKind]] = {item_id: [] for item_id in item_ids}
+    targets_by_source: dict[str, list[str]] = {item_id: [] for item_id in item_ids}
+    for edge in edges:
+        if type(edge) is not LineageEdge:
+            raise ValueError("lineage derivation edges must be exact LineageEdge records")
+        edge.validate()
+        if edge.from_item_id not in item_set or edge.to_item_id not in item_set:
+            raise ValueError("lineage derivation edge must resolve inside the item set")
+        outgoing[edge.from_item_id].append(edge.kind)
+        targets_by_source[edge.from_item_id].append(edge.to_item_id)
+    proven_originals = {
+        targets[0]
+        for source_id, targets in targets_by_source.items()
+        if len(outgoing[source_id]) == 1 and len(targets) == 1
+    }
+    result = {}
+    for item_id in item_ids:
+        kinds = outgoing[item_id]
+        if not graph_complete:
+            result[item_id] = (LineageKind.UNKNOWN, False)
+        elif len(kinds) == 1 and kinds[0] is not LineageKind.UNKNOWN:
+            result[item_id] = (kinds[0], True)
+        elif not kinds and item_id in proven_originals:
+            result[item_id] = (LineageKind.ORIGINAL, True)
+        else:
+            result[item_id] = (LineageKind.UNKNOWN, False)
+    return result
 
 
 def _without_times_and_checksum(value):
