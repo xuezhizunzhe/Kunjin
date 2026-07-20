@@ -234,7 +234,7 @@ Without actual owner candidates, preserve `owner_candidate_state=owner_candidate
 For all workflows:
 
 1. Never request exact income, debt, reserve, asset, goal, derived-capacity, or loss-budget values in chat. Direct the user to `kunjin profile edit` for exact local entry. Never execute non-JSON `suitability assess` through Codex tools; keep both exact assessment views local.
-2. Preserve every returned status and stable code exactly. Do not rename, omit, merge, soften, or replace a code with prose; add a beginner-readable explanation separately.
+2. Preserve every returned status and stable code exactly in internal reasoning and audit context; never rename, merge, soften, infer, or discard one. In beginner-facing responses, explain the conclusion, evidence, gaps, and next step in natural Chinese and omit raw codes and boolean fields by default. Show only the necessary raw codes when the owner explicitly requests technical details, when diagnosing a failure or conflict, or when omission would create a material safety ambiguity; even then, state the Chinese meaning first. Never hide source failure, insufficient evidence, missing official confirmation, unavailable action authorization, or the no-automatic-trading boundary merely because raw codes are omitted.
 3. Do not require suitability or allocation for authorization or revocation, screenshot and ledger evidence work, fact-only D1 classification, other fact-only fund or market research, data-freshness checks, data synchronization, or reduction/exit research.
 4. Run `--json status` before portfolio work.
 5. When the user provides an Alipay payment screenshot, run `--json ledger import IMAGE` with `--fund-code CODE` only if the user supplied or confirmed that code.
