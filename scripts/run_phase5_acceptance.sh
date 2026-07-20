@@ -5,9 +5,10 @@ readonly PATH="/usr/bin:/bin"
 export PATH
 unset PYTHONHOME PYTHONPATH
 umask 077
+readonly OWNER_ENTRYPOINT="/Users/yanzihao/KunJin/scripts/run_phase5_acceptance.sh"
 
 usage() {
-    printf '%s\n' 'usage: run_phase5_acceptance.sh local|fault' >&2
+    printf '%s\n' 'usage: run_phase5_acceptance.sh local|fault|engineering|owner' >&2
 }
 
 if [[ $# -ne 1 ]]; then
@@ -16,7 +17,7 @@ if [[ $# -ne 1 ]]; then
 fi
 readonly MODE="$1"
 case "${MODE}" in
-    local|fault) ;;
+    local|fault|engineering|owner) ;;
     *) usage; exit 2 ;;
 esac
 
@@ -33,14 +34,40 @@ if [[ ! -x "${PYTHON}" || ! -f "${HELPER}" || -L "${HELPER}" ]]; then
     exit 69
 fi
 
+if [[ "${MODE}" == "engineering" || "${MODE}" == "owner" ]]; then
+    if [[ -n "${KUNJIN_DATA_DIR:-}" || -n "${KUNJIN_STATE_DIR:-}" ]]; then
+        printf '%s\n' '{"error_code":"phase5_private_runtime_override","ok":false}' >&2
+        exit 77
+    fi
+    if [[ "${MODE}" == "engineering" ]]; then
+        if [[ -z "${KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE:-}" \
+            || -n "${KUNJIN_PHASE5_OWNER_SUBJECT_FILE:-}" ]]; then
+            printf '%s\n' '{"error_code":"phase5_engineering_subject_required","ok":false}' >&2
+            exit 77
+        fi
+    else
+        if [[ "$0" != "${OWNER_ENTRYPOINT}" \
+            || "${KUNJIN_PHASE5_OWNER_APPROVED:-}" != "explicit_private_read_only_review" \
+            || -z "${KUNJIN_PHASE5_OWNER_SUBJECT_FILE:-}" \
+            || -n "${KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE:-}" ]]; then
+            printf '%s\n' '{"error_code":"phase5_owner_approval_required","ok":false}' >&2
+            exit 77
+        fi
+    fi
+fi
+
 readonly RUNTIME_DIR="$(/usr/bin/mktemp -d /private/tmp/kunjin-phase5-acceptance.XXXXXXXX)"
 /bin/chmod 700 "${RUNTIME_DIR}"
-export KUNJIN_DATA_DIR="${RUNTIME_DIR}/data"
-export KUNJIN_STATE_DIR="${RUNTIME_DIR}/state"
 export KUNJIN_PHASE5_RUNTIME_DIR="${RUNTIME_DIR}"
 export PYTHONPYCACHEPREFIX="${RUNTIME_DIR}/pycache"
-/bin/mkdir -p "${KUNJIN_DATA_DIR}" "${KUNJIN_STATE_DIR}" "${PYTHONPYCACHEPREFIX}"
-/bin/chmod 700 "${KUNJIN_DATA_DIR}" "${KUNJIN_STATE_DIR}" "${PYTHONPYCACHEPREFIX}"
+/bin/mkdir -p "${PYTHONPYCACHEPREFIX}"
+/bin/chmod 700 "${PYTHONPYCACHEPREFIX}"
+if [[ "${MODE}" == "local" || "${MODE}" == "fault" ]]; then
+    export KUNJIN_DATA_DIR="${RUNTIME_DIR}/data"
+    export KUNJIN_STATE_DIR="${RUNTIME_DIR}/state"
+    /bin/mkdir -p "${KUNJIN_DATA_DIR}" "${KUNJIN_STATE_DIR}"
+    /bin/chmod 700 "${KUNJIN_DATA_DIR}" "${KUNJIN_STATE_DIR}"
+fi
 
 CHILD_PIDS=()
 set -m
@@ -143,6 +170,11 @@ if ! capture_is_bounded "${SUMMARY_OUT}" || ! capture_is_bounded "${SUMMARY_ERR}
     exit 70
 fi
 /bin/chmod 600 "${SUMMARY_OUT}"
+if [[ "${MODE}" == "engineering" || "${MODE}" == "owner" ]]; then
+    unset KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE
+    unset KUNJIN_PHASE5_OWNER_SUBJECT_FILE
+    unset KUNJIN_PHASE5_OWNER_APPROVED
+fi
 
 if ! run_tracked "${VALIDATED_OUT}" "${VALIDATED_ERR}" \
     "${PYTHON}" "${HELPER}" validate "${MODE}" "${SUMMARY_OUT}"; then

@@ -5,13 +5,17 @@ import hashlib
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
+
+from kunjin.decision.models import ActionKind
 
 MAX_SUMMARY_BYTES = 32_768
 MAX_PROBE_OUTPUT_BYTES = 1_048_576
@@ -162,6 +166,22 @@ _FAULT_KEYS = frozenset(
         "sell_timing",
     }
 )
+_PRIVATE_MODE_KEYS = frozenset(
+    {
+        "action_authorized",
+        "automatic_trade",
+        "conditional_review_usability",
+        "counts",
+        "engineering_flow",
+        "evidence_readiness",
+        "exact_amount_available",
+        "history_comparability",
+        "mode",
+        "redemption_feasibility",
+        "sell_timing",
+        "thesis_review_readiness",
+    }
+)
 _OBSERVATION_KEYS = frozenset(
     {"case", "evidence_checksum", "probe_kind", "status"}
 )
@@ -176,6 +196,20 @@ _PRIVATE_SENTINEL = re.compile(r"(?:OWNER|ENGINEERING)_PRIVATE_SENTINEL", re.IGN
 _LONG_SECRET = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{42,}={0,2}(?![A-Za-z0-9_-])")
 _CHECKSUM = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_FUND_CODE = re.compile(r"[0-9]{6}")
+_PRIVATE_ACTIONS = frozenset(
+    {
+        ActionKind.CONTINUE_HOLDING,
+        ActionKind.REDUCE_TO_CASH,
+        ActionKind.FULL_EXIT,
+    }
+)
+_PRIVATE_CALL_SEQUENCE = (
+    "brief_calls",
+    "intelligence_calls",
+    "match_projection_calls",
+    "holding_review_calls",
+)
 
 
 @dataclass(frozen=True)
@@ -187,9 +221,59 @@ class AcceptanceFixture:
     outcome: str
 
 
+@dataclass(frozen=True)
+class PrivateSubject:
+    fund_code: str
+    action: ActionKind
+
+
+@dataclass(frozen=True)
+class PrivateAcceptanceFixture:
+    mode: str
+    evidence_readiness: str
+    history_comparability: str
+    thesis_review_readiness: str
+    conditional_review_usability: str
+    redemption_feasibility: str
+    review_disposition: str
+
+
+@dataclass
+class PrivateCallLedger:
+    calls: list[str] = field(default_factory=list)
+
+    def record(self, call: str) -> None:
+        if (
+            type(call) is not str
+            or len(self.calls) >= len(_PRIVATE_CALL_SEQUENCE)
+            or call != _PRIVATE_CALL_SEQUENCE[len(self.calls)]
+        ):
+            raise ValueError("private acceptance call sequence invalid")
+        self.calls.append(call)
+
+    def counts(self) -> dict[str, int]:
+        if tuple(self.calls) != _PRIVATE_CALL_SEQUENCE:
+            raise ValueError("private acceptance call sequence incomplete")
+        return {
+            "brief_calls": self.calls.count("brief_calls"),
+            "intelligence_calls": self.calls.count("intelligence_calls"),
+            "match_projection_calls": self.calls.count("match_projection_calls"),
+            "adjudication_calls": 0,
+            "holding_review_calls": self.calls.count("holding_review_calls"),
+            "network_retries": 0,
+        }
+
+
+@dataclass(frozen=True)
+class PrivateChainResult:
+    review: Mapping[str, object]
+    counts: Mapping[str, int]
+    projection_id: int
+
+
 def build_acceptance_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="phase5_acceptance.py")
-    parser.add_argument("mode", choices=("local", "fault"))
+    parser.add_argument("mode", choices=("local", "fault", "engineering", "owner"))
     return parser
 
 
@@ -231,6 +315,186 @@ def fault_fixture(case: str) -> AcceptanceFixture:
         ),
         outcome=outcomes.get(case, "fail_closed"),
     )
+
+
+def possible_match_fixture(*, mode: str = "owner") -> PrivateAcceptanceFixture:
+    return PrivateAcceptanceFixture(
+        mode=mode,
+        evidence_readiness="partial",
+        history_comparability="not_available",
+        thesis_review_readiness="manual_review_required",
+        conditional_review_usability="partial",
+        redemption_feasibility="not_requested",
+        review_disposition="manual_thesis_review_required",
+    )
+
+
+def owner_acceptance(value: PrivateAcceptanceFixture) -> dict[str, object]:
+    if type(value) is not PrivateAcceptanceFixture or value.mode != "owner":
+        raise ValueError("owner acceptance fixture invalid")
+    ledger = PrivateCallLedger()
+    for call in _PRIVATE_CALL_SEQUENCE:
+        ledger.record(call)
+    return _private_summary(value, ledger.counts(), adjudication_unchanged=True)
+
+
+def _private_summary(
+    value: PrivateAcceptanceFixture,
+    counts: Mapping[str, int],
+    *,
+    adjudication_unchanged: bool,
+) -> dict[str, object]:
+    if dict(counts) != PREVIEW_COUNTS or adjudication_unchanged is not True:
+        raise ValueError("private acceptance flow incomplete")
+    summary = {
+        "action_authorized": False,
+        "automatic_trade": False,
+        "conditional_review_usability": value.conditional_review_usability,
+        "counts": dict(counts),
+        "engineering_flow": "pass",
+        "evidence_readiness": value.evidence_readiness,
+        "exact_amount_available": False,
+        "history_comparability": value.history_comparability,
+        "mode": value.mode,
+        "redemption_feasibility": value.redemption_feasibility,
+        "sell_timing": "insufficient_data",
+        "thesis_review_readiness": value.thesis_review_readiness,
+    }
+    validate_summary(summary, expected_mode=value.mode)
+    return summary
+
+
+def _under(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def secure_read_private_subject(
+    path: Path,
+    *,
+    excluded_roots: Sequence[Path],
+) -> PrivateSubject:
+    failure = "private subject file invalid"
+    if type(path) is not type(Path()) or not path.is_absolute():
+        raise ValueError(failure)
+    try:
+        parent = path.parent.resolve(strict=True)
+        parent_stat = os.lstat(parent)
+    except (OSError, RuntimeError):
+        raise ValueError(failure) from None
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or stat.S_IMODE(parent_stat.st_mode) != 0o700
+        or parent_stat.st_uid != os.getuid()
+    ):
+        raise ValueError(failure)
+    try:
+        initial = os.lstat(path)
+    except OSError:
+        raise ValueError(failure) from None
+    if not stat.S_ISREG(initial.st_mode) or stat.S_ISLNK(initial.st_mode):
+        raise ValueError(failure)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError(failure)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise ValueError(failure) from None
+    try:
+        metadata = os.fstat(descriptor)
+        current = os.lstat(path)
+        resolved = path.resolve(strict=True)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+            or stat.S_ISLNK(current.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino)
+            or any(_under(resolved, root.resolve(strict=False)) for root in excluded_roots)
+        ):
+            raise ValueError(failure)
+        raw = os.read(descriptor, 16_385)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 16_384:
+        raise ValueError(failure)
+    try:
+        def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(failure)
+                result[key] = value
+            return result
+
+        payload = json.loads(raw.decode("ascii"), object_pairs_hook=strict_object)
+    except (UnicodeError, ValueError, TypeError):
+        raise ValueError(failure) from None
+    if (
+        type(payload) is not dict
+        or set(payload) != {"fund_code", "action"}
+        or any((ancestor / ".git").exists() for ancestor in (resolved.parent, *resolved.parents))
+    ):
+        raise ValueError(failure)
+    code = payload["fund_code"]
+    action_value = payload["action"]
+    try:
+        action = ActionKind(action_value)
+    except (TypeError, ValueError):
+        raise ValueError(failure) from None
+    if (
+        type(code) is not str
+        or _FUND_CODE.fullmatch(code) is None
+        or code == "000000"
+        or action not in _PRIVATE_ACTIONS
+    ):
+        raise ValueError(failure)
+    return PrivateSubject(code, action)
+
+
+def private_subject_path(mode: str, environ: Mapping[str, str]) -> Path:
+    if mode not in {"engineering", "owner"}:
+        raise ValueError("private mode invalid")
+    engineering = environ.get("KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE")
+    owner = environ.get("KUNJIN_PHASE5_OWNER_SUBJECT_FILE")
+    if engineering and owner:
+        raise ValueError("engineering and owner subject files must be separate")
+    selected = engineering if mode == "engineering" else owner
+    if not selected or (mode == "engineering" and owner) or (mode == "owner" and engineering):
+        raise ValueError("private subject file invalid")
+    return Path(selected)
+
+
+class NoExternalOperations(AbstractContextManager):
+    def __init__(self) -> None:
+        self._originals: list[tuple[object, str, object]] = []
+
+    @staticmethod
+    def _deny(*_args, **_kwargs):
+        raise OSError("private acceptance external operation prohibited")
+
+    def _patch(self, owner: object, name: str) -> None:
+        if hasattr(owner, name):
+            original = getattr(owner, name)
+            self._originals.append((owner, name, original))
+            setattr(owner, name, self._deny)
+
+    def __enter__(self):
+        for name in ("create_connection", "getaddrinfo"):
+            self._patch(socket, name)
+        for name in ("connect", "connect_ex"):
+            self._patch(socket.socket, name)
+        for name in ("Popen", "run", "call", "check_call", "check_output"):
+            self._patch(subprocess, name)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        while self._originals:
+            owner, name, original = self._originals.pop()
+            setattr(owner, name, original)
+        return False
 
 
 def _placeholder_observation(case: str) -> dict[str, object]:
@@ -316,31 +580,66 @@ def _validate_observation(value: object, expected_case: str) -> None:
 
 
 def validate_summary(value: object, *, expected_mode: str) -> dict[str, object]:
-    if expected_mode not in {"local", "fault"} or type(value) is not dict:
+    if expected_mode not in {"local", "fault", "engineering", "owner"} or type(
+        value
+    ) is not dict:
         raise ValueError("acceptance output invalid")
-    expected_keys = _LOCAL_KEYS if expected_mode == "local" else _FAULT_KEYS
+    expected_keys = (
+        _LOCAL_KEYS
+        if expected_mode == "local"
+        else _FAULT_KEYS
+        if expected_mode == "fault"
+        else _PRIVATE_MODE_KEYS
+    )
     if set(value) != expected_keys:
         raise ValueError("acceptance output invalid")
     for key in (
         "action_authorized",
         "automatic_trade",
         "exact_amount_available",
-        "official_negative_check_complete",
     ):
         _validate_exact_bool(value[key])
         if value[key] is not False:
             raise ValueError("acceptance output invalid")
-    _validate_exact_int(value["network_retries"], 0)
-    fixed = {
-        "mode": expected_mode,
-        "review_disposition": "abstain",
-        "review_maturity": "evidence_only",
-        "sell_timing": "insufficient_data",
-    }
+    if expected_mode in {"local", "fault"}:
+        _validate_exact_bool(value["official_negative_check_complete"])
+        if value["official_negative_check_complete"] is not False:
+            raise ValueError("acceptance output invalid")
+        _validate_exact_int(value["network_retries"], 0)
+    fixed = {"mode": expected_mode, "sell_timing": "insufficient_data"}
+    if expected_mode in {"local", "fault"}:
+        fixed["review_maturity"] = "evidence_only"
     if any(value[key] != expected for key, expected in fixed.items()):
         raise ValueError("acceptance output invalid")
 
-    if expected_mode == "local":
+    if expected_mode in {"engineering", "owner"}:
+        if (
+            value["engineering_flow"] not in {"pass", "failed"}
+            or value["evidence_readiness"]
+            not in {"ready", "partial", "insufficient_data"}
+            or value["history_comparability"]
+            not in {"comparable", "not_comparable", "not_available"}
+            or value["thesis_review_readiness"]
+            not in {"ready", "manual_review_required", "missing", "insufficient_data"}
+            or value["conditional_review_usability"]
+            not in {"observed_for_request", "partial", "not_testable"}
+            or value["redemption_feasibility"]
+            not in {
+                "not_requested",
+                "insufficient_data",
+                "restricted",
+                "evidence_complete_non_authorizing",
+            }
+        ):
+            raise ValueError("acceptance output invalid")
+        counts = value["counts"]
+        if type(counts) is not dict or set(counts) != set(PREVIEW_COUNTS):
+            raise ValueError("acceptance output invalid")
+        for key, expected in PREVIEW_COUNTS.items():
+            _validate_exact_int(counts[key], expected)
+    elif expected_mode == "local":
+        if value["review_disposition"] != "abstain":
+            raise ValueError("acceptance output invalid")
         if (
             value["acceptance_scope"] != "synthetic_local_preview_only"
             or value["outcome"] != "accepted_preview"
@@ -358,6 +657,8 @@ def validate_summary(value: object, *, expected_mode: str) -> dict[str, object]:
         _validate_identifier_list(value["observed_faults"], ())
         _validate_observation(value["observation"], "local_authenticated_chain")
     else:
+        if value["review_disposition"] != "abstain":
+            raise ValueError("acceptance output invalid")
         if (
             value["acceptance_scope"] != "synthetic_local_faults_only"
             or value["outcome"] != "fault_contract_verified"
@@ -526,11 +827,326 @@ def _run_local_probe(runtime_dir: Path) -> dict[str, object]:
     )
 
 
+def _private_cli_call(
+    cli,
+    context,
+    argv: list[str],
+    expected: str,
+    *,
+    ledger: PrivateCallLedger,
+    call: str,
+) -> dict[str, object]:
+    ledger.record(call)
+    payload, exit_code, json_output = cli.run(["--json", *argv], context)
+    if (
+        not json_output
+        or exit_code != 0
+        or type(payload) is not dict
+        or payload.get("command") != expected
+        or type(payload.get("data")) is not dict
+    ):
+        raise ValueError("private acceptance command failed")
+    return payload["data"]
+
+
+def _private_thesis_readiness(state: object) -> str:
+    if state in {"manual_review_pending", "manual_review_uncertain"}:
+        return "manual_review_required"
+    if state == "thesis_missing":
+        return "missing"
+    if state in {
+        "no_matching_evidence",
+        "presented_match_confirmed",
+        "presented_match_rejected",
+    }:
+        return "ready"
+    return "insufficient_data"
+
+
+def _private_summary_from_review(
+    mode: str,
+    subject: PrivateSubject,
+    chain: PrivateChainResult,
+    *,
+    adjudication_unchanged: bool,
+) -> dict[str, object]:
+    review = chain.review
+    interpretation = review.get("interpretation")
+    boundary = review.get("review_boundary")
+    evidence_delta = review.get("evidence_delta")
+    redemption = review.get("redemption")
+    if (
+        type(interpretation) is not dict
+        or review.get("flow_status") not in {"complete", "partial"}
+        or review.get("fund_code") != subject.fund_code
+        or review.get("action") != subject.action.value
+        or boundary
+        != {
+            "action_authorized": False,
+            "automatic_trade": False,
+            "exact_amount_available": False,
+            "review_maturity": "evidence_only",
+        }
+    ):
+        raise ValueError("private acceptance review invalid")
+    candidate_match = review.get("candidate_thesis_match")
+    if (
+        type(candidate_match) is not dict
+        or candidate_match.get("projection_id") != chain.projection_id
+    ):
+        raise ValueError("private acceptance projection binding failed")
+    evidence_readiness = review.get("evidence_readiness", "insufficient_data")
+    history = (
+        evidence_delta.get("history_comparability", "not_available")
+        if type(evidence_delta) is dict
+        else "not_available"
+    )
+    redemption_state = (
+        redemption.get("feasibility", "insufficient_data")
+        if type(redemption) is dict
+        else "insufficient_data"
+    )
+    disposition = interpretation.get("review_disposition")
+    thesis_readiness = _private_thesis_readiness(
+        interpretation.get("thesis_review_state")
+    )
+    conditional = (
+        "observed_for_request"
+        if evidence_readiness == "ready"
+        and disposition in {"continue_observing", "reduce_review", "exit_review"}
+        else "partial"
+        if review.get("flow_status") in {"complete", "partial"}
+        else "not_testable"
+    )
+    summary = {
+        "action_authorized": False,
+        "automatic_trade": False,
+        "conditional_review_usability": conditional,
+        "counts": dict(chain.counts),
+        "engineering_flow": (
+            "pass"
+            if dict(chain.counts) == PREVIEW_COUNTS and adjudication_unchanged is True
+            else "failed"
+        ),
+        "evidence_readiness": evidence_readiness,
+        "exact_amount_available": False,
+        "history_comparability": history,
+        "mode": mode,
+        "redemption_feasibility": redemption_state,
+        "sell_timing": review.get("sell_timing"),
+        "thesis_review_readiness": thesis_readiness,
+    }
+    if summary["engineering_flow"] != "pass":
+        raise ValueError("private acceptance flow incomplete")
+    validate_summary(summary, expected_mode=mode)
+    return summary
+
+
+def _local_snapshot_holds(context, fund_code: str) -> bool:
+    return any(
+        item.fund_code == fund_code and item.shares > 0
+        for item in context.repository.latest_positions()
+    )
+
+
+def _run_private_chain(
+    mode: str, subject: PrivateSubject, key: bytes
+) -> PrivateChainResult:
+    from scripts import phase41_acceptance as phase41
+
+    cli, context = phase41._build_context_with_key(key)
+    if mode == "owner" and not _local_snapshot_holds(context, subject.fund_code):
+        raise ValueError("owner subject is not held in the latest local snapshot")
+
+    def offline_portfolio(*_args, **_kwargs):
+        raise OSError("private acceptance portfolio refresh prohibited")
+
+    context.brief_service._portfolio_service.sync = offline_portfolio
+    ledger = PrivateCallLedger()
+    brief = _private_cli_call(
+        cli,
+        context,
+        [
+            "fund",
+            "brief",
+            subject.fund_code,
+            "--action",
+            subject.action.value,
+            "--mode",
+            "rapid",
+        ],
+        "fund.brief",
+        ledger=ledger,
+        call="brief_calls",
+    )
+    intelligence = _private_cli_call(
+        cli,
+        context,
+        ["fund", "intelligence", subject.fund_code, "--mode", "rapid"],
+        "fund.intelligence",
+        ledger=ledger,
+        call="intelligence_calls",
+    )
+    brief_request = brief.get("request")
+    intelligence_request = intelligence.get("request")
+    if type(brief_request) is not dict or type(intelligence_request) is not dict:
+        raise ValueError("private acceptance request binding failed")
+    brief_id = brief_request.get("request_run_id")
+    intelligence_id = intelligence_request.get("request_run_id")
+    if (
+        type(brief_id) is not int
+        or brief_id <= 0
+        or type(intelligence_id) is not int
+        or intelligence_id <= 0
+    ):
+        raise ValueError("private acceptance request binding failed")
+    projection = _private_cli_call(
+        cli,
+        context,
+        [
+            "thesis",
+            "match-project",
+            subject.fund_code,
+            "--intelligence-request-run-id",
+            str(intelligence_id),
+        ],
+        "thesis.match-project",
+        ledger=ledger,
+        call="match_projection_calls",
+    )
+    projection_id = projection.get("id")
+    if type(projection_id) is not int or projection_id <= 0:
+        raise ValueError("private acceptance projection binding failed")
+    review = _private_cli_call(
+        cli,
+        context,
+        [
+            "fund",
+            "holding-review",
+            subject.fund_code,
+            "--action",
+            subject.action.value,
+            "--brief-request-run-id",
+            str(brief_id),
+            "--intelligence-request-run-id",
+            str(intelligence_id),
+        ],
+        "fund.holding-review",
+        ledger=ledger,
+        call="holding_review_calls",
+    )
+    return PrivateChainResult(review, ledger.counts(), projection_id)
+
+
+def _adjudication_digest(database: Path) -> tuple[int, str]:
+    import sqlite3
+
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+        rows = connection.execute(
+            "SELECT id, record_checksum FROM thesis_evidence_adjudications ORDER BY id"
+        ).fetchall()
+    encoded = json.dumps(rows, ensure_ascii=True, separators=(",", ":"))
+    return len(rows), hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+
+def _load_owner_key_without_sensitive_environment(phase41) -> bytes:
+    calls = 0
+
+    def run_exact(command: list[str]):
+        nonlocal calls
+        calls += 1
+        expected = [
+            "/usr/bin/security",
+            "find-generic-password",
+            "-s",
+            "com.kunjin.profile-encryption",
+            "-a",
+            "v1",
+            "-w",
+        ]
+        if command != expected or calls != 1:
+            raise ValueError("owner Keychain access invalid")
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            shell=False,
+            env={"HOME": str(phase41._canonical_home()), "PATH": "/usr/bin:/bin"},
+            timeout=15,
+            check=False,
+        )
+        return completed.returncode, completed.stdout, completed.stderr
+
+    key = phase41.load_owner_key_once(run_exact)
+    if calls != 1:
+        raise ValueError("owner Keychain access count invalid")
+    return key
+
+
+def run_private_acceptance(mode: str, runtime_dir: Path) -> dict[str, object]:
+    from scripts import phase41_acceptance as phase41
+
+    if "KUNJIN_DATA_DIR" in os.environ or "KUNJIN_STATE_DIR" in os.environ:
+        raise ValueError("private runtime override prohibited")
+    if mode == "owner" and os.environ.get("KUNJIN_PHASE5_OWNER_APPROVED") != (
+        "explicit_private_read_only_review"
+    ):
+        raise ValueError("owner approval required")
+    subject_path = private_subject_path(mode, os.environ)
+    subject = secure_read_private_subject(
+        subject_path,
+        excluded_roots=(Path(__file__).resolve().parents[1],),
+    )
+    data_dir = runtime_dir / "data"
+    state_dir = runtime_dir / "state"
+    data_dir.mkdir(mode=0o700)
+    state_dir.mkdir(mode=0o700)
+    target = data_dir / "kunjin.db"
+    source = phase41._canonical_owner_database()
+    key = b"\0" * 32
+    sensitive_names = (
+        "KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE",
+        "KUNJIN_PHASE5_OWNER_SUBJECT_FILE",
+        "KUNJIN_PHASE5_OWNER_APPROVED",
+    )
+    sensitive = {name: os.environ.pop(name) for name in sensitive_names if name in os.environ}
+    try:
+        if mode == "owner":
+            key = _load_owner_key_without_sensitive_environment(phase41)
+        with phase41.ReadOnlyDatabaseGuard(source, target):
+            before = _adjudication_digest(target)
+            os.environ["KUNJIN_DATA_DIR"] = str(data_dir)
+            os.environ["KUNJIN_STATE_DIR"] = str(state_dir)
+            try:
+                with NoExternalOperations():
+                    chain = _run_private_chain(mode, subject, key)
+            finally:
+                os.environ.pop("KUNJIN_DATA_DIR", None)
+                os.environ.pop("KUNJIN_STATE_DIR", None)
+                key = b""
+            adjudication_unchanged = _adjudication_digest(target) == before
+            if not adjudication_unchanged:
+                raise ValueError("private acceptance adjudication changed")
+            summary = _private_summary_from_review(
+                mode,
+                subject,
+                chain,
+                adjudication_unchanged=adjudication_unchanged,
+            )
+    finally:
+        os.environ.update(sensitive)
+    phase41.check_runtime_permissions(runtime_dir)
+    return summary
+
+
 def project_mode(mode: str, runtime_dir: Path) -> dict[str, object]:
     if mode == "local":
         return project_acceptance(
             local_fixture(), observation=_run_local_probe(runtime_dir)
         )
+    if mode in {"engineering", "owner"}:
+        return run_private_acceptance(mode, runtime_dir)
     if mode != "fault":
         raise ValueError("acceptance mode invalid")
     observations = [run_fault_probe(case, runtime_dir) for case in FAULT_CASES]
@@ -611,12 +1227,17 @@ def _validate_file(mode: str, path_value: str) -> int:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
-        if len(args) == 2 and args[0] == "produce" and args[1] in {"local", "fault"}:
+        if len(args) == 2 and args[0] == "produce" and args[1] in {
+            "local",
+            "fault",
+            "engineering",
+            "owner",
+        }:
             return _produce(args[1])
         if (
             len(args) == 3
             and args[0] == "validate"
-            and args[1] in {"local", "fault"}
+            and args[1] in {"local", "fault", "engineering", "owner"}
         ):
             return _validate_file(args[1], args[2])
         if len(args) == 1 and args[0] in {"local", "fault"}:
@@ -625,7 +1246,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 path.chmod(0o700)
                 os.environ["KUNJIN_PHASE5_RUNTIME_DIR"] = str(path)
                 return _produce(args[0])
-    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+    except (OSError, RuntimeError, subprocess.SubprocessError, TypeError, ValueError):
         print('{"error_code":"phase5_acceptance_failed","ok":false}')
         return 70
     print('{"error_code":"phase5_arguments_invalid","ok":false}')

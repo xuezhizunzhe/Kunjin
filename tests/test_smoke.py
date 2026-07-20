@@ -3607,7 +3607,7 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         self.assertIn("tests/unit/test_selection_service.py", script)
         self.assertIn("tests/unit/test_selection_research.py", script)
 
-    def test_phase5_acceptance_is_local_fault_only_and_non_authorizing(self) -> None:
+    def test_phase5_acceptance_declares_hardened_private_modes(self) -> None:
         root = Path(__file__).resolve().parents[1]
         script = (root / "scripts/run_phase5_acceptance.sh").read_text(
             encoding="utf-8"
@@ -3615,8 +3615,16 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         helper = (root / "scripts/phase5_acceptance.py").read_text(encoding="utf-8")
         combined = script + "\n" + helper
 
-        self.assertIn("local|fault", script)
-        self.assertNotIn("engineering|owner", script)
+        self.assertIn("local|fault|engineering|owner", script)
+        self.assertIn("KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE", combined)
+        self.assertIn("KUNJIN_PHASE5_OWNER_SUBJECT_FILE", combined)
+        self.assertIn("explicit_private_read_only_review", combined)
+        self.assertIn("secure_read_private_subject", helper)
+        self.assertIn("ReadOnlyDatabaseGuard", helper)
+        self.assertIn("load_owner_key_once", helper)
+        self.assertIn("thesis_evidence_adjudications", helper)
+        self.assertIn("NoExternalOperations", helper)
+        self.assertIn("latest local snapshot", helper)
         self.assertIn('readonly PATH="/usr/bin:/bin"', script)
         self.assertIn("unset PYTHONHOME PYTHONPATH", script)
         self.assertIn("umask 077", script)
@@ -3662,7 +3670,7 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         ):
             self.assertIn(fault, helper)
 
-    def test_phase5_acceptance_rejects_private_modes_before_python(self) -> None:
+    def test_phase5_acceptance_rejects_unapproved_private_modes_before_python(self) -> None:
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary) / "repository"
@@ -3683,7 +3691,7 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             fake_python.chmod(0o755)
             env = {**os.environ, "PHASE5_MARKER": str(marker)}
 
-            for mode in ("engineering", "owner", "deep"):
+            for mode in ("engineering", "owner"):
                 completed = subprocess.run(
                     [str(wrapper), mode],
                     env=env,
@@ -3691,9 +3699,96 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
                     capture_output=True,
                     timeout=5,
                 )
-                self.assertEqual(completed.returncode, 2)
-                self.assertIn(b"local|fault", completed.stderr)
+                self.assertEqual(completed.returncode, 77)
                 self.assertFalse(marker.exists())
+            completed = subprocess.run(
+                [str(wrapper), "deep"],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn(b"local|fault|engineering|owner", completed.stderr)
+
+    def test_phase5_acceptance_clears_private_environment_before_validation(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            scripts = repository / "scripts"
+            venv = repository / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            venv.mkdir(parents=True)
+            wrapper = scripts / "run_phase5_acceptance.sh"
+            shutil.copy2(root / "scripts/run_phase5_acceptance.sh", wrapper)
+            shutil.copy2(root / "scripts/phase5_acceptance.py", scripts)
+            wrapper.chmod(0o755)
+            marker = repository / "validated-clean"
+            summary = json.dumps(
+                {
+                    "action_authorized": False,
+                    "automatic_trade": False,
+                    "conditional_review_usability": "partial",
+                    "counts": {
+                        "brief_calls": 1,
+                        "intelligence_calls": 1,
+                        "match_projection_calls": 1,
+                        "adjudication_calls": 0,
+                        "holding_review_calls": 1,
+                        "network_retries": 0,
+                    },
+                    "engineering_flow": "pass",
+                    "evidence_readiness": "partial",
+                    "exact_amount_available": False,
+                    "history_comparability": "not_available",
+                    "mode": "engineering",
+                    "redemption_feasibility": "not_requested",
+                    "sell_timing": "insufficient_data",
+                    "thesis_review_readiness": "ready",
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            fake_python = venv / "python"
+            fake_python.write_text(
+                "#!/bin/bash\n"
+                "if [[ \"$2\" == produce ]]; then\n"
+                "  [[ -n \"${KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE:-}\" ]] || exit 21\n"
+                f"  printf '%s\\n' '{summary}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [[ \"$2\" == validate ]]; then\n"
+                "  [[ -z \"${KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE:-}\" ]] || exit 22\n"
+                "  [[ -z \"${KUNJIN_PHASE5_OWNER_SUBJECT_FILE:-}\" ]] || exit 22\n"
+                "  [[ -z \"${KUNJIN_PHASE5_OWNER_APPROVED:-}\" ]] || exit 22\n"
+                "  printf clean > \"${PHASE5_MARKER}\"\n"
+                "  /bin/cat \"$4\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 23\n",
+                encoding="ascii",
+            )
+            fake_python.chmod(0o755)
+            env = {
+                **os.environ,
+                "KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE": str(
+                    Path(temporary) / "subject.json"
+                ),
+                "PHASE5_MARKER": str(marker),
+            }
+            env.pop("KUNJIN_DATA_DIR", None)
+            env.pop("KUNJIN_STATE_DIR", None)
+
+            completed = subprocess.run(
+                [str(wrapper), "engineering"],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(marker.read_text(encoding="ascii"), "clean")
 
     def test_phase5_acceptance_rejects_unexpected_child_exit(self) -> None:
         root = Path(__file__).resolve().parents[1]
