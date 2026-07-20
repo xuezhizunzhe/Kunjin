@@ -311,6 +311,16 @@ def test_lineage_direction_requires_structural_proof() -> None:
     assert ambiguous["source_one"] == (LineageKind.UNKNOWN, False)
     assert ambiguous["source_two"] == (LineageKind.UNKNOWN, False)
 
+    for kind in (LineageKind.UNKNOWN, LineageKind.INDEPENDENTLY_REPORTED):
+        unsupported = replace(edge, kind=kind)
+        unsupported_result = holding_store_module._derive_lineage_states(
+            ("derivative", "source"),
+            (unsupported,),
+            graph_complete=True,
+        )
+        assert unsupported_result["derivative"] == (LineageKind.UNKNOWN, False)
+        assert unsupported_result["source"] == (LineageKind.UNKNOWN, False)
+
 
 @pytest.mark.parametrize("request_run_id", [True, 0, -1])
 def test_latest_projection_rejects_nonpositive_or_bool_id(context, request_run_id) -> None:
@@ -614,6 +624,15 @@ def test_review_rejects_cross_thesis_previous_pointer(context) -> None:
 
 def test_latest_comparable_review_supports_missing_thesis(context) -> None:
     store = context["store"]
+    regular_projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = store.publish_adjudication(
+        desired_adjudication(context, regular_projection)
+    )
+    with context["repository"].connect() as connection, connection:
+        connection.execute(
+            "UPDATE investment_theses SET active=0 WHERE id=?",
+            (context["thesis_id"],),
+        )
     projection_value = desired_projection(
         context,
         thesis_id=None,
@@ -622,10 +641,6 @@ def test_latest_comparable_review_supports_missing_thesis(context) -> None:
         evidence_descriptors=(),
     )
     projection = store.publish_thesis_match(projection_value)
-    regular_projection = store.publish_thesis_match(desired_projection(context))
-    adjudication = store.publish_adjudication(
-        desired_adjudication(context, regular_projection)
-    )
     value = desired_review(context, regular_projection, adjudication)
     result = replace(
         value.result,
@@ -651,6 +666,15 @@ def test_latest_comparable_review_supports_missing_thesis(context) -> None:
     value = replace(value, semantic_identity_checksum=value.expected_semantic_identity_checksum())
     value = replace(value, record_checksum=value.expected_record_checksum())
     stored = store.publish_review(value)
+    context["repository"].add_thesis(
+        InvestmentThesis(
+            fund_code="123456",
+            rationale="Replacement active thesis.",
+            horizon="Five years.",
+            invalidation="Replacement condition.",
+            created_at=NOW,
+        )
+    )
 
     assert store.latest_comparable_review(
         "123456",
@@ -658,6 +682,67 @@ def test_latest_comparable_review_supports_missing_thesis(context) -> None:
         None,
         HeldFundManualReviewPolicyV1().checksum(),
     ) == stored
+
+
+def test_stale_thesis_missing_projection_is_unusable_after_active_thesis_added(
+    context,
+) -> None:
+    store = context["store"]
+    regular_projection = store.publish_thesis_match(desired_projection(context))
+    adjudication = store.publish_adjudication(
+        desired_adjudication(context, regular_projection)
+    )
+    with context["repository"].connect() as connection, connection:
+        connection.execute(
+            "UPDATE investment_theses SET active=0 WHERE id=?",
+            (context["thesis_id"],),
+        )
+    missing_value = desired_projection(
+        context,
+        thesis_id=None,
+        thesis_fingerprint=None,
+        projection_state=ThesisMatchProjectionState.THESIS_MISSING,
+        evidence_descriptors=(),
+    )
+    missing = store.publish_thesis_match(missing_value)
+    context["repository"].add_thesis(
+        InvestmentThesis(
+            fund_code="123456",
+            rationale="New active thesis.",
+            horizon="Five years.",
+            invalidation="New invalidation.",
+            created_at=NOW,
+        )
+    )
+    value = desired_review(context, regular_projection, adjudication)
+    result = replace(
+        value.result,
+        thesis_review_state=ThesisMatchState.THESIS_MISSING,
+        evidence_ids=(),
+        action_review_source_sufficiency=(
+            ActionReviewSourceSufficiency.INSUFFICIENT_DATA
+        ),
+    )
+    value = replace(
+        value,
+        thesis_match_projection_id=missing.id,
+        thesis_match_projection_checksum=missing.value.record_checksum,
+        active_thesis_state=BindingState.MISSING,
+        active_thesis_id=None,
+        active_thesis_fingerprint=None,
+        adjudication_state=BindingState.MISSING,
+        adjudication_id=None,
+        adjudication_checksum=None,
+        result=result,
+        result_fingerprint=result.expected_result_fingerprint(),
+    )
+    value = replace(value, semantic_identity_checksum=value.expected_semantic_identity_checksum())
+    value = replace(value, record_checksum=value.expected_record_checksum())
+
+    with pytest.raises(HoldingReviewStoreError, match="active thesis absence"):
+        store.latest_thesis_match("123456", context["intelligence_run_id"])
+    with pytest.raises(HoldingReviewStoreError, match="active thesis absence"):
+        store.publish_review(value)
 
 
 def test_historical_review_survives_adjudication_supersession_and_thesis_replacement(

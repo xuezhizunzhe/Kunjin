@@ -54,6 +54,9 @@ from kunjin.models import InvestmentThesis
 from kunjin.storage.repository import Repository
 
 MAX_REVIEW_JSON_BYTES = 4 * 1024 * 1024
+_ORIGIN_PROVING_LINEAGE_KINDS = frozenset(
+    (LineageKind.DIRECT_QUOTE, LineageKind.REPRINT)
+)
 
 
 class HoldingReviewStoreError(RuntimeError):
@@ -500,6 +503,8 @@ class HoldingReviewStore:
                 != value.thesis_fingerprint
             ):
                 raise HoldingReviewStoreError("thesis match projection binding failed")
+        elif require_active_thesis:
+            _authenticate_no_active_thesis(connection, value.fund_code)
         derived = self._derived_evidence_descriptors(connection, intelligence)
         try:
             expected = tuple(derived[item.evidence_id] for item in value.evidence_descriptors)
@@ -572,6 +577,8 @@ class HoldingReviewStore:
                 != value.active_thesis_fingerprint
             ):
                 raise HoldingReviewStoreError("holding review snapshot binding failed")
+        elif require_current_adjudication:
+            _authenticate_no_active_thesis(connection, value.fund_code)
         if value.adjudication_id is not None:
             row = connection.execute(
                 "SELECT * FROM thesis_evidence_adjudications WHERE id=?",
@@ -1050,6 +1057,18 @@ def _authenticated_thesis(
     return value
 
 
+def _authenticate_no_active_thesis(
+    connection: sqlite3.Connection,
+    fund_code: str,
+) -> None:
+    row = connection.execute(
+        "SELECT count(*) AS count FROM investment_theses WHERE fund_code=? AND active=1",
+        (fund_code,),
+    ).fetchone()
+    if row is None or type(row["count"]) is not int or row["count"] != 0:
+        raise HoldingReviewStoreError("active thesis absence authentication failed")
+
+
 def _derive_lineage_states(
     item_ids: tuple[str, ...],
     edges: tuple[LineageEdge, ...],
@@ -1076,14 +1095,16 @@ def _derive_lineage_states(
     proven_originals = {
         targets[0]
         for source_id, targets in targets_by_source.items()
-        if len(outgoing[source_id]) == 1 and len(targets) == 1
+        if len(outgoing[source_id]) == 1
+        and outgoing[source_id][0] in _ORIGIN_PROVING_LINEAGE_KINDS
+        and len(targets) == 1
     }
     result = {}
     for item_id in item_ids:
         kinds = outgoing[item_id]
         if not graph_complete:
             result[item_id] = (LineageKind.UNKNOWN, False)
-        elif len(kinds) == 1 and kinds[0] is not LineageKind.UNKNOWN:
+        elif len(kinds) == 1 and kinds[0] in _ORIGIN_PROVING_LINEAGE_KINDS:
             result[item_id] = (kinds[0], True)
         elif not kinds and item_id in proven_originals:
             result[item_id] = (LineageKind.ORIGINAL, True)
