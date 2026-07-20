@@ -237,6 +237,28 @@ def test_continue_observing_rejects_each_core_omission(omitted: str) -> None:
         review_result(omitted_work=(omitted,)).validate()
 
 
+def test_manual_thesis_review_allows_confirmed_semantics_without_action_upgrade() -> None:
+    value = review_result(
+        thesis_review_state=ThesisMatchState.PRESENTED_MATCH_CONFIRMED,
+        review_disposition=ReviewDisposition.MANUAL_THESIS_REVIEW_REQUIRED,
+    )
+    value.validate()
+    assert value.boundary == ReviewBoundary()
+    assert value.sell_timing == "insufficient_data"
+
+
+@pytest.mark.parametrize("action", (ActionKind.REDUCE_TO_CASH, ActionKind.FULL_EXIT))
+def test_manual_confirmed_semantics_remain_forbidden_for_action_requests(action) -> None:
+    value = review_result(
+        action=action,
+        thesis_review_state=ThesisMatchState.PRESENTED_MATCH_CONFIRMED,
+        review_disposition=ReviewDisposition.MANUAL_THESIS_REVIEW_REQUIRED,
+        redemption_feasibility=RedemptionFeasibility.INSUFFICIENT_DATA,
+    )
+    with pytest.raises(ValueError, match="continue-holding request"):
+        value.validate()
+
+
 @pytest.mark.parametrize(
     "changes",
     (

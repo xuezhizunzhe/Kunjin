@@ -1049,14 +1049,20 @@ class HoldingReviewResult(_CanonicalRecord):
                 and not hard_trigger
             ):
                 raise ValueError("action review requires confirmed thesis evidence or a hard event")
-        if self.review_disposition is ReviewDisposition.MANUAL_THESIS_REVIEW_REQUIRED and (
-            self.thesis_review_state
-            not in {
+        if self.review_disposition is ReviewDisposition.MANUAL_THESIS_REVIEW_REQUIRED:
+            unresolved = self.thesis_review_state in {
                 ThesisMatchState.MANUAL_REVIEW_PENDING,
                 ThesisMatchState.MANUAL_REVIEW_UNCERTAIN,
             }
-        ):
-            raise ValueError("manual thesis review disposition requires unresolved thesis evidence")
+            confirmed_continue = (
+                self.thesis_review_state is ThesisMatchState.PRESENTED_MATCH_CONFIRMED
+                and self.action is ActionKind.CONTINUE_HOLDING
+            )
+            if not unresolved and not confirmed_continue:
+                raise ValueError(
+                    "manual thesis review disposition requires unresolved thesis evidence "
+                    "or confirmed evidence on a continue-holding request"
+                )
         if self.flow_status is FlowStatus.FAILED and (
             self.review_disposition is not ReviewDisposition.ABSTAIN
             or self.evidence_readiness is not EvidenceReadiness.INSUFFICIENT_DATA
@@ -1084,7 +1090,7 @@ class HoldingReviewResult(_CanonicalRecord):
         restriction_triggered = (
             TriggeredReviewCode.REDEMPTION_RESTRICTION_REVIEW in self.triggered_reviews
         )
-        if restricted != restriction_triggered:
+        if restricted and not restriction_triggered:
             raise ValueError("redemption restriction requires its authenticated review trigger")
         if self.action is ActionKind.CONTINUE_HOLDING:
             valid = (
@@ -1097,7 +1103,7 @@ class HoldingReviewResult(_CanonicalRecord):
             self.redemption_feasibility
             is RedemptionFeasibility.EVIDENCE_COMPLETE_NON_AUTHORIZING
         ):
-            valid = all_usable
+            valid = all_usable and not restriction_triggered
         elif self.redemption_feasibility is RedemptionFeasibility.INSUFFICIENT_DATA:
             valid = not restricted and not all_usable
         else:
