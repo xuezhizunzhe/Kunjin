@@ -237,6 +237,41 @@ def test_continue_observing_rejects_each_core_omission(omitted: str) -> None:
         review_result(omitted_work=(omitted,)).validate()
 
 
+def test_complete_result_retains_other_fund_gap_in_closed_coverage() -> None:
+    gap = "authenticated_index_identity_654321"
+    result = review_result(
+        omitted_work=(gap,),
+        history_comparability=HistoryComparability.COMPARABLE,
+        evidence_delta=EvidenceDelta(HistoryComparability.COMPARABLE, True),
+    )
+
+    result.validate()
+    assert result.omitted_work == (gap,)
+
+
+@pytest.mark.parametrize(
+    "gap",
+    (
+        "adjusted_return_common_end_mismatch_123456_654321",
+        "authenticated_index_identity_123456",
+        "authenticated_index_identity_000000",
+        "authenticated_index_identity_extra_654321",
+        "formal_nav",
+        "holdings_overlap_invalid_123456_654321",
+        "holdings_pair_comparability_123456_654321",
+        "holdings_report_period_unaligned_123456_654321",
+        "identity_scope_unknown",
+        "source_attempt_654321",
+    ),
+)
+def test_complete_result_rejects_selected_or_unscoped_gap(gap: str) -> None:
+    with pytest.raises(ValueError, match="ready holding review requires complete current coverage"):
+        review_result(
+            omitted_work=(gap,),
+            review_disposition=ReviewDisposition.ABSTAIN,
+        ).validate()
+
+
 def test_manual_thesis_review_allows_confirmed_semantics_without_action_upgrade() -> None:
     value = review_result(
         thesis_review_state=ThesisMatchState.PRESENTED_MATCH_CONFIRMED,

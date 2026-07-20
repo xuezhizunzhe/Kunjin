@@ -49,6 +49,60 @@ _SUPPORTED_OFFICIAL_EVENTS = frozenset(
         OfficialEventCode.BENCHMARK_CHANGE_NOTICE,
     )
 )
+_FUND_SCOPED_OMISSION_STEMS = (
+    "adjusted_return_accumulated_nav_missing_",
+    "adjusted_return_asymmetric_dates_",
+    "adjusted_return_correlation_invalid_",
+    "adjusted_return_date_order_invalid_",
+    "adjusted_return_discontinuity_",
+    "adjusted_return_duplicate_date_",
+    "adjusted_return_evidence_binding_invalid_",
+    "adjusted_return_evidence_conflict_",
+    "adjusted_return_evidence_future_",
+    "adjusted_return_evidence_incomplete_",
+    "adjusted_return_evidence_stale_",
+    "adjusted_return_observation_invalid_",
+    "adjusted_return_samples_insufficient_",
+    "adjusted_return_series_missing_",
+    "adjusted_return_source_binding_invalid_",
+    "adjusted_return_subject_mismatch_",
+    "adjusted_return_zero_variance_",
+    "authenticated_index_identity_",
+    "benchmark_effective_date_conflict_",
+    "coverage_evidence_budget_",
+    "current_benchmark_",
+    "current_benchmark_evidence_conflict_",
+    "current_benchmark_evidence_future_",
+    "current_benchmark_evidence_stale_",
+    "current_manager_team_",
+    "current_manager_team_evidence_conflict_",
+    "current_manager_team_evidence_future_",
+    "current_manager_team_evidence_stale_",
+    "d2_fact_id_duplicate_",
+    "d2_fact_set_invalid_",
+    "holdings_duplicate_exposure_",
+    "holdings_evidence_conflict_",
+    "holdings_evidence_future_",
+    "holdings_evidence_malformed_",
+    "holdings_evidence_missing_",
+    "holdings_evidence_stale_",
+    "holdings_industries_",
+    "identity_active_status_",
+    "identity_active_status_evidence_conflict_",
+    "identity_active_status_evidence_future_",
+    "identity_active_status_evidence_stale_",
+    "identity_evidence_conflict_",
+    "identity_evidence_missing_",
+    "identity_subject_conflict_",
+    "manager_evidence_conflict_",
+    "manager_evidence_missing_",
+    "share_class_evidence_conflict_",
+    "share_class_evidence_future_",
+    "share_class_evidence_stale_",
+    "share_class_identity_",
+    "share_class_sibling_not_authenticated_",
+    "share_class_sibling_unconfirmed_",
+)
 
 
 class FlowStatus(str, Enum):
@@ -223,6 +277,30 @@ def _sorted_identifiers(
     if validated != tuple(sorted(validated)):
         raise ValueError(f"{name} must be a sorted unique exact tuple")
     return validated
+
+
+def blocking_omissions_for_fund(
+    fund_code: str,
+    omissions: Tuple[str, ...],
+) -> Tuple[str, ...]:
+    _fund_code(fund_code)
+    _sorted_identifiers(omissions, "scoped omissions")
+    blocking = []
+    for omission in omissions:
+        suffix = omission.rsplit("_", 1)[-1]
+        scoped_code = (
+            suffix
+            if any(
+                omission == f"{stem}{suffix}"
+                for stem in _FUND_SCOPED_OMISSION_STEMS
+            )
+            and _FUND_CODE_PATTERN.fullmatch(suffix) is not None
+            and suffix != "000000"
+            else None
+        )
+        if scoped_code is None or scoped_code == fund_code:
+            blocking.append(omission)
+    return tuple(blocking)
 
 
 def _enum_tuple(value: object, enum_type: type[Enum], name: str) -> None:
@@ -965,12 +1043,16 @@ class HoldingReviewResult(_CanonicalRecord):
         self.evidence_delta.validate()
         if self.history_comparability is not self.evidence_delta.history_comparability:
             raise ValueError("result history comparability and evidence delta differ")
+        blocking_omissions = blocking_omissions_for_fund(
+            self.fund_code,
+            self.omitted_work,
+        )
         if self.evidence_delta.evidence_unchanged and (
             self.flow_status is not FlowStatus.COMPLETE
             or self.evidence_readiness is not EvidenceReadiness.READY
             or not self.official_negative_check_complete
             or not self.intelligence_schedule_complete
-            or self.omitted_work
+            or blocking_omissions
             or self.intelligence_omitted_work
             or self.intelligence_degraded_sources
         ):
@@ -995,11 +1077,6 @@ class HoldingReviewResult(_CanonicalRecord):
             for reference in references
         )
         if self.review_disposition is ReviewDisposition.CONTINUE_OBSERVING:
-            from kunjin.holding_review.policy import HeldFundManualReviewPolicyV1
-
-            forbidden = set(self.omitted_work) & set(
-                HeldFundManualReviewPolicyV1().core_omission_prohibition
-            )
             allowed_thesis_states = {
                 ThesisMatchState.NO_MATCHING_EVIDENCE,
                 ThesisMatchState.PRESENTED_MATCH_REJECTED,
@@ -1010,13 +1087,18 @@ class HoldingReviewResult(_CanonicalRecord):
                 or self.thesis_review_state not in allowed_thesis_states
                 or self.triggered_reviews
                 or self.hard_event_review
-                or forbidden
+                or blocking_omissions
                 or not self.official_negative_check_complete
                 or not self.intelligence_schedule_complete
                 or self.intelligence_omitted_work
                 or self.intelligence_degraded_sources
             ):
                 raise ValueError("continue observing evidence is incomplete")
+        if (
+            self.evidence_readiness is EvidenceReadiness.READY
+            and blocking_omissions
+        ):
+            raise ValueError("ready holding review requires complete current coverage")
         if self.hard_event_review != hard_trigger:
             raise ValueError("hard event review requires an authenticated hard-event trigger")
         support_ids = {reference.support_evidence_id for reference in references}

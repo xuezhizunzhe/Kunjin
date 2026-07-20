@@ -41,6 +41,60 @@ from kunjin.intelligence.models import LineageKind
 NOW = datetime(2026, 7, 20, 4, 0, tzinfo=timezone.utc)
 CHECKSUM = "a" * 64
 THESIS_FINGERPRINT = "b" * 64
+D2_FUND_SCOPED_OMISSION_STEMS = (
+    "adjusted_return_accumulated_nav_missing_",
+    "adjusted_return_asymmetric_dates_",
+    "adjusted_return_correlation_invalid_",
+    "adjusted_return_date_order_invalid_",
+    "adjusted_return_discontinuity_",
+    "adjusted_return_duplicate_date_",
+    "adjusted_return_evidence_binding_invalid_",
+    "adjusted_return_evidence_conflict_",
+    "adjusted_return_evidence_future_",
+    "adjusted_return_evidence_incomplete_",
+    "adjusted_return_evidence_stale_",
+    "adjusted_return_observation_invalid_",
+    "adjusted_return_samples_insufficient_",
+    "adjusted_return_series_missing_",
+    "adjusted_return_source_binding_invalid_",
+    "adjusted_return_subject_mismatch_",
+    "adjusted_return_zero_variance_",
+    "authenticated_index_identity_",
+    "benchmark_effective_date_conflict_",
+    "coverage_evidence_budget_",
+    "current_benchmark_",
+    "current_benchmark_evidence_conflict_",
+    "current_benchmark_evidence_future_",
+    "current_benchmark_evidence_stale_",
+    "current_manager_team_",
+    "current_manager_team_evidence_conflict_",
+    "current_manager_team_evidence_future_",
+    "current_manager_team_evidence_stale_",
+    "d2_fact_id_duplicate_",
+    "d2_fact_set_invalid_",
+    "holdings_duplicate_exposure_",
+    "holdings_evidence_conflict_",
+    "holdings_evidence_future_",
+    "holdings_evidence_malformed_",
+    "holdings_evidence_missing_",
+    "holdings_evidence_stale_",
+    "holdings_industries_",
+    "identity_active_status_",
+    "identity_active_status_evidence_conflict_",
+    "identity_active_status_evidence_future_",
+    "identity_active_status_evidence_stale_",
+    "identity_evidence_conflict_",
+    "identity_evidence_missing_",
+    "identity_subject_conflict_",
+    "manager_evidence_conflict_",
+    "manager_evidence_missing_",
+    "share_class_evidence_conflict_",
+    "share_class_evidence_future_",
+    "share_class_evidence_stale_",
+    "share_class_identity_",
+    "share_class_sibling_not_authenticated_",
+    "share_class_sibling_unconfirmed_",
+)
 
 
 def evidence_item(evidence_id: str = "evidence_a", **changes: object) -> ReviewEvidenceItem:
@@ -174,6 +228,23 @@ def previous_snapshot(evidence_ids: tuple[str, ...] = ("evidence_a",)) -> Holdin
     )
     value = replace(value, semantic_identity_checksum=value.expected_semantic_identity_checksum())
     return replace(value, record_checksum=value.expected_record_checksum())
+
+
+def previous_snapshot_with_omissions(
+    omitted_work: tuple[str, ...],
+) -> HoldingReviewSnapshot:
+    prior = previous_snapshot()
+    result = replace(prior.result, omitted_work=omitted_work)
+    prior = replace(
+        prior,
+        result=result,
+        result_fingerprint=result.expected_result_fingerprint(),
+    )
+    prior = replace(
+        prior,
+        semantic_identity_checksum=prior.expected_semantic_identity_checksum(),
+    )
+    return replace(prior, record_checksum=prior.expected_record_checksum())
 
 
 def previous_event_snapshot(
@@ -375,6 +446,74 @@ def test_closed_complete_no_candidate_can_only_continue_observing() -> None:
     assert result.review_disposition is ReviewDisposition.CONTINUE_OBSERVING
     assert result.boundary == ReviewBoundary()
     assert result.sell_timing == "insufficient_data"
+
+
+@pytest.mark.parametrize("stem", D2_FUND_SCOPED_OMISSION_STEMS)
+def test_other_fund_gap_remains_visible_without_blocking_selected_fund(stem: str) -> None:
+    gap = f"{stem}654321"
+    result = engine().evaluate(
+        review_inputs(
+            official_negative_check_complete=True,
+            omitted_work=(gap,),
+        )
+    )
+
+    assert result.omitted_work == (gap,)
+    assert result.flow_status is FlowStatus.COMPLETE
+    assert result.evidence_readiness is EvidenceReadiness.READY
+    assert result.review_disposition is ReviewDisposition.CONTINUE_OBSERVING
+
+
+@pytest.mark.parametrize("stem", D2_FUND_SCOPED_OMISSION_STEMS)
+def test_selected_fund_scoped_gap_still_blocks(stem: str) -> None:
+    result = engine().evaluate(
+        review_inputs(
+            official_negative_check_complete=True,
+            omitted_work=(f"{stem}123456",),
+        )
+    )
+
+    assert result.flow_status is FlowStatus.PARTIAL
+    assert result.review_disposition is ReviewDisposition.ABSTAIN
+
+
+@pytest.mark.parametrize(
+    "gap",
+    (
+        "adjusted_return_common_end_mismatch_123456_654321",
+        "authenticated_index_identity_000000",
+        "authenticated_index_identity_extra_654321",
+        "formal_nav",
+        "holdings_overlap_invalid_123456_654321",
+        "holdings_pair_comparability_123456_654321",
+        "holdings_report_period_unaligned_123456_654321",
+        "identity_scope_unknown",
+        "source_attempt_654321",
+    ),
+)
+def test_selected_or_unscoped_gap_still_blocks(gap: str) -> None:
+    result = engine().evaluate(
+        review_inputs(
+            official_negative_check_complete=True,
+            omitted_work=(gap,),
+        )
+    )
+
+    assert result.flow_status is FlowStatus.PARTIAL
+    assert result.review_disposition is ReviewDisposition.ABSTAIN
+
+
+def test_preview_without_official_negative_check_never_becomes_ready() -> None:
+    result = engine().evaluate(
+        review_inputs(
+            official_negative_check_complete=False,
+            omitted_work=(),
+        )
+    )
+
+    assert result.flow_status is FlowStatus.PARTIAL
+    assert result.evidence_readiness is EvidenceReadiness.PARTIAL
+    assert result.review_disposition is ReviewDisposition.ABSTAIN
 
 
 @pytest.mark.parametrize(
@@ -639,6 +778,65 @@ def test_exact_comparable_history_can_report_unchanged_only_with_closed_coverage
     )
     assert result.history_comparability is HistoryComparability.COMPARABLE
     assert result.evidence_delta.evidence_unchanged is True
+
+
+def test_other_fund_gap_does_not_create_false_history_coverage_loss() -> None:
+    other_fund_gap = "authenticated_index_identity_654321"
+    prior = previous_snapshot_with_omissions((other_fund_gap,))
+    review_engine = engine(prior)
+
+    repeated = review_engine.evaluate(
+        review_inputs(
+            previous_review_id=1,
+            official_negative_check_complete=True,
+            omitted_work=(other_fund_gap,),
+        )
+    )
+    assert repeated.history_comparability is HistoryComparability.COMPARABLE
+    assert repeated.evidence_delta.evidence_unchanged is True
+    assert "coverage_decreased" not in repeated.evidence_delta.reason_codes
+
+
+@pytest.mark.parametrize(
+    "prior_gaps,current_gaps",
+    (
+        ((), ("authenticated_index_identity_654321",)),
+        (("authenticated_index_identity_654321",), ()),
+        (
+            ("authenticated_index_identity_654321",),
+            ("current_benchmark_654321",),
+        ),
+    ),
+)
+def test_other_fund_gap_change_is_comparable_but_not_unchanged(
+    prior_gaps: tuple[str, ...],
+    current_gaps: tuple[str, ...],
+) -> None:
+    result = engine(previous_snapshot_with_omissions(prior_gaps)).evaluate(
+        review_inputs(
+            previous_review_id=1,
+            official_negative_check_complete=True,
+            omitted_work=current_gaps,
+        )
+    )
+
+    assert result.history_comparability is HistoryComparability.COMPARABLE
+    assert result.evidence_delta.evidence_unchanged is False
+    assert result.evidence_delta.reason_codes == ("portfolio_coverage_gaps_changed",)
+
+
+def test_selected_gap_still_causes_history_coverage_loss() -> None:
+    result = engine(previous_snapshot()).evaluate(
+        review_inputs(
+            previous_review_id=1,
+            official_negative_check_complete=True,
+            omitted_work=("authenticated_index_identity_123456",),
+        )
+    )
+
+    assert result.history_comparability is HistoryComparability.NOT_COMPARABLE
+    assert result.evidence_delta.evidence_unchanged is False
+    assert "coverage_decreased" in result.evidence_delta.reason_codes
 
 
 def test_previous_review_constructor_arguments_are_strictly_paired() -> None:

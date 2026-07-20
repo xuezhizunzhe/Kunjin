@@ -22,6 +22,7 @@ from kunjin.holding_review.models import (
     ReviewEvidenceItem,
     ThesisMatchState,
     TriggeredReviewCode,
+    blocking_omissions_for_fund,
 )
 from kunjin.holding_review.policy import HeldFundManualReviewPolicyV1
 from kunjin.intelligence.models import LineageKind
@@ -428,7 +429,7 @@ class HoldingReviewEngine:
                 support_ids,
                 ("previous_review_from_future",),
             )
-        return compare_evidence(
+        delta = compare_evidence(
             prior,
             inputs.review_evidence_items,
             current_coverage_complete,
@@ -436,6 +437,21 @@ class HoldingReviewEngine:
             current_additional_ids=support_ids,
             current_official_event_evidence=inputs.official_event_evidence,
         )
+        prior_portfolio_gaps = _nonblocking_omissions_for_fund(
+            prior.result.fund_code,
+            prior.result.omitted_work,
+        )
+        current_portfolio_gaps = _nonblocking_omissions_for_fund(
+            inputs.fund_code,
+            inputs.omitted_work,
+        )
+        if prior_portfolio_gaps != current_portfolio_gaps:
+            return _with_delta_reason(
+                delta,
+                "portfolio_coverage_gaps_changed",
+                make_not_comparable=False,
+            )
+        return delta
 
     def _comparable_prior_result(
         self,
@@ -465,7 +481,7 @@ def _input_coverage_complete(inputs: HoldingReviewInputs) -> bool:
     return (
         inputs.official_negative_check_complete
         and inputs.intelligence_schedule_complete
-        and not inputs.omitted_work
+        and not blocking_omissions_for_fund(inputs.fund_code, inputs.omitted_work)
         and not inputs.intelligence_omitted_work
         and not inputs.intelligence_degraded_sources
         and all(
@@ -486,7 +502,7 @@ def _result_coverage_complete(result: HoldingReviewResult) -> bool:
         and result.evidence_readiness is EvidenceReadiness.READY
         and result.official_negative_check_complete
         and result.intelligence_schedule_complete
-        and not result.omitted_work
+        and not blocking_omissions_for_fund(result.fund_code, result.omitted_work)
         and not result.intelligence_omitted_work
         and not result.intelligence_degraded_sources
         and not result.evidence_delta.corrected_evidence_ids
@@ -494,6 +510,14 @@ def _result_coverage_complete(result: HoldingReviewResult) -> bool:
         and not result.evidence_delta.expired_evidence_ids
         and not result.evidence_delta.conflicted_evidence_ids
     )
+
+
+def _nonblocking_omissions_for_fund(
+    fund_code: str,
+    omissions: Tuple[str, ...],
+) -> Tuple[str, ...]:
+    blocking = set(blocking_omissions_for_fund(fund_code, omissions))
+    return tuple(omission for omission in omissions if omission not in blocking)
 
 
 def _readiness(
