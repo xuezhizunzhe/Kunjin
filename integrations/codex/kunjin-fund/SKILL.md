@@ -78,33 +78,29 @@ still be split into its reduction and purchase legs.
 For `continue_holding` only, run JSON suitability status exactly once before fund brief. If both state and freshness are fresh, continue; if either is missing or stale, run JSON suitability assess exactly once from the existing encrypted local profile.
 Do not rerun suitability status. If suitability status or assessment fails, do not retry; continue to the single brief. Never run non-JSON `suitability assess`, request profile amounts, or ask the owner to refill a still-fresh profile. reduce_to_cash and full_exit skip this Phase B preflight. Run this finite route:
 
+Choose exactly one brief mode for one held-fund workflow. Default to Rapid. Use Deep instead only when the owner explicitly requests same-fund official-body confirmation. Never run both Rapid and Deep briefs in the same workflow, and never run Rapid first and automatically upgrade it to Deep.
+
 ```bash
 kunjin --json fund brief CODE --action ACTION --mode rapid
+# Explicit alternative, not a second brief in the same workflow:
+kunjin --json fund brief CODE --action ACTION --mode deep
 kunjin --json fund intelligence CODE --window recent --mode rapid
 kunjin --json thesis match-project CODE --intelligence-request-run-id INTELLIGENCE_REQUEST_RUN_ID
 kunjin --json thesis adjudicate CODE --thesis-match-projection-id PROJECTION_ID --decision DECISION
 kunjin --json fund holding-review CODE --action ACTION --brief-request-run-id BRIEF_REQUEST_RUN_ID --intelligence-request-run-id INTELLIGENCE_REQUEST_RUN_ID
 ```
 
-The order is `fund brief exactly once -> fund intelligence exactly once -> thesis
-match-project exactly once -> thesis adjudicate at most once -> fund holding-review
-exactly once`. Read each brief/intelligence `data.request.request_run_id` and the
-projection `data.id`; never substitute latest/history records. Run `thesis
-adjudicate` only after the owner explicitly confirms the exact projected evidence.
-An acceptance token is not owner adjudication. Otherwise skip adjudication.
+The order is `fund brief exactly once -> fund intelligence exactly once -> thesis match-project exactly once -> thesis adjudicate at most once -> fund holding-review exactly once`. Read each brief/intelligence `data.request.request_run_id` and projection `data.id`; never substitute latest/history records. Run `thesis adjudicate` only after the owner explicitly confirms the exact projected evidence. This is a projection-specific owner decision, not confirmation of the source, whole thesis, or future evidence. An acceptance token is not owner adjudication. Otherwise skip adjudication.
 
-`fund holding-review` is local and network-free. Each command keeps its own
-independent budget. Rapid intelligence owns its own 90-second budget. Never retry
-automatically. Never run Deep automatically. Never develop an adapter during the
-request. Stop after the review and present every gap.
+`fund holding-review` is local and network-free. Each command keeps its own independent budget. A Rapid brief owns 90 seconds; an explicit Deep brief owns 480 seconds; `fund intelligence` owns its own Rapid 90-second budget; `match-project`, optional `adjudicate`, and `holding-review` are local and share no network budget. Never retry automatically. Never continue in the background. Never run Deep automatically. Never develop an adapter during the request. Stop after the review and present every gap.
 
-Rapid title candidates cannot prove that a high-impact official event is absent.
-Deep official confirmation is deferred. The preview fixes
-`official_negative_check_complete=false`, requires `official_confirmation_required`,
-allows only `review_disposition=abstain|manual_thesis_review_required`, and keeps
-`sell_timing=insufficient_data`, `action_authorized=false`,
-`exact_amount_available=false`, and `automatic_trade=false`. Never turn it into a
-sale date, amount, order, or 90% beginner-help claim.
+Rapid performs ordinary context and title-level candidate discovery only. Run explicit Deep only when the owner requests same-fund official-body confirmation, using `kunjin --json fund brief CODE --action ACTION --mode deep`; never promote a Rapid run in place. Deep covers fund liquidation, fund termination, redemption restriction, manager change, fee change, and benchmark change. Rapid title candidates cannot prove that a high-impact event is absent. An authenticated official negative-check closure may set `official_negative_check_complete=true` only when same-fund binding, registered manager official sources, the bounded window, pagination terminal state, candidate bodies, and the authenticated closure are all complete. Any source, window, binding, body, conflict, truncation, or cap gap forces `official_negative_check_complete=false`, `official_confirmation_required`, and `abstain` or `manual_thesis_review_required`. Never fall back to Tier 2 to close an official gap.
+
+`official_negative_check_complete=true` does not mean no major risk and does not mean zero candidates; a complete check can contain authenticated major events. For a complete zero-candidate result, say only: `本次有界官方检查未发现需要升级复核的候选；这不能排除其他重大风险。`
+
+Use `review_disposition=continue_observing|reduce_review|exit_review only when its evidence contract is complete`; otherwise use `abstain` or `manual_thesis_review_required`. Always preserve `sell_timing=insufficient_data`, `action_authorized=false`, `exact_amount_available=false`, and `automatic_trade=false`. Never output an unconfirmed exact amount, sale date, order, or automatic trade.
+
+Beginner-facing output defaults to Chinese and separates `事实、分析、条件建议、风险、失效条件、证据缺口`. State the supporting evidence and invalidation conditions for every conditional direction. The response gives a Chinese conclusion by default and hides internal codes unless the owner requests technical details or hiding one creates a safety ambiguity. KunJin `不承诺收益`, `不提供万能赢家`, and `不声称未经验证的命中率或帮助率`.
 
 Use the brief when the request includes `continue_holding`, `reduce_to_cash`,
 `full_exit`, or `switch_funds`; `fact_research` is always added internally.
@@ -470,12 +466,12 @@ Route the five personal MVP scenarios without implying unavailable decisions:
 - latest news: route `fact_research`, then run `kunjin --json news recent --window recent --mode rapid`;
 - market context or a direction-to-buy question: route `fact_research` and also `buy_or_add` when purchase intent exists, then run `market overview`; expect `direction=insufficient_data` until its missing dimensions are authenticated;
 - named candidate: route `fact_research` and `buy_or_add`; resolve names uniquely, refresh required bounded evidence outside the shortlist command, then use `fund shortlist` only for 2-5 exact owner-supplied codes and keep mandatory purchase abstention;
-- held-fund daily review: clarify partial reduction versus full exit, use the corresponding `fund brief` action, then `fund intelligence` and `thesis review`; this reviews evidence and does not time a sale; and
+- held-fund daily review: choose one brief mode and preserve `exact intelligence request ID -> thesis match-project -> exact projection owner confirmation -> optional adjudicate -> holding-review with exact brief and intelligence request IDs`; an acceptance token cannot replace that owner confirmation, and this review does not time a sale; and
 - portfolio diagnosis: run `status -> sync portfolio -> portfolio diagnose`; refresh stale or missing disclosures separately when broader observed coverage is needed.
 
 Preserve source outcome, date, source tier, publication date, `fact` versus `reasoned_inference`, lineage, reprint, conflict, partial, cooldown, cap, and manual supplementation fields. A reprint is not independent confirmation. At `market_session=unknown`, state `direction=insufficient_data`; never turn HTTP retrieval time or `experimental_shadow` into market timing. Source accuracy is not prediction accuracy.
 
-Treat fund relevance as `disclosed_context`, not current or complete exposure. Use `fund profile`, `fund fees`, and `fund research` for identity, manager, fee, formal-NAV, and risk facts. A thesis `possible_invalidation_match` or `no_matching_evidence` requires manual semantic review and cannot trigger a sale. Preserve `action_maturity=evidence_only`, `action_authorized=false`, and `exact_amount_available=false`.
+Treat fund relevance as `disclosed_context`, not current or complete exposure. Use `fund profile`, `fund fees`, and `fund research` for identity, manager, fee, formal-NAV, and risk facts. A thesis `possible_invalidation_match` requires projection-specific manual review; `no_matching_evidence` proves neither unchanged evidence nor a sale condition. Preserve `action_maturity=evidence_only`, `action_authorized=false`, and `exact_amount_available=false`.
 
 `portfolio diagnose` is evidence only. Its optional `--candidate` accepts one user-supplied candidate; it does not satisfy complete D2, D3, buy or add, hold, reduce, or exit, or exact amount gates. Preserve coverage and unknown codes. Legacy `portfolio analyze` and `portfolio overlap` remain lower-level tools.
 `fund shortlist` composes local comparison, D1, personal-gate status, and observed portfolio-impact evidence without network access. Preserve candidate order for identity only and every returned date, source tier, aligned NAV interval, D1 state, coverage, conflict, warning, missing-evidence code, and stable reason code; never call `conditional_shortlist` a recommendation or winner.
@@ -489,7 +485,7 @@ Use read-only browsing only as visibly separate transient `external_context` wit
 - Never request exact income, debt, reserve, asset, goal, or loss-budget values in chat. Direct exact entry to the local interactive `kunjin profile edit`.
 - Treat `profile status` and `profile history` as metadata-only. A missing Keychain profile-encryption key makes the encrypted profile unavailable; do not reveal, reset, overwrite, or silently replace the old profile.
 - Phase A profile presence is not suitability approval. Run the amount-free `--json suitability assess` when a current route requires Phase B for holding or risk-increasing work, not before authorization, evidence capture, factual research, reduction/exit research, or sync work.
-- Treat every Phase B, Phase C, and D1 state as `research_only`. `ready_for_allocation` and `range_available` are not buy recommendations. Phase C does not classify a real fund, choose a target, approve an amount, or justify a 90% beginner-help claim. D1 classifies public-product evidence only; even `verified` is not suitability, allocation, a recommendation, or a buy signal. Only the minimum D2 subset and bounded Phase 4 shortlist are implemented; complete D2 and D3 exact-amount/channel authorization are not, and Phase E remains unimplemented.
+- Treat every Phase B, Phase C, and D1 state as `research_only`. `ready_for_allocation` and `range_available` are not buy recommendations. Phase C does not classify a real fund, choose a target, approve an amount, or justify an unvalidated help-rate claim. D1 classifies public-product evidence only; even `verified` is not suitability, allocation, a recommendation, or a buy signal. Only the minimum D2 subset, bounded Phase 4 shortlist, and Phase 5 manual review are implemented; complete D2, D3 exact-amount/channel authorization, and mature automated Phase E monitoring/timing remain unavailable.
 - Never operate Alipay or modify Yangjibao holdings.
 - Never run `ledger confirm` without explicit confirmation of the displayed draft from the user.
 - Never expose a managed screenshot path. `ledger document delete` removes only KunJin's private managed copy, not the user's original image or the immutable confirmed transaction.

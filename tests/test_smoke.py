@@ -4037,21 +4037,63 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             "thesis adjudicate at most once",
             "fund holding-review exactly once",
             "local and network-free",
-            "Rapid title candidates cannot prove that a high-impact official event is absent",
-            "Deep official confirmation is deferred",
+            "Choose exactly one brief mode for one held-fund workflow",
+            "Default to Rapid",
+            "Never run both Rapid and Deep briefs in the same workflow",
+            "Rapid performs ordinary context and title-level candidate discovery only",
+            "Run explicit Deep only when the owner requests same-fund official-body confirmation",
+            "kunjin --json fund brief CODE --action ACTION --mode deep",
+            "fund liquidation",
+            "fund termination",
+            "redemption restriction",
+            "manager change",
+            "fee change",
+            "benchmark change",
+            "authenticated official negative-check closure",
+            "registered manager official sources",
+            "bounded window",
+            "pagination terminal state",
+            "authenticated closure",
+            "official_negative_check_complete=true",
             "official_negative_check_complete=false",
             "official_confirmation_required",
-            "review_disposition=abstain|manual_thesis_review_required",
+            "does not mean no major risk and does not mean zero candidates",
+            "本次有界官方检查未发现需要升级复核的候选；这不能排除其他重大风险。",
+            "Never fall back to Tier 2",
+            "Any source, window, binding, body, conflict, truncation, or cap gap forces",
+            (
+                "review_disposition=continue_observing|reduce_review|exit_review "
+                "only when its evidence contract is complete"
+            ),
             "sell_timing=insufficient_data",
             "action_authorized=false",
             "exact_amount_available=false",
             "automatic_trade=false",
             "Each command keeps its own independent budget",
+            "A Rapid brief owns 90 seconds",
+            "an explicit Deep brief owns 480 seconds",
+            "`fund intelligence` owns its own Rapid 90-second budget",
+            (
+                "`match-project`, optional `adjudicate`, and `holding-review` "
+                "are local and share no network budget"
+            ),
             "Never retry automatically",
+            "Never continue in the background",
             "Never develop an adapter during the request",
             "Never run Deep automatically",
             "An acceptance token is not owner adjudication",
+            "projection-specific owner decision",
+            (
+                "exact intelligence request ID -> thesis match-project -> exact projection "
+                "owner confirmation -> optional adjudicate -> holding-review with exact brief "
+                "and intelligence request IDs"
+            ),
             "Stop after the review and present every gap",
+            "事实、分析、条件建议、风险、失效条件、证据缺口",
+            "Chinese conclusion by default and hides internal codes",
+            "不承诺收益",
+            "不提供万能赢家",
+            "不声称未经验证的命中率或帮助率",
         )
         for document in normalized_documents:
             for phrase in required_phrases:
@@ -4093,8 +4135,15 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             "未发现公告就表示没有重大风险",
             "provides 90% beginner help",
             "guarantees 90% beginner help",
+            "guaranteed return",
+            "universal winner",
+            "60%-80% hit rate",
+            "then `fund intelligence` and `thesis review`",
+            "Deep official confirmation is deferred",
+            "This bounded official check found no candidate",
         ):
-            self.assertNotIn(unsupported_claim, normalized_skill)
+            for document in normalized_documents:
+                self.assertNotIn(unsupported_claim, document)
         self.assertLess(len(skill.splitlines()), 500)
 
 
