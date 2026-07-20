@@ -579,6 +579,58 @@ class HoldingReviewStore:
         except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
             raise HoldingReviewStoreError("holding review snapshot authentication failed") from None
 
+    def authenticated_review_evidence_descriptors(
+        self,
+        review_id: int,
+    ) -> tuple[ReviewEvidenceItem, ...]:
+        _positive_id(review_id, "review id")
+        try:
+            with self.repository.connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM holding_review_snapshots WHERE id=?",
+                    (review_id,),
+                ).fetchone()
+                if row is None:
+                    raise HoldingReviewStoreError(
+                        "holding review snapshot authentication failed"
+                    )
+                stored = self._stored_review(row)
+                self._authenticate_review_references(
+                    connection,
+                    stored.value,
+                    require_current_adjudication=False,
+                )
+                intelligence = self._intelligence_by_request(
+                    connection, stored.value.intelligence_request_run_id
+                )
+                descriptors = self._derived_evidence_descriptors(
+                    connection, intelligence
+                )
+                official_ids = {
+                    reference.support_evidence_id
+                    for reference in stored.value.result.official_event_evidence
+                }
+                evidence_ids = tuple(
+                    evidence_id
+                    for evidence_id in stored.value.result.evidence_ids
+                    if evidence_id not in official_ids
+                )
+                if any(evidence_id not in descriptors for evidence_id in evidence_ids):
+                    raise HoldingReviewStoreError(
+                        "holding review evidence descriptor authentication failed"
+                    )
+                return tuple(descriptors[evidence_id] for evidence_id in evidence_ids)
+        except HoldingReviewStoreError:
+            raise
+        except (BriefStoreError, IntelligenceStoreError, sqlite3.DatabaseError):
+            raise HoldingReviewStoreError(
+                "holding review evidence descriptor authentication failed"
+            ) from None
+        except (TypeError, ValueError, OverflowError, UnicodeError, KeyError):
+            raise HoldingReviewStoreError(
+                "holding review evidence descriptor authentication failed"
+            ) from None
+
     def _authenticate_projection_references(
         self,
         connection: sqlite3.Connection,
