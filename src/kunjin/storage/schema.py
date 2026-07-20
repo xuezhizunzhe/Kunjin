@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -3889,4 +3889,858 @@ WHEN NOT EXISTS (
       AND julianday(NEW.retrieved_at) <= julianday(finished_at, '+1 second')
 )
 BEGIN SELECT RAISE(ABORT, 'intelligence item source attempt binding failed'); END;
+"""
+
+SCHEMA_V21 = """
+CREATE TABLE fund_official_announcement_contents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id)='integer' AND id>0),
+    brief_request_run_id INTEGER NOT NULL REFERENCES request_runs(id) ON DELETE RESTRICT,
+    source_attempt_id INTEGER NOT NULL REFERENCES source_attempts(id) ON DELETE RESTRICT,
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code)='text' AND length(CAST(fund_code AS BLOB))=6
+        AND fund_code NOT GLOB '*[^0-9]*' AND fund_code<>'000000'
+    ),
+    listing_source_document_id INTEGER NOT NULL
+        REFERENCES fund_source_documents(id) ON DELETE RESTRICT,
+    canonical_announcement_url TEXT NOT NULL CHECK(
+        typeof(canonical_announcement_url)='text'
+        AND canonical_announcement_url GLOB 'https://*'
+        AND instr(canonical_announcement_url, char(0))=0
+    ),
+    announcement_title TEXT NOT NULL CHECK(
+        typeof(announcement_title)='text' AND length(announcement_title)>0
+        AND instr(announcement_title, char(0))=0
+    ),
+    announcement_published_at TEXT NOT NULL CHECK(julianday(announcement_published_at) IS NOT NULL),
+    publisher TEXT NOT NULL CHECK(
+        typeof(publisher)='text' AND length(publisher)>0 AND instr(publisher, char(0))=0
+    ),
+    normalized_content TEXT NOT NULL CHECK(
+        typeof(normalized_content)='text' AND instr(normalized_content, char(0))=0
+    ),
+    normalized_content_bytes INTEGER NOT NULL CHECK(
+        typeof(normalized_content_bytes)='integer'
+        AND normalized_content_bytes BETWEEN 1 AND 524288
+    ),
+    normalized_content_sha256 TEXT NOT NULL CHECK(
+        typeof(normalized_content_sha256)='text'
+        AND length(CAST(normalized_content_sha256 AS BLOB))=64
+        AND normalized_content_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    original_source_id TEXT NOT NULL CHECK(
+        original_source_id='fund_manager_official_documents'
+    ),
+    quoted_source_id TEXT CHECK(
+        quoted_source_id IS NULL OR (
+            typeof(quoted_source_id)='text' AND length(quoted_source_id) BETWEEN 1 AND 128
+            AND quoted_source_id<>original_source_id
+        )
+    ),
+    integrity_status TEXT NOT NULL CHECK(integrity_status IN ('active','corrected','retracted')),
+    integrity_checked_at TEXT NOT NULL CHECK(julianday(integrity_checked_at) IS NOT NULL),
+    retrieved_at TEXT NOT NULL CHECK(julianday(retrieved_at) IS NOT NULL),
+    record_checksum TEXT NOT NULL CHECK(
+        typeof(record_checksum)='text' AND length(CAST(record_checksum AS BLOB))=64
+        AND record_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    UNIQUE(listing_source_document_id, canonical_announcement_url,
+           normalized_content_sha256, integrity_checked_at),
+    CHECK(integrity_checked_at >= announcement_published_at),
+    CHECK(retrieved_at >= announcement_published_at)
+);
+
+CREATE TABLE held_review_official_event_projections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id)='integer' AND id>0),
+    brief_request_run_id INTEGER NOT NULL REFERENCES request_runs(id) ON DELETE RESTRICT,
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code)='text' AND length(CAST(fund_code AS BLOB))=6
+        AND fund_code NOT GLOB '*[^0-9]*' AND fund_code<>'000000'
+    ),
+    announcement_row_id INTEGER NOT NULL REFERENCES fund_announcements(id) ON DELETE RESTRICT,
+    announcement_content_id INTEGER NOT NULL
+        REFERENCES fund_official_announcement_contents(id) ON DELETE RESTRICT,
+    event_code TEXT NOT NULL CHECK(event_code IN (
+        'fund_liquidation_notice','fund_termination_notice',
+        'redemption_restriction_notice','manager_change_notice',
+        'fee_change_notice','benchmark_change_notice'
+    )),
+    triggered_review_code TEXT NOT NULL CHECK(triggered_review_code IN (
+        'full_exit_feasibility_review','redemption_restriction_review',
+        'manager_change_review','fee_change_review','benchmark_change_review'
+    )),
+    policy_version TEXT NOT NULL CHECK(
+        typeof(policy_version)='text' AND length(policy_version) BETWEEN 1 AND 64
+    ),
+    policy_checksum TEXT NOT NULL CHECK(
+        typeof(policy_checksum)='text' AND length(CAST(policy_checksum AS BLOB))=64
+        AND policy_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    record_checksum TEXT NOT NULL CHECK(
+        typeof(record_checksum)='text' AND length(CAST(record_checksum AS BLOB))=64
+        AND record_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    UNIQUE(brief_request_run_id, announcement_content_id, event_code),
+    CHECK(
+        (event_code IN ('fund_liquidation_notice','fund_termination_notice')
+         AND triggered_review_code='full_exit_feasibility_review')
+        OR (event_code='redemption_restriction_notice'
+            AND triggered_review_code='redemption_restriction_review')
+        OR (event_code='manager_change_notice'
+            AND triggered_review_code='manager_change_review')
+        OR (event_code='fee_change_notice' AND triggered_review_code='fee_change_review')
+        OR (event_code='benchmark_change_notice'
+            AND triggered_review_code='benchmark_change_review')
+    )
+);
+
+CREATE TABLE thesis_match_projections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id)='integer' AND id>0),
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code)='text' AND length(CAST(fund_code AS BLOB))=6
+        AND fund_code NOT GLOB '*[^0-9]*' AND fund_code<>'000000'
+    ),
+    thesis_id INTEGER REFERENCES investment_theses(id) ON DELETE RESTRICT,
+    thesis_fingerprint TEXT CHECK(
+        thesis_fingerprint IS NULL OR (
+            typeof(thesis_fingerprint)='text'
+            AND length(CAST(thesis_fingerprint AS BLOB))=64
+            AND thesis_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    intelligence_request_run_id INTEGER NOT NULL REFERENCES request_runs(id) ON DELETE RESTRICT,
+    intelligence_snapshot_id INTEGER NOT NULL
+        REFERENCES intelligence_snapshots(id) ON DELETE RESTRICT,
+    intelligence_snapshot_checksum TEXT NOT NULL CHECK(
+        typeof(intelligence_snapshot_checksum)='text'
+        AND length(CAST(intelligence_snapshot_checksum AS BLOB))=64
+        AND intelligence_snapshot_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    matcher_policy_version TEXT NOT NULL CHECK(
+        typeof(matcher_policy_version)='text' AND length(matcher_policy_version) BETWEEN 1 AND 64
+    ),
+    matcher_policy_checksum TEXT NOT NULL CHECK(
+        typeof(matcher_policy_checksum)='text'
+        AND length(CAST(matcher_policy_checksum AS BLOB))=64
+        AND matcher_policy_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    projection_state TEXT NOT NULL CHECK(projection_state IN (
+        'thesis_missing','no_matching_evidence','possible_invalidation_match'
+    )),
+    evidence_ids_json TEXT NOT NULL CHECK(
+        typeof(evidence_ids_json)='text' AND json_valid(evidence_ids_json)
+        AND json_type(evidence_ids_json)='array' AND evidence_ids_json=json(evidence_ids_json)
+        AND json_array_length(evidence_ids_json)<=128
+        AND length(CAST(evidence_ids_json AS BLOB))<=16384
+    ),
+    evidence_descriptors_json TEXT NOT NULL CHECK(
+        typeof(evidence_descriptors_json)='text' AND json_valid(evidence_descriptors_json)
+        AND json_type(evidence_descriptors_json)='array'
+        AND evidence_descriptors_json=json(evidence_descriptors_json)
+        AND json_array_length(evidence_descriptors_json)<=128
+        AND length(CAST(evidence_descriptors_json AS BLOB))<=262144
+    ),
+    evidence_set_checksum TEXT NOT NULL CHECK(
+        typeof(evidence_set_checksum)='text'
+        AND length(CAST(evidence_set_checksum AS BLOB))=64
+        AND evidence_set_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+    record_checksum TEXT NOT NULL CHECK(
+        typeof(record_checksum)='text' AND length(CAST(record_checksum AS BLOB))=64
+        AND record_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    UNIQUE(fund_code, thesis_fingerprint, intelligence_request_run_id,
+           matcher_policy_checksum, evidence_set_checksum),
+    CHECK((thesis_id IS NULL)=(thesis_fingerprint IS NULL)),
+    CHECK(
+        (projection_state='thesis_missing' AND thesis_id IS NULL
+         AND json_array_length(evidence_ids_json)=0
+         AND json_array_length(evidence_descriptors_json)=0)
+        OR (projection_state='no_matching_evidence' AND thesis_id IS NOT NULL
+            AND json_array_length(evidence_ids_json)=0
+            AND json_array_length(evidence_descriptors_json)=0)
+        OR (projection_state='possible_invalidation_match' AND thesis_id IS NOT NULL
+            AND json_array_length(evidence_ids_json)>0
+            AND json_array_length(evidence_ids_json)=json_array_length(evidence_descriptors_json))
+    )
+);
+
+CREATE TABLE thesis_evidence_adjudications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id)='integer' AND id>0),
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code)='text' AND length(CAST(fund_code AS BLOB))=6
+        AND fund_code NOT GLOB '*[^0-9]*' AND fund_code<>'000000'
+    ),
+    thesis_id INTEGER NOT NULL REFERENCES investment_theses(id) ON DELETE RESTRICT,
+    thesis_fingerprint TEXT NOT NULL CHECK(
+        typeof(thesis_fingerprint)='text' AND length(CAST(thesis_fingerprint AS BLOB))=64
+        AND thesis_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    thesis_match_projection_id INTEGER NOT NULL
+        REFERENCES thesis_match_projections(id) ON DELETE RESTRICT,
+    thesis_match_projection_checksum TEXT NOT NULL CHECK(
+        typeof(thesis_match_projection_checksum)='text'
+        AND length(CAST(thesis_match_projection_checksum AS BLOB))=64
+        AND thesis_match_projection_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    intelligence_request_run_id INTEGER NOT NULL REFERENCES request_runs(id) ON DELETE RESTRICT,
+    intelligence_snapshot_checksum TEXT NOT NULL CHECK(
+        typeof(intelligence_snapshot_checksum)='text'
+        AND length(CAST(intelligence_snapshot_checksum AS BLOB))=64
+        AND intelligence_snapshot_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    evidence_ids_json TEXT NOT NULL CHECK(
+        typeof(evidence_ids_json)='text' AND json_valid(evidence_ids_json)
+        AND json_type(evidence_ids_json)='array' AND evidence_ids_json=json(evidence_ids_json)
+        AND json_array_length(evidence_ids_json) BETWEEN 1 AND 128
+        AND length(CAST(evidence_ids_json AS BLOB))<=16384
+    ),
+    evidence_set_checksum TEXT NOT NULL CHECK(
+        typeof(evidence_set_checksum)='text' AND length(CAST(evidence_set_checksum AS BLOB))=64
+        AND evidence_set_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    decision TEXT NOT NULL CHECK(decision IN (
+        'presented_match_confirmed','presented_match_rejected','uncertain'
+    )),
+    superseded_adjudication_id INTEGER
+        REFERENCES thesis_evidence_adjudications(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+    record_checksum TEXT NOT NULL CHECK(
+        typeof(record_checksum)='text' AND length(CAST(record_checksum AS BLOB))=64
+        AND record_checksum NOT GLOB '*[^0-9a-f]*'
+    )
+);
+
+CREATE UNIQUE INDEX thesis_evidence_adjudication_identity
+ON thesis_evidence_adjudications(
+    fund_code, thesis_id, thesis_fingerprint, thesis_match_projection_id,
+    thesis_match_projection_checksum, intelligence_request_run_id,
+    intelligence_snapshot_checksum, evidence_set_checksum, decision,
+    COALESCE(superseded_adjudication_id, 0)
+);
+
+CREATE TABLE holding_review_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id)='integer' AND id>0),
+    fund_code TEXT NOT NULL CHECK(
+        typeof(fund_code)='text' AND length(CAST(fund_code AS BLOB))=6
+        AND fund_code NOT GLOB '*[^0-9]*' AND fund_code<>'000000'
+    ),
+    action TEXT NOT NULL CHECK(action IN ('continue_holding','reduce_to_cash','full_exit')),
+    brief_request_run_id INTEGER NOT NULL REFERENCES request_runs(id) ON DELETE RESTRICT,
+    brief_snapshot_id INTEGER NOT NULL REFERENCES fund_brief_snapshots(id) ON DELETE RESTRICT,
+    brief_snapshot_checksum TEXT NOT NULL CHECK(
+        typeof(brief_snapshot_checksum)='text'
+        AND length(CAST(brief_snapshot_checksum AS BLOB))=64
+        AND brief_snapshot_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    intelligence_request_run_id INTEGER NOT NULL REFERENCES request_runs(id) ON DELETE RESTRICT,
+    intelligence_snapshot_id INTEGER NOT NULL
+        REFERENCES intelligence_snapshots(id) ON DELETE RESTRICT,
+    intelligence_snapshot_checksum TEXT NOT NULL CHECK(
+        typeof(intelligence_snapshot_checksum)='text'
+        AND length(CAST(intelligence_snapshot_checksum AS BLOB))=64
+        AND intelligence_snapshot_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    thesis_match_projection_id INTEGER NOT NULL
+        REFERENCES thesis_match_projections(id) ON DELETE RESTRICT,
+    thesis_match_projection_checksum TEXT NOT NULL CHECK(
+        typeof(thesis_match_projection_checksum)='text'
+        AND length(CAST(thesis_match_projection_checksum AS BLOB))=64
+        AND thesis_match_projection_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    active_thesis_state TEXT NOT NULL CHECK(active_thesis_state IN ('present','missing')),
+    active_thesis_id INTEGER REFERENCES investment_theses(id) ON DELETE RESTRICT,
+    active_thesis_fingerprint TEXT CHECK(
+        active_thesis_fingerprint IS NULL OR (
+            typeof(active_thesis_fingerprint)='text'
+            AND length(CAST(active_thesis_fingerprint AS BLOB))=64
+            AND active_thesis_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    adjudication_state TEXT NOT NULL CHECK(adjudication_state IN ('present','missing')),
+    adjudication_id INTEGER REFERENCES thesis_evidence_adjudications(id) ON DELETE RESTRICT,
+    adjudication_checksum TEXT CHECK(
+        adjudication_checksum IS NULL OR (
+            typeof(adjudication_checksum)='text'
+            AND length(CAST(adjudication_checksum AS BLOB))=64
+            AND adjudication_checksum NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    previous_review_id INTEGER REFERENCES holding_review_snapshots(id) ON DELETE RESTRICT,
+    result_json TEXT NOT NULL CHECK(
+        typeof(result_json)='text' AND json_valid(result_json)
+        AND json_type(result_json)='object' AND result_json=json(result_json)
+        AND length(CAST(result_json AS BLOB))<=4194304
+    ),
+    result_fingerprint TEXT NOT NULL CHECK(
+        typeof(result_fingerprint)='text' AND length(CAST(result_fingerprint AS BLOB))=64
+        AND result_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    policy_version TEXT NOT NULL CHECK(
+        typeof(policy_version)='text' AND length(policy_version) BETWEEN 1 AND 64
+    ),
+    policy_checksum TEXT NOT NULL CHECK(
+        typeof(policy_checksum)='text' AND length(CAST(policy_checksum AS BLOB))=64
+        AND policy_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+    semantic_identity_checksum TEXT NOT NULL UNIQUE CHECK(
+        typeof(semantic_identity_checksum)='text'
+        AND length(CAST(semantic_identity_checksum AS BLOB))=64
+        AND semantic_identity_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    record_checksum TEXT NOT NULL CHECK(
+        typeof(record_checksum)='text' AND length(CAST(record_checksum AS BLOB))=64
+        AND record_checksum NOT GLOB '*[^0-9a-f]*'
+    ),
+    CHECK(
+        (active_thesis_state='present' AND active_thesis_id IS NOT NULL
+         AND active_thesis_fingerprint IS NOT NULL)
+        OR (active_thesis_state='missing' AND active_thesis_id IS NULL
+            AND active_thesis_fingerprint IS NULL)
+    ),
+    CHECK(
+        (adjudication_state='present' AND adjudication_id IS NOT NULL
+         AND adjudication_checksum IS NOT NULL AND active_thesis_state='present')
+        OR (adjudication_state='missing' AND adjudication_id IS NULL
+            AND adjudication_checksum IS NULL)
+    )
+);
+
+CREATE INDEX holding_review_snapshots_history
+ON holding_review_snapshots(fund_code, action, created_at DESC, id DESC);
+
+CREATE UNIQUE INDEX holding_review_snapshot_semantic_fields
+ON holding_review_snapshots(
+    fund_code, action,
+    brief_request_run_id, brief_snapshot_id, brief_snapshot_checksum,
+    intelligence_request_run_id, intelligence_snapshot_id,
+    intelligence_snapshot_checksum,
+    thesis_match_projection_id, thesis_match_projection_checksum,
+    active_thesis_state, COALESCE(active_thesis_id, 0),
+    COALESCE(active_thesis_fingerprint, ''),
+    adjudication_state, COALESCE(adjudication_id, 0),
+    COALESCE(adjudication_checksum, ''),
+    json_extract(result_json, '$.remainder_intent'),
+    json_extract(result_json, '$.exit_reason'),
+    json_extract(result_json, '$.use_of_proceeds'),
+    policy_checksum, result_fingerprint
+);
+
+CREATE TRIGGER fund_official_announcement_content_no_replace
+BEFORE INSERT ON fund_official_announcement_contents
+WHEN EXISTS(
+    SELECT 1 FROM fund_official_announcement_contents
+    WHERE id=NEW.id OR (
+        listing_source_document_id=NEW.listing_source_document_id
+        AND canonical_announcement_url=NEW.canonical_announcement_url
+        AND normalized_content_sha256=NEW.normalized_content_sha256
+        AND integrity_checked_at=NEW.integrity_checked_at
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'official announcement contents cannot be replaced'); END;
+
+CREATE TRIGGER held_review_official_event_projection_no_replace
+BEFORE INSERT ON held_review_official_event_projections
+WHEN EXISTS(
+    SELECT 1 FROM held_review_official_event_projections
+    WHERE id=NEW.id OR (
+        brief_request_run_id=NEW.brief_request_run_id
+        AND announcement_content_id=NEW.announcement_content_id
+        AND event_code=NEW.event_code
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'official event projections cannot be replaced'); END;
+
+CREATE TRIGGER fund_official_announcement_content_insert_guard
+BEFORE INSERT ON fund_official_announcement_contents
+WHEN NOT EXISTS(
+    SELECT 1
+    FROM request_runs AS run
+    JOIN source_attempts AS attempt ON attempt.id=NEW.source_attempt_id
+    JOIN fund_source_documents AS document ON document.id=NEW.listing_source_document_id
+    JOIN fund_announcements AS announcement
+      ON announcement.source_document_id=document.id
+    WHERE run.id=NEW.brief_request_run_id AND run.status='running'
+      AND attempt.request_run_id=run.id
+      AND attempt.subject_key='fund:' || NEW.fund_code
+      AND attempt.source_id=NEW.original_source_id
+      AND attempt.field_id='fund_manager_product_announcement'
+      AND attempt.outcome IN ('success','cache_hit')
+      AND document.fund_code=NEW.fund_code
+      AND document.document_kind='announcement'
+      AND document.source_tier=1
+      AND document.source_name=attempt.source_id
+      AND document.publisher=NEW.publisher
+      AND announcement.fund_code=NEW.fund_code
+      AND announcement.url=NEW.canonical_announcement_url
+      AND announcement.title=NEW.announcement_title
+      AND announcement.published_at=NEW.announcement_published_at
+      AND announcement.publisher=NEW.publisher
+      AND announcement.source_tier=1
+ )
+ OR NEW.normalized_content_bytes<>length(CAST(NEW.normalized_content AS BLOB))
+ OR NEW.normalized_content_sha256<>lower(hex(sha256(NEW.normalized_content)))
+BEGIN SELECT RAISE(ABORT, 'official announcement content binding failed'); END;
+
+CREATE TRIGGER held_review_official_event_projection_insert_guard
+BEFORE INSERT ON held_review_official_event_projections
+WHEN NOT EXISTS(
+    SELECT 1
+    FROM request_runs AS run
+    JOIN fund_announcements AS announcement ON announcement.id=NEW.announcement_row_id
+    JOIN fund_official_announcement_contents AS content
+      ON content.id=NEW.announcement_content_id
+    WHERE run.id=NEW.brief_request_run_id AND run.status='running'
+      AND announcement.fund_code=NEW.fund_code
+      AND content.brief_request_run_id=run.id
+      AND content.fund_code=NEW.fund_code
+      AND content.listing_source_document_id=announcement.source_document_id
+      AND content.canonical_announcement_url=announcement.url
+      AND content.announcement_title=announcement.title
+      AND content.announcement_published_at=announcement.published_at
+      AND content.publisher=announcement.publisher
+ )
+BEGIN SELECT RAISE(ABORT, 'official event projection binding failed'); END;
+
+CREATE TRIGGER thesis_match_projection_insert_guard
+BEFORE INSERT ON thesis_match_projections
+WHEN NOT EXISTS(
+    SELECT 1
+    FROM request_runs AS run
+    JOIN intelligence_snapshots AS snapshot ON snapshot.id=NEW.intelligence_snapshot_id
+    WHERE run.id=NEW.intelligence_request_run_id
+      AND run.status IN ('complete','partial')
+      AND snapshot.request_run_id=run.id
+      AND snapshot.result_checksum=NEW.intelligence_snapshot_checksum
+      AND snapshot.workflow='fund_intelligence'
+      AND json_extract(snapshot.canonical_snapshot_json, '$.request_run_id')=run.id
+      AND json_extract(snapshot.canonical_snapshot_json, '$.subject_fund_code')=NEW.fund_code
+ )
+ OR (
+    NEW.thesis_id IS NOT NULL AND NOT EXISTS(
+        SELECT 1 FROM investment_theses
+        WHERE id=NEW.thesis_id AND fund_code=NEW.fund_code AND active=1
+    )
+ )
+ OR EXISTS(
+    SELECT 1 FROM json_each(NEW.evidence_ids_json) AS evidence
+    WHERE evidence.type<>'text' OR length(evidence.value) NOT BETWEEN 1 AND 128
+       OR json_extract(NEW.evidence_descriptors_json, '$[' || evidence.key || '].evidence_id')
+          IS NOT evidence.value
+ )
+ OR EXISTS(
+    SELECT value FROM json_each(NEW.evidence_ids_json)
+    GROUP BY value HAVING count(*)>1
+ )
+ OR EXISTS(
+    SELECT 1 FROM json_each(NEW.evidence_descriptors_json) AS descriptor
+    WHERE descriptor.type IS NOT 'object'
+       OR (SELECT count(*) FROM json_each(descriptor.value))<>9
+       OR EXISTS(
+          SELECT 1 FROM json_each(descriptor.value) AS field
+          WHERE field.key NOT IN (
+              'conflicted','current','direct_subject_binding','evidence_id',
+              'graph_closed','lineage_kind','original_lineage','retracted','source_tier'
+          )
+       )
+       OR json_type(descriptor.value, '$.evidence_id') IS NOT 'text'
+       OR length(json_extract(descriptor.value, '$.evidence_id')) NOT BETWEEN 1 AND 128
+       OR json_type(descriptor.value, '$.source_tier') IS NOT 'integer'
+       OR json_extract(descriptor.value, '$.source_tier') NOT IN (1,2)
+       OR json_type(descriptor.value, '$.lineage_kind') IS NOT 'text'
+       OR json_extract(descriptor.value, '$.lineage_kind') NOT IN (
+          'original','direct_quote','reprint','independently_reported',
+          'correction_of','retraction_of','clarification_of','unknown'
+       )
+       OR json_type(descriptor.value, '$.current') IS NULL
+       OR json_type(descriptor.value, '$.current') NOT IN ('true','false')
+       OR json_type(descriptor.value, '$.graph_closed') IS NULL
+       OR json_type(descriptor.value, '$.graph_closed') NOT IN ('true','false')
+       OR json_type(descriptor.value, '$.original_lineage') IS NULL
+       OR json_type(descriptor.value, '$.original_lineage') NOT IN ('true','false')
+       OR json_type(descriptor.value, '$.retracted') IS NULL
+       OR json_type(descriptor.value, '$.retracted') NOT IN ('true','false')
+       OR json_type(descriptor.value, '$.conflicted') IS NULL
+       OR json_type(descriptor.value, '$.conflicted') NOT IN ('true','false')
+       OR json_type(descriptor.value, '$.direct_subject_binding') IS NULL
+       OR json_type(descriptor.value, '$.direct_subject_binding') NOT IN ('true','false')
+       OR json_extract(descriptor.value, '$.original_lineage') IS NOT
+          (json_extract(descriptor.value, '$.lineage_kind')='original')
+       OR descriptor.value IS NOT json_object(
+          'conflicted',json(CASE json_type(descriptor.value, '$.conflicted')
+              WHEN 'true' THEN 'true' ELSE 'false' END),
+          'current',json(CASE json_type(descriptor.value, '$.current')
+              WHEN 'true' THEN 'true' ELSE 'false' END),
+          'direct_subject_binding',json(CASE
+              json_type(descriptor.value, '$.direct_subject_binding')
+              WHEN 'true' THEN 'true' ELSE 'false' END),
+          'evidence_id',json_extract(descriptor.value, '$.evidence_id'),
+          'graph_closed',json(CASE json_type(descriptor.value, '$.graph_closed')
+              WHEN 'true' THEN 'true' ELSE 'false' END),
+          'lineage_kind',json_extract(descriptor.value, '$.lineage_kind'),
+          'original_lineage',json(CASE
+              json_type(descriptor.value, '$.original_lineage')
+              WHEN 'true' THEN 'true' ELSE 'false' END),
+          'retracted',json(CASE json_type(descriptor.value, '$.retracted')
+              WHEN 'true' THEN 'true' ELSE 'false' END),
+          'source_tier',json_extract(descriptor.value, '$.source_tier')
+       )
+ )
+ OR EXISTS(
+    SELECT 1 FROM json_each(NEW.evidence_ids_json) AS evidence
+    WHERE NOT EXISTS(
+        SELECT 1
+        FROM intelligence_snapshots AS snapshot
+        JOIN intelligence_snapshot_item_uses AS item_use
+          ON item_use.request_run_id=snapshot.request_run_id
+        JOIN intelligence_news_items AS item ON item.id=item_use.item_id
+        JOIN source_attempts AS attempt ON attempt.id=item_use.source_attempt_id
+        WHERE snapshot.id=NEW.intelligence_snapshot_id
+          AND snapshot.request_run_id=NEW.intelligence_request_run_id
+          AND item.item_key=evidence.value
+          AND json_extract(
+              NEW.evidence_descriptors_json,
+              '$[' || evidence.key || '].source_tier'
+          )=CASE item.source_tier WHEN 'tier_1' THEN 1 WHEN 'tier_2' THEN 2 END
+          AND json_extract(
+              NEW.evidence_descriptors_json,
+              '$[' || evidence.key || '].retracted'
+          )=(item.integrity_state='retracted')
+          AND attempt.request_run_id=NEW.intelligence_request_run_id
+          AND attempt.source_id=item.source_id
+          AND attempt.outcome IN ('success','cache_hit')
+          AND EXISTS(
+              SELECT 1 FROM json_each(snapshot.canonical_snapshot_json, '$.item_ids')
+              WHERE type='text' AND value=item.item_key
+          )
+          AND EXISTS(
+              SELECT 1
+              FROM json_each(snapshot.canonical_snapshot_json, '$.source_attempt_ids')
+              WHERE type='integer' AND value=item_use.source_attempt_id
+          )
+    )
+ )
+ OR NEW.evidence_set_checksum<>lower(hex(sha256(json_object(
+      'evidence_descriptors',json(NEW.evidence_descriptors_json),
+      'evidence_ids',json(NEW.evidence_ids_json)
+  ))))
+BEGIN SELECT RAISE(ABORT, 'thesis match projection binding failed'); END;
+
+CREATE TRIGGER thesis_match_projection_no_replace
+BEFORE INSERT ON thesis_match_projections
+WHEN EXISTS(
+    SELECT 1 FROM thesis_match_projections
+    WHERE id=NEW.id OR (
+        fund_code=NEW.fund_code
+        AND thesis_fingerprint IS NEW.thesis_fingerprint
+        AND intelligence_request_run_id=NEW.intelligence_request_run_id
+        AND matcher_policy_checksum=NEW.matcher_policy_checksum
+        AND evidence_set_checksum=NEW.evidence_set_checksum
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'thesis match projections cannot be replaced'); END;
+
+CREATE TRIGGER thesis_evidence_adjudication_no_replace
+BEFORE INSERT ON thesis_evidence_adjudications
+WHEN EXISTS(
+    SELECT 1 FROM thesis_evidence_adjudications
+    WHERE id=NEW.id OR (
+        fund_code=NEW.fund_code
+        AND thesis_id=NEW.thesis_id
+        AND thesis_fingerprint=NEW.thesis_fingerprint
+        AND thesis_match_projection_id=NEW.thesis_match_projection_id
+        AND thesis_match_projection_checksum=NEW.thesis_match_projection_checksum
+        AND intelligence_request_run_id=NEW.intelligence_request_run_id
+        AND intelligence_snapshot_checksum=NEW.intelligence_snapshot_checksum
+        AND evidence_set_checksum=NEW.evidence_set_checksum
+        AND decision=NEW.decision
+        AND COALESCE(superseded_adjudication_id,0)
+            =COALESCE(NEW.superseded_adjudication_id,0)
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'thesis evidence adjudications cannot be replaced'); END;
+
+CREATE TRIGGER thesis_evidence_adjudication_insert_guard
+BEFORE INSERT ON thesis_evidence_adjudications
+WHEN NOT EXISTS(
+    SELECT 1
+    FROM thesis_match_projections AS projection
+    JOIN investment_theses AS thesis ON thesis.id=NEW.thesis_id
+    JOIN intelligence_snapshots AS snapshot
+      ON snapshot.id=projection.intelligence_snapshot_id
+    WHERE projection.id=NEW.thesis_match_projection_id
+      AND projection.record_checksum=NEW.thesis_match_projection_checksum
+      AND projection.projection_state='possible_invalidation_match'
+      AND projection.fund_code=NEW.fund_code
+      AND projection.thesis_id=NEW.thesis_id
+      AND projection.thesis_fingerprint=NEW.thesis_fingerprint
+      AND projection.intelligence_request_run_id=NEW.intelligence_request_run_id
+      AND projection.intelligence_snapshot_checksum=NEW.intelligence_snapshot_checksum
+      AND projection.evidence_ids_json=NEW.evidence_ids_json
+      AND thesis.fund_code=NEW.fund_code AND thesis.active=1
+      AND snapshot.request_run_id=NEW.intelligence_request_run_id
+      AND snapshot.result_checksum=NEW.intelligence_snapshot_checksum
+ )
+ OR NEW.evidence_set_checksum<>lower(hex(sha256(NEW.evidence_ids_json)))
+ OR EXISTS(
+    SELECT 1 FROM json_each(NEW.evidence_ids_json)
+    WHERE type<>'text' OR length(value) NOT BETWEEN 1 AND 128
+ )
+ OR EXISTS(
+    SELECT value FROM json_each(NEW.evidence_ids_json)
+    GROUP BY value HAVING count(*)>1
+ )
+ OR (
+    NEW.superseded_adjudication_id IS NULL AND EXISTS(
+        SELECT 1 FROM thesis_evidence_adjudications AS prior
+        WHERE prior.fund_code=NEW.fund_code
+          AND prior.thesis_id=NEW.thesis_id
+          AND prior.thesis_fingerprint=NEW.thesis_fingerprint
+          AND prior.thesis_match_projection_id=NEW.thesis_match_projection_id
+          AND prior.thesis_match_projection_checksum=NEW.thesis_match_projection_checksum
+          AND prior.intelligence_request_run_id=NEW.intelligence_request_run_id
+          AND prior.intelligence_snapshot_checksum=NEW.intelligence_snapshot_checksum
+          AND prior.evidence_ids_json=NEW.evidence_ids_json
+          AND prior.evidence_set_checksum=NEW.evidence_set_checksum
+    )
+ )
+ OR (
+    NEW.superseded_adjudication_id IS NOT NULL AND NOT EXISTS(
+        SELECT 1 FROM thesis_evidence_adjudications AS prior
+        WHERE prior.id=NEW.superseded_adjudication_id
+          AND prior.fund_code=NEW.fund_code
+          AND prior.thesis_id=NEW.thesis_id
+          AND prior.thesis_fingerprint=NEW.thesis_fingerprint
+          AND prior.thesis_match_projection_id=NEW.thesis_match_projection_id
+          AND prior.thesis_match_projection_checksum=NEW.thesis_match_projection_checksum
+          AND prior.intelligence_request_run_id=NEW.intelligence_request_run_id
+          AND prior.intelligence_snapshot_checksum=NEW.intelligence_snapshot_checksum
+          AND prior.evidence_ids_json=NEW.evidence_ids_json
+          AND prior.evidence_set_checksum=NEW.evidence_set_checksum
+          AND prior.decision<>NEW.decision
+          AND prior.created_at<NEW.created_at
+          AND NOT EXISTS(
+              SELECT 1 FROM thesis_evidence_adjudications AS child
+              WHERE child.superseded_adjudication_id=prior.id
+          )
+    )
+ )
+BEGIN SELECT RAISE(ABORT, 'thesis evidence adjudication binding failed'); END;
+
+CREATE TRIGGER holding_review_snapshot_no_replace
+BEFORE INSERT ON holding_review_snapshots
+WHEN EXISTS(
+    SELECT 1 FROM holding_review_snapshots AS prior
+    WHERE prior.id=NEW.id
+       OR prior.semantic_identity_checksum=NEW.semantic_identity_checksum
+       OR (
+          prior.fund_code=NEW.fund_code AND prior.action=NEW.action
+          AND prior.brief_request_run_id=NEW.brief_request_run_id
+          AND prior.brief_snapshot_id=NEW.brief_snapshot_id
+          AND prior.brief_snapshot_checksum=NEW.brief_snapshot_checksum
+          AND prior.intelligence_request_run_id=NEW.intelligence_request_run_id
+          AND prior.intelligence_snapshot_id=NEW.intelligence_snapshot_id
+          AND prior.intelligence_snapshot_checksum=NEW.intelligence_snapshot_checksum
+          AND prior.thesis_match_projection_id=NEW.thesis_match_projection_id
+          AND prior.thesis_match_projection_checksum=NEW.thesis_match_projection_checksum
+          AND prior.active_thesis_state=NEW.active_thesis_state
+          AND prior.active_thesis_id IS NEW.active_thesis_id
+          AND prior.active_thesis_fingerprint IS NEW.active_thesis_fingerprint
+          AND prior.adjudication_state=NEW.adjudication_state
+          AND prior.adjudication_id IS NEW.adjudication_id
+          AND prior.adjudication_checksum IS NEW.adjudication_checksum
+          AND json_extract(prior.result_json, '$.remainder_intent')
+              IS json_extract(NEW.result_json, '$.remainder_intent')
+          AND json_extract(prior.result_json, '$.exit_reason')
+              IS json_extract(NEW.result_json, '$.exit_reason')
+          AND json_extract(prior.result_json, '$.use_of_proceeds')
+              IS json_extract(NEW.result_json, '$.use_of_proceeds')
+          AND prior.policy_checksum=NEW.policy_checksum
+          AND prior.result_fingerprint=NEW.result_fingerprint
+       )
+)
+BEGIN SELECT RAISE(ABORT, 'holding review snapshots cannot be replaced'); END;
+
+CREATE TRIGGER holding_review_snapshot_insert_guard
+BEFORE INSERT ON holding_review_snapshots
+WHEN NOT EXISTS(
+    SELECT 1
+    FROM request_runs AS brief_run
+    JOIN fund_brief_snapshots AS brief ON brief.id=NEW.brief_snapshot_id
+    JOIN request_runs AS intelligence_run ON intelligence_run.id=NEW.intelligence_request_run_id
+    JOIN intelligence_snapshots AS intelligence
+      ON intelligence.id=NEW.intelligence_snapshot_id
+    JOIN thesis_match_projections AS projection
+      ON projection.id=NEW.thesis_match_projection_id
+    WHERE brief_run.id=NEW.brief_request_run_id
+      AND brief_run.status IN ('complete','partial')
+      AND brief.request_run_id=brief_run.id
+      AND brief.result_checksum=NEW.brief_snapshot_checksum
+      AND brief.fund_code=NEW.fund_code
+      AND EXISTS(SELECT 1 FROM json_each(brief.action_ids_json) WHERE value=NEW.action)
+      AND intelligence_run.status IN ('complete','partial')
+      AND intelligence.request_run_id=intelligence_run.id
+      AND intelligence.result_checksum=NEW.intelligence_snapshot_checksum
+      AND intelligence.workflow='fund_intelligence'
+      AND json_extract(intelligence.canonical_snapshot_json, '$.subject_fund_code')=NEW.fund_code
+      AND projection.intelligence_request_run_id=intelligence_run.id
+      AND projection.intelligence_snapshot_id=intelligence.id
+      AND projection.intelligence_snapshot_checksum=NEW.intelligence_snapshot_checksum
+      AND projection.record_checksum=NEW.thesis_match_projection_checksum
+      AND projection.fund_code=NEW.fund_code
+ )
+ OR (
+    NEW.active_thesis_state='present' AND NOT EXISTS(
+        SELECT 1
+        FROM investment_theses AS thesis
+        JOIN thesis_match_projections AS projection
+          ON projection.id=NEW.thesis_match_projection_id
+        WHERE thesis.id=NEW.active_thesis_id
+          AND thesis.fund_code=NEW.fund_code AND thesis.active=1
+          AND projection.thesis_id=thesis.id
+          AND projection.thesis_fingerprint=NEW.active_thesis_fingerprint
+          AND projection.projection_state<>'thesis_missing'
+    )
+ )
+ OR (
+    NEW.active_thesis_state='missing' AND NOT EXISTS(
+        SELECT 1 FROM thesis_match_projections
+        WHERE id=NEW.thesis_match_projection_id AND projection_state='thesis_missing'
+    )
+ )
+ OR (
+    NEW.adjudication_state='present' AND NOT EXISTS(
+        SELECT 1 FROM thesis_evidence_adjudications
+        WHERE id=NEW.adjudication_id
+          AND record_checksum=NEW.adjudication_checksum
+          AND fund_code=NEW.fund_code
+          AND thesis_id=NEW.active_thesis_id
+          AND thesis_fingerprint=NEW.active_thesis_fingerprint
+          AND thesis_match_projection_id=NEW.thesis_match_projection_id
+          AND thesis_match_projection_checksum=NEW.thesis_match_projection_checksum
+          AND intelligence_request_run_id=NEW.intelligence_request_run_id
+          AND intelligence_snapshot_checksum=NEW.intelligence_snapshot_checksum
+    )
+ )
+ OR (
+    NEW.previous_review_id IS NOT NULL AND NOT EXISTS(
+        SELECT 1 FROM holding_review_snapshots AS previous
+        WHERE previous.id=NEW.previous_review_id
+          AND previous.fund_code=NEW.fund_code AND previous.action=NEW.action
+          AND previous.created_at<=NEW.created_at
+    )
+ )
+ OR json_type(NEW.result_json, '$.fund_code') IS NOT 'text'
+ OR json_extract(NEW.result_json, '$.fund_code') IS NOT NEW.fund_code
+ OR json_type(NEW.result_json, '$.action') IS NOT 'text'
+ OR json_extract(NEW.result_json, '$.action') IS NOT NEW.action
+ OR json_type(NEW.result_json, '$.remainder_intent') IS NOT 'text'
+ OR json_extract(NEW.result_json, '$.remainder_intent') NOT IN (
+      'retain_some','no_minimum_intent','unknown'
+ )
+ OR json_type(NEW.result_json, '$.exit_reason') IS NOT 'text'
+ OR json_extract(NEW.result_json, '$.exit_reason') NOT IN (
+      'owner_believes_thesis_invalidated','goal_changed','cash_need',
+      'risk_reduction','other','unknown'
+ )
+ OR json_type(NEW.result_json, '$.use_of_proceeds') IS NOT 'text'
+ OR json_extract(NEW.result_json, '$.use_of_proceeds') NOT IN (
+      'cash_reserve','known_goal','reallocation_review','other','unknown'
+ )
+ OR (NEW.action='continue_holding' AND (
+      json_extract(NEW.result_json, '$.remainder_intent') IS NOT 'unknown'
+      OR json_extract(NEW.result_json, '$.exit_reason') IS NOT 'unknown'
+      OR json_extract(NEW.result_json, '$.use_of_proceeds') IS NOT 'unknown'
+ ))
+ OR (NEW.action='reduce_to_cash' AND (
+      json_extract(NEW.result_json, '$.exit_reason') IS NOT 'unknown'
+      OR json_extract(NEW.result_json, '$.use_of_proceeds') IS NOT 'unknown'
+ ))
+ OR (NEW.action='full_exit'
+     AND json_extract(NEW.result_json, '$.remainder_intent') IS NOT 'unknown')
+BEGIN SELECT RAISE(ABORT, 'holding review snapshot binding failed'); END;
+
+CREATE TRIGGER holding_review_snapshot_private_key_guard
+BEFORE INSERT ON holding_review_snapshots
+WHEN EXISTS(
+    SELECT 1
+    FROM (
+        SELECT lower(replace(replace(replace(replace(replace(
+            key, '-', '_'), ' ', '_'), '.', '_'), '/', '_'), char(92), '_')) AS key
+        FROM json_tree(NEW.result_json) WHERE key IS NOT NULL
+    )
+    WHERE instr('_' || key || '_', '_ciphertext_')>0
+       OR instr('_' || key || '_', '_authorization_')>0
+       OR instr('_' || key || '_', '_account_number_')>0
+       OR instr('_' || key || '_', '_api_key_')>0
+       OR instr('_' || key || '_', '_access_key_')>0
+       OR instr('_' || key || '_', '_auth_key_')>0
+       OR instr('_' || key || '_', '_balance_')>0
+       OR instr('_' || key || '_', '_cookie_')>0
+       OR instr('_' || key || '_', '_credential_')>0
+       OR instr('_' || key || '_', '_debt_')>0
+       OR instr('_' || key || '_', '_header_')>0
+       OR instr('_' || key || '_', '_headers_')>0
+       OR instr('_' || key || '_', '_income_')>0
+       OR instr('_' || key || '_', '_nonce_')>0
+       OR instr('_' || key || '_', '_note_')>0
+       OR instr('_' || key || '_', '_notes_')>0
+       OR instr('_' || key || '_', '_private_')>0
+       OR instr('_' || key || '_', '_profile_')>0
+       OR instr('_' || key || '_', '_profit_')>0
+       OR instr('_' || key || '_', '_reserve_')>0
+       OR instr('_' || key || '_', '_secret_')>0
+       OR instr('_' || key || '_', '_session_')>0
+       OR instr('_' || key || '_', '_shares_')>0
+       OR instr('_' || key || '_', '_token_')>0
+       OR instr('_' || key || '_', '_weight_')>0
+       OR key IN ('assets','current_value','holding_value','market_value')
+       OR instr(key, 'accountbalance')>0
+       OR instr(key, 'authorizationheader')>0
+       OR instr(key, 'currentvalue')>0
+       OR instr(key, 'filepath')>0
+       OR instr(key, 'holdingvalue')>0
+       OR instr(key, 'marketvalue')>0
+       OR instr(key, 'password')>0
+       OR key IN ('memo','networth')
+       OR (instr('_' || key || '_', '_amount_')>0 AND key<>'exact_amount_available')
+       OR (instr('_' || key || '_', '_cost_')>0 AND key<>'transaction_cost_state')
+       OR (instr('_' || key || '_', '_raw_')>0 AND instr('_' || key || '_', '_body_')>0)
+       OR (instr('_' || key || '_', '_response_')>0 AND instr('_' || key || '_', '_body_')>0)
+       OR (instr('_' || key || '_', '_local_')>0 AND instr('_' || key || '_', '_path_')>0)
+       OR (instr('_' || key || '_', '_portfolio_')>0 AND instr('_' || key || '_', '_weight_')>0)
+ )
+BEGIN SELECT RAISE(ABORT, 'holding review snapshot contains a private key'); END;
+
+CREATE TRIGGER fund_official_announcement_content_no_update
+BEFORE UPDATE ON fund_official_announcement_contents
+BEGIN SELECT RAISE(ABORT, 'official announcement contents are immutable'); END;
+CREATE TRIGGER fund_official_announcement_content_no_delete
+BEFORE DELETE ON fund_official_announcement_contents
+BEGIN SELECT RAISE(ABORT, 'official announcement contents are immutable'); END;
+CREATE TRIGGER held_review_official_event_projection_no_update
+BEFORE UPDATE ON held_review_official_event_projections
+BEGIN SELECT RAISE(ABORT, 'official event projections are immutable'); END;
+CREATE TRIGGER held_review_official_event_projection_no_delete
+BEFORE DELETE ON held_review_official_event_projections
+BEGIN SELECT RAISE(ABORT, 'official event projections are immutable'); END;
+CREATE TRIGGER thesis_match_projection_no_update
+BEFORE UPDATE ON thesis_match_projections
+BEGIN SELECT RAISE(ABORT, 'thesis match projections are immutable'); END;
+CREATE TRIGGER thesis_match_projection_no_delete
+BEFORE DELETE ON thesis_match_projections
+BEGIN SELECT RAISE(ABORT, 'thesis match projections are immutable'); END;
+CREATE TRIGGER thesis_evidence_adjudication_no_update
+BEFORE UPDATE ON thesis_evidence_adjudications
+BEGIN SELECT RAISE(ABORT, 'thesis evidence adjudications are immutable'); END;
+CREATE TRIGGER thesis_evidence_adjudication_no_delete
+BEFORE DELETE ON thesis_evidence_adjudications
+BEGIN SELECT RAISE(ABORT, 'thesis evidence adjudications are immutable'); END;
+CREATE TRIGGER holding_review_snapshot_no_update
+BEFORE UPDATE ON holding_review_snapshots
+BEGIN SELECT RAISE(ABORT, 'holding review snapshots are immutable'); END;
+CREATE TRIGGER holding_review_snapshot_no_delete
+BEFORE DELETE ON holding_review_snapshots
+BEGIN SELECT RAISE(ABORT, 'holding review snapshots are immutable'); END;
 """

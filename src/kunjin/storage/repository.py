@@ -47,6 +47,7 @@ from kunjin.storage.schema import (
     SCHEMA_V18,
     SCHEMA_V19,
     SCHEMA_V20,
+    SCHEMA_V21,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -131,6 +132,20 @@ _INTELLIGENCE_DROP_TABLES = (
     "entity_aliases",
     "market_entities",
     "intelligence_policy_versions",
+)
+_HELD_REVIEW_TABLES = {
+    "fund_official_announcement_contents",
+    "held_review_official_event_projections",
+    "thesis_match_projections",
+    "thesis_evidence_adjudications",
+    "holding_review_snapshots",
+}
+_HELD_REVIEW_OBJECT_PREFIXES = (
+    "fund_official_announcement_content",
+    "held_review_official_event_projection",
+    "thesis_match_projection",
+    "thesis_evidence_adjudication",
+    "holding_review_snapshot",
 )
 _DECISION_AUDIT_OBJECT_NAMESPACES = (
     "request_run_",
@@ -223,6 +238,7 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (18, SCHEMA_V18),
         (19, SCHEMA_V19),
         (20, SCHEMA_V20),
+        (21, SCHEMA_V21),
     )
 
 
@@ -311,6 +327,17 @@ def _owned_intelligence_objects(
         for name, value in objects.items()
         if _ascii_identifier(value[1]) in _INTELLIGENCE_TABLES
         or _ascii_identifier(name).startswith(_INTELLIGENCE_OBJECT_PREFIXES)
+    }
+
+
+def _owned_held_review_objects(
+    objects: Dict[str, Tuple[str, str, str]],
+) -> Dict[str, Tuple[str, str, str]]:
+    return {
+        name: value
+        for name, value in objects.items()
+        if _ascii_identifier(value[1]) in _HELD_REVIEW_TABLES
+        or _ascii_identifier(name).startswith(_HELD_REVIEW_OBJECT_PREFIXES)
     }
 
 
@@ -977,6 +1004,17 @@ def _validate_applied_schema(
         actual,
         protected_tables=_INTELLIGENCE_TABLES,
         error_message="intelligence schema does not match V19",
+    )
+    if 21 not in applied_versions:
+        return
+    if _owned_held_review_objects(actual) != _owned_held_review_objects(expected):
+        raise sqlite3.DatabaseError("held review schema does not match V21")
+    _reject_unexpected_schema_dependencies(
+        connection,
+        expected,
+        actual,
+        protected_tables=_HELD_REVIEW_TABLES,
+        error_message="held review schema does not match V21",
     )
 
 
