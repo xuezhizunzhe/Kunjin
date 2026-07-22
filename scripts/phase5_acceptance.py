@@ -5,15 +5,19 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import shutil
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from kunjin.decision.models import ActionKind
 
@@ -27,6 +31,26 @@ PREVIEW_COUNTS = {
     "holding_review_calls": 1,
     "network_retries": 0,
 }
+
+_PRIVATE_STAGE_EXIT_CODES = {
+    "private_input": 71,
+    "owner_keychain": 72,
+    "private_database_snapshot": 73,
+    "private_flow": 74,
+    "private_verification": 75,
+}
+
+
+class PrivateAcceptanceStageError(RuntimeError):
+    def __init__(self, stage: str) -> None:
+        if type(stage) is not str or stage not in _PRIVATE_STAGE_EXIT_CODES:
+            raise ValueError("private acceptance failure stage invalid")
+        self.stage = stage
+        super().__init__(stage)
+
+    @property
+    def exit_code(self) -> int:
+        return _PRIVATE_STAGE_EXIT_CODES[self.stage]
 
 FAULT_CASES = (
     "fund_binding_mismatch",
@@ -120,6 +144,9 @@ _LOCAL_PROBE_NODE = (
     "tests/unit/test_phase5_acceptance.py::"
     "test_local_preview_runs_authenticated_chain_once_without_network"
 )
+_ENGINEERING_LIFECYCLE_NODE = (
+    "tests/unit/test_phase5_replay.py::test_engineering_two_stage_lifecycle"
+)
 _CORE_GAPS = frozenset(
     {
         "brief_snapshot_missing",
@@ -179,7 +206,9 @@ _PRIVATE_MODE_KEYS = frozenset(
         "mode",
         "redemption_feasibility",
         "sell_timing",
+        "technical_integrity_pass",
         "thesis_review_readiness",
+        "owner_workflow_demonstrated",
     }
 )
 _OBSERVATION_KEYS = frozenset(
@@ -210,6 +239,78 @@ _PRIVATE_CALL_SEQUENCE = (
     "match_projection_calls",
     "holding_review_calls",
 )
+_OWNER_APPROVAL = "explicit_private_read_only_review"
+_OWNER_ENTRYPOINT = Path("/Users/yanzihao/KunJin/scripts/run_phase5_acceptance.sh")
+_OWNER_CONFIRMATION_TTL_SECONDS = 600
+_OWNER_CONTROLLER_REQUEST_ID = re.compile(r"[0-9a-f]{64}")
+_OWNER_TRANSPORT_STAGES = frozenset(
+    {
+        "input_received",
+        "request_prepared",
+        "confirm_loaded",
+        "runner_started",
+        "runner_finished",
+    }
+)
+_OWNER_FAILURE_STAGES = frozenset(
+    {
+        "private_input",
+        "owner_keychain",
+        "private_database_snapshot",
+        "private_flow",
+        "private_verification",
+    }
+)
+_OWNER_FAILURE_CODE_CATEGORIES = {
+    "phase5_owner_approval_required": "owner_approval_required",
+    "phase5_private_runtime_override": "private_runtime_override",
+    "phase5_runtime_unavailable": "runtime_unavailable",
+    "phase5_acceptance_output_invalid": "acceptance_output_invalid",
+}
+_OWNER_RUN_STAGES = frozenset(
+    {
+        "input_received",
+        "runner_started",
+        "runner_finished",
+        *_OWNER_FAILURE_STAGES,
+        *_OWNER_FAILURE_CODE_CATEGORIES.values(),
+    }
+)
+_MAX_OWNER_FAILURE_OUTPUT_BYTES = 1024
+_OWNER_FAILURE_CODES = frozenset(
+    {
+        "phase5_owner_approval_required",
+        "phase5_private_runtime_override",
+        "phase5_runtime_unavailable",
+        "phase5_acceptance_tests_failed",
+        "phase5_acceptance_output_invalid",
+    }
+)
+_OWNER_INPUT_NAMES = (
+    "KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE",
+    "KUNJIN_PHASE5_OWNER_SUBJECT_FILE",
+    "KUNJIN_PHASE5_OWNER_APPROVED",
+)
+_LEGACY_PRIVATE_TEST_TOKEN = object()
+_SYNTHETIC_OWNER_CONTROLLER_TEST_TOKEN = object()
+_CAPTURE_STAGE_BY_FAILURE = {
+    "capture_input": "private_input",
+    "capture_runtime": "private_input",
+    "private_database_snapshot": "private_database_snapshot",
+    "profile_credential_access": "owner_keychain",
+    "portfolio_credential_access": "private_flow",
+    "portfolio_credential_mutation": "private_flow",
+    "worker_boundary": "private_flow",
+    "rapid_command": "private_flow",
+    "rapid_capture": "private_flow",
+    "portfolio_observation": "private_flow",
+    "capture_binding": "private_flow",
+    "capture_ledger": "private_flow",
+    "database_schema": "private_verification",
+    "database_close": "private_verification",
+    "package_sealing": "private_verification",
+    "capture_clock": "private_verification",
+}
 
 
 @dataclass(frozen=True)
@@ -358,7 +459,9 @@ def _private_summary(
         "mode": value.mode,
         "redemption_feasibility": value.redemption_feasibility,
         "sell_timing": "insufficient_data",
+        "technical_integrity_pass": True,
         "thesis_review_readiness": value.thesis_review_readiness,
+        "owner_workflow_demonstrated": False,
     }
     validate_summary(summary, expected_mode=value.mode)
     return summary
@@ -366,6 +469,52 @@ def _private_summary(
 
 def _under(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
+
+
+def _decode_private_subject(
+    raw: bytes,
+    *,
+    resolved: Path,
+    excluded_roots: Sequence[Path],
+) -> PrivateSubject:
+    failure = "private subject file invalid"
+    if len(raw) > 16_384 or any(
+        _under(resolved, root.resolve(strict=False)) for root in excluded_roots
+    ):
+        raise ValueError(failure)
+
+    try:
+        def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(failure)
+                result[key] = value
+            return result
+
+        payload = json.loads(raw.decode("ascii"), object_pairs_hook=strict_object)
+    except (UnicodeError, ValueError, TypeError):
+        raise ValueError(failure) from None
+    if (
+        type(payload) is not dict
+        or set(payload) != {"fund_code", "action"}
+        or any((ancestor / ".git").exists() for ancestor in (resolved.parent, *resolved.parents))
+    ):
+        raise ValueError(failure)
+    code = payload["fund_code"]
+    action_value = payload["action"]
+    try:
+        action = ActionKind(action_value)
+    except (TypeError, ValueError):
+        raise ValueError(failure) from None
+    if (
+        type(code) is not str
+        or _FUND_CODE.fullmatch(code) is None
+        or code == "000000"
+        or action not in _PRIVATE_ACTIONS
+    ):
+        raise ValueError(failure)
+    return PrivateSubject(code, action)
 
 
 def secure_read_private_subject(
@@ -418,40 +567,11 @@ def secure_read_private_subject(
         raw = os.read(descriptor, 16_385)
     finally:
         os.close(descriptor)
-    if len(raw) > 16_384:
-        raise ValueError(failure)
-    try:
-        def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-            result: dict[str, object] = {}
-            for key, value in pairs:
-                if key in result:
-                    raise ValueError(failure)
-                result[key] = value
-            return result
-
-        payload = json.loads(raw.decode("ascii"), object_pairs_hook=strict_object)
-    except (UnicodeError, ValueError, TypeError):
-        raise ValueError(failure) from None
-    if (
-        type(payload) is not dict
-        or set(payload) != {"fund_code", "action"}
-        or any((ancestor / ".git").exists() for ancestor in (resolved.parent, *resolved.parents))
-    ):
-        raise ValueError(failure)
-    code = payload["fund_code"]
-    action_value = payload["action"]
-    try:
-        action = ActionKind(action_value)
-    except (TypeError, ValueError):
-        raise ValueError(failure) from None
-    if (
-        type(code) is not str
-        or _FUND_CODE.fullmatch(code) is None
-        or code == "000000"
-        or action not in _PRIVATE_ACTIONS
-    ):
-        raise ValueError(failure)
-    return PrivateSubject(code, action)
+    return _decode_private_subject(
+        raw,
+        resolved=resolved,
+        excluded_roots=excluded_roots,
+    )
 
 
 def private_subject_path(mode: str, environ: Mapping[str, str]) -> Path:
@@ -467,26 +587,826 @@ def private_subject_path(mode: str, environ: Mapping[str, str]) -> Path:
     return Path(selected)
 
 
-class NoExternalOperations(AbstractContextManager):
+@dataclass(repr=False)
+class PreparedOwnerSubject:
+    """One pending owner selection; it cannot start capture on its own."""
+
+    path: Path
+    _root: Path = field(repr=False)
+    _cleaned: bool = field(default=False, init=False, repr=False)
+
+    def preflight(self) -> PrivateSubject:
+        if self._cleaned:
+            raise ValueError("owner subject preflight invalid")
+        try:
+            selected = private_subject_path(
+                "owner", {"KUNJIN_PHASE5_OWNER_SUBJECT_FILE": str(self.path)}
+            )
+            return secure_read_private_subject(
+                selected,
+                excluded_roots=(Path(__file__).resolve().parents[1],),
+            )
+        except (OSError, RuntimeError, ValueError):
+            self.cleanup()
+            raise ValueError("owner subject preflight invalid") from None
+
+    def owner_environment(self) -> dict[str, str]:
+        self.preflight()
+        return {"KUNJIN_PHASE5_OWNER_SUBJECT_FILE": str(self.path.resolve(strict=True))}
+
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        try:
+            metadata = os.lstat(self._root)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+                or metadata.st_uid != os.getuid()
+            ):
+                raise ValueError("owner subject cleanup invalid")
+            shutil.rmtree(self._root)
+        except (OSError, ValueError):
+            raise ValueError("owner subject cleanup invalid") from None
+
+
+class OwnerAcceptanceFailure(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class OwnerControllerTransportFailure(RuntimeError):
+    def __init__(self, stage: str) -> None:
+        if type(stage) is not str or stage not in _OWNER_TRANSPORT_STAGES:
+            raise ValueError("owner controller transport stage invalid")
+        self.stage = stage
+        super().__init__(stage)
+
+
+class OwnerRunFailure(RuntimeError):
+    def __init__(self, stage: str) -> None:
+        if type(stage) is not str or stage not in _OWNER_RUN_STAGES:
+            raise ValueError("owner run stage invalid")
+        self.stage = stage
+        super().__init__(stage)
+
+
+@dataclass(frozen=True)
+class OwnerControllerTransportResult:
+    stages: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class OwnerRunResult:
+    stage: str
+
+
+def _owner_run_selection(fund_code: str, action_value: str) -> PrivateSubject:
+    try:
+        action = ActionKind(action_value)
+    except (TypeError, ValueError):
+        raise ValueError("owner subject request invalid") from None
+    if (
+        type(fund_code) is not str
+        or _FUND_CODE.fullmatch(fund_code) is None
+        or fund_code == "000000"
+        or action not in _PRIVATE_ACTIONS
+    ):
+        raise ValueError("owner subject request invalid")
+    return PrivateSubject(fund_code=fund_code, action=action)
+
+
+def _owner_run_confirmation_factory():
+    seal = object()
+
+    @dataclass(repr=False)
+    class OwnerRunConfirmation:
+        """An in-memory, single-use event produced by the conversation bridge."""
+
+        _seal: object = field(repr=False)
+        _selection: PrivateSubject = field(repr=False)
+        _consumed: bool = field(default=False, init=False, repr=False)
+
+        def consume(self) -> PrivateSubject:
+            if self._seal is not seal or self._consumed:
+                raise ValueError("owner confirmation invalid")
+            self._consumed = True
+            return self._selection
+
+    def issue(selection: PrivateSubject) -> OwnerRunConfirmation:
+        return OwnerRunConfirmation(_seal=seal, _selection=selection)
+
+    return OwnerRunConfirmation, issue
+
+
+_OwnerRunConfirmation, _issue_owner_run_confirmation = (
+    _owner_run_confirmation_factory()
+)
+
+
+class OwnerConversationRunBridge:
+    """Private same-process bridge from a recorded chat confirmation to one run."""
+
     def __init__(self) -> None:
+        self._confirmation: Optional[_OwnerRunConfirmation] = None
+
+    def record_explicit_confirmation(
+        self, fund_code: str, action_value: str
+    ) -> _OwnerRunConfirmation:
+        if self._confirmation is not None:
+            raise ValueError("owner confirmation already pending")
+        confirmation = _issue_owner_run_confirmation(
+            _owner_run_selection(fund_code, action_value)
+        )
+        self._confirmation = confirmation
+        return confirmation
+
+    def run_confirmed_owner_once(self, *, runner=None) -> OwnerRunResult:
+        confirmation = self._confirmation
+        self._confirmation = None
+        if confirmation is None:
+            raise OwnerRunFailure("input_received")
+        return _run_confirmed_owner_once(confirmation, runner=runner)
+
+
+def _owner_failure_code(completed: object) -> str:
+    encoded = getattr(completed, "stderr", None)
+    if type(encoded) is not str or len(encoded) > _MAX_OWNER_FAILURE_OUTPUT_BYTES:
+        return "phase5_owner_acceptance_failed"
+    try:
+        value = json.loads(encoded)
+    except (TypeError, ValueError):
+        return "phase5_owner_acceptance_failed"
+    code = value.get("error_code") if type(value) is dict else None
+    if (
+        type(value) is dict
+        and set(value) == {"error_code", "ok"}
+        and value["ok"] is False
+        and type(code) is str
+        and code in _OWNER_FAILURE_CODES
+    ):
+        return code
+    return "phase5_owner_acceptance_failed"
+
+
+def _owner_run_failure_category(completed: object) -> str:
+    encoded = getattr(completed, "stderr", None)
+    if (
+        type(encoded) is not str
+        or len(encoded) > _MAX_OWNER_FAILURE_OUTPUT_BYTES
+        or not encoded.isascii()
+    ):
+        return "runner_finished"
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("owner failure payload invalid")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(encoded, object_pairs_hook=strict_object)
+    except (TypeError, ValueError):
+        return "runner_finished"
+    if type(payload) is not dict or payload.get("ok") is not False:
+        return "runner_finished"
+    code = payload.get("error_code")
+    if type(code) is not str:
+        return "runner_finished"
+    category = _OWNER_FAILURE_CODE_CATEGORIES.get(code)
+    if set(payload) == {"error_code", "ok"} and category is not None:
+        return category
+    stage = payload.get("failure_stage")
+    if (
+        set(payload) == {"error_code", "failure_stage", "ok"}
+        and code == "phase5_acceptance_tests_failed"
+        and type(stage) is str
+        and stage in _OWNER_FAILURE_STAGES
+    ):
+        return stage
+    return "runner_finished"
+
+def prepare_owner_subject(
+    fund_code: str,
+    action_value: str,
+    *,
+    parent: Optional[Path] = None,
+) -> PreparedOwnerSubject:
+    """Create a private pending selection after the user confirms code and action."""
+
+    try:
+        selection = _owner_run_selection(fund_code, action_value)
+    except ValueError:
+        raise
+    if parent is not None and (
+        type(parent) is not type(Path()) or not parent.is_absolute()
+    ):
+        raise ValueError("owner subject request invalid")
+    root = Path(
+        tempfile.mkdtemp(
+            prefix="kunjin-phase5-owner-subject.",
+            dir=None if parent is None else str(parent),
+        )
+    ).resolve(strict=True)
+    path = root / "subject.json"
+    prepared = PreparedOwnerSubject(path=path, _root=root)
+    descriptor = -1
+    try:
+        root.chmod(0o700)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        encoded = json.dumps(
+            {"fund_code": selection.fund_code, "action": selection.action.value},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise OSError("owner subject write failed")
+            offset += written
+        os.fsync(descriptor)
+        path.chmod(0o600)
+        prepared.preflight()
+        return prepared
+    except (OSError, RuntimeError, ValueError):
+        prepared.cleanup()
+        raise ValueError("owner subject request invalid") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _run_confirmed_owner_once(
+    confirmation: object, *, runner=None
+) -> OwnerRunResult:
+    """Run one explicitly confirmed owner acceptance without public transport."""
+
+    if type(confirmation) is not _OwnerRunConfirmation:
+        raise OwnerRunFailure("input_received")
+    try:
+        selection = confirmation.consume()
+    except ValueError:
+        raise OwnerRunFailure("input_received") from None
+    runner = subprocess.run if runner is None else runner
+    if not callable(runner):
+        raise OwnerRunFailure("input_received")
+    try:
+        prepared = prepare_owner_subject(selection.fund_code, selection.action.value)
+    except (OSError, RuntimeError, ValueError):
+        raise OwnerRunFailure("input_received") from None
+    try:
+        environment = prepared.owner_environment()
+        environment["KUNJIN_PHASE5_OWNER_APPROVED"] = _OWNER_APPROVAL
+        try:
+            completed = runner(
+                [str(_OWNER_ENTRYPOINT), "owner"],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                shell=False,
+                check=False,
+            )
+        except Exception:
+            raise OwnerRunFailure("runner_started") from None
+    finally:
+        prepared.cleanup()
+    if getattr(completed, "returncode", None) != 0:
+        raise OwnerRunFailure(_owner_run_failure_category(completed))
+    if type(getattr(completed, "stdout", None)) is not str:
+        raise OwnerRunFailure("runner_finished")
+    return OwnerRunResult("runner_finished")
+
+
+def _owner_controller_parent() -> Path:
+    try:
+        temporary_root = Path(tempfile.gettempdir()).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("owner controller unavailable") from None
+    parent = temporary_root / f"kunjin-phase5-owner-controller-{os.getuid()}"
+    try:
+        parent.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    try:
+        metadata = os.lstat(parent)
+        resolved = parent.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("owner controller unavailable") from None
+    if (
+        resolved != parent
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != os.getuid()
+    ):
+        raise ValueError("owner controller unavailable")
+    return resolved
+
+
+def _secure_private_bytes(path: Path, *, parent: Path) -> bytes:
+    failure = "owner controller request invalid"
+    if (
+        type(path) is not type(Path())
+        or type(parent) is not type(Path())
+        or not path.is_absolute()
+        or not parent.is_absolute()
+        or path.parent != parent
+    ):
+        raise ValueError(failure)
+    try:
+        parent_metadata = os.lstat(parent)
+        initial = os.lstat(path)
+    except OSError:
+        raise ValueError(failure) from None
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or stat.S_ISLNK(parent_metadata.st_mode)
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        or parent_metadata.st_uid != os.getuid()
+        or not stat.S_ISREG(initial.st_mode)
+        or stat.S_ISLNK(initial.st_mode)
+    ):
+        raise ValueError(failure)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError(failure)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise ValueError(failure) from None
+    try:
+        metadata = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+            or stat.S_ISLNK(current.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError(failure)
+        return os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+
+
+def _remove_private_controller_directory(path: Path) -> None:
+    try:
+        metadata = os.lstat(path)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.getuid()
+        ):
+            raise ValueError("owner controller request invalid")
+        shutil.rmtree(path)
+    except (OSError, ValueError):
+        raise ValueError("owner controller request invalid") from None
+
+
+def _discard_owner_controller_entry(path: Path, *, parent: Path) -> None:
+    if path.parent != parent:
+        raise ValueError("owner controller request invalid")
+    try:
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            os.unlink(path)
+        else:
+            shutil.rmtree(path)
+    except OSError:
+        raise ValueError("owner controller request invalid") from None
+
+
+def _read_pending_controller_metadata(
+    state_root: Path, request_id: str
+) -> tuple[int, Path]:
+    raw = _secure_private_bytes(state_root / "pending.json", parent=state_root)
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        for key, value in pairs:
+            if key in payload:
+                raise ValueError("owner confirmation invalid")
+            payload[key] = value
+        return payload
+
+    payload = json.loads(raw.decode("ascii"), object_pairs_hook=strict_object)
+    if (
+        type(payload) is not dict
+        or set(payload) != {"expires_at", "request_id", "subject_root"}
+        or payload["request_id"] != request_id
+        or type(payload["expires_at"]) is not int
+        or type(payload["subject_root"]) is not str
+    ):
+        raise ValueError("owner confirmation invalid")
+    subject_root = Path(payload["subject_root"])
+    if (
+        not subject_root.is_absolute()
+        or subject_root.parent != state_root
+        or not _under(subject_root, state_root)
+    ):
+        raise ValueError("owner confirmation invalid")
+    return payload["expires_at"], subject_root
+
+
+def _validate_pending_controller_structure(state_root: Path, request_id: str) -> int:
+    expires_at, subject_root = _read_pending_controller_metadata(
+        state_root, request_id
+    )
+    try:
+        subject_metadata = os.lstat(subject_root)
+        subject_file = subject_root / "subject.json"
+        subject_file_metadata = os.lstat(subject_file)
+        state_children = {child.name for child in state_root.iterdir()}
+        subject_children = {child.name for child in subject_root.iterdir()}
+    except OSError:
+        raise ValueError("owner confirmation invalid") from None
+    if (
+        not stat.S_ISDIR(subject_metadata.st_mode)
+        or stat.S_ISLNK(subject_metadata.st_mode)
+        or stat.S_IMODE(subject_metadata.st_mode) != 0o700
+        or subject_metadata.st_uid != os.getuid()
+        or not stat.S_ISREG(subject_file_metadata.st_mode)
+        or stat.S_ISLNK(subject_file_metadata.st_mode)
+        or stat.S_IMODE(subject_file_metadata.st_mode) != 0o600
+        or subject_file_metadata.st_uid != os.getuid()
+        or state_children != {"pending.json", subject_root.name}
+        or subject_children != {"subject.json"}
+    ):
+        raise ValueError("owner confirmation invalid")
+    return expires_at
+
+
+def _purge_owner_controller_requests(parent: Path) -> None:
+    try:
+        parent_metadata = os.lstat(parent)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_ISLNK(parent_metadata.st_mode)
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+            or parent_metadata.st_uid != os.getuid()
+        ):
+            raise ValueError("owner controller unavailable")
+        entries = tuple(parent.iterdir())
+    except (OSError, ValueError):
+        raise ValueError("owner controller unavailable") from None
+    for entry in entries:
+        request_id = entry.name
+        try:
+            if _OWNER_CONTROLLER_REQUEST_ID.fullmatch(request_id) is None:
+                raise ValueError("owner confirmation invalid")
+            expires_at = _validate_pending_controller_structure(entry, request_id)
+            if time.time() > expires_at:
+                raise ValueError("owner confirmation expired")
+        except (OSError, RuntimeError, UnicodeError, ValueError, TypeError):
+            _discard_owner_controller_entry(entry, parent=parent)
+
+
+@dataclass(repr=False)
+class PendingOwnerControllerRequest:
+    """A preflighted private selection that needs a later confirm event."""
+
+    request_id: str
+    _state_root: Path = field(repr=False)
+    _prepared: PreparedOwnerSubject = field(repr=False)
+    _expires_at: int = field(repr=False)
+    _consumed: bool = field(default=False, init=False, repr=False)
+
+    def confirm(self, *, runner, test_token: object = None) -> str:
+        if test_token is not _SYNTHETIC_OWNER_CONTROLLER_TEST_TOKEN:
+            raise ValueError("synthetic controller execution required")
+        if self._consumed or type(self._expires_at) is not int:
+            raise ValueError("owner confirmation invalid")
+        _purge_owner_controller_requests(self._state_root.parent)
+        if not self._state_root.exists():
+            self._consumed = True
+            raise ValueError("owner confirmation invalid")
+        if time.time() > self._expires_at:
+            self.cleanup()
+            raise ValueError("owner confirmation invalid")
+        marker = self._state_root / "pending.json"
+        try:
+            _secure_private_bytes(marker, parent=self._state_root)
+            os.unlink(marker)
+            self._consumed = True
+            return _execute_confirmed_owner_subject(
+                self._prepared,
+                runner=runner,
+                test_token=test_token,
+            )
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError("owner confirmation invalid") from None
+        finally:
+            self.cleanup()
+
+    def cleanup(self) -> None:
+        if self._consumed and not self._state_root.exists() and self._prepared._cleaned:
+            return
+        self._consumed = True
+        failure = None
+        try:
+            self._prepared.cleanup()
+        except ValueError as exc:
+            failure = exc
+        try:
+            if self._state_root.exists():
+                _remove_private_controller_directory(self._state_root)
+        except ValueError as exc:
+            failure = exc
+        if failure is not None:
+            raise ValueError("owner controller request invalid") from None
+
+
+def _pending_controller_payload(
+    request_id: str, subject_root: Path, expires_at: int
+) -> bytes:
+    if (
+        type(request_id) is not str
+        or _OWNER_CONTROLLER_REQUEST_ID.fullmatch(request_id) is None
+        or type(subject_root) is not type(Path())
+        or not subject_root.is_absolute()
+        or type(expires_at) is not int
+    ):
+        raise ValueError("owner controller request invalid")
+    return json.dumps(
+        {
+            "expires_at": expires_at,
+            "request_id": request_id,
+            "subject_root": str(subject_root),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def _write_pending_controller_payload(path: Path, payload: bytes) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        written = os.write(descriptor, payload)
+        if written != len(payload):
+            raise OSError("owner controller write failed")
+        os.fsync(descriptor)
+        path.chmod(0o600)
+    except OSError:
+        raise ValueError("owner controller request invalid") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _execute_confirmed_owner_subject(
+    prepared: PreparedOwnerSubject, *, runner, test_token: object
+) -> str:
+    if (
+        test_token is not _SYNTHETIC_OWNER_CONTROLLER_TEST_TOKEN
+        or type(prepared) is not PreparedOwnerSubject
+        or not callable(runner)
+    ):
+        raise ValueError("owner confirmation invalid")
+    environment = prepared.owner_environment()
+    environment["KUNJIN_PHASE5_OWNER_APPROVED"] = _OWNER_APPROVAL
+    try:
+        completed = runner(
+            [str(_OWNER_ENTRYPOINT), "owner"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            shell=False,
+            check=False,
+        )
+    finally:
+        prepared.cleanup()
+    if getattr(completed, "returncode", None) != 0:
+        raise OwnerAcceptanceFailure(_owner_failure_code(completed))
+    if type(getattr(completed, "stdout", None)) is not str:
+        raise ValueError("owner acceptance failed")
+    return completed.stdout
+
+
+def _prepare_owner_controller_request(
+    fund_code: str, action_value: str
+) -> PendingOwnerControllerRequest:
+    """Accept a confirmed selection inside the private controller process only."""
+
+    parent = _owner_controller_parent().resolve(strict=True)
+    _purge_owner_controller_requests(parent)
+    request_id = secrets.token_hex(32)
+    state_root = parent / request_id
+    prepared: Optional[PreparedOwnerSubject] = None
+    try:
+        os.mkdir(state_root, 0o700)
+        state_root.chmod(0o700)
+        prepared = prepare_owner_subject(
+            fund_code, action_value, parent=state_root
+        )
+        expires_at = int(time.time()) + _OWNER_CONFIRMATION_TTL_SECONDS
+        _write_pending_controller_payload(
+            state_root / "pending.json",
+            _pending_controller_payload(request_id, prepared._root, expires_at),
+        )
+        return PendingOwnerControllerRequest(
+            request_id=request_id,
+            _state_root=state_root,
+            _prepared=prepared,
+            _expires_at=expires_at,
+        )
+    except (OSError, RuntimeError, ValueError):
+        if prepared is not None:
+            try:
+                prepared.cleanup()
+            except ValueError:
+                pass
+        if state_root.exists():
+            try:
+                _remove_private_controller_directory(state_root)
+            except ValueError:
+                pass
+        raise ValueError("owner controller request invalid") from None
+
+
+def _load_pending_owner_controller_request(
+    request_id: str,
+) -> PendingOwnerControllerRequest:
+    if (
+        type(request_id) is not str
+        or _OWNER_CONTROLLER_REQUEST_ID.fullmatch(request_id) is None
+    ):
+        raise ValueError("owner confirmation invalid")
+    parent = _owner_controller_parent().resolve(strict=True)
+    _purge_owner_controller_requests(parent)
+    state_root = parent / request_id
+    try:
+        expires_at, subject_root = _read_pending_controller_metadata(
+            state_root, request_id
+        )
+        _validate_pending_controller_structure(state_root, request_id)
+        prepared = PreparedOwnerSubject(
+            path=subject_root / "subject.json", _root=subject_root
+        )
+        prepared.preflight()
+        return PendingOwnerControllerRequest(
+            request_id=request_id,
+            _state_root=state_root,
+            _prepared=prepared,
+            _expires_at=expires_at,
+        )
+    except (OSError, RuntimeError, UnicodeError, ValueError, TypeError):
+        try:
+            if state_root.exists():
+                _remove_private_controller_directory(state_root)
+        except ValueError:
+            pass
+        raise ValueError("owner confirmation invalid") from None
+
+
+def _decode_owner_controller_transport_input(raw: bytes) -> tuple[str, str]:
+    if type(raw) is not bytes or not raw or len(raw) > 16_384:
+        raise ValueError("owner controller transport input invalid")
+    try:
+        def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            payload: dict[str, object] = {}
+            for key, value in pairs:
+                if key in payload:
+                    raise ValueError("owner controller transport input invalid")
+                payload[key] = value
+            return payload
+
+        payload = json.loads(raw.decode("ascii"), object_pairs_hook=strict_object)
+    except (UnicodeError, ValueError, TypeError):
+        raise ValueError("owner controller transport input invalid") from None
+    if (
+        type(payload) is not dict
+        or set(payload) != {"fund_code", "action"}
+        or type(payload["fund_code"]) is not str
+        or type(payload["action"]) is not str
+    ):
+        raise ValueError("owner controller transport input invalid")
+    return payload["fund_code"], payload["action"]
+
+
+def _run_owner_controller_transport(
+    read_input: Callable[[], bytes], *, runner
+) -> OwnerControllerTransportResult:
+    """Move an already-confirmed selection through private memory only."""
+
+    stages: list[str] = []
+    pending: Optional[PendingOwnerControllerRequest] = None
+    try:
+        if not callable(read_input) or not callable(runner):
+            raise ValueError("owner controller transport invalid")
+        fund_code, action_value = _decode_owner_controller_transport_input(read_input())
+        stages.append("input_received")
+        pending = _prepare_owner_controller_request(fund_code, action_value)
+        stages.append("request_prepared")
+        confirmed = _load_pending_owner_controller_request(pending.request_id)
+        stages.append("confirm_loaded")
+
+        def observed_runner(*args, **kwargs):
+            stages.append("runner_started")
+            try:
+                return runner(*args, **kwargs)
+            finally:
+                stages.append("runner_finished")
+
+        confirmed.confirm(
+            runner=observed_runner,
+            test_token=_SYNTHETIC_OWNER_CONTROLLER_TEST_TOKEN,
+        )
+        return OwnerControllerTransportResult(tuple(stages))
+    except (OSError, RuntimeError, UnicodeError, ValueError, TypeError):
+        stage = stages[-1] if stages else "input_received"
+        raise OwnerControllerTransportFailure(stage) from None
+    finally:
+        if pending is not None:
+            try:
+                pending.cleanup()
+            except ValueError:
+                pass
+
+
+class NoExternalOperations(AbstractContextManager):
+    def __init__(self, *, allow_workers: bool = False) -> None:
+        if type(allow_workers) is not bool:
+            raise ValueError("private acceptance worker boundary invalid")
+        self._allow_workers = allow_workers
+        self._worker_popen = None
         self._originals: list[tuple[object, str, object]] = []
 
     @staticmethod
     def _deny(*_args, **_kwargs):
         raise OSError("private acceptance external operation prohibited")
 
-    def _patch(self, owner: object, name: str) -> None:
+    def _patch(self, owner: object, name: str, replacement=None) -> None:
         if hasattr(owner, name):
             original = getattr(owner, name)
             self._originals.append((owner, name, original))
-            setattr(owner, name, self._deny)
+            setattr(owner, name, self._deny if replacement is None else replacement)
+
+    def _validated_worker_popen(self, *args, **kwargs):
+        from kunjin.decision import worker as worker_runtime
+
+        profiles = {
+            "kunjin.decision.worker_main": worker_runtime.PUBLIC_WORKER_ENV,
+            "kunjin.intelligence.worker_main": worker_runtime.PUBLIC_WORKER_ENV,
+            "kunjin.brief.portfolio_worker_main": (
+                worker_runtime.PRIVATE_KEYCHAIN_WORKER_ENV
+            ),
+        }
+        if len(args) != 1 or type(args[0]) is not tuple:
+            return self._deny()
+        argv = args[0]
+        module = argv[3] if len(argv) == 4 else None
+        profile = profiles.get(module)
+        if profile is None or argv != worker_runtime._default_worker_argv(module):
+            return self._deny()
+        expected = {
+            "shell": False,
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+            "restore_signals": True,
+            "start_new_session": True,
+            "env": dict(worker_runtime._worker_environment(profile)),
+        }
+        if kwargs != expected or self._worker_popen is None:
+            return self._deny()
+        return self._worker_popen(*args, **kwargs)
 
     def __enter__(self):
         for name in ("create_connection", "getaddrinfo"):
             self._patch(socket, name)
         for name in ("connect", "connect_ex"):
             self._patch(socket.socket, name)
-        for name in ("Popen", "run", "call", "check_call", "check_output"):
+        if self._allow_workers:
+            self._worker_popen = subprocess.Popen
+            self._patch(subprocess, "Popen", self._validated_worker_popen)
+        else:
+            self._patch(subprocess, "Popen")
+        for name in ("run", "call", "check_call", "check_output"):
             self._patch(subprocess, name)
         return self
 
@@ -494,6 +1414,7 @@ class NoExternalOperations(AbstractContextManager):
         while self._originals:
             owner, name, original = self._originals.pop()
             setattr(owner, name, original)
+        self._worker_popen = None
         return False
 
 
@@ -613,8 +1534,15 @@ def validate_summary(value: object, *, expected_mode: str) -> dict[str, object]:
         raise ValueError("acceptance output invalid")
 
     if expected_mode in {"engineering", "owner"}:
+        _validate_exact_bool(value["technical_integrity_pass"])
+        _validate_exact_bool(value["owner_workflow_demonstrated"])
         if (
-            value["engineering_flow"] not in {"pass", "failed"}
+            value["technical_integrity_pass"] is not True
+            or expected_mode == "engineering"
+            and value["owner_workflow_demonstrated"] is not False
+            or value["owner_workflow_demonstrated"] is True
+            and value["evidence_readiness"] != "ready"
+            or value["engineering_flow"] not in {"pass", "failed"}
             or value["evidence_readiness"]
             not in {"ready", "partial", "insufficient_data"}
             or value["history_comparability"]
@@ -934,7 +1862,9 @@ def _private_summary_from_review(
         "mode": mode,
         "redemption_feasibility": redemption_state,
         "sell_timing": review.get("sell_timing"),
+        "technical_integrity_pass": True,
         "thesis_review_readiness": thesis_readiness,
+        "owner_workflow_demonstrated": False,
     }
     if summary["engineering_flow"] != "pass":
         raise ValueError("private acceptance flow incomplete")
@@ -961,7 +1891,8 @@ def _run_private_chain(
     def offline_portfolio(*_args, **_kwargs):
         raise OSError("private acceptance portfolio refresh prohibited")
 
-    context.brief_service._portfolio_service.sync = offline_portfolio
+    if mode == "engineering":
+        context.brief_service._portfolio_service.sync = offline_portfolio
     ledger = PrivateCallLedger()
     brief = _private_cli_call(
         cli,
@@ -1041,10 +1972,18 @@ def _run_private_chain(
 def _adjudication_digest(database: Path) -> tuple[int, str]:
     import sqlite3
 
-    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+    # A fresh SQLite backup can retain WAL mode without having sidecar files yet.
+    # Open the ephemeral copy normally so SQLite can initialize those sidecars,
+    # then prohibit SQL writes for the authenticated digest query.
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA schema_version").fetchone()
+        connection.execute("PRAGMA query_only=ON")
         rows = connection.execute(
             "SELECT id, record_checksum FROM thesis_evidence_adjudications ORDER BY id"
         ).fetchall()
+    finally:
+        connection.close()
     encoded = json.dumps(rows, ensure_ascii=True, separators=(",", ":"))
     return len(rows), hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
@@ -1084,7 +2023,311 @@ def _load_owner_key_without_sensitive_environment(phase41) -> bytes:
     return key
 
 
-def run_private_acceptance(mode: str, runtime_dir: Path) -> dict[str, object]:
+@dataclass
+class _OwnerSubjectLease:
+    subject: PrivateSubject
+    parent: Path
+    name: str
+    parent_fd: int
+    subject_fd: int
+    device: int
+    inode: int
+
+    def delete(self) -> None:
+        failure = "private subject cleanup invalid"
+        try:
+            parent_stat = os.fstat(self.parent_fd)
+            opened = os.fstat(self.subject_fd)
+            current = os.stat(
+                self.name,
+                dir_fd=self.parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(parent_stat.st_mode)
+                or stat.S_IMODE(parent_stat.st_mode) != 0o700
+                or parent_stat.st_uid != os.getuid()
+                or not stat.S_ISREG(opened.st_mode)
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_uid != os.getuid()
+                or stat.S_ISLNK(current.st_mode)
+                or (opened.st_dev, opened.st_ino) != (self.device, self.inode)
+                or (current.st_dev, current.st_ino) != (self.device, self.inode)
+            ):
+                raise ValueError(failure)
+            os.unlink(self.name, dir_fd=self.parent_fd)
+        except (OSError, ValueError):
+            raise ValueError(failure) from None
+        finally:
+            os.close(self.subject_fd)
+            os.close(self.parent_fd)
+
+
+def _open_owner_subject_lease() -> _OwnerSubjectLease:
+    failure = "private subject file invalid"
+    if os.environ.get("KUNJIN_PHASE5_OWNER_APPROVED") != _OWNER_APPROVAL:
+        raise ValueError("owner approval required")
+    path = private_subject_path("owner", os.environ)
+    if type(path) is not type(Path()) or not path.is_absolute():
+        raise ValueError(failure)
+    try:
+        parent = path.parent.resolve(strict=True)
+        parent_stat = os.lstat(parent)
+    except (OSError, RuntimeError):
+        raise ValueError(failure) from None
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or stat.S_ISLNK(parent_stat.st_mode)
+        or stat.S_IMODE(parent_stat.st_mode) != 0o700
+        or parent_stat.st_uid != os.getuid()
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        raise ValueError(failure)
+    parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    parent_flags |= getattr(os, "O_CLOEXEC", 0)
+    subject_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    parent_fd = -1
+    subject_fd = -1
+    try:
+        parent_fd = os.open(parent, parent_flags)
+        subject_fd = os.open(path.name, subject_flags, dir_fd=parent_fd)
+        opened = os.fstat(subject_fd)
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        resolved = path.resolve(strict=True)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_uid != os.getuid()
+            or stat.S_ISLNK(current.st_mode)
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError(failure)
+        raw = os.read(subject_fd, 16_385)
+        subject = _decode_private_subject(
+            raw,
+            resolved=resolved,
+            excluded_roots=(Path(__file__).resolve().parents[1],),
+        )
+        return _OwnerSubjectLease(
+            subject=subject,
+            parent=parent,
+            name=path.name,
+            parent_fd=parent_fd,
+            subject_fd=subject_fd,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+        )
+    except BaseException:
+        if subject_fd >= 0:
+            os.close(subject_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        raise
+
+
+def _capture_dependencies() -> object:
+    """Build the live-only capture edges lazily to avoid capture import cycles."""
+    from scripts import phase41_acceptance as phase41
+    from scripts.phase5_capture import CaptureDependencies
+
+    return CaptureDependencies(
+        owner_database=phase41._canonical_owner_database,
+        profile_key_loader=lambda: _load_owner_key_without_sensitive_environment(phase41),
+        context_builder=phase41._build_context_with_key,
+        clock=lambda: datetime.now(timezone.utc),
+        database_guard_factory=phase41.ReadOnlyDatabaseGuard,
+        owner_capture=True,
+    )
+
+
+def _remove_owner_inputs() -> None:
+    for name in _OWNER_INPUT_NAMES:
+        os.environ.pop(name, None)
+
+
+def capture_owner(package_root: Path, runtime_dir: Path) -> None:
+    """Perform exactly one authorized capture and always consume its subject file."""
+    from scripts.phase5_capture import CaptureFailure, capture_rapid
+    from scripts.phase5_capture_package import (
+        PackageError,
+        cleanup_expired_packages,
+        secure_create_package_root,
+    )
+
+    lease: _OwnerSubjectLease | None = None
+    captured = False
+    try:
+        try:
+            lease = _open_owner_subject_lease()
+            cleanup_expired_packages(package_root.parent, now=datetime.now(timezone.utc))
+            secure_create_package_root(package_root.parent, package_root.name)
+            capture_work = runtime_dir / "capture-work"
+            capture_work.mkdir(mode=0o700)
+            capture_work.chmod(0o700)
+            manifest = capture_rapid(
+                lease.subject,
+                package_root,
+                capture_work,
+                _capture_dependencies(),
+            )
+            captured = True
+            if (
+                manifest.profile_key_reads != 1
+                or manifest.portfolio_token_reads != 1
+                or manifest.portfolio_token_mutation_attempts != 0
+            ):
+                raise PrivateAcceptanceStageError("private_verification")
+        except (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError):
+            raise
+        except CaptureFailure as error:
+            raise PrivateAcceptanceStageError(
+                _CAPTURE_STAGE_BY_FAILURE.get(error.args[0], "private_flow")
+            ) from None
+        except PackageError:
+            raise PrivateAcceptanceStageError("private_verification") from None
+        except PrivateAcceptanceStageError:
+            raise
+        except Exception:
+            raise PrivateAcceptanceStageError("private_flow") from None
+    finally:
+        cleanup_failure: Exception | None = None
+        if lease is not None:
+            try:
+                lease.delete()
+            except Exception as error:
+                cleanup_failure = error
+        _remove_owner_inputs()
+        if not captured:
+            try:
+                cleanup_expired_packages(package_root.parent, now=datetime.now(timezone.utc))
+            except Exception:
+                pass
+        if cleanup_failure is not None:
+            raise PrivateAcceptanceStageError("private_verification") from None
+
+
+def _read_protected_replay_result(path: Path) -> object:
+    from scripts.phase5_replay import ReplayFailure, ReplayResult, protected_replay_payload
+
+    if not isinstance(path, Path) or path.name != "protected-replay-result.json":
+        raise ValueError("protected replay result invalid")
+    descriptor = -1
+    try:
+        parent = os.lstat(path.parent)
+        metadata = os.lstat(path)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or stat.S_ISLNK(parent.st_mode)
+            or stat.S_IMODE(parent.st_mode) != 0o700
+            or parent.st_uid != os.getuid()
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size > MAX_SUMMARY_BYTES
+        ):
+            raise ValueError("protected replay result invalid")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ValueError("protected replay result invalid")
+        encoded = os.read(descriptor, MAX_SUMMARY_BYTES + 1)
+    except OSError:
+        raise ValueError("protected replay result invalid") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            value: dict[str, object] = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("protected replay result invalid")
+                value[key] = item
+            return value
+
+        value = json.loads(encoded.decode("ascii"), object_pairs_hook=strict_object)
+        result = ReplayResult(**value)
+        if protected_replay_payload(result) != value:
+            raise ValueError("protected replay result invalid")
+        return result
+    except (ReplayFailure, TypeError, UnicodeError, ValueError):
+        raise ValueError("protected replay result invalid") from None
+
+
+def replay_package(package_root: Path, work_root: Path) -> None:
+    """Run one strictly offline replay. Owner inputs are never legal here."""
+    if any(name in os.environ for name in _OWNER_INPUT_NAMES):
+        raise ValueError("private replay environment invalid")
+    from scripts.phase5_replay import replay_once, write_protected_result
+
+    result = replay_once(
+        package_root,
+        work_root,
+        validation_now=datetime.now(timezone.utc),
+    )
+    write_protected_result(result, work_root)
+
+
+def _write_compare_summary(summary: Mapping[str, object], path: Path, runtime_dir: Path) -> None:
+    if path.parent.resolve(strict=True) != runtime_dir.resolve(strict=True):
+        raise ValueError("acceptance output invalid")
+    encoded = encode_summary(dict(summary)).encode("ascii")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise OSError("short acceptance summary write")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def compare_private_replays(
+    mode: str,
+    first_path: Path,
+    second_path: Path,
+    summary_path: Path,
+    runtime_dir: Path,
+) -> None:
+    from scripts.phase5_replay import compare_replays
+
+    if mode not in {"engineering", "owner"} or any(
+        name in os.environ for name in _OWNER_INPUT_NAMES
+    ):
+        raise ValueError("private replay comparison invalid")
+    try:
+        summary = compare_replays(
+            _read_protected_replay_result(first_path),
+            _read_protected_replay_result(second_path),
+            mode=mode,
+        )
+        _write_compare_summary(summary, summary_path, runtime_dir)
+    finally:
+        for path in (first_path, second_path):
+            try:
+                if path.exists() and path.is_file() and not path.is_symlink():
+                    path.unlink()
+            except OSError:
+                pass
+
+
+def _run_legacy_private_acceptance_for_tests(
+    mode: str,
+    runtime_dir: Path,
+    *,
+    test_token: object,
+) -> dict[str, object]:
+    """Retain the retired monolithic flow only for synthetic compatibility tests."""
+    if test_token is not _LEGACY_PRIVATE_TEST_TOKEN:
+        raise ValueError("legacy private acceptance is test-only")
     from scripts import phase41_acceptance as phase41
 
     if "KUNJIN_DATA_DIR" in os.environ or "KUNJIN_STATE_DIR" in os.environ:
@@ -1093,11 +2336,16 @@ def run_private_acceptance(mode: str, runtime_dir: Path) -> dict[str, object]:
         "explicit_private_read_only_review"
     ):
         raise ValueError("owner approval required")
-    subject_path = private_subject_path(mode, os.environ)
-    subject = secure_read_private_subject(
-        subject_path,
-        excluded_roots=(Path(__file__).resolve().parents[1],),
-    )
+    try:
+        subject_path = private_subject_path(mode, os.environ)
+        subject = secure_read_private_subject(
+            subject_path,
+            excluded_roots=(Path(__file__).resolve().parents[1],),
+        )
+    except MemoryError:
+        raise
+    except Exception:
+        raise PrivateAcceptanceStageError("private_input") from None
     data_dir = runtime_dir / "data"
     state_dir = runtime_dir / "state"
     data_dir.mkdir(mode=0o700)
@@ -1113,30 +2361,51 @@ def run_private_acceptance(mode: str, runtime_dir: Path) -> dict[str, object]:
     sensitive = {name: os.environ.pop(name) for name in sensitive_names if name in os.environ}
     try:
         if mode == "owner":
-            key = _load_owner_key_without_sensitive_environment(phase41)
-        with phase41.ReadOnlyDatabaseGuard(source, target):
-            before = _adjudication_digest(target)
-            os.environ["KUNJIN_DATA_DIR"] = str(data_dir)
-            os.environ["KUNJIN_STATE_DIR"] = str(state_dir)
             try:
-                with NoExternalOperations():
-                    chain = _run_private_chain(mode, subject, key)
-            finally:
-                os.environ.pop("KUNJIN_DATA_DIR", None)
-                os.environ.pop("KUNJIN_STATE_DIR", None)
-                key = b""
-            adjudication_unchanged = _adjudication_digest(target) == before
-            if not adjudication_unchanged:
-                raise ValueError("private acceptance adjudication changed")
-            summary = _private_summary_from_review(
-                mode,
-                subject,
-                chain,
-                adjudication_unchanged=adjudication_unchanged,
-            )
+                key = _load_owner_key_without_sensitive_environment(phase41)
+            except MemoryError:
+                raise
+            except Exception:
+                raise PrivateAcceptanceStageError("owner_keychain") from None
+        stage = "private_database_snapshot"
+        try:
+            with phase41.ReadOnlyDatabaseGuard(source, target):
+                stage = "private_verification"
+                before = _adjudication_digest(target)
+                os.environ["KUNJIN_DATA_DIR"] = str(data_dir)
+                os.environ["KUNJIN_STATE_DIR"] = str(state_dir)
+                try:
+                    stage = "private_flow"
+                    with NoExternalOperations(allow_workers=mode == "owner"):
+                        chain = _run_private_chain(mode, subject, key)
+                finally:
+                    os.environ.pop("KUNJIN_DATA_DIR", None)
+                    os.environ.pop("KUNJIN_STATE_DIR", None)
+                    key = b""
+                stage = "private_verification"
+                adjudication_unchanged = _adjudication_digest(target) == before
+                if not adjudication_unchanged:
+                    raise ValueError("private acceptance adjudication changed")
+                summary = _private_summary_from_review(
+                    mode,
+                    subject,
+                    chain,
+                    adjudication_unchanged=adjudication_unchanged,
+                )
+        except PrivateAcceptanceStageError:
+            raise
+        except MemoryError:
+            raise
+        except Exception:
+            raise PrivateAcceptanceStageError(stage) from None
     finally:
         os.environ.update(sensitive)
-    phase41.check_runtime_permissions(runtime_dir)
+    try:
+        phase41.check_runtime_permissions(runtime_dir)
+    except MemoryError:
+        raise
+    except Exception:
+        raise PrivateAcceptanceStageError("private_verification") from None
     return summary
 
 
@@ -1146,7 +2415,7 @@ def project_mode(mode: str, runtime_dir: Path) -> dict[str, object]:
             local_fixture(), observation=_run_local_probe(runtime_dir)
         )
     if mode in {"engineering", "owner"}:
-        return run_private_acceptance(mode, runtime_dir)
+        raise ValueError("legacy private acceptance disabled")
     if mode != "fault":
         raise ValueError("acceptance mode invalid")
     observations = [run_fault_probe(case, runtime_dir) for case in FAULT_CASES]
@@ -1213,7 +2482,23 @@ def _read_private_summary(path: Path, runtime_dir: Path) -> str:
 
 
 def _produce(mode: str) -> int:
-    encoded = encode_summary(project_mode(mode, _runtime_dir()))
+    runtime_dir = _runtime_dir()
+    if mode == "engineering":
+        _run_pytest_probe(
+            "engineering_two_stage_lifecycle",
+            _ENGINEERING_LIFECYCLE_NODE,
+            runtime_dir,
+            repository_root=Path(__file__).resolve().parents[1],
+            python=Path(sys.executable),
+        )
+        summary = _private_summary(
+            possible_match_fixture(mode="engineering"),
+            PREVIEW_COUNTS,
+            adjudication_unchanged=True,
+        )
+    else:
+        summary = project_mode(mode, runtime_dir)
+    encoded = encode_summary(summary)
     print(encoded)
     return 0
 
@@ -1224,6 +2509,29 @@ def _validate_file(mode: str, path_value: str) -> int:
     return 0
 
 
+def _replay_package(package_value: str, work_value: str) -> int:
+    replay_package(Path(package_value), Path(work_value))
+    print('{"ok":true}')
+    return 0
+
+
+def _compare_private(
+    mode: str,
+    first_value: str,
+    second_value: str,
+    summary_value: str,
+) -> int:
+    compare_private_replays(
+        mode,
+        Path(first_value),
+        Path(second_value),
+        Path(summary_value),
+        _runtime_dir(),
+    )
+    print('{"ok":true}')
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -1231,9 +2539,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "local",
             "fault",
             "engineering",
-            "owner",
         }:
             return _produce(args[1])
+        if len(args) == 3 and args[0] == "replay":
+            return _replay_package(args[1], args[2])
+        if len(args) == 5 and args[0] == "compare" and args[1] in {
+            "engineering",
+            "owner",
+        }:
+            return _compare_private(args[1], args[2], args[3], args[4])
         if (
             len(args) == 3
             and args[0] == "validate"
@@ -1246,7 +2560,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 path.chmod(0o700)
                 os.environ["KUNJIN_PHASE5_RUNTIME_DIR"] = str(path)
                 return _produce(args[0])
-    except (OSError, RuntimeError, subprocess.SubprocessError, TypeError, ValueError):
+    except PrivateAcceptanceStageError as exc:
+        print('{"error_code":"phase5_acceptance_failed","ok":false}')
+        return exc.exit_code
+    except MemoryError:
+        raise
+    except Exception:
         print('{"error_code":"phase5_acceptance_failed","ok":false}')
         return 70
     print('{"error_code":"phase5_arguments_invalid","ok":false}')

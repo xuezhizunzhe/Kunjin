@@ -26,6 +26,42 @@ class OcrMustNotRun:
 
 
 class SmokeTest(unittest.TestCase):
+    def test_kunjin_skill_routes_public_questions_to_research_summary(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+
+        for phrase in (
+            "research summary news",
+            "research summary market",
+            "research summary fund CODE",
+            "research scan --window recent --mode rapid",
+            "research panorama",
+            "候选方向初筛",
+            "跨领域扫描",
+            "portfolio review",
+            "临时手动组合",
+            "investor guardrails",
+            "投资者画像与配置边界",
+            "应急资金",
+            "与现有持仓驱动不同的分散宽基角色",
+            "不能自动指定基金代码",
+            "fund review CODE",
+            "基金复核",
+            "同一报告期、同一行业分类下共同类别的较小权重之和",
+            "本次未取得足以支持该市场结论的可核验事实",
+            "fund candidates CODE_A CODE_B",
+            "同类比较与候选选择",
+            "不自动发现新基金代码",
+            "fund review-triggers CODE",
+            "买后按需复核",
+            "不是后台监控、自动推送或自动交易",
+            "不构成自动交易",
+            "严格 Phase 5 验收",
+        ):
+            self.assertIn(phrase, skill)
+
     def test_kunjin_skill_exact_amount_requires_ephemeral_owner_authorization(self) -> None:
         root = Path(__file__).resolve().parents[1]
         skill = (root / "integrations/codex/kunjin-fund/SKILL.md").read_text(
@@ -3691,16 +3727,15 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             fake_python.chmod(0o755)
             env = {**os.environ, "PHASE5_MARKER": str(marker)}
 
-            for mode in ("engineering", "owner"):
-                completed = subprocess.run(
-                    [str(wrapper), mode],
-                    env=env,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    timeout=5,
-                )
-                self.assertEqual(completed.returncode, 77)
-                self.assertFalse(marker.exists())
+            completed = subprocess.run(
+                [str(wrapper), "owner"],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 77)
+            self.assertFalse(marker.exists())
             completed = subprocess.run(
                 [str(wrapper), "deep"],
                 env=env,
@@ -3710,6 +3745,104 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             )
             self.assertEqual(completed.returncode, 2)
             self.assertIn(b"local|fault|engineering|owner", completed.stderr)
+
+    def test_phase5_owner_shell_reaches_private_capture_once_and_replays_twice(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "scripts/run_phase5_acceptance.sh").read_text(
+            encoding="utf-8"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            scripts = repository / "scripts"
+            venv = repository / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            venv.mkdir(parents=True)
+            wrapper = scripts / "run_phase5_acceptance.sh"
+            owner_entrypoint = (
+                'readonly OWNER_ENTRYPOINT="/Users/yanzihao/KunJin/scripts/'
+                'run_phase5_acceptance.sh"'
+            )
+            wrapper.write_text(
+                source.replace(
+                    owner_entrypoint,
+                    f'readonly OWNER_ENTRYPOINT="{wrapper}"',
+                ),
+                encoding="utf-8",
+            )
+            shutil.copy2(root / "scripts/phase5_acceptance.py", scripts)
+            shutil.copy2(root / "scripts/phase5_owner_capture.py", scripts)
+            wrapper.chmod(0o755)
+            calls = repository / "owner-calls"
+            fake_python = venv / "python"
+            fake_python.write_text(
+                "#!/bin/bash\n"
+                "case \"$(/usr/bin/basename -- \"$1\"):$2\" in\n"
+                "  phase5_owner_capture.py:*)\n"
+                "    printf 'capture\\n' >> \"${PHASE5_OWNER_CALLS}\"\n"
+                "    /bin/mkdir -p -- \"$2\"\n"
+                "    /usr/bin/touch -- \"$2/capture-complete\"\n"
+                "    if [[ \"${PHASE5_OWNER_SCENARIO:-success}\" == capture_failure ]]; then\n"
+                "      printf 'private detail' >&2\n"
+                "      exit 72\n"
+                "    fi\n"
+                "    printf '%s\\n' '{\"ok\":true}'\n"
+                "    ;;\n"
+                "  phase5_acceptance.py:replay)\n"
+                "    printf 'replay\\n' >> \"${PHASE5_OWNER_CALLS}\"\n"
+                "    /bin/mkdir -p -- \"$4\"\n"
+                "    /usr/bin/touch -- \"$4/protected-replay-result.json\"\n"
+                "    printf '%s\\n' '{\"ok\":true}'\n"
+                "    ;;\n"
+                "  phase5_acceptance.py:compare)\n"
+                "    printf 'compare\\n' >> \"${PHASE5_OWNER_CALLS}\"\n"
+                "    printf '%s\\n' '{\"ok\":true}' > \"$6\"\n"
+                "    printf '%s\\n' '{\"ok\":true}'\n"
+                "    ;;\n"
+                "  phase5_acceptance.py:validate)\n"
+                "    printf 'validate\\n' >> \"${PHASE5_OWNER_CALLS}\"\n"
+                "    printf '%s\\n' '{\"ok\":true}'\n"
+                "    ;;\n"
+                "  *) exit 70 ;;\n"
+                "esac\n",
+                encoding="ascii",
+            )
+            fake_python.chmod(0o755)
+            env = {
+                **os.environ,
+                "KUNJIN_PHASE5_OWNER_APPROVED": "explicit_private_read_only_review",
+                "KUNJIN_PHASE5_OWNER_SUBJECT_FILE": "/private/owner-subject",
+                "PHASE5_OWNER_CALLS": str(calls),
+            }
+
+            completed = subprocess.run(
+                [str(wrapper), "owner"],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(calls.read_text(encoding="ascii").splitlines(), [
+                "capture", "replay", "replay", "compare", "validate"
+            ])
+            self.assertEqual(completed.stdout, b'{"ok":true}\n')
+            self.assertEqual(completed.stderr, b"")
+
+            env["PHASE5_OWNER_SCENARIO"] = "capture_failure"
+            failed = subprocess.run(
+                [str(wrapper), "owner"],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5,
+            )
+
+            self.assertEqual(failed.returncode, 70)
+            self.assertEqual(calls.read_text(encoding="ascii").splitlines(), [
+                "capture", "replay", "replay", "compare", "validate", "capture"
+            ])
+            self.assertNotIn(b"private detail", failed.stdout + failed.stderr)
 
     def test_phase5_acceptance_clears_private_environment_before_validation(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -3753,7 +3886,7 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             fake_python.write_text(
                 "#!/bin/bash\n"
                 "if [[ \"$2\" == produce ]]; then\n"
-                "  [[ -n \"${KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE:-}\" ]] || exit 21\n"
+                "  [[ -z \"${KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE:-}\" ]] || exit 21\n"
                 f"  printf '%s\\n' '{summary}'\n"
                 "  exit 0\n"
                 "fi\n"
@@ -3771,9 +3904,6 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             fake_python.chmod(0o755)
             env = {
                 **os.environ,
-                "KUNJIN_PHASE5_ENGINEERING_SUBJECT_FILE": str(
-                    Path(temporary) / "subject.json"
-                ),
                 "PHASE5_MARKER": str(marker),
             }
             env.pop("KUNJIN_DATA_DIR", None)
@@ -3816,6 +3946,44 @@ json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
             self.assertEqual(completed.returncode, 70)
             self.assertEqual(completed.stdout, b"")
             self.assertIn(b"phase5_acceptance_tests_failed", completed.stderr)
+
+    def test_phase5_acceptance_reports_only_fixed_private_failure_stage(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            scripts = repository / "scripts"
+            venv = repository / ".venv" / "bin"
+            scripts.mkdir(parents=True)
+            venv.mkdir(parents=True)
+            wrapper = scripts / "run_phase5_acceptance.sh"
+            shutil.copy2(root / "scripts/run_phase5_acceptance.sh", wrapper)
+            shutil.copy2(root / "scripts/phase5_acceptance.py", scripts)
+            wrapper.chmod(0o755)
+            fake_python = venv / "python"
+            fake_python.write_text(
+                "#!/bin/bash\n"
+                "printf '%s\\n' 'private-path=/Users/owner exact=999999 token=secret'\n"
+                "exit 72\n",
+                encoding="ascii",
+            )
+            fake_python.chmod(0o755)
+
+            completed = subprocess.run(
+                [str(wrapper), "fault"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5,
+            )
+
+            self.assertEqual(completed.returncode, 70)
+            self.assertEqual(completed.stdout, b"")
+            self.assertEqual(
+                completed.stderr,
+                b'{"error_code":"phase5_acceptance_tests_failed",'
+                b'"failure_stage":"owner_keychain","ok":false}\n',
+            )
+            self.assertNotIn(b"999999", completed.stderr)
+            self.assertNotIn(b"secret", completed.stderr)
 
     def test_phase5_acceptance_interrupt_cleans_process_group(self) -> None:
         root = Path(__file__).resolve().parents[1]

@@ -1012,6 +1012,455 @@ class CliIntegrationTest(unittest.TestCase):
         self.assert_envelope(payload, "news.recent")
         self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
 
+    def test_research_summary_routes_one_public_workflow(self) -> None:
+        now = self.suitability_now
+        terminal = AuthenticatedTerminalRequest(
+            id=19,
+            request_id="a" * 32,
+            mode=RequestMode.RAPID,
+            status=RequestTerminalStatus.PARTIAL,
+            started_at=now,
+            deadline_at=now + timedelta(seconds=90),
+            finished_at=now + timedelta(seconds=1),
+            omitted_work=("source_unavailable",),
+        )
+
+        class FakeIntelligenceService:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def _result(self, workflow, fund_code=None):
+                return PragmaticIntelligenceResult(
+                    report=None,
+                    terminal_request=terminal,
+                    subject=IntelligenceRequestSubject(
+                        workflow=workflow,
+                        interval=QueryInterval(
+                            now - timedelta(hours=72),
+                            now,
+                            "Asia/Shanghai",
+                        ),
+                        subject_scope=(
+                            "global_public"
+                            if fund_code is None
+                            else "named_public_fund"
+                        ),
+                        fund_code=fund_code,
+                    ),
+                    items=(),
+                    item_uses=(),
+                    lineage_edges=(),
+                    events=(),
+                    source_summaries=(),
+                    sector_labels=(),
+                    fund_context=None,
+                    thesis_review=None,
+                )
+
+            def news_recent(inner_self, **kwargs):
+                inner_self.calls.append(("news", kwargs))
+                return inner_self._result(IntelligenceWorkflow.NEWS_RECENT)
+
+            def market_overview(inner_self, **kwargs):
+                inner_self.calls.append(("market", kwargs))
+                return inner_self._result(IntelligenceWorkflow.MARKET_OVERVIEW)
+
+            def fund_intelligence(inner_self, fund_code, **kwargs):
+                inner_self.calls.append(("fund", fund_code, kwargs))
+                return inner_self._result(
+                    IntelligenceWorkflow.FUND_INTELLIGENCE, fund_code
+                )
+
+        service = FakeIntelligenceService()
+        self.context.intelligence_service = service
+        cases = (
+            (["--json", "research", "summary", "news"], "news_recent"),
+            (["--json", "research", "summary", "market"], "market_overview"),
+            (
+                ["--json", "research", "summary", "fund", "519755"],
+                "fund_intelligence",
+            ),
+        )
+        for argv, workflow in cases:
+            with self.subTest(argv=argv):
+                payload, exit_code, json_output = run(argv, self.context)
+                self.assertEqual(exit_code, 0, payload)
+                self.assertTrue(json_output)
+                self.assert_envelope(payload, "research.summary")
+                self.assertEqual(payload["data"]["retrieval"]["workflow"], workflow)
+                self.assertFalse(
+                    payload["data"]["conditional_guidance"]["action_authorized"]
+                )
+                self.assertFalse(
+                    payload["data"]["conditional_guidance"]["automatic_trade"]
+                )
+
+        self.assertEqual([item[0] for item in service.calls], ["news", "market", "fund"])
+
+    def test_research_summary_requires_json_and_a_fund_code_for_fund_scope(self) -> None:
+        payload, exit_code, json_output = run(
+            ["research", "summary", "news"], self.context
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(json_output)
+        self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
+        payload, exit_code, json_output = run(
+            ["--json", "research", "summary", "fund"], self.context
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(json_output)
+        self.assertEqual(payload["errors"][0]["code"], "invalid_arguments")
+
+    def test_research_scan_uses_market_overview_once(self) -> None:
+        terminal = AuthenticatedTerminalRequest(
+            id=20,
+            request_id="b" * 32,
+            mode=RequestMode.RAPID,
+            status=RequestTerminalStatus.PARTIAL,
+            started_at=self.suitability_now,
+            deadline_at=self.suitability_now + timedelta(seconds=90),
+            finished_at=self.suitability_now + timedelta(seconds=1),
+            omitted_work=("source_unavailable",),
+        )
+
+        class FakeIntelligenceService:
+            calls = 0
+
+            def market_overview(inner_self, **_kwargs):
+                inner_self.calls += 1
+                return PragmaticIntelligenceResult(
+                    report=None,
+                    terminal_request=terminal,
+                    subject=IntelligenceRequestSubject(
+                        workflow=IntelligenceWorkflow.MARKET_OVERVIEW,
+                        interval=QueryInterval(
+                            self.suitability_now - timedelta(hours=72),
+                            self.suitability_now,
+                            "Asia/Shanghai",
+                        ),
+                        subject_scope="global_public",
+                        fund_code=None,
+                    ),
+                    items=(),
+                    item_uses=(),
+                    lineage_edges=(),
+                    events=(),
+                    source_summaries=(),
+                    sector_labels=(),
+                    fund_context=None,
+                    thesis_review=None,
+                )
+
+        service = FakeIntelligenceService()
+        self.context.intelligence_service = service
+        payload, exit_code, json_output = run(
+            ["--json", "research", "scan", "--window", "recent"], self.context
+        )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "research.scan")
+        self.assertEqual(payload["data"]["retrieval"]["workflow"], "market_overview")
+        self.assertEqual(service.calls, 1)
+
+    def test_research_supplement_is_local_and_preliminary_only(self) -> None:
+        payload, exit_code, json_output = run(
+            [
+                "--json",
+                "research",
+                "supplement",
+                "--source-name",
+                "公开行业统计",
+                "--source-kind",
+                "industry_data",
+                "--title",
+                "月度行业统计",
+                "--published-at",
+                "2026-07-20T08:00:00+00:00",
+                "--source-url",
+                "https://example.test/monthly",
+                "--statistics-period",
+                "2026年6月",
+                "--indicator-name",
+                "样本产量",
+                "--indicator-value",
+                "100",
+                "--unit",
+                "万台",
+                "--methodology",
+                "来源页面标明月度统计口径",
+                "--domain",
+                "autos",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "research.supplement")
+        self.assertEqual(
+            payload["data"]["fact"]["source"]["research_source_level"],
+            "provisional_tier_2",
+        )
+        self.assertEqual(
+            payload["data"]["current_research_use"]["state"],
+            "prepared_for_next_research",
+        )
+        self.assertFalse(payload["data"]["current_research_use"]["strong_direction_eligible"])
+        self.assertFalse(payload["data"]["conditional_guidance"]["automatic_trade"])
+
+    def test_research_supplement_timeline_uses_only_supplied_materials(self) -> None:
+        def material(period, published_at, value):
+            return json.dumps(
+                {
+                    "source_name": "中国政府网",
+                    "source_kind": "official",
+                    "title": f"{period}全社会用电量",
+                    "published_at": published_at,
+                    "original_url": "https://www.gov.cn/example.htm",
+                    "statistics_period": period,
+                    "indicator_name": "全社会用电量",
+                    "indicator_value": value,
+                    "unit": "亿千瓦时",
+                    "methodology": "用户提供的同口径月度材料",
+                    "domain_id": "power_energy",
+                }
+            )
+
+        payload, exit_code, json_output = run(
+            [
+                "--json",
+                "research",
+                "supplement-timeline",
+                "--material-json",
+                material("2026年3月", "2026-04-20T00:00:00+08:00", "8595"),
+                "--material-json",
+                material("2026年4月", "2026-05-19T00:00:00+08:00", "8205"),
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "research.supplement_timeline")
+        self.assertEqual(payload["data"]["conclusion"]["state"], "timeline_available")
+        self.assertEqual(len(payload["data"]["timeline"]), 2)
+        self.assertFalse(payload["data"]["current_research_use"]["strong_direction_eligible"])
+
+    def test_research_panorama_uses_month_and_quarter_market_windows(self) -> None:
+        terminal = AuthenticatedTerminalRequest(
+            id=21,
+            request_id="c" * 32,
+            mode=RequestMode.RAPID,
+            status=RequestTerminalStatus.PARTIAL,
+            started_at=self.suitability_now,
+            deadline_at=self.suitability_now + timedelta(seconds=90),
+            finished_at=self.suitability_now + timedelta(seconds=1),
+            omitted_work=("source_unavailable",),
+        )
+
+        class FakeIntelligenceService:
+            calls = []
+
+            def market_overview(inner_self, **kwargs):
+                inner_self.calls.append(kwargs)
+                return PragmaticIntelligenceResult(
+                    report=None, terminal_request=terminal,
+                    subject=IntelligenceRequestSubject(
+                        workflow=IntelligenceWorkflow.MARKET_OVERVIEW,
+                        interval=QueryInterval(
+                            self.suitability_now - timedelta(hours=72),
+                            self.suitability_now,
+                            "Asia/Shanghai",
+                        ),
+                        subject_scope="global_public", fund_code=None,
+                    ), items=(), item_uses=(), lineage_edges=(), events=(),
+                    source_summaries=(), sector_labels=(), fund_context=None,
+                    thesis_review=None,
+                )
+
+        service = FakeIntelligenceService()
+        self.context.intelligence_service = service
+        payload, exit_code, json_output = run(["--json", "research", "panorama"], self.context)
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "research.panorama")
+        self.assertEqual(len(service.calls), 2)
+        self.assertTrue(all(item["mode"] == "rapid" for item in service.calls))
+        self.assertEqual(
+            [(item["end"] - item["start"]).days for item in service.calls],
+            [29, 89],
+        )
+
+    def test_portfolio_review_manual_mode_does_not_synchronize(self) -> None:
+        class MustNotSync:
+            def sync_portfolio(self, **_kwargs):
+                raise AssertionError("manual portfolio review must not synchronize")
+
+        self.context.sync_service = MustNotSync()
+        payload, exit_code, json_output = run(
+            [
+                "--json",
+                "portfolio",
+                "review",
+                "--manual-position",
+                "123456=60",
+                "--manual-position",
+                "654321=40",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "portfolio.review")
+        self.assertEqual(payload["data"]["input_source"], "manual_temporary")
+        self.assertFalse(
+            payload["data"]["conditional_guidance"]["automatic_trade"]
+        )
+
+    def test_fund_review_composes_public_context_conservatively(self) -> None:
+        self.context.brief_service = SimpleNamespace(
+            brief_outcome=lambda *_args, **_kwargs: object()
+        )
+        self.context.intelligence_service = SimpleNamespace(
+            fund_intelligence=lambda *_args, **_kwargs: object(),
+            market_overview=lambda *_args, **_kwargs: object(),
+        )
+        with (
+            patch("kunjin.brief.research.public_outcome_payload", return_value={}),
+            patch(
+                "kunjin.intelligence.research.public_intelligence_payload",
+                return_value={},
+            ),
+            patch(
+                "kunjin.cli.summarize_public_research",
+                return_value={"sources": [], "what_happened": [], "retrieval": {}},
+            ),
+            patch("kunjin.cli.scan_public_research", return_value={"directions": []}),
+        ):
+            payload, exit_code, json_output = run(
+                ["--json", "fund", "review", "123456"], self.context
+            )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "fund.review")
+        self.assertEqual(payload["data"]["conclusion"]["disposition"], "需补充信息")
+        self.assertFalse(
+            payload["data"]["conditional_guidance"]["automatic_trade"]
+        )
+
+    def test_fund_review_related_group_is_explicit_and_non_transactional(self) -> None:
+        self.context.brief_service = SimpleNamespace(
+            brief_outcome=lambda *_args, **_kwargs: object()
+        )
+        self.context.intelligence_service = SimpleNamespace(
+            fund_intelligence=lambda *_args, **_kwargs: object(),
+            market_overview=lambda *_args, **_kwargs: object(),
+        )
+        comparison = {
+            "coverage": {"members_total": 2, "members_with_disclosures": 2},
+            "pairwise_overlap": [],
+            "sources": [],
+            "warnings": [],
+            "data_gaps": [],
+        }
+        with (
+            patch("kunjin.brief.research.public_outcome_payload", return_value={}),
+            patch("kunjin.intelligence.research.public_intelligence_payload", return_value={}),
+            patch(
+                "kunjin.cli.summarize_public_research",
+                return_value={"sources": [], "what_happened": [], "retrieval": {}},
+            ),
+            patch("kunjin.cli.scan_public_research", return_value={"directions": []}),
+            patch("kunjin.cli.build_explicit_compare_report", return_value=comparison),
+        ):
+            payload, exit_code, json_output = run(
+                [
+                    "--json",
+                    "fund",
+                    "review",
+                    "123456",
+                    "--related-fund",
+                    "654321",
+                ],
+                self.context,
+            )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "fund.review")
+        self.assertEqual(
+            payload["data"]["related_fund_context"]["fund_codes"],
+            ["123456", "654321"],
+        )
+        self.assertFalse(payload["data"]["conditional_guidance"]["automatic_trade"])
+
+    def test_investor_guardrails_returns_category_boundaries(self) -> None:
+        payload, exit_code, json_output = run(
+            [
+                "--json",
+                "investor",
+                "guardrails",
+                "--emergency-fund",
+                "yes",
+                "--near-term-use",
+                "no",
+                "--horizon",
+                "long",
+                "--volatility",
+                "medium",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "investor.guardrails")
+        self.assertEqual(payload["data"]["readiness"], "可以继续研究")
+        self.assertFalse(payload["data"]["action_boundary"]["automatic_trade"])
+        self.assertEqual(
+            payload["data"]["portfolio_research"]["state"],
+            "portfolio_unavailable",
+        )
+
+    def test_fund_candidates_requires_profile_before_research_candidates(self) -> None:
+        with patch(
+            "kunjin.cli.build_explicit_compare_report",
+            return_value={
+                "coverage": {"members_with_disclosures": 2, "members_total": 2},
+                "metric_orderings": {},
+                "sources": [],
+                "candidate_portfolio_overlap": {},
+                "pairwise_overlap": [],
+                "warnings": [],
+                "data_gaps": [],
+            },
+        ):
+            payload, exit_code, json_output = run(
+                ["--json", "fund", "candidates", "123456", "654321"], self.context
+            )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "fund.candidates")
+        self.assertEqual(payload["data"]["conclusion"]["disposition"], "需补充个人信息")
+        self.assertFalse(payload["data"]["conditional_guidance"]["automatic_trade"])
+
+    def test_fund_review_triggers_are_on_demand_only(self) -> None:
+        payload, exit_code, json_output = run(
+            ["--json", "fund", "review-triggers", "123456"], self.context
+        )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "fund.review-triggers")
+        self.assertFalse(payload["data"]["action_boundary"]["automatic_monitoring"])
+        self.assertFalse(payload["data"]["action_boundary"]["automatic_trade"])
+
     def test_phase0_decision_route_parser_and_json_contract(self) -> None:
         payload, exit_code, json_output = run(
             [
@@ -1648,7 +2097,7 @@ class CliIntegrationTest(unittest.TestCase):
     def test_phase0_command_errors_never_publish_private_exception_details(self) -> None:
         private_details = (
             "access_token=never-print-this monthly_net_income=918273645001 "
-            f"managed_path={self.context.paths.database} worker_pid=4242"
+            f"managed_path={self.context.paths.database} worker_pid=42424242424242424242"
         )
 
         class FailingDecisionService:
@@ -1680,7 +2129,7 @@ class CliIntegrationTest(unittest.TestCase):
             "never-print-this",
             "918273645001",
             str(self.context.paths.database),
-            "4242",
+            "42424242424242424242",
         ):
             self.assertNotIn(private, rendered)
 

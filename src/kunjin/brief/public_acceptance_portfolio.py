@@ -250,7 +250,12 @@ class _SyntheticWorker:
             for index, account in enumerate(accounts, start=1)
         )
         payload = PortfolioObservationPayload(observed_at, accounts, positions)
-        encoded = encode_portfolio_success(request, payload)
+        encoded = encode_portfolio_success(
+            request,
+            payload,
+            keychain_read_count=0,
+            keychain_mutation_attempt_count=0,
+        )
         response = decode_portfolio_response(encoded, request)
         self._payload_sha256 = hashlib.sha256(encoded).hexdigest()
         self._request_id = request.request_id

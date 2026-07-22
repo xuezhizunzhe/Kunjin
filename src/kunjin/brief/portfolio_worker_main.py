@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from kunjin.adapters.yangjibao import (
@@ -25,6 +26,37 @@ from kunjin.decision.models import canonical_decimal
 from kunjin.security.keychain import CredentialStoreError, KeychainTokenStore
 
 
+@dataclass
+class _CredentialLedger:
+    keychain_read_count: int = 0
+    mutation_attempt_count: int = 0
+
+    def load_keychain_once(self) -> str | None:
+        self.keychain_read_count += 1
+        if self.keychain_read_count != 1:
+            raise CredentialStoreError("portfolio worker repeated Keychain read")
+        return KeychainTokenStore().load()
+
+
+class _ReadOnlyTokenStore:
+    def __init__(self, token: str | None, ledger: _CredentialLedger) -> None:
+        if token is not None and type(token) is not str:
+            raise ValueError("portfolio token must be text or absent")
+        self._token = token
+        self._ledger = ledger
+
+    def load(self) -> str | None:
+        return self._token
+
+    def save(self, _token: str) -> None:
+        self._ledger.mutation_attempt_count += 1
+        raise CredentialStoreError("portfolio worker token is read-only")
+
+    def delete(self) -> None:
+        self._ledger.mutation_attempt_count += 1
+        raise CredentialStoreError("portfolio worker token is read-only")
+
+
 def _read_request() -> bytes:
     frame = sys.stdin.buffer.read(MAX_PORTFOLIO_REQUEST_BYTES + 1)
     if len(frame) > MAX_PORTFOLIO_REQUEST_BYTES:
@@ -36,8 +68,9 @@ def _optional_decimal(value):
     return None if value is None else canonical_decimal(value)
 
 
-def _success(request):
-    client = YangjibaoClient(KeychainTokenStore())
+def _success(request, ledger: _CredentialLedger):
+    token = ledger.load_keychain_once()
+    client = YangjibaoClient(_ReadOnlyTokenStore(token, ledger))
     _raw_accounts, accounts = client.list_accounts()
     if type(accounts) is not list or len(accounts) > MAX_PORTFOLIO_ACCOUNTS:
         raise ValueError("portfolio account count exceeds its limit")
@@ -90,6 +123,8 @@ def _success(request):
             tuple(projected_accounts),
             tuple(projected_positions),
         ),
+        keychain_read_count=ledger.keychain_read_count,
+        keychain_mutation_attempt_count=ledger.mutation_attempt_count,
     )
 
 
@@ -98,18 +133,49 @@ def main() -> int:
         request = decode_portfolio_request(_read_request())
     except ValueError:
         return 2
+    ledger = _CredentialLedger()
     try:
-        frame = _success(request)
+        frame = _success(request, ledger)
     except AuthenticationRequiredError:
-        frame = encode_portfolio_error(request, "authentication_required", False)
+        frame = encode_portfolio_error(
+            request,
+            "authentication_required",
+            False,
+            keychain_read_count=ledger.keychain_read_count,
+            keychain_mutation_attempt_count=ledger.mutation_attempt_count,
+        )
     except RateLimitedError:
-        frame = encode_portfolio_error(request, "rate_limited", True)
+        frame = encode_portfolio_error(
+            request,
+            "rate_limited",
+            True,
+            keychain_read_count=ledger.keychain_read_count,
+            keychain_mutation_attempt_count=ledger.mutation_attempt_count,
+        )
     except (CredentialStoreError, RemoteResponseError):
-        frame = encode_portfolio_error(request, "source_unavailable", False)
+        frame = encode_portfolio_error(
+            request,
+            "source_unavailable",
+            False,
+            keychain_read_count=ledger.keychain_read_count,
+            keychain_mutation_attempt_count=ledger.mutation_attempt_count,
+        )
     except (ArithmeticError, TypeError, ValueError):
-        frame = encode_portfolio_error(request, "validation_failure", False)
+        frame = encode_portfolio_error(
+            request,
+            "validation_failure",
+            False,
+            keychain_read_count=ledger.keychain_read_count,
+            keychain_mutation_attempt_count=ledger.mutation_attempt_count,
+        )
     except Exception:
-        frame = encode_portfolio_error(request, "source_unavailable", False)
+        frame = encode_portfolio_error(
+            request,
+            "source_unavailable",
+            False,
+            keychain_read_count=ledger.keychain_read_count,
+            keychain_mutation_attempt_count=ledger.mutation_attempt_count,
+        )
     sys.stdout.buffer.write(frame)
     sys.stdout.buffer.flush()
     return 0

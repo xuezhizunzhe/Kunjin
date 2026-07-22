@@ -9,11 +9,13 @@ from unittest.mock import patch
 
 import pytest
 
+from kunjin.adapters.yangjibao import AuthenticationRequiredError
 from kunjin.brief.portfolio import BoundedPortfolioService, run_portfolio_worker
 from kunjin.brief.portfolio_worker_protocol import (
     MAX_PORTFOLIO_ACCOUNTS,
     MAX_PORTFOLIO_POSITIONS_PER_ACCOUNT,
     MAX_PORTFOLIO_RESPONSE_BYTES,
+    SCHEMA_VERSION,
     PortfolioAccount,
     PortfolioObservationPayload,
     PortfolioPosition,
@@ -21,6 +23,7 @@ from kunjin.brief.portfolio_worker_protocol import (
     PortfolioWorkerResponse,
     decode_portfolio_request,
     decode_portfolio_response,
+    encode_portfolio_error,
     encode_portfolio_request,
     encode_portfolio_success,
 )
@@ -34,6 +37,7 @@ from kunjin.decision.models import (
 from kunjin.decision.store import DecisionAuditStore
 from kunjin.decision.worker import PRIVATE_KEYCHAIN_WORKER_ENV
 from kunjin.funds.service import SourceRequestContext
+from kunjin.security.keychain import CredentialStoreError
 from kunjin.services.sync import PortfolioSyncService
 from kunjin.storage.repository import Repository
 
@@ -43,7 +47,7 @@ SHARES_SENTINEL = "73129.17"
 
 
 def _request(request_id: str = "a" * 32) -> PortfolioWorkerRequest:
-    return PortfolioWorkerRequest(1, request_id, "portfolio_observation")
+    return PortfolioWorkerRequest(SCHEMA_VERSION, request_id, "portfolio_observation")
 
 
 def _payload() -> PortfolioObservationPayload:
@@ -68,7 +72,7 @@ def _payload() -> PortfolioObservationPayload:
 
 def _response(request: PortfolioWorkerRequest) -> PortfolioWorkerResponse:
     return PortfolioWorkerResponse(
-        schema_version=1,
+        schema_version=SCHEMA_VERSION,
         request_id=request.request_id,
         operation=request.operation,
         ok=True,
@@ -76,7 +80,61 @@ def _response(request: PortfolioWorkerRequest) -> PortfolioWorkerResponse:
         reason_code=None,
         retryable=None,
         message=None,
+        keychain_read_count=1,
+        keychain_mutation_attempt_count=0,
     )
+
+
+def _valid_client_type():
+    class Client:
+        def __init__(self, store) -> None:
+            self.store = store
+
+        def list_accounts(self):
+            assert self.store.load() == TOKEN_SENTINEL
+            account = SimpleNamespace(
+                source="yangjibao",
+                source_account_id="account-1",
+                title="learning-account",
+                observed_at=NOW,
+                validate=lambda: None,
+            )
+            return {}, [account]
+
+        def list_holdings(self, account_id, observed_at=None):
+            assert account_id == "account-1"
+            assert self.store.load() == TOKEN_SENTINEL
+            position = SimpleNamespace(
+                source_account_id=account_id,
+                fund_code="123456",
+                fund_name="fixture-fund-A",
+                share_class="A",
+                shares=Decimal("1"),
+                formal_nav=Decimal("1"),
+                estimated_nav=None,
+                observed_profit=None,
+                observed_at=observed_at,
+                validate=lambda: None,
+            )
+            return {}, [position]
+
+    return Client
+
+
+def _run_worker_main(monkeypatch, *, token_store, client_type) -> bytes:
+    from kunjin.brief import portfolio_worker_main as worker_main
+
+    output = io.BytesIO()
+    monkeypatch.setattr(worker_main, "KeychainTokenStore", lambda: token_store)
+    monkeypatch.setattr(worker_main, "YangjibaoClient", client_type)
+    monkeypatch.setattr(
+        worker_main,
+        "_read_request",
+        lambda: encode_portfolio_request(_request()),
+    )
+    monkeypatch.setattr(worker_main.sys, "stdout", SimpleNamespace(buffer=output))
+    assert worker_main.main() == 0
+    return output.getvalue()
 
 
 def _context(repository: Repository, request_id: str = "a" * 32):
@@ -102,7 +160,7 @@ def test_portfolio_request_is_exact_canonical_and_contains_no_secret() -> None:
     assert json.loads(frame) == {
         "operation": "portfolio_observation",
         "request_id": "a" * 32,
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
     }
     assert TOKEN_SENTINEL.encode() not in frame
     with pytest.raises(ValueError):
@@ -112,7 +170,12 @@ def test_portfolio_request_is_exact_canonical_and_contains_no_secret() -> None:
 def test_portfolio_response_round_trips_typed_private_observations_without_secret() -> None:
     request = _request()
 
-    frame = encode_portfolio_success(request, _payload())
+    frame = encode_portfolio_success(
+        request,
+        _payload(),
+        keychain_read_count=1,
+        keychain_mutation_attempt_count=0,
+    )
     response = decode_portfolio_response(frame, request)
 
     assert response == _response(request)
@@ -121,13 +184,80 @@ def test_portfolio_response_round_trips_typed_private_observations_without_secre
     assert len(frame) < MAX_PORTFOLIO_RESPONSE_BYTES
 
 
+def test_portfolio_response_requires_credential_attestation() -> None:
+    request = _request()
+
+    frame = encode_portfolio_success(
+        request,
+        _payload(),
+        keychain_read_count=1,
+        keychain_mutation_attempt_count=0,
+    )
+    response = decode_portfolio_response(frame, request)
+
+    assert response.keychain_read_count == 1
+    assert response.keychain_mutation_attempt_count == 0
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("keychain_read_count", True),
+        ("keychain_read_count", 2),
+        ("keychain_mutation_attempt_count", -1),
+    ),
+)
+def test_portfolio_response_rejects_invalid_credential_attestation(
+    field: str, value: object
+) -> None:
+    request = _request()
+    raw = json.loads(
+        encode_portfolio_error(
+            request,
+            "authentication_required",
+            False,
+            keychain_read_count=1,
+            keychain_mutation_attempt_count=0,
+        )
+    )
+    raw[field] = value
+
+    with pytest.raises(ValueError, match="credential attestation"):
+        decode_portfolio_response(
+            json.dumps(raw, separators=(",", ":")).encode(), request
+        )
+
+
+def test_portfolio_response_rejects_missing_credential_attestation() -> None:
+    request = _request()
+    raw = json.loads(
+        encode_portfolio_success(
+            request,
+            _payload(),
+            keychain_read_count=1,
+            keychain_mutation_attempt_count=0,
+        )
+    )
+    del raw["keychain_read_count"]
+
+    with pytest.raises(ValueError, match="success shape"):
+        decode_portfolio_response(
+            json.dumps(raw, separators=(",", ":")).encode(), request
+        )
+
+
 def test_portfolio_protocol_rejects_unexpected_dataclass_state() -> None:
     request = _request()
     payload = _payload()
     object.__setattr__(payload.accounts[0], "token", TOKEN_SENTINEL)
 
     with pytest.raises(ValueError, match="state"):
-        encode_portfolio_success(request, payload)
+        encode_portfolio_success(
+            request,
+            payload,
+            keychain_read_count=1,
+            keychain_mutation_attempt_count=0,
+        )
 
 
 @pytest.mark.parametrize(
@@ -143,7 +273,14 @@ def test_portfolio_protocol_rejects_unexpected_dataclass_state() -> None:
 )
 def test_portfolio_response_rejects_noncanonical_or_malformed_records(mutation) -> None:
     request = _request()
-    value = json.loads(encode_portfolio_success(request, _payload()))
+    value = json.loads(
+        encode_portfolio_success(
+            request,
+            _payload(),
+            keychain_read_count=1,
+            keychain_mutation_attempt_count=0,
+        )
+    )
     mutation(value)
 
     with pytest.raises(ValueError):
@@ -173,9 +310,34 @@ def test_private_worker_transport_uses_only_private_environment_profile() -> Non
     assert TOKEN_SENTINEL not in repr(runner.call_args)
 
 
-def test_worker_main_calls_only_read_methods_and_never_emits_token(monkeypatch) -> None:
-    from kunjin.brief import portfolio_worker_main as worker_main
+def test_private_worker_transport_rejects_keychain_mutation_attestation() -> None:
+    request = _request()
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id=request.request_id,
+        monotonic=lambda: 1.0,
+        wall_clock=lambda: NOW,
+    )
+    unsafe = decode_portfolio_response(
+        encode_portfolio_success(
+            request,
+            _payload(),
+            keychain_read_count=1,
+            keychain_mutation_attempt_count=1,
+        ),
+        request,
+    )
 
+    def run_unsafe_worker(_request, _budget, *, validator, **_kwargs):
+        validator(unsafe, _request, _budget)
+        return unsafe
+
+    with patch("kunjin.brief.portfolio._run_framed_worker", side_effect=run_unsafe_worker):
+        with pytest.raises(ValueError, match="credential attestation is unsafe"):
+            run_portfolio_worker(request, budget)
+
+
+def test_worker_main_calls_only_read_methods_and_never_emits_token(monkeypatch) -> None:
     calls = []
 
     class TokenStore:
@@ -191,7 +353,6 @@ def test_worker_main_calls_only_read_methods_and_never_emits_token(monkeypatch) 
 
     class Client:
         def __init__(self, store):
-            assert isinstance(store, TokenStore)
             self.store = store
 
         def list_accounts(self):
@@ -207,6 +368,7 @@ def test_worker_main_calls_only_read_methods_and_never_emits_token(monkeypatch) 
             return {"token": TOKEN_SENTINEL}, [account]
 
         def list_holdings(self, account_id, observed_at=None):
+            assert self.store.load() == TOKEN_SENTINEL
             calls.append(("list_holdings", account_id))
             position = SimpleNamespace(
                 source_account_id=account_id,
@@ -222,17 +384,151 @@ def test_worker_main_calls_only_read_methods_and_never_emits_token(monkeypatch) 
             )
             return {"authorization": TOKEN_SENTINEL}, [position]
 
-    output = io.BytesIO()
-    monkeypatch.setattr(worker_main, "KeychainTokenStore", TokenStore)
-    monkeypatch.setattr(worker_main, "YangjibaoClient", Client)
-    monkeypatch.setattr(worker_main, "_read_request", lambda: encode_portfolio_request(_request()))
-    monkeypatch.setattr(worker_main.sys, "stdout", SimpleNamespace(buffer=output))
-
-    assert worker_main.main() == 0
-    decoded = decode_portfolio_response(output.getvalue(), _request())
+    decoded_frame = _run_worker_main(
+        monkeypatch,
+        token_store=TokenStore(),
+        client_type=Client,
+    )
+    decoded = decode_portfolio_response(decoded_frame, _request())
     assert decoded.ok is True
+    assert decoded.keychain_read_count == 1
+    assert decoded.keychain_mutation_attempt_count == 0
     assert calls == ["load", "list_accounts", ("list_holdings", "account-1")]
-    assert TOKEN_SENTINEL.encode() not in output.getvalue()
+    assert TOKEN_SENTINEL.encode() not in decoded_frame
+
+
+def test_worker_reads_keychain_once_and_attests_no_mutation(monkeypatch) -> None:
+    loads = []
+
+    class TokenStore:
+        def load(self):
+            loads.append("load")
+            return TOKEN_SENTINEL
+
+    frame = _run_worker_main(
+        monkeypatch,
+        token_store=TokenStore(),
+        client_type=_valid_client_type(),
+    )
+    response = decode_portfolio_response(frame, _request())
+
+    assert loads == ["load"]
+    assert response.ok is True
+    assert response.keychain_read_count == 1
+    assert response.keychain_mutation_attempt_count == 0
+    assert TOKEN_SENTINEL.encode() not in frame
+
+
+def test_worker_expired_token_is_nonretryable_and_attests_one_read(monkeypatch) -> None:
+    loads = []
+
+    class TokenStore:
+        def load(self):
+            loads.append("load")
+            return TOKEN_SENTINEL
+
+    class ExpiredClient:
+        def __init__(self, _store) -> None:
+            pass
+
+        def list_accounts(self):
+            raise AuthenticationRequiredError("Yangjibao authorization expired")
+
+    frame = _run_worker_main(
+        monkeypatch,
+        token_store=TokenStore(),
+        client_type=ExpiredClient,
+    )
+    response = decode_portfolio_response(frame, _request())
+
+    assert loads == ["load"]
+    assert response.ok is False
+    assert response.reason_code == "authentication_required"
+    assert response.retryable is False
+    assert response.keychain_read_count == 1
+    assert response.keychain_mutation_attempt_count == 0
+    assert TOKEN_SENTINEL.encode() not in frame
+
+
+def test_worker_missing_token_is_nonretryable_and_attests_one_read(monkeypatch) -> None:
+    loads = []
+
+    class TokenStore:
+        def load(self):
+            loads.append("load")
+            return None
+
+    class MissingTokenClient:
+        def __init__(self, store) -> None:
+            self.store = store
+
+        def list_accounts(self):
+            assert self.store.load() is None
+            raise AuthenticationRequiredError("Yangjibao authorization is required")
+
+    frame = _run_worker_main(
+        monkeypatch,
+        token_store=TokenStore(),
+        client_type=MissingTokenClient,
+    )
+    response = decode_portfolio_response(frame, _request())
+
+    assert loads == ["load"]
+    assert response.ok is False
+    assert response.reason_code == "authentication_required"
+    assert response.retryable is False
+    assert response.keychain_read_count == 1
+    assert response.keychain_mutation_attempt_count == 0
+
+
+def test_worker_mutation_attempt_is_attested_and_rejected_by_parent(monkeypatch) -> None:
+    keychain_calls = []
+
+    class TokenStore:
+        def load(self):
+            keychain_calls.append("load")
+            return TOKEN_SENTINEL
+
+        def save(self, _token):
+            keychain_calls.append("save")
+
+        def delete(self):
+            keychain_calls.append("delete")
+
+    ValidClient = _valid_client_type()
+
+    class MutationClient(ValidClient):
+        def __init__(self, store) -> None:
+            super().__init__(store)
+            with pytest.raises(CredentialStoreError, match="read-only"):
+                store.save("replacement")
+
+    frame = _run_worker_main(
+        monkeypatch,
+        token_store=TokenStore(),
+        client_type=MutationClient,
+    )
+    response = decode_portfolio_response(frame, _request())
+    assert response.ok is True
+    assert response.keychain_read_count == 1
+    assert response.keychain_mutation_attempt_count == 1
+    assert keychain_calls == ["load"]
+    assert TOKEN_SENTINEL.encode() not in frame
+
+    budget = RequestBudget.create(
+        RequestMode.RAPID,
+        request_id=response.request_id,
+        monotonic=lambda: 1.0,
+        wall_clock=lambda: NOW,
+    )
+
+    def run_unsafe_worker(_request, _budget, *, validator, **_kwargs):
+        validator(response, _request, _budget)
+        return response
+
+    with patch("kunjin.brief.portfolio._run_framed_worker", side_effect=run_unsafe_worker):
+        with pytest.raises(ValueError, match="credential attestation is unsafe"):
+            run_portfolio_worker(_request(), budget)
 
 
 def test_worker_main_sanitizes_unexpected_exception(monkeypatch) -> None:
@@ -243,7 +539,7 @@ def test_worker_main_sanitizes_unexpected_exception(monkeypatch) -> None:
     monkeypatch.setattr(
         worker_main,
         "_success",
-        lambda _request: (_ for _ in ()).throw(RuntimeError(TOKEN_SENTINEL)),
+        lambda _request, _ledger: (_ for _ in ()).throw(RuntimeError(TOKEN_SENTINEL)),
     )
     monkeypatch.setattr(worker_main.sys, "stdout", SimpleNamespace(buffer=output))
 
@@ -251,6 +547,8 @@ def test_worker_main_sanitizes_unexpected_exception(monkeypatch) -> None:
     response = decode_portfolio_response(output.getvalue(), _request())
     assert response.ok is False
     assert response.reason_code == "source_unavailable"
+    assert response.keychain_read_count == 0
+    assert response.keychain_mutation_attempt_count == 0
     assert TOKEN_SENTINEL.encode() not in output.getvalue()
 
 
@@ -277,10 +575,15 @@ def test_worker_rejects_oversized_account_list_before_holdings_requests(monkeypa
             holdings_calls.append(observed_at)
             return [], []
 
+    monkeypatch.setattr(
+        worker_main,
+        "KeychainTokenStore",
+        lambda: SimpleNamespace(load=lambda: TOKEN_SENTINEL),
+    )
     monkeypatch.setattr(worker_main, "YangjibaoClient", Client)
 
     with pytest.raises(ValueError, match="account count"):
-        worker_main._success(_request())
+        worker_main._success(_request(), worker_main._CredentialLedger())
     assert holdings_calls == []
 
 
@@ -309,10 +612,15 @@ def test_worker_stops_after_oversized_account_holdings(monkeypatch) -> None:
             holdings_calls.append((account_id, observed_at))
             return [], [object()] * (MAX_PORTFOLIO_POSITIONS_PER_ACCOUNT + 1)
 
+    monkeypatch.setattr(
+        worker_main,
+        "KeychainTokenStore",
+        lambda: SimpleNamespace(load=lambda: TOKEN_SENTINEL),
+    )
     monkeypatch.setattr(worker_main, "YangjibaoClient", Client)
 
     with pytest.raises(ValueError, match="position count"):
-        worker_main._success(_request())
+        worker_main._success(_request(), worker_main._CredentialLedger())
     assert holdings_calls == [("account-1", NOW)]
 
 
@@ -371,6 +679,12 @@ def test_authentication_required_is_nonretryable_and_does_not_replace_portfolio(
 ) -> None:
     repository = Repository(tmp_path / "kunjin.db")
     repository.migrate()
+    seed_context, _ticks = _context(repository, "9" * 32)
+    BoundedPortfolioService(
+        repository,
+        worker_runner=lambda request, _budget: _response(request),
+    ).sync("123456", seed_context)
+    before = repository.latest_positions()
     context, _ticks = _context(repository, "b" * 32)
 
     def worker(request, _budget):
@@ -383,6 +697,8 @@ def test_authentication_required_is_nonretryable_and_does_not_replace_portfolio(
             "authentication_required",
             False,
             "portfolio source error: authentication_required",
+            1,
+            0,
         )
 
     result = BoundedPortfolioService(repository, worker_runner=worker).sync("123456", context)
@@ -393,7 +709,7 @@ def test_authentication_required_is_nonretryable_and_does_not_replace_portfolio(
     assert result.portfolio_binding.snapshot_complete is False
     assert result.portfolio_binding.positions == ()
     assert result.position_present is None
-    assert repository.latest_positions() == []
+    assert repository.latest_positions() == before
     attempt = context.audit_store.source_attempt_history(
         "yangjibao_portfolio_observation",
         "personal_position_observation",
@@ -451,6 +767,8 @@ def test_cancelled_worker_error_never_writes_attempt(tmp_path) -> None:
             "rate_limited",
             True,
             "portfolio source error: rate_limited",
+            1,
+            0,
         )
         budget.cancel("test_cancelled")
         return response
@@ -480,6 +798,8 @@ def test_cancelled_worker_error_never_writes_attempt(tmp_path) -> None:
             "source_unavailable",
             False,
             "portfolio source error: source_unavailable",
+            1,
+            0,
         ),
         lambda request: PortfolioWorkerResponse(
             request.schema_version,
@@ -490,6 +810,8 @@ def test_cancelled_worker_error_never_writes_attempt(tmp_path) -> None:
             "rate_limited",
             False,
             "portfolio source error: rate_limited",
+            1,
+            0,
         ),
         lambda request: PortfolioWorkerResponse(
             request.schema_version,
@@ -500,6 +822,8 @@ def test_cancelled_worker_error_never_writes_attempt(tmp_path) -> None:
             "source_unavailable",
             False,
             "private detail " + TOKEN_SENTINEL,
+            1,
+            0,
         ),
     ),
 )
@@ -543,6 +867,8 @@ def test_rate_limit_cooldown_prevents_next_worker_call(tmp_path) -> None:
             "rate_limited",
             True,
             "portfolio source error: rate_limited",
+            1,
+            0,
         )
 
     first = BoundedPortfolioService(
@@ -651,6 +977,8 @@ def test_successful_empty_snapshot_removes_old_positions(tmp_path) -> None:
             None,
             None,
             None,
+            1,
+            0,
         ),
     ).sync("123456", second_context)
 
@@ -674,7 +1002,16 @@ def test_parent_rejects_payload_outside_request_lifetime_without_writes(tmp_path
         BoundedPortfolioService(
             repository,
             worker_runner=lambda _request, _budget: PortfolioWorkerResponse(
-                1, request.request_id, request.operation, True, stale, None, None, None
+                SCHEMA_VERSION,
+                request.request_id,
+                request.operation,
+                True,
+                stale,
+                None,
+                None,
+                None,
+                1,
+                0,
             ),
         ).sync("123456", context)
 

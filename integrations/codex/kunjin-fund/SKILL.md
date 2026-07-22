@@ -70,6 +70,158 @@ reuse a historical route after profile, portfolio, policy, or evidence changes.
 For Phase B and Phase C, preserve every exact block, binding-constraint, and
 profile-conflict codes plus their local correction conditions.
 
+## MVP Public Research Summary
+
+For a beginner asking what has recently changed in the market, an industry, or
+a named fund, use the Chinese-first summary command before considering a
+held-fund review:
+
+```bash
+kunjin --json research summary news --window recent --mode rapid
+kunjin --json research summary market --window recent --mode rapid
+kunjin --json research summary fund CODE --window recent --mode rapid
+kunjin --json research scan --window recent --mode rapid
+kunjin --json research panorama
+```
+
+Choose exactly one scope for one question. Do not run Deep automatically, do
+not retry automatically, and do not call portfolio sync, Yangjibao, Keychain,
+or any capture/replay workflow for this public-research route.
+
+Present the result in natural Chinese in this order: `结论`、`发生了什么`、
+`为什么可能重要`、`和我的基金可能有什么关系`、`风险与不知道的地方`、`来源`。
+Every stated fact must retain the returned source name, URL, publication date,
+source tier, and retrieval time. Keep public facts, media or institution views,
+system analysis, and conditional guidance separate. A fund relationship based
+on disclosed holdings, a benchmark, or an index is dated context only; never
+describe it as real-time complete holdings.
+
+Conditional guidance may say `值得继续研究`、`可以关注`、`可能拥挤` or
+`需要谨慎` only when the returned evidence supports that wording. It is not a
+guaranteed return, exact timing, buy/sell order, or automatic trade. When the
+summary says evidence is insufficient, explain the gap and a useful next
+research direction instead of inventing a market conclusion. This MVP route
+不需要严格 Phase 5 验收，也不构成自动交易。
+
+### 跨领域扫描
+
+当用户问“最近有什么值得关注的板块、行业指标或领域变化”，先运行
+`research scan`，无需让用户预先指定行业。它会从本次公开市场数据中主动
+筛查电力与能源、煤炭与油气、房地产与建材、汽车、航运外贸、AI 算力、
+消费、政策和天气等方向。将有板块或来源事实支持的方向称为系统分析线索，
+按“发生了什么 -> 时间线 -> 可能影响 -> 条件性关注 -> 风险与不知道的地方
+-> 来源”回答。
+
+`research scan` 不代表已覆盖全部领域；当某方向没有可核验市场板块或来源
+事实时，必须明确显示证据缺口，尤其不能把未覆盖的天气、政策或行业变化
+编造成市场原因。扫描不是后台监控、自动推送、异常评分或交易信号。
+
+`research scan` 只是候选方向初筛。当用户希望了解候选方向近一周、近一月和
+近六个月的变化时，运行 `research panorama`。它最多保留三个有公开观察支撑
+的方向，按窗口提供来源时间线、可能原因、替代解释、条件性关注与风险。它
+不是完整跨领域行业研究；没有来源支撑的行业、股票或基金关联必须保持为证据
+缺口。基金关系只能引用有日期的披露持仓、基准或指数，不能声称实时完整持仓。
+
+当前网络环境没有形成稳定的自动行业公开数据来源。电力能源、汽车、房地产建材
+和航运外贸的自动数据覆盖必须显示为网络阻塞，不能假装已完成。用户可提供公开
+网页链接或复制出的统计文字；截图中的可见字段须由用户手动说明，或由对话外层
+整理为字段。系统不直接读取图片，不自动访问链接、不保存网页全文、不做 OCR、
+Word 转换、登录绕过或重试。需要保留来源名称、原始 URL（如有）、发布日期、
+统计期、指标名、数值、单位和口径；缺失时用自然中文提示用户补充这些字段。单条
+补充材料只构成“值得进一步查证”的预备线索，不能单独形成较强方向、基金推荐或
+交易结论；它只会被整理为后续明确研究调用可引用的临时材料。
+
+当用户一次提供同一主题的两至六条可比月度或季度材料，或问“分析这几个月的变化”时，
+由外层从自然语言中整理字段并运行一次 `research supplement-timeline`；用户不需要
+编写 JSON、文件路径或命令。该入口只接受同一领域、同一指标、可比较单位和同一统计粒度，并按统计期
+而非发布日期排序；必须展示覆盖统计期、缺失期、重复期和冲突期。混合指标、领域、单位
+或同统计期冲突不能包装成连续趋势。随后只读运行一次 `portfolio show`，以同一答复列出
+可能相关的现有基金名称/代码及可得权重；关联依据只能是带日期的基准、指数或披露，权重
+不可得时明确说明。此路径不触发 `sync portfolio`、养基宝、Keychain 或任何 Phase 5 工作，
+并始终保持“预备研究线索”、无强方向、无交易指令。
+
+### 持仓复核
+
+当用户要分析全部持仓时，运行 `kunjin --json portfolio review`。它只进行一次
+既有只读同步；成功时给出集中度、已披露重叠和信息缺口，失败或空持仓时必须
+直接说明本次不能诊断，不得把旧缓存说成本次同步结果。
+
+同步失败时，邀请用户在对话中用自然中文提供基金名称或代码及大概比例。Skill
+把确认后的信息转换为内部临时手动组合，不向用户展示参数、JSON 或文件路径。
+临时手动组合不保存、不读取 Keychain 或 Token，只观察集中度和带日期的披露
+重叠；它不是已同步持仓、交易建议或自动交易。
+
+### 基金复核
+
+### 投资者画像与配置边界
+
+当用户问“我现在适不适合开始买基金”“我的组合要不要加仓”“我适合什么类型”时，
+先用自然中文了解四项最小信息：是否已有应急资金、这笔钱近期是否可能使用、预计
+持有期限、可承受的波动程度。用户不需要提供金额、JSON、文件或路径；也可选说出
+大致已有风险资产或主题集中情况。Skill 在内部运行：
+
+```bash
+kunjin --json investor guardrails
+```
+
+结果必须先说明是否可以继续研究、是否应先补应急资金或降低风险，再给出宽基、债券、
+行业主题等类别的研究边界和比例区间。它不是精确配置金额、交易指令或收益承诺。未提供
+应急资金、期限、资金用途或波动承受时，应明确缺少什么，只给保守的研究方向；已提供的
+组合只能用于观察集中度和带日期披露重叠，不能声称实时完整持仓。
+
+当已有组合缓存且用户已给出上述四项信息时，Skill 在内部加入缓存组合上下文。输出必须
+分开已观察到的集中或同管理人关系、季度披露和身份资料的未知边界，以及应优先研究的
+类别角色。可以给“与现有持仓驱动不同的分散宽基角色”“低波动或高质量固定收益角色”等
+条件性研究方向；不能自动指定基金代码、精确金额或把“可以继续研究”写成交易授权。
+只有用户随后明确列出两到五只候选基金，才进入 `fund candidates` 横向比较。
+
+当用户问某只基金“是否继续持有、要不要减仓观察、和我的组合有什么关系”时，
+运行 `kunjin --json fund review CODE`。Skill 可在内部补充行动、组合上下文和
+基础约束。除了持有期限、风险承受程度和近期资金用途，Skill 还应先询问应急资金
+是否已具备；用户仍只需自然中文回答，不需要 JSON、文件路径或精确金额。
+
+基金复核会把公开基金事实、来源与日期、近期市场线索、可选组合集中度和披露
+重叠放在同一份中文结果中。只有画像、期限和资金用途彼此一致，才可给出更具体的
+继续研究、可作为候选或谨慎方向；缺少信息或画像提示先降低风险时，必须标为“需补充
+信息”，并只给保守的研究建议。结果只可为继续持有复核、减仓观察、退出复核、暂不
+动作或需补充信息，绝不自动交易、保证收益或推导精确买卖金额。
+
+当用户已点名相关主题基金时，Skill 在内部把它们作为相关基金组传入复核结果。输出必须
+说明目标基金与该组的当前组合权重、哪些成员有披露、以及未披露部分不能按零处理。每个
+行业披露重叠都要紧邻说明：它是同一报告期、同一行业分类下共同类别的较小权重之和，不
+等于同等比例的底层股票相同，也不代表实时完整持仓。若近期市场段没有可核验事实及其
+来源、URL、发布日期/统计期，必须明确写“本次未取得足以支持该市场结论的可核验事实”。
+
+### 同类比较与候选选择
+
+当用户已经列出两到五只想比较的基金时，先收集同一份自然中文画像，再在内部运行：
+
+```bash
+kunjin --json fund candidates CODE_A CODE_B
+```
+
+只比较用户明确列出的基金，不自动发现新基金代码、不用总分选唯一优胜者。结果必须展示
+每只基金可核验的来源名称、URL、发布日期和检索时间；比较历史表现、费用或披露重叠时，
+必须保留统计期、可比性提示及资料缺口。基金关联和组合重叠仅基于有日期的披露持仓、
+基准或指数，不能表述为实时完整持仓。
+
+画像完整、公开披露足够且同类可比时，只能称为“可作为研究候选”；画像缺失、披露不足
+或产品类别不匹配时，应先说明需要补什么。比较不是买入、加仓、切换、精确金额或自动
+交易建议。
+
+### 买后按需复核
+
+当用户问“买了之后什么时候该重新看”“什么变化需要减仓或退出复核”时，先运行：
+
+```bash
+kunjin --json fund review-triggers CODE
+```
+
+按个人资金用途、风险承受、组合集中度、基金正式公告/披露，以及有来源的市场行业事实
+分组解释触发条件。它不是后台监控、自动推送或自动交易；单日涨跌、媒体叙事或无日期的
+行业传闻不能单独构成买卖条件。触发后再按问题运行基金复核、组合复核或公开研究，并保留
+来源、URL、发布日期/统计期与证据缺口。
+
 ## Run One Held-Fund Preview
 
 For one currently held fund question, select one owner-selected held fund and
@@ -91,6 +243,10 @@ kunjin --json fund holding-review CODE --action ACTION --brief-request-run-id BR
 ```
 
 The order is `fund brief exactly once -> fund intelligence exactly once -> thesis match-project exactly once -> thesis adjudicate at most once -> fund holding-review exactly once`. Read each brief/intelligence `data.request.request_run_id` and projection `data.id`; never substitute latest/history records. Run `thesis adjudicate` only after the owner explicitly confirms the exact projected evidence. This is a projection-specific owner decision, not confirmation of the source, whole thesis, or future evidence. An acceptance token is not owner adjudication. Otherwise skip adjudication.
+
+## Phase 5 Owner Acceptance
+Only after all Phase 5 gates and a new explicit owner confirmation, run once: `.venv/bin/python scripts/phase5_owner_run.py CODE ACTION`.
+This controlled one-shot creates its private subject, performs one read-only capture and two offline replays, then cleans input state; on failure do not retry, never trade automatically, and never expose or write back credentials.
 
 `fund holding-review` is local and network-free. Each command keeps its own independent budget. A Rapid brief owns 90 seconds; an explicit Deep brief owns 480 seconds; `fund intelligence` owns its own Rapid 90-second budget; `match-project`, optional `adjudicate`, and `holding-review` are local and share no network budget. Never retry automatically. Never continue in the background. Never run Deep automatically. Never develop an adapter during the request. Stop after the review and present every gap.
 

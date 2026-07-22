@@ -13,10 +13,12 @@ from kunjin.brief.d2 import build_d2_relationships
 from kunjin.brief.facts import SourceLinkedFactSet
 from kunjin.brief.models import BriefEvidenceState, BriefFact
 from kunjin.brief.portfolio_worker_protocol import (
+    SCHEMA_VERSION,
     PortfolioAccount,
     PortfolioObservationPayload,
     PortfolioPosition,
     PortfolioWorkerRequest,
+    decode_portfolio_response,
     encode_portfolio_success,
 )
 from kunjin.brief.public_acceptance_portfolio import (
@@ -245,7 +247,7 @@ def test_anonymous_capability_builds_same_request_synthetic_portfolio(monkeypatc
         assert d2.coverage.evidence_state is not BriefEvidenceState.INSUFFICIENT
         assert d2.holdings_coverage.evidence_state is not BriefEvidenceState.INSUFFICIENT
         expected_request = PortfolioWorkerRequest(
-            1,
+            SCHEMA_VERSION,
             context.budget.request_id,
             "portfolio_observation",
         )
@@ -275,16 +277,20 @@ def test_anonymous_capability_builds_same_request_synthetic_portfolio(monkeypatc
             )
             for index, account in enumerate(expected_accounts, start=1)
         )
-        expected_payload_sha256 = hashlib.sha256(
-            encode_portfolio_success(
-                expected_request,
-                PortfolioObservationPayload(
-                    context.budget.started_at,
-                    expected_accounts,
-                    expected_positions,
-                ),
-            )
-        ).hexdigest()
+        expected_frame = encode_portfolio_success(
+            expected_request,
+            PortfolioObservationPayload(
+                context.budget.started_at,
+                expected_accounts,
+                expected_positions,
+            ),
+            keychain_read_count=0,
+            keychain_mutation_attempt_count=0,
+        )
+        expected_response = decode_portfolio_response(expected_frame, expected_request)
+        assert expected_response.keychain_read_count == 0
+        assert expected_response.keychain_mutation_attempt_count == 0
+        expected_payload_sha256 = hashlib.sha256(expected_frame).hexdigest()
         marker = json.loads(os.read(marker_read_fd, 4096).decode("ascii"))
         assert marker == {
             "contract": "kunjin_phase1_public_portfolio_used_v1",

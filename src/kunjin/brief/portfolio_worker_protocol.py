@@ -14,7 +14,7 @@ from kunjin.decision.models import (
 )
 from kunjin.suitability.models import validate_private_name
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_PORTFOLIO_REQUEST_BYTES = 4 * 1024
 MAX_PORTFOLIO_RESPONSE_BYTES = 1024 * 1024
 MAX_PORTFOLIO_ACCOUNTS = 64
@@ -22,6 +22,9 @@ MAX_PORTFOLIO_POSITIONS = 4096
 MAX_PORTFOLIO_POSITIONS_PER_ACCOUNT = MAX_PORTFOLIO_POSITIONS
 _REQUEST_KEYS = frozenset({"schema_version", "request_id", "operation"})
 _RESPONSE_IDENTITY_KEYS = _REQUEST_KEYS
+_ATTESTATION_KEYS = frozenset(
+    {"keychain_read_count", "keychain_mutation_attempt_count"}
+)
 _PAYLOAD_KEYS = frozenset({"retrieved_at", "accounts", "positions"})
 _ACCOUNT_KEYS = frozenset({"source_account_id", "title", "observed_at"})
 _POSITION_KEYS = frozenset(
@@ -135,6 +138,12 @@ def portfolio_error_message(reason_code: str) -> str:
     return f"portfolio source error: {reason_code}"
 
 
+def _credential_count(value: object, label: str, *, maximum: int) -> int:
+    if type(value) is not int or value < 0 or value > maximum:
+        raise ValueError(f"portfolio worker {label} credential attestation is invalid")
+    return value
+
+
 @dataclass(frozen=True)
 class PortfolioWorkerRequest:
     schema_version: int
@@ -196,6 +205,8 @@ class PortfolioWorkerResponse:
     reason_code: Optional[str]
     retryable: Optional[bool]
     message: Optional[str]
+    keychain_read_count: int
+    keychain_mutation_attempt_count: int
 
 
 def _validate_payload(payload: PortfolioObservationPayload) -> PortfolioObservationPayload:
@@ -283,11 +294,18 @@ def _identity(request: PortfolioWorkerRequest) -> Dict[str, Any]:
 def encode_portfolio_success(
     request: PortfolioWorkerRequest,
     payload: PortfolioObservationPayload,
+    *,
+    keychain_read_count: int,
+    keychain_mutation_attempt_count: int,
 ) -> bytes:
     _validate_payload(payload)
+    _credential_count(keychain_read_count, "read count", maximum=1)
+    _credential_count(keychain_mutation_attempt_count, "mutation count", maximum=2)
     value = _identity(request)
     value.update(
         {
+            "keychain_mutation_attempt_count": keychain_mutation_attempt_count,
+            "keychain_read_count": keychain_read_count,
             "ok": True,
             "payload": {
                 "accounts": [
@@ -323,6 +341,9 @@ def encode_portfolio_error(
     request: PortfolioWorkerRequest,
     reason_code: str,
     retryable: bool,
+    *,
+    keychain_read_count: int,
+    keychain_mutation_attempt_count: int,
 ) -> bytes:
     if (
         reason_code not in _ERROR_RETRYABILITY
@@ -330,9 +351,13 @@ def encode_portfolio_error(
         or retryable is not _ERROR_RETRYABILITY[reason_code]
     ):
         raise ValueError("portfolio worker error is invalid")
+    _credential_count(keychain_read_count, "read count", maximum=1)
+    _credential_count(keychain_mutation_attempt_count, "mutation count", maximum=2)
     value = _identity(request)
     value.update(
         {
+            "keychain_mutation_attempt_count": keychain_mutation_attempt_count,
+            "keychain_read_count": keychain_read_count,
             "message": portfolio_error_message(reason_code),
             "ok": False,
             "reason_code": reason_code,
@@ -351,8 +376,14 @@ def decode_portfolio_response(
     if any(value.get(key) != expected for key, expected in identity.items()):
         raise ValueError("portfolio worker response identity mismatch")
     if value.get("ok") is True:
-        if set(value) != _RESPONSE_IDENTITY_KEYS | {"ok", "payload"}:
+        if set(value) != _RESPONSE_IDENTITY_KEYS | _ATTESTATION_KEYS | {"ok", "payload"}:
             raise ValueError("portfolio worker success shape is invalid")
+        keychain_read_count = _credential_count(
+            value["keychain_read_count"], "read count", maximum=1
+        )
+        keychain_mutation_attempt_count = _credential_count(
+            value["keychain_mutation_attempt_count"], "mutation count", maximum=2
+        )
         raw = value["payload"]
         if type(raw) is not dict or set(raw) != _PAYLOAD_KEYS:
             raise ValueError("portfolio worker payload shape is invalid")
@@ -399,14 +430,22 @@ def decode_portfolio_response(
             reason_code=None,
             retryable=None,
             message=None,
+            keychain_read_count=keychain_read_count,
+            keychain_mutation_attempt_count=keychain_mutation_attempt_count,
         )
     if value.get("ok") is not False or set(value) != _RESPONSE_IDENTITY_KEYS | {
         "ok",
         "reason_code",
         "retryable",
         "message",
-    }:
+    } | _ATTESTATION_KEYS:
         raise ValueError("portfolio worker error shape is invalid")
+    keychain_read_count = _credential_count(
+        value["keychain_read_count"], "read count", maximum=1
+    )
+    keychain_mutation_attempt_count = _credential_count(
+        value["keychain_mutation_attempt_count"], "mutation count", maximum=2
+    )
     reason = value["reason_code"]
     retryable = value["retryable"]
     if (
@@ -423,4 +462,6 @@ def decode_portfolio_response(
         reason_code=reason,
         retryable=retryable,
         message=value["message"],
+        keychain_read_count=keychain_read_count,
+        keychain_mutation_attempt_count=keychain_mutation_attempt_count,
     )

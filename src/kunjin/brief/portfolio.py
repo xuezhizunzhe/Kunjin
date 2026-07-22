@@ -59,6 +59,11 @@ def _transport_validator(result, request, budget: RequestBudget) -> None:
         raise ValueError("portfolio worker result must use the exact type")
     if result.request_id != request.request_id or result.operation != request.operation:
         raise ValueError("portfolio worker response identity mismatch")
+    if (
+        result.keychain_read_count != 1
+        or result.keychain_mutation_attempt_count != 0
+    ):
+        raise ValueError("portfolio worker credential attestation is unsafe")
     if result.ok:
         payload = result.payload
         if payload is None:
@@ -293,7 +298,12 @@ class BoundedPortfolioService:
                 or response.message is not None
             ):
                 raise ValueError("portfolio worker success response shape is invalid")
-            frame = encode_portfolio_success(request, response.payload)
+            frame = encode_portfolio_success(
+                request,
+                response.payload,
+                keychain_read_count=response.keychain_read_count,
+                keychain_mutation_attempt_count=response.keychain_mutation_attempt_count,
+            )
             if decode_portfolio_response(frame, request) != response:
                 raise ValueError("portfolio worker success response is noncanonical")
             times = (
@@ -316,6 +326,8 @@ class BoundedPortfolioService:
             request,
             response.reason_code,
             response.retryable,
+            keychain_read_count=response.keychain_read_count,
+            keychain_mutation_attempt_count=response.keychain_mutation_attempt_count,
         )
         if decode_portfolio_response(frame, request) != response:
             raise ValueError("portfolio worker error response is noncanonical")

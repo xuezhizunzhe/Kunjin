@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from itertools import combinations
@@ -442,29 +443,80 @@ def _portfolio_section(
             "securities": [],
             "industries": [],
         }, list(analysis.warnings) + ["portfolio_coverage_partial"]
+    result, warnings = _portfolio_section_from_weights(
+        analysis.weights,
+        bundles,
+        as_of,
+        value_kind=analysis.value_kind,
+        observed_at=max(position.observed_at for position in positions),
+    )
+    return result, list(analysis.warnings) + warnings
+
+
+def _portfolio_section_from_weights(
+    weights: Mapping[str, Decimal],
+    bundles: Mapping[str, DisclosureBundle],
+    as_of: datetime,
+    *,
+    value_kind: str,
+    observed_at: Optional[datetime],
+) -> Tuple[Dict[str, object], List[str]]:
     holdings_by_fund = {
-        code: bundles[code].holdings for code in analysis.weights if code in bundles
+        code: bundles[code].holdings for code in weights if code in bundles
     }
     stale = frozenset(
         code
-        for code in analysis.weights
+        for code in weights
         if code in bundles and _holdings_stale(bundles[code], as_of)
     )
-    security = portfolio_overlap(analysis.weights, holdings_by_fund, stale_codes=stale)
-    industry = _industry_portfolio_overlap(analysis.weights, bundles, stale)
-    result = {
+    security = portfolio_overlap(weights, holdings_by_fund, stale_codes=stale)
+    industry = _industry_portfolio_overlap(weights, bundles, stale)
+    result: Dict[str, object] = {
         "evidence_level": "deterministic_calculation",
         **security,
         "industries": industry["industries"],
         "industry_portfolio_weight_coverage": industry["portfolio_weight_coverage"],
         "industry_omitted_fund_codes": industry["omitted_fund_codes"],
-        "portfolio_value_kind": analysis.value_kind,
-        "portfolio_observed_at": max(position.observed_at for position in positions),
+        "portfolio_value_kind": value_kind,
     }
-    warnings = list(analysis.warnings) + list(security["warnings"])
+    if observed_at is not None:
+        result["portfolio_observed_at"] = observed_at
+    warnings = list(security["warnings"])
     if security["portfolio_weight_coverage"] < Decimal("1"):
         warnings.append("portfolio_coverage_partial")
     return result, warnings
+
+
+def build_portfolio_overlap_from_weights(
+    weights: Mapping[str, Decimal],
+    bundles: Mapping[str, DisclosureBundle],
+    as_of: datetime,
+) -> Dict[str, object]:
+    if not isinstance(weights, Mapping) or not 2 <= len(weights) <= 32:
+        raise ValueError("manual portfolio weights are invalid")
+    normalized: Dict[str, Decimal] = {}
+    for code, weight in weights.items():
+        if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code):
+            raise ValueError("manual portfolio weights are invalid")
+        if not isinstance(weight, Decimal) or not weight.is_finite() or weight <= 0:
+            raise ValueError("manual portfolio weights are invalid")
+        normalized[code] = weight
+    if len(normalized) != len(weights) or sum(normalized.values(), Decimal("0")) != Decimal("1"):
+        raise ValueError("manual portfolio weights are invalid")
+    portfolio, warnings = _portfolio_section_from_weights(
+        normalized,
+        bundles,
+        as_of,
+        value_kind="manual",
+        observed_at=None,
+    )
+    return {
+        "comparison_kind": "portfolio_overlap",
+        "input_source": "manual_temporary",
+        "as_of": as_of,
+        "portfolio_overlap": portfolio,
+        "warnings": sorted(set(warnings)),
+    }
 
 
 def _candidate_portfolio_overlap(

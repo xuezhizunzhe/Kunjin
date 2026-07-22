@@ -71,6 +71,12 @@ from kunjin.decision.source_registry import SourceRegistryV1
 from kunjin.decision.store import DecisionAuditStore
 from kunjin.diagnosis.research import public_diagnosis_payload
 from kunjin.diagnosis.service import DiagnosisService
+from kunjin.fund_candidates import build_fund_candidate_review
+from kunjin.fund_review import (
+    build_fund_review,
+    build_portfolio_weight_context,
+    build_related_fund_context,
+)
 from kunjin.funds.peers.analytics import PEER_CALCULATION_VERSION
 from kunjin.funds.peers.research import (
     build_explicit_compare_report,
@@ -117,6 +123,7 @@ from kunjin.holding_review.models import (
 from kunjin.holding_review.research import public_holding_review_payload
 from kunjin.holding_review.service import HoldingReviewServiceError
 from kunjin.holding_review.thesis import ThesisReviewError
+from kunjin.investor_guardrails import build_investor_guardrails
 from kunjin.ledger.alipay import AlipayPaymentParser, requires_confirmation
 from kunjin.ledger.ocr import OcrError, VisionOcrClient
 from kunjin.ledger.reconcile import reconcile_fund
@@ -125,6 +132,15 @@ from kunjin.ledger.store import LedgerStateError, LedgerStore
 from kunjin.logging import redact_secrets
 from kunjin.models import InvestmentThesis
 from kunjin.paths import RuntimePaths
+from kunjin.portfolio_review import ManualPortfolioPosition, PortfolioReviewService
+from kunjin.public_research.panorama import build_cross_domain_panorama
+from kunjin.public_research.scan import scan_public_research
+from kunjin.public_research.summary import summarize_public_research
+from kunjin.public_research.supplement import (
+    build_supplement_timeline,
+    summarize_user_supplied_evidence,
+)
+from kunjin.review_triggers import build_review_triggers
 from kunjin.security.keychain import CredentialStoreError, KeychainTokenStore
 from kunjin.selection.readiness import (
     ShortlistReadinessService,
@@ -176,11 +192,13 @@ _TOP_LEVEL_COMMANDS = {
     "auth",
     "decision",
     "fund",
+    "investor",
     "ledger",
     "market",
     "news",
     "portfolio",
     "profile",
+    "research",
     "report",
     "status",
     "source",
@@ -714,6 +732,8 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_subparsers.add_parser("overlap")
     portfolio_diagnose = portfolio_subparsers.add_parser("diagnose")
     portfolio_diagnose.add_argument("--candidate")
+    portfolio_review = portfolio_subparsers.add_parser("review")
+    portfolio_review.add_argument("--manual-position", action="append", default=[])
 
     fund = subparsers.add_parser("fund")
     fund_subparsers = fund.add_subparsers(dest="fund_command", required=True)
@@ -749,6 +769,12 @@ def build_parser() -> argparse.ArgumentParser:
     fund_peers.add_argument("fund_code")
     fund_compare = fund_subparsers.add_parser("compare")
     fund_compare.add_argument("fund_codes", nargs="+")
+    fund_candidates = fund_subparsers.add_parser("candidates")
+    fund_candidates.add_argument("fund_codes", nargs="+")
+    fund_candidates.add_argument("--emergency-fund", choices=["yes", "no"])
+    fund_candidates.add_argument("--near-term-use", choices=["yes", "no"])
+    fund_candidates.add_argument("--horizon", choices=["short", "medium", "long"])
+    fund_candidates.add_argument("--volatility", choices=["low", "medium", "high"])
     fund_shortlist = fund_subparsers.add_parser("shortlist")
     fund_shortlist.add_argument("fund_codes", nargs="+")
     fund_research_scope = fund_subparsers.add_parser("research-scope")
@@ -773,6 +799,35 @@ def build_parser() -> argparse.ArgumentParser:
     fund_intelligence = fund_subparsers.add_parser("intelligence")
     fund_intelligence.add_argument("fund_code")
     _add_intelligence_arguments(fund_intelligence)
+    fund_review = fund_subparsers.add_parser("review")
+    fund_review.add_argument("fund_code")
+    fund_review.add_argument(
+        "--action",
+        choices=[
+            ActionKind.CONTINUE_HOLDING.value,
+            ActionKind.REDUCE_TO_CASH.value,
+            ActionKind.FULL_EXIT.value,
+        ],
+        default=ActionKind.CONTINUE_HOLDING.value,
+    )
+    fund_review.add_argument("--horizon", choices=["short", "medium", "long"])
+    fund_review.add_argument("--risk-tolerance", choices=["low", "medium", "high"])
+    fund_review.add_argument("--near-term-use", choices=["yes", "no"])
+    fund_review.add_argument("--emergency-fund", choices=["yes", "no"])
+    fund_review.add_argument("--portfolio-context", choices=["none", "cached"], default="none")
+    fund_review.add_argument("--manual-position", action="append", default=[])
+    fund_review.add_argument("--related-fund", action="append", default=[])
+    fund_review_triggers = fund_subparsers.add_parser("review-triggers")
+    fund_review_triggers.add_argument("fund_code")
+
+    investor = subparsers.add_parser("investor")
+    investor_subparsers = investor.add_subparsers(dest="investor_command", required=True)
+    guardrails = investor_subparsers.add_parser("guardrails")
+    guardrails.add_argument("--emergency-fund", choices=["yes", "no"])
+    guardrails.add_argument("--near-term-use", choices=["yes", "no"])
+    guardrails.add_argument("--horizon", choices=["short", "medium", "long"])
+    guardrails.add_argument("--volatility", choices=["low", "medium", "high"])
+    guardrails.add_argument("--portfolio-context", choices=["none", "cached"], default="none")
     holding_review = fund_subparsers.add_parser("holding-review")
     holding_review.add_argument("fund_code")
     holding_review.add_argument(
@@ -816,6 +871,38 @@ def build_parser() -> argparse.ArgumentParser:
     news_subparsers = news.add_subparsers(dest="news_command", required=True)
     news_recent = news_subparsers.add_parser("recent")
     _add_intelligence_arguments(news_recent)
+
+    research = subparsers.add_parser("research")
+    research_subparsers = research.add_subparsers(dest="research_command", required=True)
+    research_summary = research_subparsers.add_parser("summary")
+    research_summary.add_argument("scope", choices=["news", "market", "fund"])
+    research_summary.add_argument("fund_code", nargs="?")
+    _add_intelligence_arguments(research_summary)
+    research_scan = research_subparsers.add_parser("scan")
+    _add_intelligence_arguments(research_scan)
+    research_subparsers.add_parser("panorama")
+    research_supplement = research_subparsers.add_parser("supplement")
+    research_supplement.add_argument("--source-name", required=True)
+    research_supplement.add_argument(
+        "--source-kind",
+        choices=["official", "platform_data", "industry_data", "media", "community"],
+        required=True,
+    )
+    research_timeline = research_subparsers.add_parser("supplement-timeline")
+    research_timeline.add_argument("--material-json", action="append", required=True)
+    research_supplement.add_argument("--title", required=True)
+    research_supplement.add_argument("--published-at", required=True)
+    research_supplement.add_argument("--source-url")
+    research_supplement.add_argument("--statistics-period")
+    research_supplement.add_argument("--indicator-name")
+    research_supplement.add_argument("--indicator-value")
+    research_supplement.add_argument("--unit")
+    research_supplement.add_argument("--methodology")
+    research_supplement.add_argument(
+        "--domain",
+        choices=["power_energy", "autos", "real_estate_materials", "shipping_trade"],
+        required=True,
+    )
 
     thesis = subparsers.add_parser("thesis")
     thesis_subparsers = thesis.add_subparsers(dest="thesis_command", required=True)
@@ -902,6 +989,19 @@ def _validate_fund_code(fund_code: str) -> None:
         raise InvalidFundCodeError("fund code must contain six digits")
 
 
+def _manual_portfolio_position(value: str) -> ManualPortfolioPosition:
+    code, separator, percent = value.partition("=")
+    if separator != "=" or not _FUND_CODE.fullmatch(code):
+        raise CliUsageError("manual position must use CODE=PERCENT")
+    try:
+        parsed = Decimal(percent)
+    except Exception:
+        raise CliUsageError("manual position percentage is invalid") from None
+    if not parsed.is_finite() or not Decimal("0") < parsed <= Decimal("100"):
+        raise CliUsageError("manual position percentage is invalid")
+    return ManualPortfolioPosition(code, parsed / Decimal("100"))
+
+
 def _intelligence_interval_arguments(
     args: argparse.Namespace,
 ) -> Tuple[str, Optional[date], Optional[date]]:
@@ -957,6 +1057,118 @@ def _intelligence_response(
     return public_intelligence_payload(result)
 
 
+def _research_summary_response(
+    context: ApplicationContext,
+    args: argparse.Namespace,
+) -> Dict[str, object]:
+    from kunjin.intelligence.research import public_intelligence_payload
+
+    if context.intelligence_service is None:
+        raise CliUsageError("intelligence service is unavailable")
+    window, start, end = _intelligence_interval_arguments(args)
+    if args.scope == "news":
+        if args.fund_code is not None:
+            raise CliUsageError("fund code is only allowed for fund research")
+        result = context.intelligence_service.news_recent(
+            window=window,
+            mode=args.mode,
+            start=start,
+            end=end,
+        )
+    elif args.scope == "market":
+        if args.fund_code is not None:
+            raise CliUsageError("fund code is only allowed for fund research")
+        result = context.intelligence_service.market_overview(
+            window=window,
+            mode=args.mode,
+            start=start,
+            end=end,
+        )
+    else:
+        if args.fund_code is None:
+            raise CliUsageError("fund research requires a fund code")
+        _validate_fund_code(args.fund_code)
+        result = context.intelligence_service.fund_intelligence(
+            args.fund_code,
+            window=window,
+            mode=args.mode,
+            start=start,
+            end=end,
+        )
+    return summarize_public_research(public_intelligence_payload(result))
+
+
+def _research_scan_response(
+    context: ApplicationContext,
+    args: argparse.Namespace,
+) -> Dict[str, object]:
+    from kunjin.intelligence.research import public_intelligence_payload
+
+    if context.intelligence_service is None:
+        raise CliUsageError("intelligence service is unavailable")
+    window, start, end = _intelligence_interval_arguments(args)
+    result = context.intelligence_service.market_overview(
+        window=window,
+        mode=args.mode,
+        start=start,
+        end=end,
+    )
+    return scan_public_research(public_intelligence_payload(result))
+
+
+def _research_panorama_response(context: ApplicationContext) -> Dict[str, object]:
+    from kunjin.intelligence.research import public_intelligence_payload
+
+    if context.intelligence_service is None:
+        raise CliUsageError("intelligence service is unavailable")
+    end = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    windows = (
+        ("近一月", end - timedelta(days=29)),
+        ("近三月", end - timedelta(days=89)),
+    )
+    payloads = []
+    for label, start in windows:
+        result = context.intelligence_service.market_overview(
+            window="recent",
+            mode=RequestMode.RAPID.value,
+            start=start,
+            end=end,
+        )
+        payloads.append((label, public_intelligence_payload(result)))
+    return build_cross_domain_panorama(tuple(payloads))
+
+
+def _research_supplement_response(args: argparse.Namespace) -> Dict[str, object]:
+    return summarize_user_supplied_evidence(
+        {
+            "source_name": args.source_name,
+            "source_kind": args.source_kind,
+            "title": args.title,
+            "published_at": args.published_at,
+            "original_url": args.source_url,
+            "statistics_period": args.statistics_period,
+            "indicator_name": args.indicator_name,
+            "indicator_value": args.indicator_value,
+            "unit": args.unit,
+            "methodology": args.methodology,
+            "domain_id": args.domain,
+        }
+    )
+
+
+def _research_supplement_timeline_response(args: argparse.Namespace) -> Dict[str, object]:
+    materials = []
+    for encoded in args.material_json:
+        try:
+            material = json.loads(encoded)
+        except json.JSONDecodeError as exc:
+            raise CliUsageError("supplement timeline material is invalid") from exc
+        if not isinstance(material, dict):
+            raise CliUsageError("supplement timeline material is invalid")
+        materials.append(material)
+    return build_supplement_timeline(tuple(materials))
+
+
 def _fund_brief_response(
     context: ApplicationContext,
     fund_code: str,
@@ -1003,6 +1215,24 @@ def _validate_shortlist_codes(fund_codes: Sequence[str]) -> Tuple[str, ...]:
         or "000000" in codes
     ):
         raise CliUsageError("fund shortlist requires 2 to 5 unique fund codes")
+    return codes
+
+
+def _validate_candidate_codes(fund_codes: Sequence[str]) -> Tuple[str, ...]:
+    codes = tuple(fund_codes)
+    for fund_code in codes:
+        _validate_fund_code(fund_code)
+    if len(codes) < 2 or len(codes) > 5 or len(set(codes)) != len(codes):
+        raise CliUsageError("fund candidates requires 2 to 5 unique fund codes")
+    return codes
+
+
+def _related_fund_codes(fund_code: str, related_funds: Sequence[str]) -> Tuple[str, ...]:
+    codes = (fund_code, *related_funds)
+    for code in codes:
+        _validate_fund_code(code)
+    if len(codes) > 5 or len(set(codes)) != len(codes):
+        raise CliUsageError("fund review related funds must be 1 to 5 unique fund codes")
     return codes
 
 
@@ -2914,6 +3144,149 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             public_holding_review_payload(outcome),
         )
 
+    if args.command == "fund" and args.fund_command == "review":
+        if not args.json_output:
+            raise CliUsageError("fund review requires JSON mode")
+        _validate_fund_code(args.fund_code)
+        if context.brief_service is None or context.intelligence_service is None:
+            raise CliUsageError("fund review services are unavailable")
+        from kunjin.brief.research import public_outcome_payload
+        from kunjin.intelligence.research import public_intelligence_payload
+
+        brief = public_outcome_payload(
+            context.brief_service.brief_outcome(
+                args.fund_code,
+                action=ActionKind(args.action),
+                mode=RequestMode.RAPID,
+            )
+        )
+        intelligence = summarize_public_research(
+            public_intelligence_payload(
+                context.intelligence_service.fund_intelligence(
+                    args.fund_code, window="recent", mode="rapid"
+                )
+            )
+        )
+        market_scan = scan_public_research(
+            public_intelligence_payload(
+                context.intelligence_service.market_overview(window="recent", mode="rapid")
+            )
+        )
+        portfolio = None
+        if args.manual_position or args.portfolio_context == "cached":
+            diagnosis_service = context.diagnosis_service or DiagnosisService(
+                context.repository,
+                context.fund_disclosure_store or FundDisclosureStore(context.repository),
+            )
+            review = PortfolioReviewService(
+                sync_service=context.sync_service,
+                diagnosis_service=diagnosis_service,
+                disclosure_store=context.fund_disclosure_store
+                or FundDisclosureStore(context.repository),
+            )
+            portfolio = (
+                review.manual(
+                    tuple(
+                        _manual_portfolio_position(item)
+                        for item in args.manual_position
+                    )
+                )
+                if args.manual_position
+                else {
+                    "input_source": "cached",
+                    "diagnosis": public_diagnosis_payload(
+                        diagnosis_service.diagnose()
+                    ),
+                }
+            )
+        guardrails = build_investor_guardrails(
+            emergency_fund=args.emergency_fund,
+            near_term_use=args.near_term_use,
+            horizon=args.horizon,
+            volatility=args.risk_tolerance,
+            portfolio=portfolio,
+        )
+        positions = context.repository.latest_positions()
+        analysis = analyze_portfolio(positions)
+        weights = {
+            code: format(weight, "f") for code, weight in analysis.weights.items()
+        }
+        portfolio_weight_context = (
+            build_portfolio_weight_context(
+                fund_code=args.fund_code,
+                weights=weights,
+                value_basis=analysis.value_kind,
+            )
+            if args.portfolio_context == "cached" or args.related_fund
+            else None
+        )
+        related_fund_context = None
+        if args.related_fund:
+            related_codes = _related_fund_codes(args.fund_code, args.related_fund)
+            bundles, histories, related_positions = _comparison_inputs(context, related_codes)
+            comparison = build_explicit_compare_report(
+                related_codes,
+                bundles,
+                histories,
+                related_positions,
+                datetime.now(timezone.utc),
+            )
+            related_fund_context = build_related_fund_context(
+                fund_codes=related_codes,
+                weights=weights,
+                comparison=comparison,
+            )
+        return envelope(
+            "fund.review",
+            build_fund_review(
+                fund_code=args.fund_code,
+                action=args.action,
+                brief=brief,
+                intelligence=intelligence,
+                market_scan=market_scan,
+                portfolio=portfolio,
+                horizon=args.horizon,
+                risk_tolerance=args.risk_tolerance,
+                near_term_use=args.near_term_use,
+                guardrails=guardrails,
+                portfolio_weight_context=portfolio_weight_context,
+                related_fund_context=related_fund_context,
+            ),
+        )
+
+    if args.command == "fund" and args.fund_command == "review-triggers":
+        if not args.json_output:
+            raise CliUsageError("fund review-triggers requires JSON mode")
+        _validate_fund_code(args.fund_code)
+        return envelope("fund.review-triggers", build_review_triggers(args.fund_code))
+
+    if args.command == "investor" and args.investor_command == "guardrails":
+        if not args.json_output:
+            raise CliUsageError("investor guardrails requires JSON mode")
+        portfolio = None
+        if args.portfolio_context == "cached":
+            diagnosis_service = context.diagnosis_service or DiagnosisService(
+                context.repository,
+                context.fund_disclosure_store or FundDisclosureStore(context.repository),
+            )
+            diagnosis = public_diagnosis_payload(diagnosis_service.diagnose())
+            portfolio = {
+                "portfolio_overview": diagnosis["concentration"],
+                "observed_exposures": diagnosis["relationships"],
+                "coverage": diagnosis["coverage"],
+                "missing_evidence": diagnosis["missing_evidence"],
+            }
+        return envelope(
+            "investor.guardrails",
+            build_investor_guardrails(
+                emergency_fund=args.emergency_fund,
+                near_term_use=args.near_term_use,
+                horizon=args.horizon,
+                volatility=args.volatility,
+                portfolio=portfolio,
+            ),
+        )
+
     if args.command == "thesis" and args.thesis_command == "match-project":
         if not args.json_output:
             raise CliUsageError("thesis match-project requires JSON mode")
@@ -2955,6 +3328,34 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             raise CliUsageError("intelligence research commands require JSON mode")
         nested = getattr(args, f"{args.command}_command")
         return envelope(f"{args.command}.{nested}", _intelligence_response(context, args))
+
+    if args.command == "research" and args.research_command == "summary":
+        if not args.json_output:
+            raise CliUsageError("research summary requires JSON mode")
+        return envelope("research.summary", _research_summary_response(context, args))
+
+    if args.command == "research" and args.research_command == "scan":
+        if not args.json_output:
+            raise CliUsageError("research scan requires JSON mode")
+        return envelope("research.scan", _research_scan_response(context, args))
+
+    if args.command == "research" and args.research_command == "panorama":
+        if not args.json_output:
+            raise CliUsageError("research panorama requires JSON mode")
+        return envelope("research.panorama", _research_panorama_response(context))
+
+    if args.command == "research" and args.research_command == "supplement":
+        if not args.json_output:
+            raise CliUsageError("research supplement requires JSON mode")
+        return envelope("research.supplement", _research_supplement_response(args))
+
+    if args.command == "research" and args.research_command == "supplement-timeline":
+        if not args.json_output:
+            raise CliUsageError("research supplement timeline requires JSON mode")
+        return envelope(
+            "research.supplement_timeline",
+            _research_supplement_timeline_response(args),
+        )
 
     if args.command == "profile":
         if args.profile_command == "edit" and args.json_output:
@@ -3445,6 +3846,26 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             )
         return envelope("portfolio.diagnose", data, errors=errors)
 
+    if args.command == "portfolio" and args.portfolio_command == "review":
+        if not args.json_output:
+            raise CliUsageError("portfolio review requires JSON mode")
+        diagnosis_service = context.diagnosis_service or DiagnosisService(
+            context.repository,
+            context.fund_disclosure_store or FundDisclosureStore(context.repository),
+        )
+        review = PortfolioReviewService(
+            sync_service=context.sync_service,
+            diagnosis_service=diagnosis_service,
+            disclosure_store=context.fund_disclosure_store
+            or FundDisclosureStore(context.repository),
+        )
+        data = (
+            review.manual(tuple(_manual_portfolio_position(item) for item in args.manual_position))
+            if args.manual_position
+            else review.synced()
+        )
+        return envelope("portfolio.review", data)
+
     if args.command == "fund" and args.fund_command == "research":
         _validate_fund_code(args.fund_code)
         history = context.repository.fund_history(args.fund_code)
@@ -3521,6 +3942,30 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             anchor_fund_code=fund_codes[0],
         )
         return envelope("fund.compare", data)
+
+    if args.command == "fund" and args.fund_command == "candidates":
+        if not args.json_output:
+            raise CliUsageError("fund candidates requires JSON mode")
+        fund_codes = _validate_candidate_codes(args.fund_codes)
+        bundles, histories, positions = _comparison_inputs(context, fund_codes)
+        comparison = build_explicit_compare_report(
+            fund_codes, bundles, histories, positions, datetime.now(timezone.utc)
+        )
+        guardrails = build_investor_guardrails(
+            emergency_fund=args.emergency_fund,
+            near_term_use=args.near_term_use,
+            horizon=args.horizon,
+            volatility=args.volatility,
+            portfolio=None,
+        )
+        return envelope(
+            "fund.candidates",
+            build_fund_candidate_review(
+                fund_codes=fund_codes,
+                comparison=comparison,
+                guardrails=guardrails,
+            ),
+        )
 
     if args.command == "fund" and args.fund_command == "shortlist":
         fund_codes = _validate_shortlist_codes(args.fund_codes)
