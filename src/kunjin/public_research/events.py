@@ -184,6 +184,9 @@ def build_persisted_event_timeline(
                         "source_kind": str(row["source_kind"]),
                         "evidence_state": str(row["evidence_state"]),
                         "url": str(row["original_url"]),
+                        "source_host": (
+                            urlparse(str(row["original_url"])).hostname or ""
+                        ).casefold(),
                         "published_at": str(row["published_at"]),
                         "retrieved_at": str(row["retrieved_at"]),
                     }
@@ -192,6 +195,13 @@ def build_persisted_event_timeline(
                 "comparable_fact_conflict": len(comparable) > 1,
                 "direct_fact_source_count": sum(
                     1 for row in sources if row["evidence_state"] == "fact"
+                ),
+                "independent_fact_source_count": len(
+                    {
+                        _independent_source_identity(row)
+                        for row in sources
+                        if row["evidence_state"] == "fact"
+                    }
                 ),
                 "reported_fact_source_count": sum(
                     1 for row in sources if row["evidence_state"] == "reported_fact"
@@ -221,6 +231,12 @@ def _evidence_state(source_kind: str) -> str:
     if source_kind == "media":
         return "reported_fact"
     return "fact"
+
+
+def _independent_source_identity(row: Any) -> tuple[str, str]:
+    publisher = str(row["publisher"]).casefold()
+    host = (urlparse(str(row["original_url"])).hostname or "").casefold()
+    return ("publisher", publisher) if publisher else ("host", host)
 
 
 def _sha256(value: Mapping[str, object]) -> str:

@@ -1414,6 +1414,81 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(len(timeline["data"]["events"][0]["sources"]), 2)
         self.assertEqual(timeline["data"]["events"][0]["reported_fact_source_count"], 1)
 
+    def test_research_local_overview_requires_no_domain_or_indicator(self) -> None:
+        indicator, indicator_exit, _ = run(
+            [
+                "--json",
+                "research",
+                "evidence-store",
+                "--source-name",
+                "公开统计",
+                "--source-kind",
+                "industry_data",
+                "--title",
+                "6月用电量",
+                "--published-at",
+                "2026-07-19T08:00:00+08:00",
+                "--source-url",
+                "https://example.test/power-june",
+                "--statistics-period",
+                "2026年6月",
+                "--indicator-name",
+                "全社会用电量",
+                "--indicator-value",
+                "8981",
+                "--unit",
+                "亿千瓦时",
+                "--verification-state",
+                "outer_page_verified",
+                "--domain",
+                "power_energy",
+            ],
+            self.context,
+        )
+        event, event_exit, _ = run(
+            [
+                "--json",
+                "research",
+                "event-store",
+                "--source-name",
+                "行情数据",
+                "--source-kind",
+                "platform_data",
+                "--title",
+                "电力个股日线",
+                "--source-url",
+                "https://example.test/power-event",
+                "--published-at",
+                "2026-07-20T15:00:00+08:00",
+                "--event-key",
+                "power-energy-2026-07-20-market-move",
+                "--fact-summary",
+                "行情记录电力相关个股当日上涨。",
+                "--claim-boundary",
+                "该行情事实不确认媒体归因。",
+                "--verification-state",
+                "outer_page_verified",
+                "--domain",
+                "power_energy",
+            ],
+            self.context,
+        )
+        overview, overview_exit, overview_json = run(
+            ["--json", "research", "local-overview"], self.context
+        )
+
+        self.assertEqual(indicator_exit, 0, indicator)
+        self.assertEqual(event_exit, 0, event)
+        self.assertEqual(overview_exit, 0, overview)
+        self.assertTrue(overview_json)
+        self.assert_envelope(overview, "research.local_overview")
+        self.assertEqual(overview["data"]["coverage"]["persisted_indicator_record_count"], 1)
+        self.assertEqual(overview["data"]["domains"][0]["event_counts"]["fact"], 1)
+        self.assertTrue(overview["data"]["outer_discovery"]["outer_discovery_required"])
+        self.assertEqual(
+            overview["data"]["outer_discovery"]["current_news_refresh_state"], "pending"
+        )
+
     def test_research_panorama_uses_month_and_quarter_market_windows(self) -> None:
         terminal = AuthenticatedTerminalRequest(
             id=21,

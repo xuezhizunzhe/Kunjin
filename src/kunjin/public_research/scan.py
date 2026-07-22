@@ -36,7 +36,12 @@ _SIGNALS = {
 }
 
 
-def scan_public_research(payload: Mapping[str, object]) -> dict[str, object]:
+def scan_public_research(
+    payload: Mapping[str, object],
+    *,
+    local_overview: Mapping[str, object] | None = None,
+    include_intelligence: bool = True,
+) -> dict[str, object]:
     """Discover bounded cross-domain research directions from public data."""
 
     summary = summarize_public_research(payload)
@@ -44,9 +49,11 @@ def scan_public_research(payload: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(shadow, Mapping):
         raise ValueError("public research payload experimental_shadow is invalid")
     sector_states = _sector_states(shadow.get("sector_states"))
-    facts = summary["what_happened"]
-    if not isinstance(facts, Sequence):
+    intelligence_facts = summary["what_happened"] if include_intelligence else []
+    if not isinstance(intelligence_facts, Sequence):
         raise ValueError("public research summary facts are invalid")
+    local_facts = _local_facts(local_overview)
+    facts = [*intelligence_facts, *local_facts]
     directions = [_direction(domain, sector_states, facts) for domain in _DOMAINS]
     gaps = list(summary["risks_and_unknowns"]["evidence_gaps"])
     gaps.extend(
@@ -55,23 +62,23 @@ def scan_public_research(payload: Mapping[str, object]) -> dict[str, object]:
         if item["evidence_state"] == "insufficient_data"
     )
     return {
-        "conclusion": summary["conclusion"],
+        "conclusion": _conclusion(summary["conclusion"], local_facts),
         "timeline": facts,
         "directions": directions,
+        "candidate_directions": _candidate_directions(directions),
         "conditional_guidance": summary["conditional_guidance"],
         "risks_and_unknowns": {
             **summary["risks_and_unknowns"],
             "evidence_gaps": sorted(set(gaps)),
         },
-        "sources": summary["sources"],
+        "sources": [
+            *(summary["sources"] if include_intelligence else []),
+            *_local_sources(local_facts),
+        ],
         "retrieval": summary["retrieval"],
-        "automatic_industry_data": {
-            "state": "network_blocked",
-            "text": (
-                "当前网络环境未形成稳定自动行业来源；电力、汽车、房地产建材和航运外贸"
-                "需使用用户补充的公开材料。"
-            ),
-        },
+        "local_overview": local_overview,
+        "outer_discovery": _outer_discovery(local_overview),
+        "automatic_industry_data": _automatic_industry_data(local_overview),
     }
 
 
@@ -99,13 +106,16 @@ def _direction(
     matched_sectors = [
         item for item in sector_states if _matches(item["sector_name"], keywords)
     ]
-    matched_facts = [
-        item["title"]
-        for item in facts
-        if isinstance(item, Mapping)
-        and isinstance(item.get("title"), str)
-        and _matches(item["title"], keywords)
-    ]
+    matched_facts = []
+    for item in facts:
+        if not isinstance(item, Mapping) or not isinstance(item.get("title"), str):
+            continue
+        persisted_domain = item.get("domain_id")
+        if persisted_domain is not None:
+            if persisted_domain == domain_id:
+                matched_facts.append(item["title"])
+        elif _matches(item["title"], keywords):
+            matched_facts.append(item["title"])
     if not matched_sectors and not matched_facts:
         return {
             "label": "系统分析",
@@ -131,6 +141,147 @@ def _direction(
         "matched_facts": sorted(set(matched_facts)),
         "signal": _SIGNALS[state],
         "caveat": "板块状态是公开市场观察，不代表未来收益、买卖时点或完整行业覆盖。",
+    }
+
+
+def _conclusion(value: object, local_facts: Sequence[Mapping[str, object]]) -> object:
+    if local_facts:
+        return {
+            "state": "evidence_backed_research",
+            "text": "已合并本地持久化的可追溯公开事实，仍需刷新近期外部信息后再判断。",
+        }
+    return value
+
+
+def _candidate_directions(directions: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    observed = [item for item in directions if item.get("evidence_state") == "observed"]
+    return sorted(
+        (dict(item) for item in observed),
+        key=lambda item: (-len(item["matched_facts"]), str(item["domain_id"])),
+    )[:3]
+
+
+def _local_facts(local_overview: Mapping[str, object] | None) -> list[dict[str, object]]:
+    if local_overview is None:
+        return []
+    domains = local_overview.get("domains")
+    if not isinstance(domains, Sequence) or isinstance(domains, (str, bytes)):
+        raise ValueError("local research overview domains are invalid")
+    facts = []
+    for domain in domains:
+        if not isinstance(domain, Mapping):
+            raise ValueError("local research overview domain is invalid")
+        domain_name = domain.get("domain_name")
+        indicators = domain.get("indicators")
+        events = domain.get("events")
+        if (
+            not isinstance(domain_name, str)
+            or not isinstance(indicators, Sequence)
+            or isinstance(indicators, (str, bytes))
+            or not isinstance(events, Sequence)
+            or isinstance(events, (str, bytes))
+        ):
+            raise ValueError("local research overview domain is invalid")
+        for indicator in indicators:
+            if not isinstance(indicator, Mapping):
+                raise ValueError("local research overview indicator is invalid")
+            observation = indicator.get("latest_observation")
+            if not isinstance(observation, Mapping):
+                raise ValueError("local research overview observation is invalid")
+            name = indicator.get("indicator_name")
+            unit = indicator.get("unit")
+            period = observation.get("statistics_period")
+            value = observation.get("value")
+            source = observation.get("source")
+            fields_are_text = all(isinstance(item, str) for item in (name, unit, period, value))
+            if not fields_are_text or not isinstance(source, Mapping):
+                raise ValueError("local research overview observation is invalid")
+            facts.append(
+                {
+                    "label": "持久化公开事实",
+                    "title": f"{domain_name}：{name}（{period}）",
+                    "excerpt": f"{name}为{value}{unit}，统计期为{period}。",
+                    "source": dict(source),
+                    "statistics_period": period,
+                    "origin": "persisted_indicator",
+                    "domain_id": domain.get("domain_id"),
+                }
+            )
+        for event in events:
+            if not isinstance(event, Mapping):
+                raise ValueError("local research overview event is invalid")
+            summaries = event.get("fact_summaries")
+            sources = event.get("sources")
+            if not isinstance(summaries, Sequence) or not isinstance(sources, Sequence):
+                raise ValueError("local research overview event is invalid")
+            fact_source = next(
+                (
+                    source
+                    for source in sources
+                    if isinstance(source, Mapping) and source.get("evidence_state") == "fact"
+                ),
+                None,
+            )
+            if not isinstance(fact_source, Mapping):
+                continue
+            for summary in summaries:
+                if not isinstance(summary, str):
+                    raise ValueError("local research overview event summary is invalid")
+                facts.append(
+                    {
+                        "label": "持久化市场事实",
+                        "title": f"{domain_name}：近期市场事件",
+                        "excerpt": summary,
+                        "source": {
+                            "source_name": fact_source.get("publisher"),
+                            "url": fact_source.get("url"),
+                            "source_tier": fact_source.get("source_tier"),
+                            "published_at": fact_source.get("published_at"),
+                            "retrieved_at": fact_source.get("retrieved_at"),
+                        },
+                        "statistics_period": None,
+                        "origin": "persisted_event_fact",
+                        "domain_id": domain.get("domain_id"),
+                    }
+                )
+    return facts
+
+
+def _local_sources(facts: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    values = []
+    seen = set()
+    for fact in facts:
+        source = fact.get("source")
+        if not isinstance(source, Mapping) or not isinstance(source.get("url"), str):
+            raise ValueError("local research fact source is invalid")
+        url = source["url"]
+        if url not in seen:
+            values.append(dict(source))
+            seen.add(url)
+    return values
+
+
+def _outer_discovery(local_overview: Mapping[str, object] | None) -> dict[str, object]:
+    if local_overview is not None and isinstance(local_overview.get("outer_discovery"), Mapping):
+        return dict(local_overview["outer_discovery"])
+    return {
+        "outer_discovery_required": True,
+        "current_news_refresh_state": "pending",
+        "text": "本次尚未记录外层互联网发现；最终回答前必须刷新或明确环境阻塞。",
+    }
+
+
+def _automatic_industry_data(local_overview: Mapping[str, object] | None) -> dict[str, str]:
+    if local_overview is not None:
+        coverage = local_overview.get("coverage")
+        if isinstance(coverage, Mapping) and coverage.get("persisted_indicator_record_count"):
+            return {
+                "state": "persisted_history_available",
+                "text": "已发现本地持久化的行业历史事实；近期外部新闻与行情仍待本次受控刷新。",
+            }
+    return {
+        "state": "network_refresh_needed",
+        "text": "本地未形成可复用的行业历史事实；需要外层进行一次受控公开发现。",
     }
 
 

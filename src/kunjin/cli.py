@@ -142,6 +142,7 @@ from kunjin.public_research.evidence import (
     build_refresh_plan,
     persist_verified_evidence,
 )
+from kunjin.public_research.overview import build_local_research_overview
 from kunjin.public_research.panorama import build_cross_domain_panorama
 from kunjin.public_research.scan import scan_public_research
 from kunjin.public_research.summary import summarize_public_research
@@ -890,6 +891,7 @@ def build_parser() -> argparse.ArgumentParser:
     research_scan = research_subparsers.add_parser("scan")
     _add_intelligence_arguments(research_scan)
     research_subparsers.add_parser("panorama")
+    research_subparsers.add_parser("local-overview")
     research_supplement = research_subparsers.add_parser("supplement")
     research_supplement.add_argument("--source-name", required=True)
     research_supplement.add_argument(
@@ -1205,7 +1207,10 @@ def _research_scan_response(
         start=start,
         end=end,
     )
-    return scan_public_research(public_intelligence_payload(result))
+    return scan_public_research(
+        public_intelligence_payload(result),
+        local_overview=build_local_research_overview(context.repository),
+    )
 
 
 def _research_panorama_response(context: ApplicationContext) -> Dict[str, object]:
@@ -1227,7 +1232,13 @@ def _research_panorama_response(context: ApplicationContext) -> Dict[str, object
             end=end,
         )
         payloads.append((label, public_intelligence_payload(result)))
-    return build_cross_domain_panorama(tuple(payloads))
+    return build_cross_domain_panorama(
+        tuple(payloads), local_overview=build_local_research_overview(context.repository)
+    )
+
+
+def _research_local_overview_response(context: ApplicationContext) -> Dict[str, object]:
+    return build_local_research_overview(context.repository)
 
 
 def _research_supplement_response(args: argparse.Namespace) -> Dict[str, object]:
@@ -3514,6 +3525,11 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         if not args.json_output:
             raise CliUsageError("research panorama requires JSON mode")
         return envelope("research.panorama", _research_panorama_response(context))
+
+    if args.command == "research" and args.research_command == "local-overview":
+        if not args.json_output:
+            raise CliUsageError("research local overview requires JSON mode")
+        return envelope("research.local_overview", _research_local_overview_response(context))
 
     if args.command == "research" and args.research_command == "supplement":
         if not args.json_output:

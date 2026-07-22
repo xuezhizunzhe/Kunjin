@@ -303,6 +303,17 @@ def test_event_sources_cluster_without_upgrading_media_claims(tmp_path) -> None:
         },
     )
     assert second_media_report["storage_state"] == "stored"
+    reposted_fact = persist_verified_event(
+        repository,
+        {
+            **event,
+            "source_name": "行情转载页",
+            "publisher": "交易所行情",
+            "title": "不同标题的行情转载",
+            "original_url": "https://mirror.example.test/market",
+        },
+    )
+    assert reposted_fact["storage_state"] == "stored"
     timeline = build_persisted_event_timeline(repository, "power_energy")
     leads = [
         source for source in timeline["events"][0]["sources"] if source["evidence_state"] == "lead"
@@ -317,7 +328,8 @@ def test_event_sources_cluster_without_upgrading_media_claims(tmp_path) -> None:
     assert reports[0]["source_kind"] == "media"
     assert reports[0]["source_tier"] == "tier_2"
     assert timeline["events"][0]["reported_facts"] == ["行情页面记录电力板块盘中异动。"]
-    assert timeline["events"][0]["direct_fact_source_count"] == 2
+    assert timeline["events"][0]["direct_fact_source_count"] == 3
+    assert timeline["events"][0]["independent_fact_source_count"] == 2
     assert timeline["events"][0]["reported_fact_source_count"] == 2
 
 

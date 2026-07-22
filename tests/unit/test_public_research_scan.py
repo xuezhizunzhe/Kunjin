@@ -54,7 +54,7 @@ def test_scan_discovers_multiple_unrequested_directions_from_sector_states() -> 
     assert directions["shipping_trade"]["evidence_state"] == "insufficient_data"
     assert directions["industrial_commodities"]["evidence_state"] == "insufficient_data"
     assert result["timeline"][0]["source"]["url"] == "https://example.test/policy"
-    assert result["automatic_industry_data"]["state"] == "network_blocked"
+    assert result["automatic_industry_data"]["state"] == "network_refresh_needed"
 
 
 def test_scan_keeps_facts_and_analysis_separate() -> None:

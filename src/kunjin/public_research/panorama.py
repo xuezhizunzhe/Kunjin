@@ -12,6 +12,8 @@ _MAX_FACTS_PER_DIRECTION = 3
 
 def build_cross_domain_panorama(
     windows: Sequence[tuple[str, Mapping[str, object]]],
+    *,
+    local_overview: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a bounded, source-linked panorama from public research windows."""
 
@@ -19,6 +21,18 @@ def build_cross_domain_panorama(
         raise ValueError("cross-domain panorama requires one to three windows")
     scans = [(label, scan_public_research(payload)) for label, payload in windows]
     preliminary = _preliminary_directions(scans)
+    local_scan = (
+        scan_public_research(
+            windows[0][1], local_overview=local_overview, include_intelligence=False
+        )
+        if local_overview is not None
+        else None
+    )
+    if local_scan is not None:
+        preliminary = _merge_preliminary(
+            preliminary,
+            _preliminary_directions((("本地持久化证据", local_scan),)),
+        )
     candidates = _strong_directions(scans, preliminary)
     return {
         "conclusion": {
@@ -41,7 +55,21 @@ def build_cross_domain_panorama(
         "candidate_directions": candidates,
         "strong_evidence_directions": candidates,
         "coverage": _coverage(scans, preliminary),
-        "automatic_industry_data": scans[0][1]["automatic_industry_data"],
+        "local_overview": local_overview,
+        "outer_discovery": (
+            local_scan["outer_discovery"]
+            if local_scan is not None
+            else {
+                "outer_discovery_required": True,
+                "current_news_refresh_state": "pending",
+                "text": "本次尚未记录外层互联网发现；最终回答前必须刷新或明确环境阻塞。",
+            }
+        ),
+        "automatic_industry_data": (
+            local_scan["automatic_industry_data"]
+            if local_scan is not None
+            else scans[0][1]["automatic_industry_data"]
+        ),
         "time_windows": [
             {
                 "label": label,
@@ -66,6 +94,31 @@ def build_cross_domain_panorama(
             "automatic_trade": False,
         },
     }
+
+
+def _merge_preliminary(
+    existing: Sequence[Mapping[str, object]], additions: Sequence[Mapping[str, object]]
+) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for item in (*existing, *additions):
+        domain_id = item.get("domain_id")
+        if not isinstance(domain_id, str):
+            raise ValueError("cross-domain preliminary direction is invalid")
+        if domain_id not in merged:
+            merged[domain_id] = dict(item)
+            continue
+        current = merged[domain_id]
+        _extend_unique_texts(current["observed_in"], item["observed_in"])
+        _extend_unique_facts(current["facts"], item["facts"])
+        signal = item.get("signal")
+        if signal in _SIGNAL_RANK and (
+            current.get("signal") not in _SIGNAL_RANK
+            or _SIGNAL_RANK[signal] > _SIGNAL_RANK[current["signal"]]
+        ):
+            current["signal"] = signal
+    return sorted(
+        merged.values(), key=lambda item: (-len(item["observed_in"]), item["domain_id"])
+    )[:_MAX_DIRECTIONS]
 
 
 def _preliminary_directions(
