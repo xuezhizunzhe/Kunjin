@@ -1489,6 +1489,87 @@ class CliIntegrationTest(unittest.TestCase):
             overview["data"]["outer_discovery"]["current_news_refresh_state"], "pending"
         )
 
+    def test_research_discovery_plan_uses_persisted_candidate_and_starts_pending(self) -> None:
+        stored, stored_exit, _ = run(
+            [
+                "--json",
+                "research",
+                "evidence-store",
+                "--source-name",
+                "公开统计",
+                "--source-kind",
+                "industry_data",
+                "--title",
+                "6月用电量",
+                "--published-at",
+                "2026-07-19T08:00:00+08:00",
+                "--source-url",
+                "https://example.test/power-june-plan",
+                "--statistics-period",
+                "2026年6月",
+                "--indicator-name",
+                "全社会用电量",
+                "--indicator-value",
+                "8981",
+                "--unit",
+                "亿千瓦时",
+                "--verification-state",
+                "outer_page_verified",
+                "--domain",
+                "power_energy",
+            ],
+            self.context,
+        )
+        terminal = AuthenticatedTerminalRequest(
+            id=23,
+            request_id="d" * 32,
+            mode=RequestMode.RAPID,
+            status=RequestTerminalStatus.PARTIAL,
+            started_at=self.suitability_now,
+            deadline_at=self.suitability_now + timedelta(seconds=90),
+            finished_at=self.suitability_now + timedelta(seconds=1),
+            omitted_work=("source_unavailable",),
+        )
+
+        class FakeIntelligenceService:
+            def market_overview(inner_self, **_kwargs):
+                return PragmaticIntelligenceResult(
+                    report=None,
+                    terminal_request=terminal,
+                    subject=IntelligenceRequestSubject(
+                        workflow=IntelligenceWorkflow.MARKET_OVERVIEW,
+                        interval=QueryInterval(
+                            self.suitability_now - timedelta(hours=72),
+                            self.suitability_now,
+                            "Asia/Shanghai",
+                        ),
+                        subject_scope="global_public",
+                        fund_code=None,
+                    ),
+                    items=(),
+                    item_uses=(),
+                    lineage_edges=(),
+                    events=(),
+                    source_summaries=(),
+                    sector_labels=(),
+                    fund_context=None,
+                    thesis_review=None,
+                )
+
+        self.context.intelligence_service = FakeIntelligenceService()
+        payload, exit_code, json_output = run(
+            ["--json", "research", "discovery-plan", "--window", "recent"], self.context
+        )
+
+        self.assertEqual(stored_exit, 0, stored)
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "research.discovery_plan")
+        plans = payload["data"]["candidate_plans"]
+        self.assertEqual([item["domain_id"] for item in plans], ["power_energy"])
+        self.assertEqual(plans[0]["current_news_refresh_state"], "pending")
+        self.assertTrue(payload["data"]["scan"]["outer_discovery"]["outer_discovery_required"])
+
     def test_research_panorama_uses_month_and_quarter_market_windows(self) -> None:
         terminal = AuthenticatedTerminalRequest(
             id=21,

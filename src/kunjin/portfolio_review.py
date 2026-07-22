@@ -16,6 +16,20 @@ class ManualPortfolioPosition:
     weight: Decimal
 
 
+def thematic_exposure_observation(theme_name: str) -> dict[str, str]:
+    """State the disclosure boundary when a portfolio has no identified theme fund."""
+
+    if not isinstance(theme_name, str) or not (name := " ".join(theme_name.split())):
+        raise ValueError("theme name is invalid")
+    return {
+        "state": "no_explicit_theme_fund_identified",
+        "text": (
+            f"当前组合未识别到明确的{name}主题持仓；其他主动或指数基金的间接暴露"
+            "需带日期披露确认，未知部分不按零处理。"
+        ),
+    }
+
+
 class PortfolioReviewService:
     def __init__(
         self,

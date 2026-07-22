@@ -133,6 +133,7 @@ from kunjin.logging import redact_secrets
 from kunjin.models import InvestmentThesis
 from kunjin.paths import RuntimePaths
 from kunjin.portfolio_review import ManualPortfolioPosition, PortfolioReviewService
+from kunjin.public_research.discovery import build_candidate_discovery_plan
 from kunjin.public_research.events import (
     build_persisted_event_timeline,
     persist_verified_event,
@@ -890,6 +891,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_intelligence_arguments(research_summary)
     research_scan = research_subparsers.add_parser("scan")
     _add_intelligence_arguments(research_scan)
+    research_discovery_plan = research_subparsers.add_parser("discovery-plan")
+    _add_intelligence_arguments(research_discovery_plan)
     research_subparsers.add_parser("panorama")
     research_subparsers.add_parser("local-overview")
     research_supplement = research_subparsers.add_parser("supplement")
@@ -1211,6 +1214,14 @@ def _research_scan_response(
         public_intelligence_payload(result),
         local_overview=build_local_research_overview(context.repository),
     )
+
+
+def _research_discovery_plan_response(
+    context: ApplicationContext,
+    args: argparse.Namespace,
+) -> Dict[str, object]:
+    scan = _research_scan_response(context, args)
+    return {"scan": scan, **build_candidate_discovery_plan(scan)}
 
 
 def _research_panorama_response(context: ApplicationContext) -> Dict[str, object]:
@@ -3520,6 +3531,13 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         if not args.json_output:
             raise CliUsageError("research scan requires JSON mode")
         return envelope("research.scan", _research_scan_response(context, args))
+
+    if args.command == "research" and args.research_command == "discovery-plan":
+        if not args.json_output:
+            raise CliUsageError("research discovery plan requires JSON mode")
+        return envelope(
+            "research.discovery_plan", _research_discovery_plan_response(context, args)
+        )
 
     if args.command == "research" and args.research_command == "panorama":
         if not args.json_output:

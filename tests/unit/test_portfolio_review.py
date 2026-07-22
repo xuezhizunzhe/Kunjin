@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from kunjin.portfolio_review import ManualPortfolioPosition, PortfolioReviewService
+from kunjin.portfolio_review import (
+    ManualPortfolioPosition,
+    PortfolioReviewService,
+    thematic_exposure_observation,
+)
 from kunjin.services.sync import SyncError
 
 
@@ -47,3 +51,12 @@ def test_synced_review_returns_manual_fallback_on_login_failure() -> None:
     assert review["input_source"] == "sync_failed"
     assert review["manual_fallback"] == {"available": True}
     assert "private details" not in str(review)
+
+
+def test_unidentified_theme_is_not_described_as_zero_underlying_exposure() -> None:
+    result = thematic_exposure_observation("电力")
+
+    assert result["state"] == "no_explicit_theme_fund_identified"
+    assert "未识别到明确的电力主题持仓" in result["text"]
+    assert "间接暴露需带日期披露确认" in result["text"]
+    assert "零暴露" not in result["text"]
