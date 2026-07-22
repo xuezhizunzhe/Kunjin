@@ -94,8 +94,8 @@ def test_v19_migration_is_additive_and_preserves_prior_bytes(
         after = bytes(
             connection.execute("SELECT CAST(error_message AS BLOB) FROM sync_runs").fetchone()[0]
         )
-    assert SCHEMA_VERSION == 22
-    assert versions == tuple(range(1, 23))
+    assert SCHEMA_VERSION == 23
+    assert versions == tuple(range(1, 24))
     assert after == before
 
 

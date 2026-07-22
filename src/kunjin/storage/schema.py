@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -5149,4 +5149,41 @@ BEGIN SELECT RAISE(ABORT, 'official check closures are immutable'); END;
 CREATE TRIGGER held_review_official_check_closure_no_delete
 BEFORE DELETE ON held_review_official_check_closures
 BEGIN SELECT RAISE(ABORT, 'official check closures are immutable'); END;
+"""
+
+SCHEMA_V23 = """
+CREATE TABLE public_research_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_id TEXT NOT NULL CHECK(length(domain_id) BETWEEN 1 AND 64),
+    source_name TEXT NOT NULL CHECK(length(source_name) BETWEEN 1 AND 256),
+    publisher TEXT NOT NULL CHECK(length(publisher) BETWEEN 1 AND 256),
+    source_kind TEXT NOT NULL CHECK(source_kind IN (
+        'official', 'platform_data', 'industry_data', 'media', 'community'
+    )),
+    source_tier TEXT NOT NULL CHECK(source_tier IN ('tier_1', 'tier_2')),
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 1000),
+    original_url TEXT NOT NULL CHECK(original_url GLOB 'https://*'),
+    published_at TEXT NOT NULL,
+    statistics_period TEXT NOT NULL CHECK(length(statistics_period) BETWEEN 1 AND 64),
+    indicator_name TEXT NOT NULL CHECK(length(indicator_name) BETWEEN 1 AND 256),
+    indicator_value TEXT NOT NULL CHECK(length(indicator_value) BETWEEN 1 AND 256),
+    unit TEXT NOT NULL CHECK(length(unit) BETWEEN 1 AND 128),
+    methodology TEXT,
+    short_excerpt TEXT CHECK(short_excerpt IS NULL OR length(short_excerpt) <= 1000),
+    excerpt_sha256 TEXT NOT NULL CHECK(
+        length(excerpt_sha256) = 64 AND excerpt_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    verification_state TEXT NOT NULL CHECK(verification_state = 'outer_page_verified'),
+    revision_of_evidence_id INTEGER REFERENCES public_research_evidence(id) ON DELETE RESTRICT,
+    retrieved_at TEXT NOT NULL,
+    record_sha256 TEXT NOT NULL UNIQUE CHECK(
+        length(record_sha256) = 64 AND record_sha256 NOT GLOB '*[^0-9a-f]*'
+    )
+);
+
+CREATE INDEX public_research_evidence_timeline_idx
+ON public_research_evidence(domain_id, indicator_name, unit, statistics_period);
+
+CREATE INDEX public_research_evidence_source_idx
+ON public_research_evidence(original_url, published_at);
 """

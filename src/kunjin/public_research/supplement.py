@@ -11,7 +11,18 @@ _SOURCE_KINDS = frozenset(
     {"official", "platform_data", "industry_data", "media", "community"}
 )
 _DOMAIN_IDS = frozenset(
-    {"power_energy", "autos", "real_estate_materials", "shipping_trade"}
+    {
+        "power_energy",
+        "coal_oil_gas",
+        "real_estate_materials",
+        "industrial_commodities",
+        "autos",
+        "shipping_trade",
+        "ai_compute",
+        "consumer",
+        "policy",
+        "weather",
+    }
 )
 _MAX_TEXT = 1_000
 _MONTH_PERIOD = re.compile(r"^(?P<year>20\d{2})年(?P<month>1[0-2]|[1-9])月$")
@@ -113,8 +124,8 @@ def summarize_user_supplied_evidence(value: Mapping[str, object]) -> dict[str, o
 def build_supplement_timeline(materials: tuple[Mapping[str, object], ...]) -> dict[str, object]:
     """Build one non-persistent, same-topic timeline from supplied materials."""
 
-    if not 2 <= len(materials) <= 6:
-        raise ValueError("supplement timeline requires two to six materials")
+    if not 2 <= len(materials) <= 12:
+        raise ValueError("supplement timeline requires two to twelve materials")
     entries = []
     gaps = set()
     domains = set()
@@ -371,6 +382,9 @@ def _material(value: Mapping[str, object]) -> dict[str, str | None]:
         "unit": _optional_text(value.get("unit"), "unit"),
         "methodology": _optional_text(value.get("methodology"), "methodology"),
         "domain_id": domain_id,
+        "source_verification_state": _optional_verification_state(
+            value.get("source_verification_state")
+        ),
     }
 
 
@@ -397,6 +411,15 @@ def _optional_url(value: object) -> str | None:
     if parsed.scheme != "https" or not parsed.netloc:
         raise ValueError("supplemented evidence original URL is invalid")
     return url
+
+
+def _optional_verification_state(value: object) -> str | None:
+    if value is None:
+        return None
+    state = _required_text(value, "source verification state")
+    if state != "outer_page_verified":
+        raise ValueError("supplemented evidence source verification state is invalid")
+    return state
 
 
 def _indicator_gaps(material: Mapping[str, str | None]) -> list[str]:
@@ -453,12 +476,16 @@ def _is_verified_official_material(material: Mapping[str, str | None]) -> bool:
 
 
 def _source_level(material: Mapping[str, str | None]) -> str:
+    if material["source_verification_state"] == "outer_page_verified":
+        return "tier_1" if material["source_kind"] == "official" else "tier_2"
     if _is_verified_official_material(material):
         return "provisional_tier_1"
     return "provisional_tier_2"
 
 
 def _verification_state(material: Mapping[str, str | None]) -> str:
+    if material["source_verification_state"] is not None:
+        return material["source_verification_state"]
     if _is_verified_official_material(material):
         return "official_domain_https_url_not_fetched"
     return "user_material_https_url_not_fetched"

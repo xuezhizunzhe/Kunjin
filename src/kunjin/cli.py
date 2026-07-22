@@ -133,6 +133,11 @@ from kunjin.logging import redact_secrets
 from kunjin.models import InvestmentThesis
 from kunjin.paths import RuntimePaths
 from kunjin.portfolio_review import ManualPortfolioPosition, PortfolioReviewService
+from kunjin.public_research.evidence import (
+    build_persisted_timeline,
+    build_refresh_plan,
+    persist_verified_evidence,
+)
 from kunjin.public_research.panorama import build_cross_domain_panorama
 from kunjin.public_research.scan import scan_public_research
 from kunjin.public_research.summary import summarize_public_research
@@ -890,6 +895,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     research_timeline = research_subparsers.add_parser("supplement-timeline")
     research_timeline.add_argument("--material-json", action="append", required=True)
+    research_evidence_store = research_subparsers.add_parser("evidence-store")
+    research_evidence_store.add_argument("--source-name", required=True)
+    research_evidence_store.add_argument(
+        "--source-kind",
+        choices=["official", "platform_data", "industry_data", "media", "community"],
+        required=True,
+    )
+    research_evidence_store.add_argument("--publisher")
+    research_evidence_store.add_argument("--title", required=True)
+    research_evidence_store.add_argument("--published-at", required=True)
+    research_evidence_store.add_argument("--source-url", required=True)
+    research_evidence_store.add_argument("--statistics-period", required=True)
+    research_evidence_store.add_argument("--indicator-name", required=True)
+    research_evidence_store.add_argument("--indicator-value", required=True)
+    research_evidence_store.add_argument("--unit", required=True)
+    research_evidence_store.add_argument("--methodology")
+    research_evidence_store.add_argument("--short-excerpt")
+    research_evidence_store.add_argument(
+        "--verification-state", choices=["outer_page_verified"], required=True
+    )
+    research_evidence_store.add_argument(
+        "--domain",
+        choices=[
+            "power_energy",
+            "coal_oil_gas",
+            "real_estate_materials",
+            "industrial_commodities",
+            "autos",
+            "shipping_trade",
+            "ai_compute",
+            "consumer",
+            "policy",
+            "weather",
+        ],
+        required=True,
+    )
+    research_evidence_timeline = research_subparsers.add_parser("evidence-timeline")
+    research_evidence_timeline.add_argument("--domain", required=True)
+    research_evidence_timeline.add_argument("--indicator-name", required=True)
+    research_evidence_timeline.add_argument("--unit", required=True)
+    research_evidence_plan = research_subparsers.add_parser("evidence-refresh-plan")
+    research_evidence_plan.add_argument("--domain", required=True)
+    research_evidence_plan.add_argument("--indicator-name", required=True)
+    research_evidence_plan.add_argument("--unit", required=True)
+    research_evidence_plan.add_argument("--from-period")
+    research_evidence_plan.add_argument("--through-period", required=True)
     research_supplement.add_argument("--title", required=True)
     research_supplement.add_argument("--published-at", required=True)
     research_supplement.add_argument("--source-url")
@@ -900,7 +951,18 @@ def build_parser() -> argparse.ArgumentParser:
     research_supplement.add_argument("--methodology")
     research_supplement.add_argument(
         "--domain",
-        choices=["power_energy", "autos", "real_estate_materials", "shipping_trade"],
+        choices=[
+            "power_energy",
+            "coal_oil_gas",
+            "real_estate_materials",
+            "industrial_commodities",
+            "autos",
+            "shipping_trade",
+            "ai_compute",
+            "consumer",
+            "policy",
+            "weather",
+        ],
         required=True,
     )
 
@@ -1167,6 +1229,51 @@ def _research_supplement_timeline_response(args: argparse.Namespace) -> Dict[str
             raise CliUsageError("supplement timeline material is invalid")
         materials.append(material)
     return build_supplement_timeline(tuple(materials))
+
+
+def _research_evidence_store_response(
+    context: ApplicationContext, args: argparse.Namespace
+) -> Dict[str, object]:
+    return persist_verified_evidence(
+        context.repository,
+        {
+            "source_name": args.source_name,
+            "publisher": args.publisher,
+            "source_kind": args.source_kind,
+            "title": args.title,
+            "published_at": args.published_at,
+            "original_url": args.source_url,
+            "statistics_period": args.statistics_period,
+            "indicator_name": args.indicator_name,
+            "indicator_value": args.indicator_value,
+            "unit": args.unit,
+            "methodology": args.methodology,
+            "domain_id": args.domain,
+            "source_verification_state": args.verification_state,
+            "short_excerpt": args.short_excerpt,
+        },
+    )
+
+
+def _research_evidence_timeline_response(
+    context: ApplicationContext, args: argparse.Namespace
+) -> Dict[str, object]:
+    return build_persisted_timeline(
+        context.repository, args.domain, args.indicator_name, args.unit
+    )
+
+
+def _research_evidence_refresh_plan_response(
+    context: ApplicationContext, args: argparse.Namespace
+) -> Dict[str, object]:
+    return build_refresh_plan(
+        context.repository,
+        args.domain,
+        args.indicator_name,
+        args.unit,
+        args.through_period,
+        args.from_period,
+    )
 
 
 def _fund_brief_response(
@@ -3355,6 +3462,29 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         return envelope(
             "research.supplement_timeline",
             _research_supplement_timeline_response(args),
+        )
+
+    if args.command == "research" and args.research_command == "evidence-store":
+        if not args.json_output:
+            raise CliUsageError("research evidence store requires JSON mode")
+        return envelope(
+            "research.evidence_store", _research_evidence_store_response(context, args)
+        )
+
+    if args.command == "research" and args.research_command == "evidence-timeline":
+        if not args.json_output:
+            raise CliUsageError("research evidence timeline requires JSON mode")
+        return envelope(
+            "research.evidence_timeline",
+            _research_evidence_timeline_response(context, args),
+        )
+
+    if args.command == "research" and args.research_command == "evidence-refresh-plan":
+        if not args.json_output:
+            raise CliUsageError("research evidence refresh plan requires JSON mode")
+        return envelope(
+            "research.evidence_refresh_plan",
+            _research_evidence_refresh_plan_response(context, args),
         )
 
     if args.command == "profile":

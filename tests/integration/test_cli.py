@@ -1248,6 +1248,99 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(len(payload["data"]["timeline"]), 2)
         self.assertFalse(payload["data"]["current_research_use"]["strong_direction_eligible"])
 
+    def test_research_evidence_store_reuses_history_and_plans_only_new_months(self) -> None:
+        for month, value in ((3, "100"), (4, "101"), (5, "102"), (6, "103"), (7, "104")):
+            payload, exit_code, json_output = run(
+                [
+                    "--json",
+                    "research",
+                    "evidence-store",
+                    "--source-name",
+                    "测试行业协会",
+                    "--publisher",
+                    "测试行业协会",
+                    "--source-kind",
+                    "industry_data",
+                    "--title",
+                    f"{month}月测试产量",
+                    "--published-at",
+                    "2026-08-01T08:00:00+08:00",
+                    "--source-url",
+                    f"https://example.test/{month}",
+                    "--statistics-period",
+                    f"2026年{month}月",
+                    "--indicator-name",
+                    "测试产量",
+                    "--indicator-value",
+                    value,
+                    "--unit",
+                    "万台",
+                    "--methodology",
+                    "单月口径",
+                    "--verification-state",
+                    "outer_page_verified",
+                    "--domain",
+                    "autos",
+                ],
+                self.context,
+            )
+            self.assertEqual(exit_code, 0, payload)
+            self.assertTrue(json_output)
+            self.assert_envelope(payload, "research.evidence_store")
+
+        timeline, exit_code, json_output = run(
+            [
+                "--json",
+                "research",
+                "evidence-timeline",
+                "--domain",
+                "autos",
+                "--indicator-name",
+                "测试产量",
+                "--unit",
+                "万台",
+            ],
+            self.context,
+        )
+        plan, plan_exit_code, plan_json_output = run(
+            [
+                "--json",
+                "research",
+                "evidence-refresh-plan",
+                "--domain",
+                "autos",
+                "--indicator-name",
+                "测试产量",
+                "--unit",
+                "万台",
+                "--through-period",
+                "2026年10月",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0, timeline)
+        self.assertTrue(json_output)
+        self.assert_envelope(timeline, "research.evidence_timeline")
+        self.assertEqual(
+            timeline["data"]["current_research_use"]["state"],
+            "used_in_persisted_timeline",
+        )
+        self.assertEqual(plan_exit_code, 0, plan)
+        self.assertTrue(plan_json_output)
+        self.assert_envelope(plan, "research.evidence_refresh_plan")
+        self.assertEqual(
+            plan["data"]["new_periods_to_fetch"],
+            ["2026年8月", "2026年9月", "2026年10月"],
+        )
+        self.assertEqual(plan["data"]["revision_check_periods"], [
+            "2026年3月",
+            "2026年4月",
+            "2026年5月",
+            "2026年6月",
+            "2026年7月",
+        ])
+
     def test_research_panorama_uses_month_and_quarter_market_windows(self) -> None:
         terminal = AuthenticatedTerminalRequest(
             id=21,

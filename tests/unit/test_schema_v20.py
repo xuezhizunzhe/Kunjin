@@ -68,8 +68,8 @@ def test_v20_replaces_only_the_news_attempt_time_guard_and_preserves_bytes(
             connection.execute("SELECT CAST(error_message AS BLOB) FROM sync_runs").fetchone()[0]
         )
 
-    assert SCHEMA_VERSION == 22
-    assert versions == tuple(range(1, 23))
+    assert SCHEMA_VERSION == 23
+    assert versions == tuple(range(1, 24))
     assert "julianday(started_at, '-1 second')" in guard
     assert "julianday(finished_at, '+1 second')" in guard
     assert "finished_at <= NEW.retrieved_at" not in guard
@@ -100,7 +100,7 @@ def test_v20_rebuilds_only_an_empty_known_v19_intelligence_namespace(
         rebuilt = connection.execute(
             "SELECT type FROM sqlite_master WHERE name='intelligence_snapshot_item_uses'"
         ).fetchone()
-    assert versions == tuple(range(1, 23))
+    assert versions == tuple(range(1, 24))
     assert rebuilt["type"] == "table"
 
 
