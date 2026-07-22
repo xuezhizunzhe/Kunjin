@@ -194,8 +194,8 @@ def test_v22_is_additive_and_preserves_v21_bytes(tmp_path: Path) -> None:
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='held_review_official_check_closures'"
         ).fetchone()
-    assert SCHEMA_VERSION == 24
-    assert versions == tuple(range(1, 25))
+    assert SCHEMA_VERSION == 25
+    assert versions == tuple(range(1, 26))
     assert table is not None
     assert _legacy_bytes(repository) == before
 

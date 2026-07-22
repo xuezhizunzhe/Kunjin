@@ -32,7 +32,7 @@ def test_v23_adds_public_research_evidence_without_rewriting_existing_rows(tmp_p
         ).fetchone()
         legacy_row = connection.execute("SELECT source FROM sync_runs").fetchone()
 
-    assert SCHEMA_VERSION == 24
-    assert versions == tuple(range(1, 25))
+    assert SCHEMA_VERSION == 25
+    assert versions == tuple(range(1, 26))
     assert evidence_table is not None
     assert legacy_row["source"] == "legacy"

@@ -165,7 +165,7 @@ class SchemaV8Test(unittest.TestCase):
                 "PRAGMA table_info(suitability_assessments)"
             ).fetchall()
 
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 25)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 26)))
         self.assertEqual(
             [str(row["name"]) for row in policy_columns],
             [
@@ -220,7 +220,7 @@ class SchemaV8Test(unittest.TestCase):
                 ).fetchall()
             }
 
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 25)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 26)))
         self.assertEqual(
             dict(profile),
             {"version": 1, "encrypted_payload": "profile-ciphertext"},
@@ -269,7 +269,7 @@ class SchemaV8Test(unittest.TestCase):
             versions = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 25)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 26)))
         self.assertIn("suitability_assessments", repository.table_names())
 
     def test_assessment_foreign_keys_restrict_profile_and_policy_deletion(self) -> None:

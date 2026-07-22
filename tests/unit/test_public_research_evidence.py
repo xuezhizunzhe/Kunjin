@@ -279,22 +279,46 @@ def test_event_sources_cluster_without_upgrading_media_claims(tmp_path) -> None:
         },
     )
     assert lead["storage_state"] == "stored"
-    media_lead = persist_verified_event(
+    media_report = persist_verified_event(
         repository,
         {
             **event,
             "source_name": "财经媒体",
             "publisher": "财经媒体",
             "source_kind": "media",
+            "title": "盘后报道：电力板块走强",
             "original_url": "https://media.example.test/market",
         },
     )
-    assert media_lead["storage_state"] == "stored"
+    assert media_report["storage_state"] == "stored"
+    second_media_report = persist_verified_event(
+        repository,
+        {
+            **event,
+            "source_name": "第二财经媒体",
+            "publisher": "第二财经媒体",
+            "source_kind": "media",
+            "title": "另一标题：电力板块午后走强",
+            "original_url": "https://second-media.example.test/market",
+        },
+    )
+    assert second_media_report["storage_state"] == "stored"
     timeline = build_persisted_event_timeline(repository, "power_energy")
     leads = [
         source for source in timeline["events"][0]["sources"] if source["evidence_state"] == "lead"
     ]
-    assert {source["publisher"] for source in leads} == {"百家号", "财经媒体"}
+    reports = [
+        source
+        for source in timeline["events"][0]["sources"]
+        if source["evidence_state"] == "reported_fact"
+    ]
+    assert {source["publisher"] for source in leads} == {"百家号"}
+    assert {source["publisher"] for source in reports} == {"财经媒体", "第二财经媒体"}
+    assert reports[0]["source_kind"] == "media"
+    assert reports[0]["source_tier"] == "tier_2"
+    assert timeline["events"][0]["reported_facts"] == ["行情页面记录电力板块盘中异动。"]
+    assert timeline["events"][0]["direct_fact_source_count"] == 2
+    assert timeline["events"][0]["reported_fact_source_count"] == 2
 
 
 def test_event_duplicate_and_comparable_fact_conflict_remain_explicit(tmp_path) -> None:

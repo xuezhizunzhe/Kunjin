@@ -20,7 +20,7 @@ _SOURCE_KINDS = _FACT_SOURCE_KINDS | frozenset({"media", "community"})
 def persist_verified_event(
     repository: Repository, material: Mapping[str, object]
 ) -> dict[str, object]:
-    """Store one verified public event; media and community links remain leads."""
+    """Store one verified public event with fact, reported-fact, or lead state."""
 
     if material.get("source_verification_state") != _VERIFIED_STATE:
         raise ValueError("outer page verification is required before persistence")
@@ -36,9 +36,7 @@ def persist_verified_event(
     title = _required_text(material.get("title"), "title")
     fact_summary = _required_text(material.get("fact_summary"), "fact summary")
     claim_boundary = _required_text(material.get("claim_boundary"), "claim boundary")
-    event_key = _optional_text(material.get("event_key"), "event key") or _event_key(
-        domain_id, title, occurred_at or published_at[:10]
-    )
+    event_key = _required_text(material.get("event_key"), "event key")
     if not 16 <= len(event_key) <= 64:
         raise ValueError("event key is invalid")
     fact_key = _optional_text(material.get("event_fact_key"), "event fact key")
@@ -59,9 +57,10 @@ def persist_verified_event(
                 "source_verification_state": _VERIFIED_STATE,
             }
         )
-        if source_kind in _FACT_SOURCE_KINDS
+        if source_kind != "community"
         else "lead"
     )
+    evidence_state = _evidence_state(source_kind)
     record = {
         "event_key": event_key,
         "domain_id": domain_id,
@@ -95,8 +94,9 @@ def persist_verified_event(
                 event_key, domain_id, source_name, publisher, source_kind, source_tier,
                 title, original_url, event_occurred_at, published_at, fact_summary,
                 claim_boundary, event_fact_key, event_fact_value, event_fact_unit,
-                short_excerpt, excerpt_sha256, verification_state, retrieved_at, record_sha256
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                short_excerpt, excerpt_sha256, verification_state, evidence_state, retrieved_at,
+                record_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_key,
@@ -117,6 +117,7 @@ def persist_verified_event(
                 short_excerpt,
                 excerpt_sha256,
                 _VERIFIED_STATE,
+                evidence_state,
                 retrieved_at,
                 record_sha256,
             ),
@@ -151,6 +152,20 @@ def build_persisted_event_timeline(
             for row in sources
             if row["event_fact_key"] is not None
         }
+        facts = sorted(
+            {
+                str(row["fact_summary"])
+                for row in sources
+                if row["evidence_state"] == "fact"
+            }
+        )
+        reported_facts = sorted(
+            {
+                str(row["fact_summary"])
+                for row in sources
+                if row["evidence_state"] == "reported_fact"
+            }
+        )
         events.append(
             {
                 "event_key": event_key,
@@ -158,20 +173,16 @@ def build_persisted_event_timeline(
                     {str(row["event_occurred_at"]) for row in sources if row["event_occurred_at"]}
                 ),
                 "published_at": [str(row["published_at"]) for row in sources],
-                "fact_summaries": sorted(
-                    {
-                        str(row["fact_summary"])
-                        for row in sources
-                        if row["source_tier"] != "lead"
-                    }
-                ),
+                "fact_summaries": facts,
+                "reported_facts": reported_facts,
                 "claim_boundaries": sorted({str(row["claim_boundary"]) for row in sources}),
                 "sources": [
                     {
                         "event_id": int(row["id"]),
                         "publisher": str(row["publisher"]),
                         "source_tier": str(row["source_tier"]),
-                        "evidence_state": "lead" if row["source_tier"] == "lead" else "fact",
+                        "source_kind": str(row["source_kind"]),
+                        "evidence_state": str(row["evidence_state"]),
                         "url": str(row["original_url"]),
                         "published_at": str(row["published_at"]),
                         "retrieved_at": str(row["retrieved_at"]),
@@ -179,6 +190,12 @@ def build_persisted_event_timeline(
                     for row in sources
                 ],
                 "comparable_fact_conflict": len(comparable) > 1,
+                "direct_fact_source_count": sum(
+                    1 for row in sources if row["evidence_state"] == "fact"
+                ),
+                "reported_fact_source_count": sum(
+                    1 for row in sources if row["evidence_state"] == "reported_fact"
+                ),
                 "recent_window_state": (
                     "recent"
                     if any(
@@ -198,8 +215,12 @@ def build_persisted_event_timeline(
     }
 
 
-def _event_key(domain_id: str, title: str, event_date: str) -> str:
-    return hashlib.sha256(f"{domain_id}|{title.casefold()}|{event_date}".encode()).hexdigest()
+def _evidence_state(source_kind: str) -> str:
+    if source_kind == "community":
+        return "lead"
+    if source_kind == "media":
+        return "reported_fact"
+    return "fact"
 
 
 def _sha256(value: Mapping[str, object]) -> str:

@@ -58,8 +58,8 @@ class SchemaV11Test(unittest.TestCase):
                 ).fetchall()
             }
 
-        self.assertEqual(SCHEMA_VERSION, 24)
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 25)))
+        self.assertEqual(SCHEMA_VERSION, 25)
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 26)))
         self.assertIn("landing_url", {row["name"] for row in columns})
         self.assertIn("fund_document_artifact_landing_url_required", triggers)
 
@@ -109,7 +109,7 @@ class SchemaV11Test(unittest.TestCase):
             ).fetchall()
         self.assertEqual(row["url"], "https://www.fund001.com/final.docx")
         self.assertEqual(row["landing_url"], row["url"])
-        self.assertEqual([int(item["version"]) for item in versions], list(range(1, 25)))
+        self.assertEqual([int(item["version"]) for item in versions], list(range(1, 26)))
 
     def test_new_artifact_cannot_omit_or_mutate_landing_url(self) -> None:
         repository = Repository(self.database)

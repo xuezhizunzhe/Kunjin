@@ -56,6 +56,6 @@ def test_v24_adds_public_research_events_without_rewriting_v23_evidence(tmp_path
             "SELECT indicator_value FROM public_research_evidence"
         ).fetchone()["indicator_value"]
 
-    assert SCHEMA_VERSION == 24
+    assert SCHEMA_VERSION == 25
     assert event_table is not None
     assert evidence == "100"

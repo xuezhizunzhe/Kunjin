@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -5221,4 +5221,16 @@ CREATE TABLE public_research_events (
 
 CREATE INDEX public_research_events_cluster_idx
 ON public_research_events(domain_id, event_key, published_at);
+"""
+
+SCHEMA_V25 = """
+ALTER TABLE public_research_events ADD COLUMN evidence_state TEXT NOT NULL DEFAULT 'fact'
+CHECK(evidence_state IN ('fact', 'reported_fact', 'lead'));
+
+UPDATE public_research_events
+SET evidence_state=CASE source_kind
+    WHEN 'community' THEN 'lead'
+    WHEN 'media' THEN 'reported_fact'
+    ELSE 'fact'
+END;
 """

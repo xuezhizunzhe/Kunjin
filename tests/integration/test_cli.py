@@ -1376,23 +1376,23 @@ class CliIntegrationTest(unittest.TestCase):
                 "research",
                 "event-store",
                 "--source-name",
-                "监管公告",
+                "财经媒体",
                 "--publisher",
-                "监管公告",
+                "财经媒体",
                 "--source-kind",
-                "official",
+                "media",
                 "--title",
-                "同日事项公告",
+                "不同标题的盘后报道",
                 "--source-url",
-                "https://www.csrc.gov.cn/event",
+                "https://media.example.test/event",
                 "--published-at",
                 "2026-07-22T11:00:00+08:00",
                 "--event-key",
                 "power-event-2026-07-22",
                 "--fact-summary",
-                "公告页面确认同日相关事项。",
+                "媒体报道同日电力板块异动。",
                 "--claim-boundary",
-                "未将媒体归因写成公告事实。",
+                "媒体归因不作为市场原因事实。",
                 "--verification-state",
                 "outer_page_verified",
                 "--domain",
@@ -1412,6 +1412,7 @@ class CliIntegrationTest(unittest.TestCase):
         self.assert_envelope(timeline, "research.event_timeline")
         self.assertEqual(len(timeline["data"]["events"]), 1)
         self.assertEqual(len(timeline["data"]["events"][0]["sources"]), 2)
+        self.assertEqual(timeline["data"]["events"][0]["reported_fact_source_count"], 1)
 
     def test_research_panorama_uses_month_and_quarter_market_windows(self) -> None:
         terminal = AuthenticatedTerminalRequest(

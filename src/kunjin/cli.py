@@ -957,7 +957,7 @@ def build_parser() -> argparse.ArgumentParser:
     research_event_store.add_argument("--source-url", required=True)
     research_event_store.add_argument("--published-at", required=True)
     research_event_store.add_argument("--event-occurred-at")
-    research_event_store.add_argument("--event-key")
+    research_event_store.add_argument("--event-key", required=True)
     research_event_store.add_argument("--fact-summary", required=True)
     research_event_store.add_argument("--claim-boundary", required=True)
     research_event_store.add_argument("--event-fact-key")

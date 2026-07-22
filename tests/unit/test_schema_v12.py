@@ -203,8 +203,8 @@ class SchemaV12Test(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE name LIKE 'fund_document_%'"
                 ).fetchall()
             }
-        self.assertEqual(SCHEMA_VERSION, 24)
-        self.assertEqual(versions, list(range(1, 25)))
+        self.assertEqual(SCHEMA_VERSION, 25)
+        self.assertEqual(versions, list(range(1, 26)))
         self.assertTrue(expected_tables <= repository.table_names())
         self.assertIn("parse_result_id", columns)
         self.assertTrue(
