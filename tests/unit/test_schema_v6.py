@@ -118,7 +118,7 @@ class SchemaV6Test(unittest.TestCase):
                 "SELECT nav_date, unit_nav FROM fund_nav WHERE fund_code = '519755'"
             ).fetchone()
 
-        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 24)))
+        self.assertEqual([int(row["version"]) for row in versions], list(range(1, 25)))
         self.assertEqual(
             dict(identity),
             {"fund_name": "交银多策略回报灵活配置混合A", "fund_type": "混合型-灵活"},

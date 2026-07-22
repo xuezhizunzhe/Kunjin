@@ -133,6 +133,10 @@ from kunjin.logging import redact_secrets
 from kunjin.models import InvestmentThesis
 from kunjin.paths import RuntimePaths
 from kunjin.portfolio_review import ManualPortfolioPosition, PortfolioReviewService
+from kunjin.public_research.events import (
+    build_persisted_event_timeline,
+    persist_verified_event,
+)
 from kunjin.public_research.evidence import (
     build_persisted_timeline,
     build_refresh_plan,
@@ -941,6 +945,32 @@ def build_parser() -> argparse.ArgumentParser:
     research_evidence_plan.add_argument("--unit", required=True)
     research_evidence_plan.add_argument("--from-period")
     research_evidence_plan.add_argument("--through-period", required=True)
+    research_event_store = research_subparsers.add_parser("event-store")
+    research_event_store.add_argument("--source-name", required=True)
+    research_event_store.add_argument("--publisher")
+    research_event_store.add_argument(
+        "--source-kind",
+        choices=["official", "platform_data", "industry_data", "media", "community"],
+        required=True,
+    )
+    research_event_store.add_argument("--title", required=True)
+    research_event_store.add_argument("--source-url", required=True)
+    research_event_store.add_argument("--published-at", required=True)
+    research_event_store.add_argument("--event-occurred-at")
+    research_event_store.add_argument("--event-key")
+    research_event_store.add_argument("--fact-summary", required=True)
+    research_event_store.add_argument("--claim-boundary", required=True)
+    research_event_store.add_argument("--event-fact-key")
+    research_event_store.add_argument("--event-fact-value")
+    research_event_store.add_argument("--event-fact-unit")
+    research_event_store.add_argument("--short-excerpt")
+    research_event_store.add_argument(
+        "--verification-state", choices=["outer_page_verified"], required=True
+    )
+    research_event_store.add_argument("--domain", required=True)
+    research_event_timeline = research_subparsers.add_parser("event-timeline")
+    research_event_timeline.add_argument("--domain", required=True)
+    research_event_timeline.add_argument("--recent-days", type=int, default=30)
     research_supplement.add_argument("--title", required=True)
     research_supplement.add_argument("--published-at", required=True)
     research_supplement.add_argument("--source-url")
@@ -1273,6 +1303,40 @@ def _research_evidence_refresh_plan_response(
         args.unit,
         args.through_period,
         args.from_period,
+    )
+
+
+def _research_event_store_response(
+    context: ApplicationContext, args: argparse.Namespace
+) -> Dict[str, object]:
+    return persist_verified_event(
+        context.repository,
+        {
+            "source_name": args.source_name,
+            "publisher": args.publisher,
+            "source_kind": args.source_kind,
+            "title": args.title,
+            "original_url": args.source_url,
+            "published_at": args.published_at,
+            "event_occurred_at": args.event_occurred_at,
+            "event_key": args.event_key,
+            "fact_summary": args.fact_summary,
+            "claim_boundary": args.claim_boundary,
+            "event_fact_key": args.event_fact_key,
+            "event_fact_value": args.event_fact_value,
+            "event_fact_unit": args.event_fact_unit,
+            "short_excerpt": args.short_excerpt,
+            "source_verification_state": args.verification_state,
+            "domain_id": args.domain,
+        },
+    )
+
+
+def _research_event_timeline_response(
+    context: ApplicationContext, args: argparse.Namespace
+) -> Dict[str, object]:
+    return build_persisted_event_timeline(
+        context.repository, args.domain, recent_days=args.recent_days
     )
 
 
@@ -3485,6 +3549,18 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         return envelope(
             "research.evidence_refresh_plan",
             _research_evidence_refresh_plan_response(context, args),
+        )
+
+    if args.command == "research" and args.research_command == "event-store":
+        if not args.json_output:
+            raise CliUsageError("research event store requires JSON mode")
+        return envelope("research.event_store", _research_event_store_response(context, args))
+
+    if args.command == "research" and args.research_command == "event-timeline":
+        if not args.json_output:
+            raise CliUsageError("research event timeline requires JSON mode")
+        return envelope(
+            "research.event_timeline", _research_event_timeline_response(context, args)
         )
 
     if args.command == "profile":

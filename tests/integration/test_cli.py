@@ -1341,6 +1341,78 @@ class CliIntegrationTest(unittest.TestCase):
             "2026年7月",
         ])
 
+    def test_research_event_store_clusters_multiple_verified_sources(self) -> None:
+        base = [
+            "--json",
+            "research",
+            "event-store",
+            "--source-name",
+            "行情平台",
+            "--publisher",
+            "行情平台",
+            "--source-kind",
+            "platform_data",
+            "--title",
+            "电力板块异动",
+            "--source-url",
+            "https://example.test/market-event",
+            "--published-at",
+            "2026-07-22T10:30:00+08:00",
+            "--event-key",
+            "power-event-2026-07-22",
+            "--fact-summary",
+            "行情页面记录电力板块异动。",
+            "--claim-boundary",
+            "报道归因不作为市场原因事实。",
+            "--verification-state",
+            "outer_page_verified",
+            "--domain",
+            "power_energy",
+        ]
+        first, first_exit, _ = run(base, self.context)
+        second, second_exit, _ = run(
+            [
+                "--json",
+                "research",
+                "event-store",
+                "--source-name",
+                "监管公告",
+                "--publisher",
+                "监管公告",
+                "--source-kind",
+                "official",
+                "--title",
+                "同日事项公告",
+                "--source-url",
+                "https://www.csrc.gov.cn/event",
+                "--published-at",
+                "2026-07-22T11:00:00+08:00",
+                "--event-key",
+                "power-event-2026-07-22",
+                "--fact-summary",
+                "公告页面确认同日相关事项。",
+                "--claim-boundary",
+                "未将媒体归因写成公告事实。",
+                "--verification-state",
+                "outer_page_verified",
+                "--domain",
+                "power_energy",
+            ],
+            self.context,
+        )
+        timeline, timeline_exit, timeline_json = run(
+            ["--json", "research", "event-timeline", "--domain", "power_energy"],
+            self.context,
+        )
+
+        self.assertEqual(first_exit, 0, first)
+        self.assertEqual(second_exit, 0, second)
+        self.assertEqual(timeline_exit, 0, timeline)
+        self.assertTrue(timeline_json)
+        self.assert_envelope(timeline, "research.event_timeline")
+        self.assertEqual(len(timeline["data"]["events"]), 1)
+        self.assertEqual(len(timeline["data"]["events"][0]["sources"]), 2)
+
     def test_research_panorama_uses_month_and_quarter_market_windows(self) -> None:
         terminal = AuthenticatedTerminalRequest(
             id=21,

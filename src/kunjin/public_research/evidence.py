@@ -95,7 +95,7 @@ def persist_verified_evidence(
 
         revision = connection.execute(
             """
-            SELECT id FROM public_research_evidence
+            SELECT id, published_at FROM public_research_evidence
             WHERE domain_id=? AND indicator_name=? AND unit=? AND statistics_period=?
               AND original_url=? AND source_name=?
               AND id NOT IN (
@@ -113,6 +113,12 @@ def persist_verified_evidence(
                 source_name,
             ),
         ).fetchone()
+        revision_id = (
+            int(revision["id"])
+            if revision is not None
+            and _published_before(str(revision["published_at"]), published_at)
+            else None
+        )
         cursor = connection.execute(
             """
             INSERT INTO public_research_evidence(
@@ -139,7 +145,7 @@ def persist_verified_evidence(
                 short_excerpt,
                 excerpt_sha256,
                 _VERIFIED_STATE,
-                None if revision is None else int(revision["id"]),
+                revision_id,
                 retrieved_at,
                 record_sha256,
             ),
@@ -148,7 +154,7 @@ def persist_verified_evidence(
     return {
         "storage_state": "stored",
         "evidence_id": evidence_id,
-        "revision_of_evidence_id": None if revision is None else int(revision["id"]),
+        "revision_of_evidence_id": revision_id,
         "record_sha256": record_sha256,
         "retrieved_at": retrieved_at,
     }
@@ -221,9 +227,9 @@ def build_refresh_plan(
     if requested is None:
         raise ValueError("refresh through period is not comparable")
     requested_start = requested if from_period is None else _timeline_period(from_period)
-    if requested_start is None or requested_start[:2] != requested[:2]:
+    if requested_start is None or requested_start[1] != requested[1]:
         raise ValueError("refresh start period does not match requested timeline")
-    if requested_start[2] > requested[2]:
+    if requested_start > requested:
         raise ValueError("refresh start period is after requested timeline")
     rows = _current_rows(repository, domain_id, indicator_name, unit)
     periods = sorted({str(row["statistics_period"]) for row in rows}, key=_period_sort_key)
@@ -231,25 +237,24 @@ def build_refresh_plan(
     if any(period is None for period in parsed):
         raise ValueError("stored evidence statistics period is not comparable")
     comparable = [period for period in parsed if period is not None]
-    if comparable and any(period[:2] != requested[:2] for period in comparable):
+    if comparable and any(period[1] != requested[1] for period in comparable):
         raise ValueError("refresh period does not match stored timeline granularity")
 
     if comparable:
-        first_index = min(requested_start[2], min(period[2] for period in comparable))
-        covered_indexes = {period[2] for period in comparable}
-        upper_index = requested[2]
+        first_period = min(requested_start, min(comparable))
+        covered_indexes = set(comparable)
         new_periods = [
-            _format_period(requested[0], requested[1], index)
-            for index in range(first_index, upper_index + 1)
-            if index not in covered_indexes
+            _format_period(year, kind, index)
+            for year, kind, index in _period_range(first_period, requested)
+            if (year, kind, index) not in covered_indexes
         ]
         revision_periods = [
             period for period in periods if _period_sort_key(period) < requested
         ]
     else:
         new_periods = [
-            _format_period(requested[0], requested[1], index)
-            for index in range(requested_start[2], requested[2] + 1)
+            _format_period(year, kind, index)
+            for year, kind, index in _period_range(requested_start, requested)
         ]
         revision_periods = []
 
@@ -367,6 +372,31 @@ def _period_sort_key(value: str) -> tuple[int, int, int]:
 
 def _format_period(year: int, kind: int, index: int) -> str:
     return f"{year}年{index}月" if kind == 1 else f"{year}年第{index}季度"
+
+
+def _period_range(
+    start: tuple[int, int, int], end: tuple[int, int, int]
+) -> list[tuple[int, int, int]]:
+    if start[1] != end[1] or start > end:
+        raise ValueError("statistics period range is invalid")
+    maximum = 12 if start[1] == 1 else 4
+    result = []
+    year, kind, index = start
+    while (year, kind, index) <= end:
+        result.append((year, kind, index))
+        if index == maximum:
+            year, index = year + 1, 1
+        else:
+            index += 1
+    return result
+
+
+def _published_before(previous: str, candidate: str) -> bool:
+    """Compare normalized instants, not ISO text with potentially different offsets."""
+
+    return datetime.fromisoformat(previous.replace("Z", "+00:00")) < datetime.fromisoformat(
+        candidate.replace("Z", "+00:00")
+    )
 
 
 def _sha256(value: Mapping[str, object]) -> str:

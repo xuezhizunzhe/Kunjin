@@ -50,6 +50,7 @@ from kunjin.storage.schema import (
     SCHEMA_V21,
     SCHEMA_V22,
     SCHEMA_V23,
+    SCHEMA_V24,
     SCHEMA_VERSION,
 )
 from kunjin.suitability.models import AssessmentStatus, BlockReason, ConstraintReason
@@ -245,6 +246,7 @@ def _migration_definitions() -> Tuple[Tuple[int, str], ...]:
         (21, SCHEMA_V21),
         (22, SCHEMA_V22),
         (23, SCHEMA_V23),
+        (24, SCHEMA_V24),
     )
 
 

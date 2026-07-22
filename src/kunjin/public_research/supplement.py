@@ -27,6 +27,18 @@ _DOMAIN_IDS = frozenset(
 _MAX_TEXT = 1_000
 _MONTH_PERIOD = re.compile(r"^(?P<year>20\d{2})年(?P<month>1[0-2]|[1-9])月$")
 _QUARTER_PERIOD = re.compile(r"^(?P<year>20\d{2})年第(?P<quarter>[1-4])季度$")
+_OFFICIAL_AUTHORITY_DOMAINS = frozenset(
+    {
+        "gov.cn",
+        "csrc.gov.cn",
+        "pbc.gov.cn",
+        "safe.gov.cn",
+        "sse.com.cn",
+        "szse.cn",
+        "bse.cn",
+        "cninfo.com.cn",
+    }
+)
 
 
 def summarize_user_supplied_evidence(value: Mapping[str, object]) -> dict[str, object]:
@@ -472,12 +484,15 @@ def _is_verified_official_material(material: Mapping[str, str | None]) -> bool:
     if material["source_kind"] != "official" or material["original_url"] is None:
         return False
     host = (urlparse(material["original_url"]).hostname or "").casefold()
-    return host == "gov.cn" or host.endswith(".gov.cn")
+    return any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in _OFFICIAL_AUTHORITY_DOMAINS
+    )
 
 
 def _source_level(material: Mapping[str, str | None]) -> str:
     if material["source_verification_state"] == "outer_page_verified":
-        return "tier_1" if material["source_kind"] == "official" else "tier_2"
+        return "tier_1" if _is_verified_official_material(material) else "tier_2"
     if _is_verified_official_material(material):
         return "provisional_tier_1"
     return "provisional_tier_2"

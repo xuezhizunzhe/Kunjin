@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -5186,4 +5186,39 @@ ON public_research_evidence(domain_id, indicator_name, unit, statistics_period);
 
 CREATE INDEX public_research_evidence_source_idx
 ON public_research_evidence(original_url, published_at);
+"""
+
+SCHEMA_V24 = """
+CREATE TABLE public_research_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL CHECK(length(event_key) BETWEEN 16 AND 64),
+    domain_id TEXT NOT NULL CHECK(length(domain_id) BETWEEN 1 AND 64),
+    source_name TEXT NOT NULL CHECK(length(source_name) BETWEEN 1 AND 256),
+    publisher TEXT NOT NULL CHECK(length(publisher) BETWEEN 1 AND 256),
+    source_kind TEXT NOT NULL CHECK(source_kind IN (
+        'official', 'platform_data', 'industry_data', 'media', 'community'
+    )),
+    source_tier TEXT NOT NULL CHECK(source_tier IN ('tier_1', 'tier_2', 'lead')),
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 1000),
+    original_url TEXT NOT NULL CHECK(original_url GLOB 'https://*'),
+    event_occurred_at TEXT,
+    published_at TEXT NOT NULL,
+    fact_summary TEXT NOT NULL CHECK(length(fact_summary) BETWEEN 1 AND 1000),
+    claim_boundary TEXT NOT NULL CHECK(length(claim_boundary) BETWEEN 1 AND 1000),
+    event_fact_key TEXT CHECK(event_fact_key IS NULL OR length(event_fact_key) <= 256),
+    event_fact_value TEXT CHECK(event_fact_value IS NULL OR length(event_fact_value) <= 256),
+    event_fact_unit TEXT CHECK(event_fact_unit IS NULL OR length(event_fact_unit) <= 128),
+    short_excerpt TEXT CHECK(short_excerpt IS NULL OR length(short_excerpt) <= 1000),
+    excerpt_sha256 TEXT NOT NULL CHECK(
+        length(excerpt_sha256) = 64 AND excerpt_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    verification_state TEXT NOT NULL CHECK(verification_state = 'outer_page_verified'),
+    retrieved_at TEXT NOT NULL,
+    record_sha256 TEXT NOT NULL UNIQUE CHECK(
+        length(record_sha256) = 64 AND record_sha256 NOT GLOB '*[^0-9a-f]*'
+    )
+);
+
+CREATE INDEX public_research_events_cluster_idx
+ON public_research_events(domain_id, event_key, published_at);
 """

@@ -96,8 +96,8 @@ def test_v16_migration_is_additive_and_preserves_prior_bytes(
         after = bytes(
             connection.execute("SELECT CAST(error_message AS BLOB) FROM sync_runs").fetchone()[0]
         )
-    assert SCHEMA_VERSION == 23
-    assert versions == tuple(range(1, 24))
+    assert SCHEMA_VERSION == 24
+    assert versions == tuple(range(1, 25))
     assert after == before
 
 
@@ -213,7 +213,7 @@ def test_v17_adds_bounded_corporate_action_state_and_preserves_nav_rows(
         assert row["source_attempt_id"] is None
         assert "corporate_action_state" in columns
         assert "source_attempt_id" in columns
-        assert versions == tuple(range(1, 24))
+        assert versions == tuple(range(1, 25))
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """
