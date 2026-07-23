@@ -431,6 +431,27 @@ class FundHoldingParserTest(unittest.TestCase):
         self.assertEqual(holding.shares, Decimal("123000"))
         self.assertEqual(holding.market_value, Decimal("4567000"))
 
+    def test_dynamic_top_ten_parser_keeps_one_complete_table_group(self) -> None:
+        base = response("quarterly_holdings.html", "FundArchivesDatas.aspx?type=jjcc")
+        content = """
+          <h4>2026年2季度股票投资明细</h4>
+          <table><tr><th>序号</th><th>股票代码</th><th>股票名称</th><th>占净值比例</th></tr>
+          <tr><td>1</td><td>000001</td><td>甲公司</td><td>6.25%</td></tr></table>
+          <table><tr><th>序号</th><th>股票代码</th><th>股票名称</th><th>占净值比例</th></tr>
+          <tr><td>1</td><td>000002</td><td>乙公司</td><td>5.25%</td></tr></table>
+        """
+        wrapped = "var apidata={content:" + json.dumps(content, ensure_ascii=False) + "};"
+
+        section = parse_quarterly_holdings(
+            TextResponse(**{**base.__dict__, "text": wrapped}), "519755"
+        )
+
+        self.assertEqual(
+            [(item.rank, item.security_code) for item in section.records],
+            [(1, "000001")],
+        )
+        self.assertIn("multiple_top10_table_groups", section.warnings)
+
     def test_parses_realistic_industry_json_without_guessing_standard_version(self) -> None:
         base = response("industry_exposure.html", "f10/HYPZ/?fundCode=519755&year=2026")
         payload = json.dumps(

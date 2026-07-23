@@ -888,6 +888,36 @@ def test_tier2_source_requires_registered_eastmoney_identity() -> None:
         assert not any(fact.field_id == "identity_active_status" for fact in result.facts)
 
 
+def test_tier2_quarterly_holdings_query_projects_as_partial_disclosure() -> None:
+    from kunjin.brief.d2 import _validated_holdings_fact
+
+    bundle = _rapid_bundle()
+    holding_source = replace(
+        bundle.source_documents[5],
+        url=(
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?"
+            "type=jjcc&code=519755&topline=10&year=&month="
+        ),
+    )
+    result = build_source_linked_facts(
+        replace(bundle, source_documents={**bundle.source_documents, 5: holding_source}),
+        AS_OF,
+        action_ids=("fact_research", "continue_holding"),
+    )
+
+    holding_fact = next(item for item in result.facts if item.field_id == "holdings_industries")
+    assert holding_fact.source_tier.value == "tier_2"
+    assert holding_fact.completeness.value == "partial"
+    assert holding_fact.freshness.value == "dated_history"
+    assert holding_fact.canonical_url == "https://fundf10.eastmoney.com/ccmx_519755.html"
+    records, _fact, issue, conflict = _validated_holdings_fact(
+        "519755", result.facts, AS_OF
+    )
+    assert len(records) == 1
+    assert issue is None
+    assert conflict is False
+
+
 def test_tier1_disclosure_requires_same_registered_identity_manager() -> None:
     bundle = _official_announcement_bundle(f"{PRODUCT_NAME}清算报告")
     mismatched = replace(

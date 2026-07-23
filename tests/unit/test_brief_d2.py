@@ -1419,6 +1419,30 @@ def test_invalid_holdings_are_omitted_and_never_zero_filled() -> None:
         assert "holdings_industries_200001" in result.holdings_coverage.unknown_fields
 
 
+def test_dated_tier2_top_ten_disclosure_remains_observed_partial_coverage() -> None:
+    dated = replace(
+        _holding_fact(
+            "200001",
+            items=(_holding_item("600000", "浦发银行", "2"),),
+        ),
+        freshness=EvidenceFreshness.DATED_HISTORY,
+    )
+    result = _build(
+        "100001",
+        (_position("100001", "50"), _position("200001", "50")),
+        {
+            "100001": _facts("100001", company="甲", manager="甲", benchmark="甲")
+            + (_holding_fact("100001", items=(_holding_item("600000", "浦发银行", "5"),)),),
+            "200001": _facts("200001", company="乙", manager="乙", benchmark="乙")
+            + (dated,),
+        },
+    )
+
+    assert result.holdings_coverage.evidence_state is BriefEvidenceState.PARTIAL
+    assert result.holdings_coverage.included_fund_codes == ("100001", "200001")
+    assert "holdings_evidence_stale_200001" not in result.missing_fields
+
+
 def test_identity_conflict_blocks_holdings_overlap_even_with_valid_disclosure() -> None:
     target = _facts("100001", company="甲", manager="甲", benchmark="甲") + (
         _holding_fact(

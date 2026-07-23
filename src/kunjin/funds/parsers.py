@@ -901,6 +901,7 @@ def parse_quarterly_holdings(
             ("name", ("股票名称", "证券名称")),
             ("weight", ("占净值比例", "占基金净值比")),
         )
+        table_groups: List[Tuple[object, ...]] = []
         for table in parse_tables(content, response.final_url):
             try:
                 indexes = _required_indexes(table.headers, dynamic_definitions)
@@ -912,6 +913,7 @@ def parse_quarterly_holdings(
             value_index = _header_index(
                 table.headers, ("持仓市值（万元）", "持仓市值(万元)", "持仓市值万元")
             )
+            table_records: List[object] = []
             for row in table.rows:
                 if max(indexes.values()) >= len(row):
                     raise FundParseError("malformed_quarterly_holding")
@@ -943,14 +945,22 @@ def parse_quarterly_holdings(
                     record.validate()
                 except (IndexError, InvalidOperation, ValueError) as exc:
                     raise FundParseError("malformed_quarterly_holding") from exc
-                records.append(record)
-        if records:
+                table_records.append(record)
+            if table_records:
+                table_groups.append(tuple(table_records))
+        if table_groups:
+            # The dynamic endpoint can embed more than one visually identical Top10
+            # table. They are not comparable without an explicit table-level label.
+            records = list(table_groups[0])
+            warnings = ["publication_date_requires_announcement_match"]
+            if len(table_groups) > 1:
+                warnings.append("multiple_top10_table_groups")
             return ParsedSection(
                 DocumentKind.QUARTERLY_HOLDINGS.value,
                 source,
                 tuple(records),
                 "success",
-                warnings=("publication_date_requires_announcement_match",),
+                warnings=tuple(warnings),
             )
     definitions = (
         ("report_period", ("报告期", "报告日期", "截止日期")),

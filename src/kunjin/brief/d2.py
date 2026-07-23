@@ -1176,7 +1176,18 @@ def _validated_holdings_fact(
     fact = selected[0]
     if fact.retrieved_at > as_of:
         return (), None, f"holdings_evidence_future_{fund_code}", True
-    if fact.freshness is not EvidenceFreshness.CURRENT:
+    if fact.freshness not in {
+        EvidenceFreshness.CURRENT,
+        EvidenceFreshness.DATED_HISTORY,
+    }:
+        return (), None, f"holdings_evidence_stale_{fund_code}", False
+    if (
+        fact.freshness is EvidenceFreshness.DATED_HISTORY
+        and (
+            fact.source_tier is not SourceTier.TIER_2
+            or fact.completeness is not EvidenceCompleteness.PARTIAL
+        )
+    ):
         return (), None, f"holdings_evidence_stale_{fund_code}", False
     if fact.conflict_ids:
         return (), None, f"holdings_evidence_conflict_{fund_code}", True

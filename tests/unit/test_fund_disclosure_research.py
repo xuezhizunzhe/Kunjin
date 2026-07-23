@@ -153,6 +153,31 @@ def complete_bundle() -> DisclosureBundle:
     )
 
 
+def test_holdings_report_does_not_merge_repeated_top_ten_ranks() -> None:
+    bundle = complete_bundle()
+    duplicate_group = FundHolding(
+        "519755",
+        date(2026, 6, 30),
+        datetime(2026, 7, 8, tzinfo=timezone.utc),
+        1,
+        "000001",
+        "另一组持仓",
+        AssetType.STOCK,
+        Decimal("4.20"),
+        "top10",
+        5,
+    )
+
+    report = build_disclosure_report(
+        replace(bundle, holdings=(*bundle.holdings, duplicate_group)), AS_OF
+    )
+
+    assert [(item["rank"], item["security_name"]) for item in report["holdings"]["items"]] == [
+        (1, "浦发银行")
+    ]
+    assert "multiple_top10_table_groups" in report["warnings"]
+
+
 class FundDisclosureResearchTest(unittest.TestCase):
     def test_complete_active_fund_has_sourced_verified_report(self) -> None:
         result = build_disclosure_report(complete_bundle(), AS_OF)

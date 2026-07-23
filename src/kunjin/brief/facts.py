@@ -122,6 +122,33 @@ def _registered_tier2_source(document: SourceDocument) -> bool:
     )
 
 
+def _tier2_canonical_url(document: SourceDocument) -> str:
+    """Expose known structured endpoints through stable public display URLs."""
+    parsed = urlparse(document.url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    values = dict(query)
+    if len(values) != len(query):
+        raise ValueError("Tier 2 source query contains duplicate fields")
+    if (
+        document.document_kind.value == "quarterly_holdings"
+        and host == "fundf10.eastmoney.com"
+        and parsed.path == "/FundArchivesDatas.aspx"
+        and values.get("type") == "jjcc"
+        and values.get("code") == document.fund_code
+    ):
+        return f"https://fundf10.eastmoney.com/ccmx_{document.fund_code}.html"
+    if (
+        document.document_kind.value == "industry_exposure"
+        and host == "api.fund.eastmoney.com"
+        and parsed.path == "/f10/HYPZ/"
+        and values.get("fundCode") == document.fund_code
+        and set(values).issubset({"fundCode", "year"})
+    ):
+        return f"https://fundf10.eastmoney.com/hytz_{document.fund_code}.html"
+    return document.url
+
+
 def _announcement_integrity_window_seconds() -> int:
     registry = SourceRegistryV1()
     for source in registry.sources:
@@ -301,7 +328,7 @@ def _source_from_document(
         source_id,
         tier,
         document.publisher,
-        document.url,
+        _tier2_canonical_url(document) if tier is SourceTier.TIER_2 else document.url,
         published_at,
         retrieved_at,
         f"disclosure_document_{document.id}",
@@ -736,11 +763,11 @@ def _project_disclosure(
     for index, (source_document_id, items) in enumerate(sorted(grouped.items()), start=1):
         projected_items = tuple(
             {
-                "rank": item["rank"],
+                "rank": str(item["rank"]),
                 "security_code": item["security_code"],
                 "security_name": item["security_name"],
                 "asset_class": item["asset_type"],
-                "disclosed_weight": item["weight"],
+                "disclosed_weight": canonical_decimal(Decimal(str(item["weight"]))),
             }
             for item in items
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,7 +14,12 @@ from kunjin.diagnosis import (
     project_diagnosis_relationship,
 )
 from kunjin.diagnosis.models import PortfolioDiagnosis
-from kunjin.diagnosis.service import DiagnosisService
+from kunjin.diagnosis.service import (
+    DiagnosisService,
+    _aggregate_d2_coverage,
+    _observed_holdings_coverage,
+    _preferred_d2_result,
+)
 from kunjin.funds.store import FundDisclosureStore
 from kunjin.models import AccountObservation, PositionObservation
 from kunjin.storage.repository import Repository
@@ -80,6 +86,85 @@ def test_public_relationship_projection_preserves_bounded_d2_evidence() -> None:
     assert result.evidence_state == "complete"
     assert result.metrics == (("manager_name", "Example Manager"),)
     assert result.report_periods == (date(2026, 3, 31),)
+
+
+def test_diagnosis_prefers_d2_projection_with_more_disclosed_portfolio_weight() -> None:
+    lower = SimpleNamespace(
+        holdings_coverage=SimpleNamespace(included_fund_codes=("000001",)),
+        coverage=SimpleNamespace(included_fund_codes=("000001", "000002")),
+    )
+    higher = SimpleNamespace(
+        holdings_coverage=SimpleNamespace(included_fund_codes=("000002",)),
+        coverage=SimpleNamespace(included_fund_codes=("000002",)),
+    )
+
+    selected = _preferred_d2_result(
+        (lower, higher),
+        {"000001": Decimal("0.2"), "000002": Decimal("0.8")},
+    )
+
+    assert selected is higher
+
+
+def test_diagnosis_aggregates_disclosed_coverage_from_bounded_d2_views() -> None:
+    first = SimpleNamespace(
+        holdings_coverage=SimpleNamespace(
+            scope="disclosed_holdings_overlap",
+            evidence_state=BriefEvidenceState.PARTIAL,
+            included_fund_codes=("000001",),
+            omitted_fund_codes=("000002",),
+            unknown_fields=("holdings_industries_000002",),
+        )
+    )
+    second = SimpleNamespace(
+        holdings_coverage=SimpleNamespace(
+            scope="disclosed_holdings_overlap",
+            evidence_state=BriefEvidenceState.PARTIAL,
+            included_fund_codes=("000002",),
+            omitted_fund_codes=("000001",),
+            unknown_fields=("holdings_industries_000001",),
+        )
+    )
+
+    result = _aggregate_d2_coverage(
+        (first, second),
+        "holdings_coverage",
+        {"000001": Decimal("0.2"), "000002": Decimal("0.8")},
+    )
+
+    assert result.evidence_state == "partial"
+    assert result.included_fund_codes == ("000001", "000002")
+    assert result.omitted_fund_codes == ()
+    assert result.known_weight == Decimal("1")
+
+
+def test_observed_holdings_coverage_keeps_dated_tier2_disclosure_partial(monkeypatch) -> None:
+    from kunjin.diagnosis import service as service_module
+
+    marker = object()
+    facts = {
+        "000001": SimpleNamespace(facts=(marker,)),
+        "000002": SimpleNamespace(facts=()),
+    }
+
+    def validate(code, _facts, _as_of):
+        if code == "000001":
+            return (object(),), None, None, False
+        return (), None, "holdings_evidence_missing_000002", False
+
+    monkeypatch.setattr(service_module, "_validated_holdings_fact", validate)
+    result = _observed_holdings_coverage(
+        facts,
+        ("000001", "000002"),
+        ("000001",),
+        {"000001": Decimal("0.7"), "000002": Decimal("0.3")},
+        NOW,
+    )
+
+    assert result.evidence_state == "partial"
+    assert result.included_fund_codes == ("000001",)
+    assert result.omitted_fund_codes == ("000002",)
+    assert result.known_weight == Decimal("0.7")
 
 
 def test_empty_portfolio_returns_authenticated_insufficient_diagnosis(

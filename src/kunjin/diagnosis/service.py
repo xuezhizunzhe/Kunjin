@@ -8,7 +8,11 @@ from decimal import Decimal
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from kunjin.analytics.portfolio import analyze_portfolio
-from kunjin.brief.d2 import PortfolioEvidenceBinding, build_d2_relationships
+from kunjin.brief.d2 import (
+    PortfolioEvidenceBinding,
+    _validated_holdings_fact,
+    build_d2_relationships,
+)
 from kunjin.brief.facts import SourceLinkedFactSet, build_source_linked_facts
 from kunjin.brief.models import BriefCoverage, RelationshipEvidence
 from kunjin.decision.budget import RequestBudget
@@ -123,6 +127,100 @@ def _coverage(
         omitted_fund_codes=tuple(sorted(source.omitted_fund_codes)),
         unknown_fields=tuple(sorted(source.unknown_fields)),
         known_weight=known_weight,
+    )
+    result.validate()
+    return result
+
+
+def _preferred_d2_result(results: Sequence[object], weights: Mapping[str, Decimal]) -> object:
+    """Prefer the bounded D2 view with the most observed portfolio disclosure."""
+    if not results:
+        raise ValueError("diagnosis requires at least one D2 result")
+
+    def score(result: object) -> tuple[Decimal, int, int]:
+        holdings = getattr(result, "holdings_coverage")
+        relationship = getattr(result, "coverage")
+        included = getattr(holdings, "included_fund_codes")
+        relationship_included = getattr(relationship, "included_fund_codes")
+        return (
+            sum((weights.get(code, Decimal("0")) for code in included), Decimal("0")),
+            len(included),
+            len(relationship_included),
+        )
+
+    return max(results, key=score)
+
+
+def _aggregate_d2_coverage(
+    results: Sequence[object], attribute: str, weights: Mapping[str, Decimal]
+) -> DiagnosisCoverage:
+    """Aggregate bounded per-target D2 coverage for one unchanged portfolio snapshot."""
+    if not results:
+        raise ValueError("diagnosis requires at least one D2 result")
+    values = [getattr(result, attribute) for result in results]
+    scope = values[0].scope
+    if any(value.scope != scope for value in values):
+        raise ValueError("D2 coverage scopes drifted")
+    included = set().union(*(set(value.included_fund_codes) for value in values))
+    universe = set().union(
+        *(set(value.included_fund_codes) | set(value.omitted_fund_codes) for value in values)
+    )
+    omitted = universe - included
+    unknown = set().union(*(set(value.unknown_fields) for value in values))
+    if not included:
+        state = "insufficient_data"
+    elif (
+        omitted
+        or unknown
+        or any(value.evidence_state.value != "complete" for value in values)
+    ):
+        state = "partial"
+    else:
+        state = "complete"
+    result = DiagnosisCoverage(
+        scope=scope,
+        evidence_state=state,
+        included_fund_codes=tuple(sorted(included)),
+        omitted_fund_codes=tuple(sorted(omitted)),
+        unknown_fields=tuple(sorted(unknown)),
+        known_weight=sum((weights.get(code, Decimal("0")) for code in included), Decimal("0")),
+    )
+    result.validate()
+    return result
+
+
+def _observed_holdings_coverage(
+    facts_by_code: Mapping[str, SourceLinkedFactSet],
+    portfolio_codes: Sequence[str],
+    permitted_codes: Sequence[str],
+    weights: Mapping[str, Decimal],
+    as_of: datetime,
+) -> DiagnosisCoverage:
+    """Separate available dated disclosures from the bounded pairwise-overlap budget."""
+    eligible = tuple(sorted(portfolio_codes))
+    permitted = set(permitted_codes)
+    included = set()
+    unknown = {f"holdings_industries_{code}" for code in eligible}
+    for code in eligible:
+        if code not in permitted:
+            continue
+        fact_set = facts_by_code.get(code)
+        if fact_set is None:
+            continue
+        records, _fact, issue, _conflict = _validated_holdings_fact(
+            code, fact_set.facts, as_of
+        )
+        if records and issue is None:
+            included.add(code)
+            unknown.discard(f"holdings_industries_{code}")
+    omitted = set(eligible) - included
+    result = DiagnosisCoverage(
+        scope="disclosed_holdings_overlap",
+        evidence_state="partial" if included else "insufficient_data",
+        included_fund_codes=tuple(sorted(included)),
+        omitted_fund_codes=tuple(sorted(omitted)),
+        unknown_fields=tuple(sorted(unknown)),
+        known_weight=sum((weights.get(code, Decimal("0")) for code in included), Decimal("0")),
     )
     result.validate()
     return result
@@ -469,9 +567,16 @@ class DiagnosisService:
 
         held_bundles = {code: bundles[code] for code in held_codes}
         overlap_report = build_portfolio_overlap_report(held_bundles, positions, as_of)
-        primary = d2_results[0]
-        relationship_coverage = _coverage(primary.coverage, analysis.weights)
-        holdings_coverage = _coverage(primary.holdings_coverage, analysis.weights)
+        relationship_coverage = _aggregate_d2_coverage(
+            d2_results, "coverage", analysis.weights
+        )
+        holdings_coverage = _observed_holdings_coverage(
+            fact_sets,
+            held_codes,
+            relationship_coverage.included_fund_codes,
+            analysis.weights,
+            as_of,
+        )
 
         candidate_impact = None
         if candidate_fund_code is not None:

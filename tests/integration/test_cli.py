@@ -1164,6 +1164,26 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(payload["data"]["retrieval"]["workflow"], "market_overview")
         self.assertEqual(service.calls, 1)
 
+    def test_research_scan_returns_local_overview_when_intelligence_fails(self) -> None:
+        class FailingIntelligenceService:
+            def market_overview(self, **_kwargs):
+                raise IntelligenceServiceError(7)
+
+        self.context.intelligence_service = FailingIntelligenceService()
+        payload, exit_code, json_output = run(
+            ["--json", "research", "scan", "--window", "recent"], self.context
+        )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "research.scan")
+        self.assertEqual(payload["data"]["retrieval"]["state"], "intelligence_service_failed")
+        self.assertIn(
+            "intelligence_service_failed",
+            payload["data"]["risks_and_unknowns"]["evidence_gaps"],
+        )
+        self.assertTrue(payload["data"]["local_overview"]["outer_discovery"]["outer_discovery_required"])
+
     def test_research_supplement_is_local_and_preliminary_only(self) -> None:
         payload, exit_code, json_output = run(
             [

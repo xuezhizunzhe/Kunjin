@@ -1221,19 +1221,53 @@ def _research_scan_response(
     args: argparse.Namespace,
 ) -> Dict[str, object]:
     from kunjin.intelligence.research import public_intelligence_payload
+    from kunjin.intelligence.service import IntelligenceServiceError
 
     if context.intelligence_service is None:
         raise CliUsageError("intelligence service is unavailable")
     window, start, end = _intelligence_interval_arguments(args)
-    result = context.intelligence_service.market_overview(
-        window=window,
-        mode=args.mode,
-        start=start,
-        end=end,
-    )
+    local_overview = build_local_research_overview(context.repository)
+    try:
+        result = context.intelligence_service.market_overview(
+            window=window,
+            mode=args.mode,
+            start=start,
+            end=end,
+        )
+    except IntelligenceServiceError:
+        now = datetime.now(timezone.utc).isoformat()
+        fallback = {
+            "request": {
+                "workflow": "market_overview",
+                "finished_at": now,
+                "interval": {
+                    "start_at": now,
+                    "end_at": now,
+                    "timezone_name": "Asia/Shanghai",
+                },
+            },
+            "items": [],
+            "experimental_shadow": {
+                "status": "insufficient_data",
+                "market_state": "insufficient_data",
+                "market_direction_status": "insufficient_data",
+                "sector_states": [],
+            },
+            "fund_relevance": {"subject_fund_code": None, "coverage_scope": None},
+            "missing_evidence": ["intelligence_service_failed"],
+            "conflicts": [],
+            "cross_validation": {"complete": False},
+        }
+        scan = scan_public_research(fallback, local_overview=local_overview)
+        retrieval = scan.get("retrieval")
+        if not isinstance(retrieval, dict):
+            raise ValueError("research scan fallback retrieval is invalid")
+        retrieval["state"] = "intelligence_service_failed"
+        retrieval["failed_stage"] = "market_overview"
+        return scan
     return scan_public_research(
         public_intelligence_payload(result),
-        local_overview=build_local_research_overview(context.repository),
+        local_overview=local_overview,
     )
 
 

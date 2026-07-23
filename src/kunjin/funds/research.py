@@ -274,6 +274,17 @@ def _holdings_report(
     period_records = [record for record in bundle.holdings if record.report_period == report_period]
     primary_tier = min(_tier(bundle, record) for record in period_records)
     primary = [record for record in period_records if _tier(bundle, record) == primary_tier]
+    seen_ranks = set()
+    unique_rank_primary = []
+    duplicate_rank_group = False
+    for record in primary:
+        if record.rank in seen_ranks:
+            duplicate_rank_group = True
+            break
+        seen_ranks.add(record.rank)
+        unique_rank_primary.append(record)
+    if duplicate_rank_group:
+        primary = unique_rank_primary
     publication_dates = [
         record.published_at for record in primary if record.published_at is not None
     ]
@@ -287,6 +298,8 @@ def _holdings_report(
     ]
     is_stale = bool(statutory_periods and max(statutory_periods) > report_period)
     warnings = ["holdings_are_older_than_latest_statutory_report"] if is_stale else []
+    if duplicate_rank_group:
+        warnings.append("multiple_top10_table_groups")
     return {
         "evidence_level": "verified_fact",
         "report_period": report_period.isoformat(),
