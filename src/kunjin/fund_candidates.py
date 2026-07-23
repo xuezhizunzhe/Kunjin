@@ -33,6 +33,7 @@ def build_fund_candidate_review(
                 disposition, bool(sources[code]), has_full_disclosures
             ),
             "public_sources": sources[code],
+            "field_lineage": _field_lineage(comparison, code, sources[code]),
             "portfolio_overlap": _mapping(
                 _mapping(comparison.get("candidate_portfolio_overlap")).get(code)
             ),
@@ -52,9 +53,7 @@ def build_fund_candidate_review(
         },
         "analysis": {
             "same_category_check": (
-                "需确认"
-                if comparability_warnings
-                else "未发现本次明确输入基金之间的类别不匹配提示"
+                "需确认" if comparability_warnings else "未发现本次明确输入基金之间的类别不匹配提示"
             ),
             "comparability_warnings": list(comparability_warnings),
             "disclosed_overlap": comparison.get("pairwise_overlap", []),
@@ -74,6 +73,106 @@ def build_fund_candidate_review(
     }
 
 
+def _field_lineage(
+    comparison: Mapping[str, object], code: str, sources: Sequence[Mapping[str, object]]
+) -> dict[str, object]:
+    """Attach each candidate-facing fact to its source or explicitly retain the gap."""
+
+    source_by_id = {item.get("id"): item for item in sources if isinstance(item.get("id"), int)}
+    disclosures = _mapping(_mapping(comparison.get("candidate_disclosures")).get(code))
+    managers = _mapping(comparison.get("managers")).get(code, [])
+    manager_ids = _source_ids(managers)
+    benchmarks = _mapping(disclosures.get("benchmarks"))
+    benchmark_ids = _source_ids(benchmarks.get("items"))
+    fees = _mapping(comparison.get("fees")).get(code, [])
+    fee_ids = _source_ids(fees)
+    quarterly = _mapping(disclosures.get("quarterly_holdings"))
+    industry = _mapping(disclosures.get("industry_exposure"))
+    metrics = _nav_metrics(comparison.get("windows"), code)
+    common_nav_end = _mapping(comparison.get("data_dates")).get("common_nav_end")
+    selection = _mapping(quarterly.get("selection"))
+    return {
+        "managers": _source_backed_field(managers, manager_ids, source_by_id),
+        "benchmark": _source_backed_field(benchmarks.get("items", []), benchmark_ids, source_by_id),
+        "fees": _source_backed_field(fees, fee_ids, source_by_id),
+        "quarterly_holdings": {
+            **quarterly,
+            "sources": _sources_for_ids(quarterly.get("source_document_ids"), source_by_id),
+            "usage_boundary": (
+                "报告期绑定未核验时，Top10 仅供人工观察，不得用于确定性证券重叠。"
+                if selection.get("report_period_binding") == "unresolved"
+                else "仅代表带日期的已披露范围，不代表实时完整持仓。"
+            ),
+        },
+        "industry_exposure": {
+            **industry,
+            "sources": _sources_for_ids(industry.get("source_document_ids"), source_by_id),
+            "usage_boundary": "行业类别交集不等于底层股票重叠，也不代表实时完整持仓。",
+        },
+        "formal_nav_metrics": {
+            "state": "source_lineage_unavailable",
+            "as_of": common_nav_end,
+            "metrics": metrics,
+            "data_gap": (
+                "本地正式净值计算保留了区间和截至日，但当前比较输出未保存可逐项引用的公开 URL；"
+                "中文回答不得为这些指标补造来源。"
+            ),
+        },
+    }
+
+
+def _source_backed_field(
+    values: object, source_ids: Sequence[int], source_by_id: Mapping[int, Mapping[str, object]]
+) -> dict[str, object]:
+    records = (
+        list(values)
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes))
+        else []
+    )
+    sources = _sources_for_ids(source_ids, source_by_id)
+    return {
+        "state": "source_backed" if records and sources else "source_lineage_unavailable",
+        "items": records,
+        "sources": sources,
+        "data_gap": None if records and sources else "该字段缺少可逐项引用的来源或日期。",
+    }
+
+
+def _source_ids(values: object) -> list[int]:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        return []
+    return sorted(
+        {
+            item.get("source_document_id")
+            for item in values
+            if isinstance(item, Mapping) and isinstance(item.get("source_document_id"), int)
+        }
+    )
+
+
+def _sources_for_ids(
+    source_ids: object, source_by_id: Mapping[int, Mapping[str, object]]
+) -> list[dict[str, object]]:
+    if not isinstance(source_ids, Sequence) or isinstance(source_ids, (str, bytes)):
+        return []
+    return [dict(source_by_id[item]) for item in source_ids if item in source_by_id]
+
+
+def _nav_metrics(value: object, code: str) -> list[dict[str, object]]:
+    if not isinstance(value, Mapping):
+        return []
+    metrics = []
+    for window, rows in value.items():
+        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+            continue
+        metrics.extend(
+            {"window": window, **dict(item)}
+            for item in rows
+            if isinstance(item, Mapping) and item.get("fund_code") == code
+        )
+    return metrics
+
+
 def _disposition(
     *,
     readiness: object,
@@ -89,9 +188,7 @@ def _disposition(
     return "可作为研究候选", "可继续比较公开资料与组合重叠，但不是买入建议。"
 
 
-def _candidate_state(
-    disposition: str, has_sources: bool, has_full_disclosures: bool
-) -> str:
+def _candidate_state(disposition: str, has_sources: bool, has_full_disclosures: bool) -> str:
     if not has_sources or not has_full_disclosures:
         return "待补公开资料"
     if disposition == "可作为研究候选":
@@ -134,9 +231,12 @@ def _sources_by_fund(value: object, codes: tuple[str, ...]) -> dict[str, list[di
             {
                 key: source.get(key)
                 for key in (
+                    "id",
+                    "document_kind",
                     "source_name",
                     "title",
                     "url",
+                    "publisher",
                     "published_at",
                     "retrieved_at",
                     "source_tier",

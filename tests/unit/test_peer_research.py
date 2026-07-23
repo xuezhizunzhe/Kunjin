@@ -69,9 +69,7 @@ def make_bundle(
             if related_code is None or share_class is None
             else (FundShareClass(code, related_code, share_class, None, source_id),)
         ),
-        manager_tenures=(
-            FundManagerTenure(code, f"经理{code}", manager_start, None, source_id),
-        ),
+        manager_tenures=(FundManagerTenure(code, f"经理{code}", manager_start, None, source_id),),
         fee_rules=fees,
         sizes=sizes,
         benchmarks=(FundBenchmark(code, benchmark, None, None, source_id),),
@@ -203,6 +201,25 @@ class PeerResearchTest(unittest.TestCase):
         for forbidden in ('"score"', '"overall_score"', '"recommendation"', '"buy"', '"sell"'):
             self.assertNotIn(forbidden, encoded)
 
+    def test_candidate_disclosure_summary_keeps_unbound_top10_status(self) -> None:
+        bundle = replace(
+            make_bundle("519755", holdings=(holding("519755", "600001", "8"),)),
+            section_statuses={"quarterly_holdings": {"warning": "top10_table_group_display_only"}},
+        )
+
+        report = build_explicit_compare_report(
+            ("519755", "000001"),
+            {"519755": bundle, "000001": make_bundle("000001")},
+            {},
+            (),
+            NOW,
+        )
+
+        holdings = report["candidate_disclosures"]["519755"]["quarterly_holdings"]
+        self.assertEqual(holdings["evidence_level"], "partial")
+        self.assertEqual(holdings["selection"]["report_period_binding"], "unresolved")
+        self.assertIn("multiple_top10_table_groups_unbound", holdings["conflicts"])
+
     def test_metric_orderings_are_independent_and_manager_start_is_not_ranked(self) -> None:
         bundles = {
             "519755": make_bundle("519755", manager_start=date(2025, 1, 1)),
@@ -242,12 +259,20 @@ class PeerResearchTest(unittest.TestCase):
             FundFeeRule("519755", FeeType.CUSTODY, 1, share_class="A", rate=Decimal("0.2")),
             FundFeeRule("519755", FeeType.SALES_SERVICE, 1, share_class="C", rate=Decimal("0.4")),
             FundFeeRule(
-                "519755", FeeType.SUBSCRIPTION, 1, share_class="A",
-                rate=Decimal("1.5"), amount_max=Decimal("100000"),
+                "519755",
+                FeeType.SUBSCRIPTION,
+                1,
+                share_class="A",
+                rate=Decimal("1.5"),
+                amount_max=Decimal("100000"),
             ),
             FundFeeRule(
-                "519755", FeeType.REDEMPTION, 1, share_class="A",
-                rate=Decimal("0.5"), holding_days_max=6,
+                "519755",
+                FeeType.REDEMPTION,
+                1,
+                share_class="A",
+                rate=Decimal("0.5"),
+                holding_days_max=6,
             ),
         )
         report = build_explicit_compare_report(
@@ -259,8 +284,13 @@ class PeerResearchTest(unittest.TestCase):
             {},
             (
                 StoredPosition(
-                    "养基宝", "519755", "基金A", Decimal("1"), NOW,
-                    share_class="A", formal_nav=Decimal("1"),
+                    "养基宝",
+                    "519755",
+                    "基金A",
+                    Decimal("1"),
+                    NOW,
+                    share_class="A",
+                    formal_nav=Decimal("1"),
                 ),
             ),
             NOW,
@@ -305,9 +335,7 @@ class PeerResearchTest(unittest.TestCase):
             "000001": make_bundle("000001", holdings=(holding("000001", "600000", "5"),)),
             "000002": make_bundle("000002"),
         }
-        compare = build_explicit_compare_report(
-            ("519755", "000001"), bundles, {}, (), NOW
-        )
+        compare = build_explicit_compare_report(("519755", "000001"), bundles, {}, (), NOW)
         metric_name = compare["pairwise_overlap"][0]["security"]["metric_name"]
         self.assertEqual(metric_name, "top10_disclosed_overlap")
         self.assertNotEqual(metric_name, "total_overlap")
@@ -328,9 +356,7 @@ class PeerResearchTest(unittest.TestCase):
                 holding("519755", "600001", "8"),
             ),
         )
-        verified = make_bundle(
-            "000001", holdings=(holding("000001", "600000", "5"),)
-        )
+        verified = make_bundle("000001", holdings=(holding("000001", "600000", "5"),))
         compare = build_explicit_compare_report(
             ("519755", "000001"),
             {"519755": ambiguous, "000001": verified},
@@ -356,9 +382,7 @@ class PeerResearchTest(unittest.TestCase):
             {"519755": ambiguous}, (position("519755"),), NOW
         )
         self.assertEqual(portfolio["portfolio_overlap"]["evidence_level"], "insufficient_data")
-        self.assertIn(
-            "holdings_report_period_binding_unresolved:519755", portfolio["warnings"]
-        )
+        self.assertIn("holdings_report_period_binding_unresolved:519755", portfolio["warnings"])
 
     def test_size_stability_and_fingerprint_are_json_stable(self) -> None:
         sizes = tuple(
@@ -381,11 +405,7 @@ class PeerResearchTest(unittest.TestCase):
                     comparison_fingerprint({"invalid": invalid})
 
     def test_portfolio_warnings_and_forbidden_key_guard_are_preserved(self) -> None:
-        bundles = {
-            "519755": make_bundle(
-                "519755", holdings=(holding("519755", "600000", "10"),)
-            )
-        }
+        bundles = {"519755": make_bundle("519755", holdings=(holding("519755", "600000", "10"),))}
         estimated = StoredPosition(
             "养基宝",
             "519755",
@@ -441,9 +461,7 @@ class PeerResearchTest(unittest.TestCase):
             "519755": with_source(make_bundle("519755"), 10, shared_url),
             "000001": with_source(make_bundle("000001"), 11, shared_url),
         }
-        report = build_explicit_compare_report(
-            ("519755", "000001"), bundles, {}, (), NOW
-        )
+        report = build_explicit_compare_report(("519755", "000001"), bundles, {}, (), NOW)
         matching = [source for source in report["sources"] if source["url"] == shared_url]
         self.assertEqual(len(matching), 1)
 

@@ -75,9 +75,19 @@ def build_candidate_discovery_plan(scan_payload: Mapping[str, object]) -> dict[s
                     "primary_direct_page_reads": 1,
                     "trusted_alternative_direct_page_reads": 1,
                 },
-                "time_limits": {
+                "time_budget": {
                     "per_direct_page_seconds": 30,
-                    "total_refresh_seconds": 120,
+                    "outer_discovery_soft_budget_seconds": 120,
+                    "explicit_deep_outer_discovery_soft_budget_seconds": 480,
+                    "scope": (
+                        "仅约束本方向的外层近期网页发现与直接页面读取；不终止整份回答、"
+                        "本地组合计算、基金同步或其他已启动的独立步骤。"
+                    ),
+                    "on_soft_budget": (
+                        "优先减少尚未开始的方向或可信替代读取次数，保留已核验的高质量材料；"
+                        "按已获得证据返回 partial 或 blocked，不以低质量线索补足结论。"
+                    ),
+                    "deep_boundary": "只有用户明确要求 Deep 时才可使用更长的外层发现软预算。",
                 },
                 "source_order": [
                     "official_or_regulator",
@@ -137,8 +147,7 @@ def assess_candidate_discovery_outcome(
     validated_reads = [
         item
         for item in direct_reads
-        if item["source_class"] in _TRUSTED_SOURCE_CLASSES
-        and item["current_window_validated"]
+        if item["source_class"] in _TRUSTED_SOURCE_CLASSES and item["current_window_validated"]
     ]
     identities = {
         _source_identity(item)

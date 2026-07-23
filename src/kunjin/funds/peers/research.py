@@ -204,9 +204,7 @@ def _metric_orderings(metrics: Sequence[WindowMetric]) -> Dict[str, object]:
         if not known:
             continue
         ordered = sorted(known, key=lambda metric: metric.fund_code)
-        ordered = sorted(
-            ordered, key=lambda metric: getattr(metric, metric_name), reverse=reverse
-        )
+        ordered = sorted(ordered, key=lambda metric: getattr(metric, metric_name), reverse=reverse)
         result[metric_name] = {
             "metric": metric_name,
             "window": metrics[0].window,
@@ -263,9 +261,7 @@ def _window_sections(
     for code in codes:
         bundle = bundles.get(code)
         start = (
-            None
-            if bundle is None
-            else current_manager_team_start(bundle.manager_tenures, as_of)
+            None if bundle is None else current_manager_team_start(bundle.manager_tenures, as_of)
         )
         if start is None:
             warnings.append(f"manager_tenure_history_insufficient:{code}")
@@ -379,9 +375,7 @@ def _pairwise_sections(
         left_holdings, left_issue = _verified_holdings_for_overlap(left, as_of)
         right_holdings, right_issue = _verified_holdings_for_overlap(right, as_of)
         if left_issue is not None or right_issue is not None:
-            warnings.append(
-                f"{left_issue or right_issue}:{left_code}:{right_code}"
-            )
+            warnings.append(f"{left_issue or right_issue}:{left_code}:{right_code}")
         else:
             try:
                 security = pairwise_overlap(left_code, right_code, left_holdings, right_holdings)
@@ -520,9 +514,7 @@ def _portfolio_section_from_weights(
             continue
         holdings_by_fund[code] = records
     stale = frozenset(
-        code
-        for code in weights
-        if code in bundles and _holdings_stale(bundles[code], as_of)
+        code for code in weights if code in bundles and _holdings_stale(bundles[code], as_of)
     )
     security = portfolio_overlap(weights, holdings_by_fund, stale_codes=stale)
     industry = _industry_portfolio_overlap(weights, bundles, stale)
@@ -585,9 +577,7 @@ def _candidate_portfolio_overlap(
     as_of: datetime,
 ) -> Dict[str, object]:
     current_exposure = {
-        (str(item["exposure_type"]), str(item["security_code"])): Decimal(
-            str(item["total_weight"])
-        )
+        (str(item["exposure_type"]), str(item["security_code"])): Decimal(str(item["total_weight"]))
         for item in portfolio.get("securities", [])
     }
     result: Dict[str, object] = {}
@@ -627,9 +617,7 @@ def _candidate_portfolio_overlap(
                 else "disclosed_portfolio_overlap"
             ),
             "report_period": latest,
-            "candidate_disclosed_weight": sum(
-                (item.weight for item in records), Decimal("0")
-            )
+            "candidate_disclosed_weight": sum((item.weight for item in records), Decimal("0"))
             / Decimal("100"),
             "overlap": sum((item["shared_weight"] for item in shared), Decimal("0")),
             "shared": shared,
@@ -643,12 +631,16 @@ def _simple_ordering(
     known = [(code, value) for code, value in values.items() if isinstance(value, Decimal)]
     known.sort(key=lambda item: item[0])
     known.sort(key=lambda item: item[1], reverse=direction == "higher")
-    return {
-        "metric": metric,
-        "direction": direction,
-        "fund_codes": [code for code, _ in known],
-        "values": dict(known),
-    } if known else {}
+    return (
+        {
+            "metric": metric,
+            "direction": direction,
+            "fund_codes": [code for code, _ in known],
+            "values": dict(known),
+        }
+        if known
+        else {}
+    )
 
 
 def _source_payload(source: SourceDocument) -> Dict[str, object]:
@@ -712,10 +704,15 @@ def _manager_payloads(
     result: Dict[str, object] = {}
     for code in codes:
         bundle = bundles.get(code)
-        current = [] if bundle is None else [
-            item for item in bundle.manager_tenures
-            if item.start_date <= as_of and (item.end_date is None or item.end_date >= as_of)
-        ]
+        current = (
+            []
+            if bundle is None
+            else [
+                item
+                for item in bundle.manager_tenures
+                if item.start_date <= as_of and (item.end_date is None or item.end_date >= as_of)
+            ]
+        )
         result[code] = [
             {
                 "manager_name": item.manager_name,
@@ -725,6 +722,60 @@ def _manager_payloads(
             }
             for item in sorted(current, key=lambda item: (item.start_date, item.manager_name))
         ]
+    return result
+
+
+def _candidate_disclosure_summaries(
+    codes: Sequence[str], bundles: Mapping[str, DisclosureBundle], as_of: datetime
+) -> Dict[str, object]:
+    """Keep per-field disclosure status available to the candidate projection."""
+
+    result: Dict[str, object] = {}
+    for code in codes:
+        bundle = bundles.get(code)
+        if bundle is None:
+            result[code] = {}
+            continue
+        report = build_disclosure_report(bundle, as_of)
+        holdings = report["holdings"]
+        industry = report["industry_exposure"]
+        industry_items = industry["items"]
+        latest_period = max((item["report_period"] for item in industry_items), default=None)
+        latest_items = [item for item in industry_items if item["report_period"] == latest_period]
+        result[code] = {
+            "benchmarks": report["benchmarks"],
+            "quarterly_holdings": {
+                key: holdings.get(key)
+                for key in (
+                    "evidence_level",
+                    "report_period",
+                    "published_at",
+                    "freshness",
+                    "source_document_ids",
+                    "selection",
+                    "conflicts",
+                )
+            },
+            "industry_exposure": {
+                "evidence_level": industry["evidence_level"],
+                "report_period": latest_period,
+                "published_at": max(
+                    (
+                        item["published_at"]
+                        for item in latest_items
+                        if item["published_at"] is not None
+                    ),
+                    default=None,
+                ),
+                "source_document_ids": sorted(
+                    {
+                        item["source_document_id"]
+                        for item in latest_items
+                        if item.get("source_document_id") is not None
+                    }
+                ),
+            },
+        }
     return result
 
 
@@ -842,6 +893,7 @@ def _build_report(
         "windows": windows,
         "metric_orderings": orderings,
         "managers": _manager_payloads(codes, bundles, as_of.date()),
+        "candidate_disclosures": _candidate_disclosure_summaries(codes, bundles, as_of),
         "fees": fees,
         "ongoing_annual_fee_rates": ongoing,
         "sizes": sizes,
@@ -956,9 +1008,7 @@ def build_portfolio_overlap_report(
         "advantages": [],
         "tradeoffs": [],
         "data_gaps": [
-            warning
-            for warning in warnings
-            if "missing" in warning or "partial" in warning
+            warning for warning in warnings if "missing" in warning or "partial" in warning
         ],
         "watch_reasons": [],
         "warnings": _unique(warnings),

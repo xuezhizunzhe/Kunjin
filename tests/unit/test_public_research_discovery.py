@@ -29,8 +29,14 @@ def test_discovery_plan_uses_separate_bounded_query_per_candidate() -> None:
     ]
     assert len({item["query"] for item in plans}) == 3
     assert all(item["attempt_limits"]["direct_page_attempts"] == 2 for item in plans)
-    assert all(item["time_limits"]["per_direct_page_seconds"] == 30 for item in plans)
-    assert all(item["time_limits"]["total_refresh_seconds"] == 120 for item in plans)
+    assert all(item["time_budget"]["per_direct_page_seconds"] == 30 for item in plans)
+    assert all(item["time_budget"]["outer_discovery_soft_budget_seconds"] == 120 for item in plans)
+    assert all(
+        item["time_budget"]["explicit_deep_outer_discovery_soft_budget_seconds"] == 480
+        for item in plans
+    )
+    assert all("不终止整份回答" in item["time_budget"]["scope"] for item in plans)
+    assert all("低质量线索" in item["time_budget"]["on_soft_budget"] for item in plans)
     assert all(item["current_news_refresh_state"] == "pending" for item in plans)
     assert all(item["research_window"] == ["近一周", "近一月"] for item in plans)
     assert all("原始 HTTPS URL" in item["evidence_requirements"] for item in plans)
@@ -50,7 +56,9 @@ def test_discovery_plan_uses_domain_terms_without_fixed_source_sites() -> None:
 
     plans = result["candidate_plans"]
     assert [item["domain_id"] for item in plans] == [
-        "coal_oil_gas", "shipping_trade", "ai_compute",
+        "coal_oil_gas",
+        "shipping_trade",
+        "ai_compute",
     ]
     assert "煤炭 油气" in plans[0]["query"]
     assert "集装箱吞吐量 出口" in plans[1]["query"]

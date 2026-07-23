@@ -158,8 +158,11 @@ KunJin CLI 不做通用网页抓取；当前自动行业来源仍可能受网络
 -> 必要时读取一次近一月或可信替代页 -> 记录 `completed`、`partial` 或 `blocked`。不重复同一行情接口，
 也不要求覆盖全部行业。任何写入最终中文回答的涨跌百分比、价格或数量，必须在同一句或紧邻位置给出原始 HTTPS
 URL 与发布日期、统计期或行情有效时间；缺少这些字段时只可说“待核验线索”，不得作为市场事实。
-每个直接页面最多等待 30 秒，整轮近期刷新最多使用 120 秒；达到任一上限即按已读材料返回 `partial` 或 `blocked`，
-不得继续等待、轮询或扩大方向数。
+每个直接页面最多等待 30 秒，用于避免单个失效页面拖住流程。整轮近期网页发现的 120 秒是软预算，
+只约束外层搜索与直接页面读取，不终止整份回答、基金同步、本地组合计算或已启动的其他独立步骤；
+它也不降低来源、日期和统计口径标准。达到软预算时优先减少尚未开始的方向或可信替代次数，保留已核验的高质量材料，
+再按已有证据返回 `partial` 或 `blocked`，不得用低质量线索凑结论。最多三个方向不是必须三个，
+证据充分的一至两个方向优于拼凑；用户明确要求 Deep 时才可使用更长的外层发现软预算。
 
 `local-overview` / `scan` 返回的 `outer_discovery_required=true` 是完成门，不是联网成功标记。`research discovery-plan`
 为每个候选方向返回 `discovery_query_executed`、`direct_page_read_count`、`independent_source_count`、
@@ -268,6 +271,11 @@ kunjin --json fund candidates CODE_A CODE_B
 比较只消费 `fund candidates` 返回的结构化本地公开资料、来源和快照；不要直接浏览、读取或列举
 `~/.local/share/kunjin`、数据库目录或基金资料目录。若普通任务环境无法运行该只读命令或命令返回不足资料，立即用
 已取得的结构化输出给出 `Partial`，说明缺口；不等待目录权限、不重复申请权限，也不把缺失持仓按零。
+逐项陈述经理、基准、费用、季度披露或净值区间时，必须使用 `candidate_reviews[].field_lineage` 中对应字段的
+URL、发布日期、检索时间或截至日；`formal_nav_metrics.state=source_lineage_unavailable` 时只能说明本地计算的
+截至日与来源缺口，不能补造链接。若 `quarterly_holdings.selection.report_period_binding=unresolved` 或
+`evidence_level=partial`，Top10 即使展示也要紧邻说明“报告期绑定未确认，仅供人工观察”，不得用于确定性证券重叠；
+独立 verified 的行业披露只可称为行业类别交集，并紧邻说明它不等于底层股票重叠。
 
 ### 买后按需复核
 
