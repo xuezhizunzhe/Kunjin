@@ -78,7 +78,22 @@ def make_bundle(
         holdings=holdings,
         industry_exposure=(),
         announcements=(),
-        source_documents={},
+        source_documents={
+            document_id: SourceDocument(
+                document_id,
+                code,
+                DocumentKind.QUARTERLY_HOLDINGS,
+                "季度持仓披露",
+                f"https://example.test/{code}/holdings/{document_id}",
+                "测试基金公司",
+                1,
+                "测试基金公司",
+                NOW,
+                NOW,
+                f"{document_id:064x}",
+            )
+            for document_id in {1, source_id}
+        },
         section_states={},
         section_statuses={},
     )
@@ -156,7 +171,7 @@ def with_source(bundle: DisclosureBundle, source_id: int, url: str) -> Disclosur
         NOW,
         "c" * 64,
     )
-    return replace(bundle, source_documents={source_id: source})
+    return replace(bundle, source_documents={**bundle.source_documents, source_id: source})
 
 
 class PeerResearchTest(unittest.TestCase):
@@ -304,6 +319,46 @@ class PeerResearchTest(unittest.TestCase):
         )
         self.assertEqual(portfolio["portfolio_overlap"]["portfolio_weight_coverage"], "0.5")
         self.assertIn("portfolio_coverage_partial", portfolio["warnings"])
+
+    def test_unbound_top10_cannot_feed_security_overlap_or_candidate_overlap(self) -> None:
+        ambiguous = make_bundle(
+            "519755",
+            holdings=(
+                holding("519755", "600000", "10"),
+                holding("519755", "600001", "8"),
+            ),
+        )
+        verified = make_bundle(
+            "000001", holdings=(holding("000001", "600000", "5"),)
+        )
+        compare = build_explicit_compare_report(
+            ("519755", "000001"),
+            {"519755": ambiguous, "000001": verified},
+            {},
+            (position("000001"),),
+            NOW,
+        )
+
+        self.assertEqual(compare["pairwise_overlap"], [])
+        self.assertIn(
+            "holdings_report_period_binding_unresolved:519755:000001",
+            compare["warnings"],
+        )
+        self.assertEqual(
+            compare["candidate_portfolio_overlap"]["519755"],
+            {
+                "evidence_level": "insufficient_data",
+                "data_gap": "holdings_report_period_binding_unresolved",
+            },
+        )
+
+        portfolio = build_portfolio_overlap_report(
+            {"519755": ambiguous}, (position("519755"),), NOW
+        )
+        self.assertEqual(portfolio["portfolio_overlap"]["evidence_level"], "insufficient_data")
+        self.assertIn(
+            "holdings_report_period_binding_unresolved:519755", portfolio["warnings"]
+        )
 
     def test_size_stability_and_fingerprint_are_json_stable(self) -> None:
         sizes = tuple(

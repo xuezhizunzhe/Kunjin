@@ -14,6 +14,7 @@ from kunjin.funds.models import (
     DocumentKind,
     FeeType,
     FundFeeRule,
+    FundHolding,
     SourceDocument,
 )
 from kunjin.funds.peers.analytics import (
@@ -319,8 +320,47 @@ def _overlap_payload(result: PairwiseOverlap) -> Dict[str, object]:
     }
 
 
+def _verified_holdings_for_overlap(
+    bundle: DisclosureBundle, as_of: datetime
+) -> Tuple[Tuple[FundHolding, ...], Optional[str]]:
+    """Return only the disclosure view whose report-period binding is verified."""
+
+    try:
+        holdings = build_disclosure_report(bundle, as_of)["holdings"]
+    except (KeyError, TypeError, ValueError):
+        return (), "holdings_evidence_unavailable"
+    selection = holdings.get("selection", {})
+    if (
+        holdings.get("evidence_level") != "verified_fact"
+        or selection.get("report_period_binding") != "verified"
+    ):
+        return (), "holdings_report_period_binding_unresolved"
+    report_period = holdings.get("report_period")
+    if not isinstance(report_period, str):
+        return (), "holdings_evidence_unavailable"
+    try:
+        selected_period = date.fromisoformat(report_period)
+    except ValueError:
+        return (), "holdings_evidence_unavailable"
+    selected_items = holdings.get("items", [])
+    keys = {
+        (item.get("rank"), item.get("security_code"), item.get("weight"))
+        for item in selected_items
+        if isinstance(item, Mapping)
+    }
+    records = tuple(
+        record
+        for record in bundle.holdings
+        if record.report_period == selected_period
+        and (record.rank, record.security_code, format(record.weight, "f")) in keys
+    )
+    if len(records) != len(keys):
+        return (), "holdings_evidence_unavailable"
+    return records, None
+
+
 def _pairwise_sections(
-    codes: Sequence[str], bundles: Mapping[str, DisclosureBundle]
+    codes: Sequence[str], bundles: Mapping[str, DisclosureBundle], as_of: datetime
 ) -> Tuple[List[object], List[str]]:
     reports: List[object] = []
     warnings: List[str] = []
@@ -336,12 +376,19 @@ def _pairwise_sections(
             "security": None,
             "industry": None,
         }
-        try:
-            security = pairwise_overlap(left_code, right_code, left.holdings, right.holdings)
-            item["security"] = _overlap_payload(security)
-            warnings.extend(security.warnings)
-        except ValueError:
-            warnings.append(f"holdings_unavailable:{left_code}:{right_code}")
+        left_holdings, left_issue = _verified_holdings_for_overlap(left, as_of)
+        right_holdings, right_issue = _verified_holdings_for_overlap(right, as_of)
+        if left_issue is not None or right_issue is not None:
+            warnings.append(
+                f"{left_issue or right_issue}:{left_code}:{right_code}"
+            )
+        else:
+            try:
+                security = pairwise_overlap(left_code, right_code, left_holdings, right_holdings)
+                item["security"] = _overlap_payload(security)
+                warnings.extend(security.warnings)
+            except ValueError:
+                warnings.append(f"holdings_unavailable:{left_code}:{right_code}")
         try:
             industry, industry_warnings = pairwise_industry_overlap(
                 left_code, right_code, left.industry_exposure, right.industry_exposure
@@ -461,9 +508,17 @@ def _portfolio_section_from_weights(
     value_kind: str,
     observed_at: Optional[datetime],
 ) -> Tuple[Dict[str, object], List[str]]:
-    holdings_by_fund = {
-        code: bundles[code].holdings for code in weights if code in bundles
-    }
+    holdings_by_fund = {}
+    eligibility_warnings = []
+    for code in weights:
+        bundle = bundles.get(code)
+        if bundle is None:
+            continue
+        records, issue = _verified_holdings_for_overlap(bundle, as_of)
+        if issue is not None:
+            eligibility_warnings.append(f"{issue}:{code}")
+            continue
+        holdings_by_fund[code] = records
     stale = frozenset(
         code
         for code in weights
@@ -472,7 +527,11 @@ def _portfolio_section_from_weights(
     security = portfolio_overlap(weights, holdings_by_fund, stale_codes=stale)
     industry = _industry_portfolio_overlap(weights, bundles, stale)
     result: Dict[str, object] = {
-        "evidence_level": "deterministic_calculation",
+        "evidence_level": (
+            "deterministic_calculation"
+            if security["portfolio_weight_coverage"] > Decimal("0")
+            else "insufficient_data"
+        ),
         **security,
         "industries": industry["industries"],
         "industry_portfolio_weight_coverage": industry["portfolio_weight_coverage"],
@@ -481,7 +540,7 @@ def _portfolio_section_from_weights(
     }
     if observed_at is not None:
         result["portfolio_observed_at"] = observed_at
-    warnings = list(security["warnings"])
+    warnings = list(security["warnings"]) + eligibility_warnings
     if security["portfolio_weight_coverage"] < Decimal("1"):
         warnings.append("portfolio_coverage_partial")
     return result, warnings
@@ -523,6 +582,7 @@ def _candidate_portfolio_overlap(
     codes: Sequence[str],
     bundles: Mapping[str, DisclosureBundle],
     portfolio: Mapping[str, object],
+    as_of: datetime,
 ) -> Dict[str, object]:
     current_exposure = {
         (str(item["exposure_type"]), str(item["security_code"])): Decimal(
@@ -533,11 +593,17 @@ def _candidate_portfolio_overlap(
     result: Dict[str, object] = {}
     for code in codes:
         bundle = bundles.get(code)
-        if bundle is None or not bundle.holdings or not current_exposure:
+        if bundle is None or not current_exposure:
             result[code] = {"evidence_level": "insufficient_data"}
             continue
-        latest = max(item.report_period for item in bundle.holdings)
-        records = [item for item in bundle.holdings if item.report_period == latest]
+        records, issue = _verified_holdings_for_overlap(bundle, as_of)
+        if issue is not None:
+            result[code] = {
+                "evidence_level": "insufficient_data",
+                "data_gap": issue,
+            }
+            continue
+        latest = max(item.report_period for item in records)
         shared = []
         for record in records:
             key = (record.asset_type.value, record.security_code)
@@ -715,9 +781,9 @@ def _build_report(
             else {"evidence_level": "insufficient_data", "observations": 0}
         )
         sizes[code] = None if stability.get("observations") == 0 else stability
-    pairwise, overlap_warnings = _pairwise_sections(codes, bundles)
+    pairwise, overlap_warnings = _pairwise_sections(codes, bundles, as_of)
     portfolio, portfolio_warnings = _portfolio_section(bundles, positions, as_of)
-    candidate_overlap = _candidate_portfolio_overlap(codes, bundles, portfolio)
+    candidate_overlap = _candidate_portfolio_overlap(codes, bundles, portfolio, as_of)
     orderings["ongoing_annual_fee_rate"] = _simple_ordering(
         "ongoing_annual_fee_rate", ongoing, "lower"
     )
