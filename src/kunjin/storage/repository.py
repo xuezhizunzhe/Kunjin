@@ -1529,10 +1529,17 @@ class Repository:
             )
 
     def latest_positions(self) -> List[StoredPosition]:
+        _, positions = self.latest_portfolio_snapshot()
+        return positions
+
+    def latest_portfolio_snapshot(
+        self,
+    ) -> Tuple[Optional[Dict[str, object]], List[StoredPosition]]:
+        """Read one coherent successful portfolio snapshot and its sync identity."""
         with self.connect() as connection:
             snapshot = connection.execute(
                 """
-                SELECT snapshots.sync_run_id
+                SELECT sync_runs.*
                 FROM portfolio_observation_snapshots snapshots
                 JOIN sync_runs ON sync_runs.id = snapshots.sync_run_id
                 WHERE sync_runs.source = 'yangjibao' AND sync_runs.status = 'success'
@@ -1564,9 +1571,9 @@ class Repository:
                     WHERE p.sync_run_id = ?
                     ORDER BY snapshot_accounts.account_title, p.fund_code
                     """,
-                    (int(snapshot["sync_run_id"]),),
+                    (int(snapshot["id"]),),
                 ).fetchall()
-        return [
+        positions = [
             StoredPosition(
                 account_title=str(row["account_title"]),
                 fund_code=str(row["fund_code"]),
@@ -1580,6 +1587,7 @@ class Repository:
             )
             for row in rows
         ]
+        return (None if snapshot is None else dict(snapshot), positions)
 
     def latest_successful_sync(self, source: str) -> Optional[Dict[str, str]]:
         with self.connect() as connection:

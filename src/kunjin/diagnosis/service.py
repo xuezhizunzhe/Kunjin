@@ -131,10 +131,16 @@ def _coverage(
 def build_authenticated_portfolio_binding(
     repository: Repository,
     positions: Sequence[StoredPosition],
+    *,
+    portfolio_sync: Mapping[str, object] | None = None,
 ) -> PortfolioEvidenceBinding:
     """Build the same authenticated/unbound binding used by DiagnosisService."""
     position_tuple = tuple(positions)
-    sync = repository.latest_successful_sync("yangjibao")
+    sync = (
+        portfolio_sync
+        if portfolio_sync is not None
+        else repository.latest_successful_sync("yangjibao")
+    )
     observed_at = max(
         _utc(item.observed_at, "position observation") for item in position_tuple
     )
@@ -355,7 +361,13 @@ class DiagnosisService:
         self._disclosure_store = disclosure_store
         self._clock = clock
 
-    def diagnose(self, candidate_fund_code: Optional[str] = None) -> PortfolioDiagnosis:
+    def diagnose(
+        self,
+        candidate_fund_code: Optional[str] = None,
+        *,
+        positions: Sequence[StoredPosition] | None = None,
+        portfolio_sync: Mapping[str, object] | None = None,
+    ) -> PortfolioDiagnosis:
         if candidate_fund_code is not None:
             if (
                 type(candidate_fund_code) is not str
@@ -364,7 +376,9 @@ class DiagnosisService:
             ):
                 raise ValueError("candidate fund code must be six digits and non-reserved")
         as_of = _utc(self._clock(), "diagnosis clock")
-        positions = tuple(self._repository.latest_positions())
+        positions = (
+            tuple(self._repository.latest_positions()) if positions is None else tuple(positions)
+        )
         held_codes = tuple(sorted({item.fund_code for item in positions if item.shares > 0}))
         if not held_codes:
             result = PortfolioDiagnosis(
@@ -389,7 +403,9 @@ class DiagnosisService:
             return result
 
         analysis = analyze_portfolio(positions)
-        binding = build_authenticated_portfolio_binding(self._repository, positions)
+        binding = build_authenticated_portfolio_binding(
+            self._repository, positions, portfolio_sync=portfolio_sync
+        )
 
         bundles = {
             code: self._disclosure_store.load_bundle(code) for code in held_codes

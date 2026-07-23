@@ -10,7 +10,7 @@ import urllib.parse
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from kunjin import __version__
@@ -133,6 +133,10 @@ from kunjin.logging import redact_secrets
 from kunjin.models import InvestmentThesis
 from kunjin.paths import RuntimePaths
 from kunjin.portfolio_review import ManualPortfolioPosition, PortfolioReviewService
+from kunjin.portfolio_snapshot import (
+    build_portfolio_snapshot_binding,
+    run_consistent_portfolio_projection,
+)
 from kunjin.public_research.discovery import build_candidate_discovery_plan
 from kunjin.public_research.events import (
     build_persisted_event_timeline,
@@ -826,6 +830,7 @@ def build_parser() -> argparse.ArgumentParser:
     fund_review.add_argument("--near-term-use", choices=["yes", "no"])
     fund_review.add_argument("--emergency-fund", choices=["yes", "no"])
     fund_review.add_argument("--portfolio-context", choices=["none", "cached"], default="none")
+    fund_review.add_argument("--cached-public-context", action="store_true")
     fund_review.add_argument("--manual-position", action="append", default=[])
     fund_review.add_argument("--related-fund", action="append", default=[])
     fund_review_triggers = fund_subparsers.add_parser("review-triggers")
@@ -1079,6 +1084,22 @@ def _add_intelligence_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _positions_payload(context: ApplicationContext) -> List[Dict[str, Any]]:
     return [serialize(position) for position in context.repository.latest_positions()]
+
+
+def _portfolio_snapshot_reader(
+    context: ApplicationContext,
+) -> tuple[Mapping[str, object] | None, Sequence[Any]]:
+    return context.repository.latest_portfolio_snapshot()
+
+
+def _snapshot_metadata(
+    binding: Mapping[str, object], *, stability_state: str, read_count: int
+) -> dict[str, object]:
+    return {
+        **binding,
+        "stability_state": stability_state,
+        "projection_read_count": read_count,
+    }
 
 
 def _validate_fund_code(fund_code: str) -> None:
@@ -1438,15 +1459,20 @@ def _peer_components(context: ApplicationContext) -> Tuple[PeerStore, FundDisclo
 
 
 def _comparison_inputs(
-    context: ApplicationContext, fund_codes: Sequence[str]
+    context: ApplicationContext,
+    fund_codes: Sequence[str],
+    *,
+    positions: Sequence[Any] | None = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Any]]:
     if context.fund_disclosure_store is None:
         raise ValueError("fund disclosure store is unavailable")
     codes = tuple(fund_codes)
     bundles = {code: context.fund_disclosure_store.load_bundle(code) for code in codes}
     histories = {code: context.repository.fund_history(code) for code in codes}
-    positions = context.repository.latest_positions()
-    return bundles, histories, positions
+    current_positions = (
+        context.repository.latest_positions() if positions is None else list(positions)
+    )
+    return bundles, histories, current_positions
 
 
 def _comparison_status(report: Dict[str, Any]) -> str:
@@ -1528,6 +1554,36 @@ def _disclosure_report(
             warnings=warnings,
         )
     return build_disclosure_report(bundle, datetime.now(timezone.utc))
+
+
+def _cached_fund_review_brief(context: ApplicationContext, fund_code: str) -> Dict[str, object]:
+    """Project only already-stored benchmark facts for a no-refresh fund review."""
+
+    report = _disclosure_report(context, fund_code)
+    sources = {
+        source["id"]: source
+        for source in report["sources"]
+        if isinstance(source, Mapping) and isinstance(source.get("id"), int)
+    }
+    facts = []
+    benchmarks = report.get("benchmarks", {}).get("items", [])
+    if isinstance(benchmarks, list):
+        for item in benchmarks:
+            if not isinstance(item, Mapping):
+                continue
+            source = sources.get(item.get("source_document_id"), {})
+            facts.append(
+                {
+                    "field_id": "current_benchmark",
+                    "value": {"description": item.get("description")},
+                    "publisher": source.get("publisher"),
+                    "canonical_url": source.get("url"),
+                    "published_at": source.get("published_at"),
+                    "retrieved_at": source.get("retrieved_at"),
+                    "source_tier": source.get("source_tier"),
+                }
+            )
+    return {"facts": facts, "cached_public_context": True}
 
 
 def _disclosure_errors(context: ApplicationContext, fund_code: str) -> List[Dict[str, str]]:
@@ -3341,32 +3397,43 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         if not args.json_output:
             raise CliUsageError("fund review requires JSON mode")
         _validate_fund_code(args.fund_code)
-        if context.brief_service is None or context.intelligence_service is None:
+        if (
+            not args.cached_public_context
+            and (context.brief_service is None or context.intelligence_service is None)
+        ):
             raise CliUsageError("fund review services are unavailable")
-        from kunjin.brief.research import public_outcome_payload
-        from kunjin.intelligence.research import public_intelligence_payload
+        if args.cached_public_context:
+            brief = _cached_fund_review_brief(context, args.fund_code)
+            intelligence = {
+                "what_happened": [],
+                "retrieval": {"state": "cached_public_context_not_refreshed"},
+            }
+            market_scan = {"directions": []}
+        else:
+            from kunjin.brief.research import public_outcome_payload
+            from kunjin.intelligence.research import public_intelligence_payload
 
-        brief = public_outcome_payload(
-            context.brief_service.brief_outcome(
-                args.fund_code,
-                action=ActionKind(args.action),
-                mode=RequestMode.RAPID,
-            )
-        )
-        intelligence = summarize_public_research(
-            public_intelligence_payload(
-                context.intelligence_service.fund_intelligence(
-                    args.fund_code, window="recent", mode="rapid"
+            brief = public_outcome_payload(
+                context.brief_service.brief_outcome(
+                    args.fund_code,
+                    action=ActionKind(args.action),
+                    mode=RequestMode.RAPID,
                 )
             )
-        )
-        market_scan = scan_public_research(
-            public_intelligence_payload(
-                context.intelligence_service.market_overview(window="recent", mode="rapid")
+            intelligence = summarize_public_research(
+                public_intelligence_payload(
+                    context.intelligence_service.fund_intelligence(
+                        args.fund_code, window="recent", mode="rapid"
+                    )
+                )
             )
-        )
-        portfolio = None
-        if args.manual_position or args.portfolio_context == "cached":
+            market_scan = scan_public_research(
+                public_intelligence_payload(
+                    context.intelligence_service.market_overview(window="recent", mode="rapid")
+                )
+            )
+        portfolio_snapshot = None
+        if args.manual_position:
             diagnosis_service = context.diagnosis_service or DiagnosisService(
                 context.repository,
                 context.fund_disclosure_store or FundDisclosureStore(context.repository),
@@ -3377,75 +3444,153 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                 disclosure_store=context.fund_disclosure_store
                 or FundDisclosureStore(context.repository),
             )
-            portfolio = (
-                review.manual(
-                    tuple(
-                        _manual_portfolio_position(item)
-                        for item in args.manual_position
-                    )
-                )
-                if args.manual_position
-                else {
-                    "input_source": "cached",
-                    "diagnosis": public_diagnosis_payload(
-                        diagnosis_service.diagnose()
-                    ),
-                }
+            portfolio = review.manual(
+                tuple(_manual_portfolio_position(item) for item in args.manual_position)
             )
-        guardrails = build_investor_guardrails(
-            emergency_fund=args.emergency_fund,
-            near_term_use=args.near_term_use,
-            horizon=args.horizon,
-            volatility=args.risk_tolerance,
-            portfolio=portfolio,
-        )
-        positions = context.repository.latest_positions()
-        analysis = analyze_portfolio(positions)
-        weights = {
-            code: format(weight, "f") for code, weight in analysis.weights.items()
-        }
-        portfolio_weight_context = (
-            build_portfolio_weight_context(
-                fund_code=args.fund_code,
-                weights=weights,
-                value_basis=analysis.value_kind,
-            )
-            if args.portfolio_context == "cached" or args.related_fund
-            else None
-        )
-        related_fund_context = None
-        if args.related_fund:
-            related_codes = _related_fund_codes(args.fund_code, args.related_fund)
-            bundles, histories, related_positions = _comparison_inputs(context, related_codes)
-            comparison = build_explicit_compare_report(
-                related_codes,
-                bundles,
-                histories,
-                related_positions,
-                datetime.now(timezone.utc),
-            )
-            related_fund_context = build_related_fund_context(
-                fund_codes=related_codes,
-                weights=weights,
-                comparison=comparison,
-            )
-        return envelope(
-            "fund.review",
-            build_fund_review(
-                fund_code=args.fund_code,
-                action=args.action,
-                brief=brief,
-                intelligence=intelligence,
-                market_scan=market_scan,
-                portfolio=portfolio,
-                horizon=args.horizon,
-                risk_tolerance=args.risk_tolerance,
+            guardrails = build_investor_guardrails(
+                emergency_fund=args.emergency_fund,
                 near_term_use=args.near_term_use,
-                guardrails=guardrails,
-                portfolio_weight_context=portfolio_weight_context,
-                related_fund_context=related_fund_context,
-            ),
+                horizon=args.horizon,
+                volatility=args.risk_tolerance,
+                portfolio=portfolio,
+            )
+            portfolio_weight_context = None
+            related_fund_context = None
+        elif args.portfolio_context == "cached" or args.related_fund:
+            diagnosis_service = context.diagnosis_service or DiagnosisService(
+                context.repository,
+                context.fund_disclosure_store or FundDisclosureStore(context.repository),
+            )
+            related_codes = (
+                _related_fund_codes(args.fund_code, args.related_fund)
+                if args.related_fund
+                else ()
+            )
+
+            def project_portfolio(
+                _binding: dict[str, object],
+                sync: Mapping[str, object] | None,
+                positions: Sequence[Any],
+            ) -> tuple[object, object, object, object]:
+                portfolio = (
+                    {
+                        "input_source": "cached",
+                        "diagnosis": public_diagnosis_payload(
+                            diagnosis_service.diagnose(
+                                positions=positions, portfolio_sync=sync
+                            )
+                        ),
+                    }
+                    if args.portfolio_context == "cached"
+                    else None
+                )
+                guardrails = build_investor_guardrails(
+                    emergency_fund=args.emergency_fund,
+                    near_term_use=args.near_term_use,
+                    horizon=args.horizon,
+                    volatility=args.risk_tolerance,
+                    portfolio=portfolio,
+                )
+                analysis = analyze_portfolio(positions)
+                weights = {
+                    code: format(weight, "f") for code, weight in analysis.weights.items()
+                }
+                weight_context = (
+                    build_portfolio_weight_context(
+                        fund_code=args.fund_code,
+                        weights=weights,
+                        value_basis=analysis.value_kind,
+                    )
+                    if args.portfolio_context == "cached" or args.related_fund
+                    else None
+                )
+                related_context = None
+                if related_codes:
+                    bundles, histories, _ = _comparison_inputs(
+                        context, related_codes, positions=positions
+                    )
+                    comparison = build_explicit_compare_report(
+                        related_codes,
+                        bundles,
+                        histories,
+                        positions,
+                        datetime.now(timezone.utc),
+                    )
+                    related_context = build_related_fund_context(
+                        fund_codes=related_codes,
+                        weights=weights,
+                        comparison=comparison,
+                    )
+                return portfolio, guardrails, weight_context, related_context
+
+            projection = run_consistent_portfolio_projection(
+                lambda: _portfolio_snapshot_reader(context), project_portfolio
+            )
+            portfolio_snapshot = _snapshot_metadata(
+                projection.binding,
+                stability_state=projection.stability_state,
+                read_count=projection.read_count,
+            )
+            if projection.value is None:
+                portfolio = {
+                    "state": "stale_unmerged",
+                    "text": "组合在重算期间再次变化，未合并旧组合诊断与新基金权重。",
+                }
+                guardrails = build_investor_guardrails(
+                    emergency_fund=args.emergency_fund,
+                    near_term_use=args.near_term_use,
+                    horizon=args.horizon,
+                    volatility=args.risk_tolerance,
+                    portfolio=None,
+                )
+                portfolio_weight_context = {
+                    "state": "stale_unmerged",
+                    "text": "当前组合快照变化过快，未输出目标基金的组合权重。",
+                }
+                related_fund_context = {
+                    "state": "stale_unmerged",
+                    "text": "当前组合快照变化过快，未输出相关基金组映射。",
+                }
+            else:
+                (
+                    portfolio,
+                    guardrails,
+                    portfolio_weight_context,
+                    related_fund_context,
+                ) = projection.value
+        else:
+            portfolio = None
+            guardrails = build_investor_guardrails(
+                emergency_fund=args.emergency_fund,
+                near_term_use=args.near_term_use,
+                horizon=args.horizon,
+                volatility=args.risk_tolerance,
+                portfolio=None,
+            )
+            portfolio_weight_context = None
+            related_fund_context = None
+        data = build_fund_review(
+            fund_code=args.fund_code,
+            action=args.action,
+            brief=brief,
+            intelligence=intelligence,
+            market_scan=market_scan,
+            portfolio=portfolio,
+            horizon=args.horizon,
+            risk_tolerance=args.risk_tolerance,
+            near_term_use=args.near_term_use,
+            guardrails=guardrails,
+            portfolio_weight_context=portfolio_weight_context,
+            related_fund_context=related_fund_context,
         )
+        if portfolio_snapshot is not None:
+            data["portfolio_snapshot"] = portfolio_snapshot
+        if args.cached_public_context:
+            data["public_context_refresh"] = {
+                "state": "not_refreshed",
+                "text": "本次仅复用本地基金资料和当前组合快照，未刷新近期市场或网页来源。",
+            }
+        return envelope("fund.review", data)
 
     if args.command == "fund" and args.fund_command == "review-triggers":
         if not args.json_output:
@@ -4030,11 +4175,20 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         )
 
     if args.command == "portfolio" and args.portfolio_command == "show":
-        positions = _positions_payload(context)
+        sync, snapshot_positions = _portfolio_snapshot_reader(context)
+        positions = [serialize(position) for position in snapshot_positions]
         warnings = [] if positions else ["no synchronized portfolio is available"]
         return envelope(
             "portfolio.show",
-            {"freshness": data_freshness, "positions": positions},
+            {
+                "freshness": data_freshness,
+                "positions": positions,
+                "portfolio_snapshot": _snapshot_metadata(
+                    build_portfolio_snapshot_binding(sync, snapshot_positions),
+                    stability_state="stable",
+                    read_count=1,
+                ),
+            },
             warnings=warnings,
         )
 
@@ -4071,8 +4225,40 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
                 context.repository
             )
             diagnosis_service = DiagnosisService(context.repository, disclosure_store)
-        result = diagnosis_service.diagnose(args.candidate)
+        projection = run_consistent_portfolio_projection(
+            lambda: _portfolio_snapshot_reader(context),
+            lambda _binding, sync, positions: diagnosis_service.diagnose(
+                args.candidate, positions=positions, portfolio_sync=sync
+            ),
+        )
+        if projection.value is None:
+            return envelope(
+                "portfolio.diagnose",
+                {
+                    "portfolio_snapshot": _snapshot_metadata(
+                        projection.binding,
+                        stability_state=projection.stability_state,
+                        read_count=projection.read_count,
+                    ),
+                    "portfolio_projection": {
+                        "state": "stale_unmerged",
+                        "text": "组合在重算期间再次变化，未合并旧诊断与新快照。",
+                    },
+                },
+                errors=[
+                    {
+                        "code": "portfolio_snapshot_changed",
+                        "message": "Portfolio changed during bounded recalculation",
+                    }
+                ],
+            )
+        result = projection.value
         data = public_diagnosis_payload(result)
+        data["portfolio_snapshot"] = _snapshot_metadata(
+            projection.binding,
+            stability_state=projection.stability_state,
+            read_count=projection.read_count,
+        )
         errors = []
         if (
             result.relationship_coverage.evidence_state == "insufficient_data"
@@ -4187,10 +4373,6 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
         if not args.json_output:
             raise CliUsageError("fund candidates requires JSON mode")
         fund_codes = _validate_candidate_codes(args.fund_codes)
-        bundles, histories, positions = _comparison_inputs(context, fund_codes)
-        comparison = build_explicit_compare_report(
-            fund_codes, bundles, histories, positions, datetime.now(timezone.utc)
-        )
         guardrails = build_investor_guardrails(
             emergency_fund=args.emergency_fund,
             near_term_use=args.near_term_use,
@@ -4198,14 +4380,47 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             volatility=args.volatility,
             portfolio=None,
         )
-        return envelope(
-            "fund.candidates",
-            build_fund_candidate_review(
+        projection = run_consistent_portfolio_projection(
+            lambda: _portfolio_snapshot_reader(context),
+            lambda _binding, _sync, positions: build_fund_candidate_review(
                 fund_codes=fund_codes,
-                comparison=comparison,
+                comparison=build_explicit_compare_report(
+                    fund_codes,
+                    *_comparison_inputs(context, fund_codes, positions=positions)[:2],
+                    positions,
+                    datetime.now(timezone.utc),
+                ),
                 guardrails=guardrails,
             ),
         )
+        if projection.value is None:
+            return envelope(
+                "fund.candidates",
+                {
+                    "portfolio_snapshot": _snapshot_metadata(
+                        projection.binding,
+                        stability_state=projection.stability_state,
+                        read_count=projection.read_count,
+                    ),
+                    "portfolio_projection": {
+                        "state": "stale_unmerged",
+                        "text": "组合在重算期间再次变化，未输出旧候选映射。",
+                    },
+                },
+                errors=[
+                    {
+                        "code": "portfolio_snapshot_changed",
+                        "message": "Portfolio changed during bounded recalculation",
+                    }
+                ],
+            )
+        data = projection.value
+        data["portfolio_snapshot"] = _snapshot_metadata(
+            projection.binding,
+            stability_state=projection.stability_state,
+            read_count=projection.read_count,
+        )
+        return envelope("fund.candidates", data)
 
     if args.command == "fund" and args.fund_command == "shortlist":
         fund_codes = _validate_shortlist_codes(args.fund_codes)

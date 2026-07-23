@@ -1664,7 +1664,15 @@ class CliIntegrationTest(unittest.TestCase):
             patch("kunjin.cli.scan_public_research", return_value={"directions": []}),
         ):
             payload, exit_code, json_output = run(
-                ["--json", "fund", "review", "123456"], self.context
+                [
+                    "--json",
+                    "fund",
+                    "review",
+                    "123456",
+                    "--portfolio-context",
+                    "cached",
+                ],
+                self.context,
             )
 
         self.assertEqual(exit_code, 0, payload)
@@ -1673,6 +1681,37 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(payload["data"]["conclusion"]["disposition"], "需补充信息")
         self.assertFalse(
             payload["data"]["conditional_guidance"]["automatic_trade"]
+        )
+        self.assertEqual(
+            payload["data"]["portfolio_snapshot"]["stability_state"], "stable"
+        )
+
+    def test_fund_review_cached_public_context_skips_brief_and_market_refresh(self) -> None:
+        class MustNotRefresh:
+            def __getattr__(self, _name):
+                raise AssertionError("cached fund review must not refresh public sources")
+
+        self.context.brief_service = MustNotRefresh()
+        self.context.intelligence_service = MustNotRefresh()
+        payload, exit_code, json_output = run(
+            [
+                "--json",
+                "fund",
+                "review",
+                "016067",
+                "--portfolio-context",
+                "cached",
+                "--cached-public-context",
+            ],
+            self.context,
+        )
+
+        self.assertEqual(exit_code, 0, payload)
+        self.assertTrue(json_output)
+        self.assert_envelope(payload, "fund.review")
+        self.assertEqual(payload["data"]["public_context_refresh"]["state"], "not_refreshed")
+        self.assertEqual(
+            payload["data"]["portfolio_snapshot"]["stability_state"], "stable"
         )
 
     def test_fund_review_related_group_is_explicit_and_non_transactional(self) -> None:
@@ -1771,6 +1810,30 @@ class CliIntegrationTest(unittest.TestCase):
         self.assert_envelope(payload, "fund.candidates")
         self.assertEqual(payload["data"]["conclusion"]["disposition"], "需补充个人信息")
         self.assertFalse(payload["data"]["conditional_guidance"]["automatic_trade"])
+        self.assertEqual(
+            payload["data"]["portfolio_snapshot"]["stability_state"], "stable"
+        )
+
+    def test_portfolio_show_and_diagnose_share_one_snapshot_binding(self) -> None:
+        shown, shown_exit, _ = run(["--json", "portfolio", "show"], self.context)
+        diagnosed, diagnosed_exit, _ = run(
+            ["--json", "portfolio", "diagnose"], self.context
+        )
+
+        self.assertEqual(shown_exit, 0, shown)
+        self.assertEqual(diagnosed_exit, 1, diagnosed)
+        self.assertEqual(diagnosed["errors"][0]["code"], "insufficient_data")
+        snapshot = shown["data"]["portfolio_snapshot"]
+        diagnosis_snapshot = diagnosed["data"]["portfolio_snapshot"]
+        for key in (
+            "sync_run_id",
+            "observation_version",
+            "observation_at",
+            "positive_position_count",
+            "positive_position_fingerprint",
+        ):
+            self.assertEqual(snapshot[key], diagnosis_snapshot[key])
+        self.assertEqual(diagnosis_snapshot["stability_state"], "stable")
 
     def test_fund_review_triggers_are_on_demand_only(self) -> None:
         payload, exit_code, json_output = run(
