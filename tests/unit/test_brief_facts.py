@@ -295,6 +295,19 @@ def test_stale_top10_holdings_and_missing_redemption_period_fail_closed() -> Non
     assert "redemption_holding_period_rules_are_missing" in result.warnings
 
 
+def test_ambiguous_top_ten_group_is_not_projected_as_overlap_fact() -> None:
+    bundle = _rapid_bundle()
+    duplicate = replace(bundle.holdings[0], security_code="000002", security_name="另一组")
+
+    result = build_source_linked_facts(
+        replace(bundle, holdings=(bundle.holdings[0], duplicate)),
+        AS_OF,
+        action_ids=("fact_research", "continue_holding"),
+    )
+
+    assert not [fact for fact in result.facts if fact.field_id == "holdings_industries"]
+
+
 def test_tier1_current_manager_wins_and_lower_tier_conflict_is_retained() -> None:
     bundle = _rapid_bundle()
     tier1_source = replace(

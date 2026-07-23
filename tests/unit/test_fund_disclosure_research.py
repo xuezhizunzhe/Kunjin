@@ -176,6 +176,44 @@ def test_holdings_report_does_not_merge_repeated_top_ten_ranks() -> None:
         (1, "浦发银行")
     ]
     assert "multiple_top10_table_groups" in report["warnings"]
+    assert report["holdings"]["evidence_level"] == "partial"
+    assert report["holdings"]["selection"]["report_period_binding"] == "unresolved"
+    assert "historical_top10_group_unbound" in report["holdings"]["conflicts"]
+
+
+def test_holdings_report_keeps_interleaved_historical_rows_display_only() -> None:
+    bundle = complete_bundle()
+    second_group = tuple(
+        FundHolding(
+            "519755",
+            date(2026, 6, 30),
+            datetime(2026, 7, 8, tzinfo=timezone.utc),
+            rank,
+            f"00000{rank}",
+            f"另一组{rank}",
+            AssetType.STOCK,
+            Decimal("4.20"),
+            "top10",
+            5,
+        )
+        for rank in (1, 2)
+    )
+    first_group_rank_two = FundHolding(
+        "519755", date(2026, 6, 30), datetime(2026, 7, 8, tzinfo=timezone.utc),
+        2, "600001", "原组2", AssetType.STOCK, Decimal("4.10"), "top10", 5,
+    )
+
+    report = build_disclosure_report(
+        replace(
+            bundle,
+            holdings=(bundle.holdings[0], second_group[0], first_group_rank_two, second_group[1]),
+        ),
+        AS_OF,
+    )
+
+    assert report["holdings"]["evidence_level"] == "partial"
+    assert report["holdings"]["selection"]["rule"] == "first_complete_rank_group_for_display_only"
+    assert [item["rank"] for item in report["holdings"]["items"]] == [1]
 
 
 class FundDisclosureResearchTest(unittest.TestCase):

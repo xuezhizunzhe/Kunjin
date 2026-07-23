@@ -285,6 +285,37 @@ def _holdings_report(
         unique_rank_primary.append(record)
     if duplicate_rank_group:
         primary = unique_rank_primary
+    section_status = bundle.section_statuses.get(DocumentKind.QUARTERLY_HOLDINGS.value, {})
+    section_warning = str(section_status.get("warning") or "")
+    parser_group_ambiguous = "top10_table_group_display_only" in section_warning
+    selection = {
+        "rule": (
+            "first_complete_rank_group_for_display_only"
+            if duplicate_rank_group
+            else (
+                "parser_selected_display_group"
+                if parser_group_ambiguous
+                else "single_bound_table_group"
+            )
+        ),
+        "report_period_binding": (
+            "unresolved" if duplicate_rank_group or parser_group_ambiguous else "verified"
+        ),
+        "uncertainty": (
+            "Repeated ranks cannot reconstruct historical table groups."
+            if duplicate_rank_group
+            else (
+                "The source page did not bind the displayed table group to one report period."
+                if parser_group_ambiguous
+                else None
+            )
+        ),
+    }
+    holding_conflicts = []
+    if duplicate_rank_group:
+        holding_conflicts.append("historical_top10_group_unbound")
+    if parser_group_ambiguous:
+        holding_conflicts.append("multiple_top10_table_groups_unbound")
     publication_dates = [
         record.published_at for record in primary if record.published_at is not None
     ]
@@ -301,7 +332,9 @@ def _holdings_report(
     if duplicate_rank_group:
         warnings.append("multiple_top10_table_groups")
     return {
-        "evidence_level": "verified_fact",
+        "evidence_level": (
+            "partial" if holding_conflicts else "verified_fact"
+        ),
         "report_period": report_period.isoformat(),
         "published_at": _iso(published_at),
         "disclosure_scopes": sorted({record.disclosure_scope for record in primary}),
@@ -312,6 +345,8 @@ def _holdings_report(
             for record in sorted(primary, key=lambda item: (item.rank, item.security_code))
         ],
         "source_document_ids": _source_ids(primary),
+        "selection": selection,
+        "conflicts": holding_conflicts,
     }, warnings
 
 

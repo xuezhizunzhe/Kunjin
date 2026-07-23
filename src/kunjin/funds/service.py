@@ -330,12 +330,19 @@ class FundDisclosureService:
             spec = self._spec(section_name)
             try:
                 parsed = self._fetch_and_parse(fund_code, spec)
+                # The historical disclosure table only persists success/not-disclosed
+                # source states. A parser-level partial result is stored with its
+                # explicit warning, and downstream reporting preserves the partial
+                # evidence semantics rather than claiming a verified Top10 fact.
+                publication_state = (
+                    "success" if parsed.state == "partial" else parsed.state
+                )
                 self.store.publish_section(
                     fund_code,
                     spec.document_kind,
                     parsed.source,
                     parsed.records,
-                    parsed.state,
+                    publication_state,
                     warning="; ".join(parsed.warnings) or None,
                 )
                 conflicts.extend(

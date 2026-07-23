@@ -756,7 +756,11 @@ def _project_disclosure(
     holding_report = report["holdings"]
     holding_state = holding_report["freshness"]
     grouped: Dict[int, List[dict]] = {}
-    for item in holding_report["items"]:
+    for item in (
+        holding_report["items"]
+        if holding_report["evidence_level"] == "verified_fact"
+        else []
+    ):
         source_document_id = item["source_document_id"]
         if type(source_document_id) is int:
             grouped.setdefault(source_document_id, []).append(item)

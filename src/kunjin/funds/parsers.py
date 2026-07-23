@@ -894,15 +894,39 @@ def parse_quarterly_holdings(
         )
         if title_match is None:
             raise FundParseError("invalid_disclosure_date")
-        report_period = _quarter_end_from_title(_visible_text(title_match.group(1)))
         dynamic_definitions = (
             ("rank", ("序号", "排名")),
             ("code", ("股票代码", "证券代码")),
             ("name", ("股票名称", "证券名称")),
             ("weight", ("占净值比例", "占基金净值比")),
         )
-        table_groups: List[Tuple[object, ...]] = []
-        for table in parse_tables(content, response.final_url):
+        table_groups: List[Tuple[Optional[date], Tuple[object, ...]]] = []
+        page_period = _quarter_end_from_title(_visible_text(title_match.group(1)))
+        table_matches = tuple(
+            re.finditer(r"<table\b[^>]*>.*?</table\s*>", content, re.DOTALL | re.IGNORECASE)
+        )
+        previous_table_end = 0
+        for table_match in table_matches:
+            parsed_tables = parse_tables(table_match.group(0), response.final_url)
+            if len(parsed_tables) != 1:
+                raise FundParseError("malformed_quarterly_holding")
+            table = parsed_tables[0]
+            local_headings = tuple(
+                re.finditer(
+                    r"<h[1-6][^>]*>(.*?)</h[1-6]>",
+                    content[previous_table_end:table_match.start()],
+                    re.DOTALL | re.IGNORECASE,
+                )
+            )
+            previous_table_end = table_match.end()
+            table_period = None
+            if local_headings:
+                try:
+                    table_period = _quarter_end_from_title(
+                        _visible_text(local_headings[-1].group(1))
+                    )
+                except FundParseError:
+                    pass
             try:
                 indexes = _required_indexes(table.headers, dynamic_definitions)
             except FundParseError:
@@ -922,7 +946,9 @@ def parse_quarterly_holdings(
                     value_text = "" if value_index is None else _normalize_text(row[value_index])
                     record = FundHolding(
                         fund_code=fund_code,
-                        report_period=report_period,
+                        # An unlabelled table remains displayable, but is never
+                        # treated as period-verified below.
+                        report_period=page_period if table_period is None else table_period,
                         published_at=None,
                         rank=int(_normalize_text(row[indexes["rank"]])),
                         security_code=_normalize_text(row[indexes["code"]]),
@@ -947,20 +973,43 @@ def parse_quarterly_holdings(
                     raise FundParseError("malformed_quarterly_holding") from exc
                 table_records.append(record)
             if table_records:
-                table_groups.append(tuple(table_records))
+                table_groups.append((table_period, tuple(table_records)))
         if table_groups:
-            # The dynamic endpoint can embed more than one visually identical Top10
-            # table. They are not comparable without an explicit table-level label.
-            records = list(table_groups[0])
             warnings = ["publication_date_requires_announcement_match"]
-            if len(table_groups) > 1:
+            conflicts: Tuple[str, ...] = ()
+            state = "success"
+            selected_period, selected_records = table_groups[0]
+            if len(table_groups) == 1 and selected_period is None:
+                state = "partial"
+                warnings.append("top10_table_group_display_only")
+                conflicts = ("top10_table_group_report_period_unbound",)
+            elif len(table_groups) > 1:
                 warnings.append("multiple_top10_table_groups")
+                matching_groups = [
+                    group for group in table_groups if group[0] == page_period
+                ]
+                if (
+                    len(matching_groups) == 1
+                    and all(group[0] is not None for group in table_groups)
+                ):
+                    selected_period, selected_records = matching_groups[0]
+                    warnings.append("top10_table_group_selected_by_heading")
+                else:
+                    # A deterministic view helps a human inspect the response,
+                    # but duplicate/unlabelled groups cannot establish one report period.
+                    state = "partial"
+                    warnings.append("top10_table_group_display_only")
+                    conflicts = ("multiple_top10_table_groups_unbound",)
+                    if matching_groups:
+                        selected_period, selected_records = matching_groups[0]
+            records = list(selected_records)
             return ParsedSection(
                 DocumentKind.QUARTERLY_HOLDINGS.value,
                 source,
                 tuple(records),
-                "success",
+                state,
                 warnings=tuple(warnings),
+                conflicts=conflicts,
             )
     definitions = (
         ("report_period", ("报告期", "报告日期", "截止日期")),

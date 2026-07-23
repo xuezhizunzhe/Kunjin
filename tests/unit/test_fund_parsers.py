@@ -431,7 +431,7 @@ class FundHoldingParserTest(unittest.TestCase):
         self.assertEqual(holding.shares, Decimal("123000"))
         self.assertEqual(holding.market_value, Decimal("4567000"))
 
-    def test_dynamic_top_ten_parser_keeps_one_complete_table_group(self) -> None:
+    def test_dynamic_top_ten_parser_marks_unbound_duplicate_groups_partial(self) -> None:
         base = response("quarterly_holdings.html", "FundArchivesDatas.aspx?type=jjcc")
         content = """
           <h4>2026年2季度股票投资明细</h4>
@@ -450,7 +450,53 @@ class FundHoldingParserTest(unittest.TestCase):
             [(item.rank, item.security_code) for item in section.records],
             [(1, "000001")],
         )
+        self.assertEqual(section.state, "partial")
         self.assertIn("multiple_top10_table_groups", section.warnings)
+        self.assertIn("multiple_top10_table_groups_unbound", section.conflicts)
+
+    def test_dynamic_top_ten_parser_selects_group_bound_to_page_period_not_dom_order(self) -> None:
+        base = response("quarterly_holdings.html", "FundArchivesDatas.aspx?type=jjcc")
+        content = """
+          <h4>2026年2季度股票投资明细</h4>
+          <h5>2026年1季度股票投资明细</h5>
+          <table><tr><th>序号</th><th>股票代码</th><th>股票名称</th><th>占净值比例</th></tr>
+          <tr><td>1</td><td>000001</td><td>一季度公司</td><td>6.25%</td></tr></table>
+          <h5>2026年2季度股票投资明细</h5>
+          <table><tr><th>序号</th><th>股票代码</th><th>股票名称</th><th>占净值比例</th></tr>
+          <tr><td>1</td><td>000002</td><td>二季度公司</td><td>5.25%</td></tr></table>
+        """
+        wrapped = "var apidata={content:" + json.dumps(content, ensure_ascii=False) + "};"
+
+        section = parse_quarterly_holdings(
+            TextResponse(**{**base.__dict__, "text": wrapped}), "519755"
+        )
+
+        self.assertEqual(section.state, "success")
+        self.assertEqual(
+            [(item.report_period, item.security_code) for item in section.records],
+            [(date(2026, 6, 30), "000002")],
+        )
+        self.assertIn("top10_table_group_selected_by_heading", section.warnings)
+
+    def test_dynamic_top_ten_parser_does_not_verify_unlabeled_table_group(self) -> None:
+        base = response("quarterly_holdings.html", "FundArchivesDatas.aspx?type=jjcc")
+        content = """
+          <h4>2026年2季度股票投资明细</h4>
+          <table><tr><th>序号</th><th>股票代码</th><th>股票名称</th><th>占净值比例</th></tr>
+          <tr><td>1</td><td>000001</td><td>甲公司</td><td>6.25%</td></tr></table>
+          <div>同类展示</div>
+          <table><tr><th>序号</th><th>股票代码</th><th>股票名称</th><th>占净值比例</th></tr>
+          <tr><td>1</td><td>000002</td><td>乙公司</td><td>5.25%</td></tr></table>
+        """
+        wrapped = "var apidata={content:" + json.dumps(content, ensure_ascii=False) + "};"
+
+        section = parse_quarterly_holdings(
+            TextResponse(**{**base.__dict__, "text": wrapped}), "519755"
+        )
+
+        self.assertEqual(section.state, "partial")
+        self.assertIn("top10_table_group_display_only", section.warnings)
+        self.assertIn("multiple_top10_table_groups_unbound", section.conflicts)
 
     def test_parses_realistic_industry_json_without_guessing_standard_version(self) -> None:
         base = response("industry_exposure.html", "f10/HYPZ/?fundCode=519755&year=2026")
