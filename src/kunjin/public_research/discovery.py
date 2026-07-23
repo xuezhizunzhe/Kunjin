@@ -20,6 +20,14 @@ _TRUSTED_SOURCE_CLASSES = frozenset(
 )
 _ATTEMPT_ROLES = ("primary", "trusted_alternative")
 _READ_STATES = frozenset({"read", "blocked"})
+_DISCOVERY_TERMS = {
+    "coal_oil_gas": "煤炭 油气 产量 价格 政策",
+    "shipping_trade": "港口 集装箱吞吐量 出口 运价",
+    "ai_compute": "人工智能 算力 半导体 订单 供给",
+    "consumer": "消费 零售 餐饮 旅游 销售",
+    "industrial_commodities": "钢铁 有色 化工 产量 价格 库存",
+    "weather": "高温 降雨 台风 干旱 能源 交通 农业",
+}
 
 
 def build_candidate_discovery_plan(scan_payload: Mapping[str, object]) -> dict[str, object]:
@@ -44,7 +52,7 @@ def build_candidate_discovery_plan(scan_payload: Mapping[str, object]) -> dict[s
             {
                 "domain_id": domain_id,
                 "domain_name": domain_name,
-                "query": f"{domain_name} 最近一周 行业数据 市场变化",
+                "query": _discovery_query(domain_id, domain_name),
                 "discovery_query_executed": False,
                 "direct_page_read_count": 0,
                 "independent_source_count": 0,
@@ -212,6 +220,11 @@ def _text(value: object, name: str) -> str:
     if not isinstance(value, str) or not (text := " ".join(value.split())):
         raise ValueError(f"{name} is invalid")
     return text
+
+
+def _discovery_query(domain_id: str, domain_name: str) -> str:
+    terms = _DISCOVERY_TERMS.get(domain_id, "行业数据 市场变化")
+    return f"{domain_name} 最近一周 {terms}"
 
 
 def _optional_text(value: object, name: str) -> str | None:

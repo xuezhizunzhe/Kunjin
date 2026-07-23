@@ -32,6 +32,28 @@ def test_discovery_plan_uses_separate_bounded_query_per_candidate() -> None:
     assert all(item["current_news_refresh_state"] == "pending" for item in plans)
 
 
+def test_discovery_plan_uses_domain_terms_without_fixed_source_sites() -> None:
+    result = build_candidate_discovery_plan(
+        {
+            "candidate_directions": [
+                {"domain_id": "coal_oil_gas", "domain_name": "煤炭与油气"},
+                {"domain_id": "shipping_trade", "domain_name": "航运、港口与外贸"},
+                {"domain_id": "ai_compute", "domain_name": "AI 与算力"},
+                {"domain_id": "consumer", "domain_name": "消费"},
+            ]
+        }
+    )
+
+    plans = result["candidate_plans"]
+    assert [item["domain_id"] for item in plans] == [
+        "coal_oil_gas", "shipping_trade", "ai_compute",
+    ]
+    assert "煤炭 油气" in plans[0]["query"]
+    assert "集装箱吞吐量 出口" in plans[1]["query"]
+    assert "算力 半导体" in plans[2]["query"]
+    assert all("http" not in item["query"] for item in plans)
+
+
 def test_search_only_discovery_is_partial_not_completed() -> None:
     plan = build_candidate_discovery_plan(_scan())["candidate_plans"][0]
 
