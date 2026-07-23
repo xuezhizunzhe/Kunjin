@@ -21,10 +21,14 @@ _TRUSTED_SOURCE_CLASSES = frozenset(
 _ATTEMPT_ROLES = ("primary", "trusted_alternative")
 _READ_STATES = frozenset({"read", "blocked"})
 _DISCOVERY_TERMS = {
+    "autos": "整车 新能源汽车 零售 交付 价格 产销",
+    "power_energy": "用电量 电网 绿电 发电量 价格",
+    "real_estate_materials": "新房价格 销售 水泥 建材 开工",
     "coal_oil_gas": "煤炭 油气 产量 价格 政策",
     "shipping_trade": "港口 集装箱吞吐量 出口 运价",
     "ai_compute": "人工智能 算力 半导体 订单 供给",
-    "consumer": "消费 零售 餐饮 旅游 销售",
+    "healthcare": "医药 生物医药 医疗器械 集采 业绩",
+    "consumer": "食品饮料 旅游 服装 家电 零售",
     "industrial_commodities": "钢铁 有色 化工 产量 价格 库存",
     "weather": "高温 降雨 台风 干旱 能源 交通 农业",
 }
@@ -53,6 +57,13 @@ def build_candidate_discovery_plan(scan_payload: Mapping[str, object]) -> dict[s
                 "domain_id": domain_id,
                 "domain_name": domain_name,
                 "query": _discovery_query(domain_id, domain_name),
+                "research_window": ["近一周", "近一月"],
+                "evidence_requirements": [
+                    "原始 HTTPS URL",
+                    "发布日期",
+                    "统计期或行情有效时间",
+                    "来源层级与原始数据归属（如适用）",
+                ],
                 "discovery_query_executed": False,
                 "direct_page_read_count": 0,
                 "independent_source_count": 0,
@@ -63,6 +74,10 @@ def build_candidate_discovery_plan(scan_payload: Mapping[str, object]) -> dict[s
                     "direct_page_attempts": _MAX_DIRECT_PAGE_ATTEMPTS,
                     "primary_direct_page_reads": 1,
                     "trusted_alternative_direct_page_reads": 1,
+                },
+                "time_limits": {
+                    "per_direct_page_seconds": 30,
+                    "total_refresh_seconds": 120,
                 },
                 "source_order": [
                     "official_or_regulator",
@@ -75,8 +90,9 @@ def build_candidate_discovery_plan(scan_payload: Mapping[str, object]) -> dict[s
                     "搜索结果页、媒体线索或转载本身不能构成完成。"
                 ),
                 "failure_fallback": (
-                    "主页面受阻后最多读取一个可信替代页；仍不足则记录 partial 或 blocked，"
-                    "不继续轮询。"
+                    "当日结构化行情不可用时，继续用本方向的近一周材料；不足时再用近一月材料。"
+                    "主页面受阻后最多读取一个可信替代页；"
+                    "仍不足则记录 partial 或 blocked，不继续轮询。"
                 ),
             }
         )
@@ -224,7 +240,7 @@ def _text(value: object, name: str) -> str:
 
 def _discovery_query(domain_id: str, domain_name: str) -> str:
     terms = _DISCOVERY_TERMS.get(domain_id, "行业数据 市场变化")
-    return f"{domain_name} 最近一周 {terms}"
+    return f"{domain_name} 最近一周 近一月 {terms}"
 
 
 def _optional_text(value: object, name: str) -> str | None:

@@ -42,13 +42,16 @@ def build_fund_review(
         if not value
     ]
     disposition = "需补充信息" if missing else _disposition(action)
-    if guardrails is not None and guardrails.get("readiness") != "可以继续研究":
+    if guardrails is not None and guardrails.get("readiness") == "先降低风险":
         disposition = "需补充信息"
     market_context = _market_context(intelligence, market_scan, brief)
     return {
         "conclusion": {
             "disposition": disposition,
-            "text": "以下是条件性复核，不构成买卖指令、收益承诺或精确金额建议。",
+            "text": (
+                "以下是条件性持有研究，不构成买卖指令、收益承诺或精确金额建议，"
+                "也不需要交易授权。"
+            ),
         },
         "fund_code": fund_code,
         "public_facts": {
@@ -88,7 +91,11 @@ def build_fund_review(
         "conditional_guidance": {
             "action_authorized": False,
             "automatic_trade": False,
-            "text": "证据足够时仅给出继续研究、观察或人工复核方向。",
+            "ordinary_research_available": True,
+            "text": (
+                "个人信息缺失时仍可给出事实与条件性观察；"
+                "补齐期限、风险和近期用途后再细化边界。"
+            ),
         },
     }
 
@@ -216,7 +223,12 @@ def _source_facts(value: object) -> list[dict[str, object]]:
         if not any(term in topic_text for term in _THEME_MARKET_TERMS):
             continue
         source = item.get("source")
-        if not isinstance(source, Mapping) or not source.get("url"):
+        if (
+            not isinstance(source, Mapping)
+            or not source.get("url")
+            or not isinstance(source.get("published_at"), str)
+            or not source["published_at"].strip()
+        ):
             continue
         facts.append(
             {

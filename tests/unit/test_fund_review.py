@@ -73,6 +73,24 @@ def test_review_keeps_a_non_ready_profile_at_information_gathering() -> None:
     assert result["conclusion"]["disposition"] == "需补充信息"
 
 
+def test_review_keeps_holding_research_available_when_only_emergency_fund_is_unknown() -> None:
+    result = build_fund_review(
+        fund_code="123456",
+        action="continue_holding",
+        brief={},
+        intelligence={},
+        market_scan={},
+        portfolio=None,
+        horizon="long",
+        risk_tolerance="medium",
+        near_term_use="no",
+        guardrails={"readiness": "需补充信息", "missing_information": ["应急资金情况"]},
+    )
+
+    assert result["conclusion"]["disposition"] == "继续持有复核"
+    assert result["conditional_guidance"]["ordinary_research_available"] is True
+
+
 def test_review_keeps_market_context_empty_without_source_backed_facts() -> None:
     result = build_fund_review(
         fund_code="123456",
@@ -161,6 +179,31 @@ def test_review_keeps_only_theme_relevant_market_facts_with_sources() -> None:
     assert [item["source"]["url"] for item in context["facts"]] == [
         "https://example.test/ai"
     ]
+
+
+def test_review_omits_market_claim_without_a_published_date() -> None:
+    result = build_fund_review(
+        fund_code="123456",
+        action="continue_holding",
+        brief={"facts": []},
+        intelligence={
+            "what_happened": [
+                {
+                    "title": "新能源汽车产业链的锂矿概念上涨",
+                    "excerpt": "新能源汽车相关的锂矿概念上涨4.87%。",
+                    "source": {"url": "https://example.test/lithium"},
+                }
+            ]
+        },
+        market_scan={"directions": []},
+        portfolio=None,
+        horizon="long",
+        risk_tolerance="medium",
+        near_term_use="no",
+        guardrails={"readiness": "可以继续研究"},
+    )
+
+    assert result["market_and_industry_context"]["state"] == "insufficient_data"
 
 
 def test_review_projects_deduplicated_market_facts_with_verified_source_label() -> None:

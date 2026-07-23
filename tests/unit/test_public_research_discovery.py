@@ -29,7 +29,11 @@ def test_discovery_plan_uses_separate_bounded_query_per_candidate() -> None:
     ]
     assert len({item["query"] for item in plans}) == 3
     assert all(item["attempt_limits"]["direct_page_attempts"] == 2 for item in plans)
+    assert all(item["time_limits"]["per_direct_page_seconds"] == 30 for item in plans)
+    assert all(item["time_limits"]["total_refresh_seconds"] == 120 for item in plans)
     assert all(item["current_news_refresh_state"] == "pending" for item in plans)
+    assert all(item["research_window"] == ["近一周", "近一月"] for item in plans)
+    assert all("原始 HTTPS URL" in item["evidence_requirements"] for item in plans)
 
 
 def test_discovery_plan_uses_domain_terms_without_fixed_source_sites() -> None:
@@ -52,6 +56,21 @@ def test_discovery_plan_uses_domain_terms_without_fixed_source_sites() -> None:
     assert "集装箱吞吐量 出口" in plans[1]["query"]
     assert "算力 半导体" in plans[2]["query"]
     assert all("http" not in item["query"] for item in plans)
+
+
+def test_discovery_plan_expands_healthcare_and_consumer_without_fixed_sites() -> None:
+    result = build_candidate_discovery_plan(
+        {
+            "candidate_directions": [
+                {"domain_id": "healthcare", "domain_name": "医药"},
+                {"domain_id": "consumer", "domain_name": "消费"},
+            ]
+        }
+    )
+
+    plans = result["candidate_plans"]
+    assert "医疗器械" in plans[0]["query"]
+    assert "食品饮料 旅游 服装 家电" in plans[1]["query"]
 
 
 def test_search_only_discovery_is_partial_not_completed() -> None:
