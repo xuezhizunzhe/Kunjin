@@ -37,6 +37,25 @@ def test_review_uses_conditional_action_label_with_constraints() -> None:
     assert result["portfolio_context"]["input_source"] == "cached"
 
 
+def test_review_keeps_combined_fund_profile_with_disclosure_boundary() -> None:
+    profile = {
+        "identity_and_share_classes": {"identity": {"fund_name": "示例基金"}},
+        "formal_nav_risk_metrics": {"period_returns": {"30d": "0.01"}},
+        "quarterly_disclosure": {"holdings": {"report_period": "2026-06-30"}},
+        "boundary": "季度披露有日期边界。",
+    }
+    result = build_fund_review(
+        fund_code="123456",
+        action="continue_holding",
+        brief={}, intelligence={}, market_scan={}, portfolio=None,
+        horizon="long", risk_tolerance="high", near_term_use="no",
+        fund_profile=profile,
+    )
+
+    assert result["fund_profile"] == profile
+    assert result["public_facts"]["fund_profile"] == profile
+
+
 def test_review_keeps_a_non_ready_profile_at_information_gathering() -> None:
     result = build_fund_review(
         fund_code="123456",

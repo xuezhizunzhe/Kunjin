@@ -22,8 +22,8 @@ def _period_return(history: Sequence[FundNavObservation], days: int) -> Optional
 def analyze_fund_history(history: Sequence[FundNavObservation]) -> Dict[str, Any]:
     ordered = sorted(history, key=lambda item: item.nav_date)
     warnings = [
-        "benchmark comparison is not available in phase two",
-        "manager tenure, fees, holdings, and fund size are not available in phase two",
+        "该计算只覆盖本地已保存的正式净值；未计算相对基准超额收益。",
+        "经理、费用、规模和季度披露应通过基金复核中的带日期公开资料分别核对。",
     ]
     if len(ordered) < 2:
         return {
@@ -89,6 +89,15 @@ def analyze_fund_history(history: Sequence[FundNavObservation]) -> Dict[str, Any
         "drawdown_peak_date": drawdown_peak_date.isoformat(),
         "trough_date": trough_date.isoformat(),
         "recovery_date": None if recovery_date is None else recovery_date.isoformat(),
+        "peak_to_trough_days": (
+            None if max_drawdown == 0 else (trough_date - drawdown_peak_date).days
+        ),
+        "trough_to_recovery_days": (
+            None if recovery_date is None else (recovery_date - trough_date).days
+        ),
+        "peak_to_recovery_days": (
+            None if recovery_date is None else (recovery_date - drawdown_peak_date).days
+        ),
         "evidence_level": "deterministic_calculation",
         "warnings": warnings,
     }

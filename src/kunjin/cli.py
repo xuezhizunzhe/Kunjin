@@ -1620,6 +1620,40 @@ def _cached_fund_review_brief(context: ApplicationContext, fund_code: str) -> Di
     return {"facts": facts, "cached_public_context": True}
 
 
+def _fund_review_profile(
+    context: ApplicationContext, fund_code: str
+) -> Dict[str, object]:
+    """Combine existing dated disclosure and formal-NAV calculations for review."""
+    report = _disclosure_report(context, fund_code)
+    nav = analyze_fund_history(context.repository.fund_history(fund_code))
+    return {
+        "state": "source_backed" if report["evidence_level"] == "verified_fact" else "partial",
+        "identity_and_share_classes": {
+            "identity": report["identity"],
+            "share_classes": report["share_classes"],
+        },
+        "managers": report["managers"],
+        "benchmarks": report["benchmarks"],
+        "fund_size": report["sizes"],
+        "fees_and_redemption": report["fees"],
+        "formal_nav_risk_metrics": nav,
+        "quarterly_disclosure": {
+            "holdings": report["holdings"],
+            "industry_exposure": report["industry_exposure"],
+        },
+        "announcements": report["announcements"],
+        "sources": report["sources"],
+        "freshness": report["freshness"],
+        "warnings": report["warnings"],
+        "conflicts": report["conflicts"],
+        "missing_sections": report["missing_sections"],
+        "boundary": (
+            "季度持仓和行业配置仅代表带日期的已披露范围；净值计算仅使用本地已保存的正式净值，"
+            "均不代表实时完整持仓或未来收益。"
+        ),
+    }
+
+
 def _disclosure_errors(context: ApplicationContext, fund_code: str) -> List[Dict[str, str]]:
     if context.fund_disclosure_store is None:
         return []
@@ -3616,6 +3650,7 @@ def execute(args: argparse.Namespace, context: ApplicationContext) -> Dict[str, 
             guardrails=guardrails,
             portfolio_weight_context=portfolio_weight_context,
             related_fund_context=related_fund_context,
+            fund_profile=_fund_review_profile(context, args.fund_code),
         )
         if portfolio_snapshot is not None:
             data["portfolio_snapshot"] = portfolio_snapshot

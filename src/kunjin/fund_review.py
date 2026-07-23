@@ -30,6 +30,7 @@ def build_fund_review(
     guardrails: Mapping[str, object] | None = None,
     portfolio_weight_context: Mapping[str, object] | None = None,
     related_fund_context: Mapping[str, object] | None = None,
+    fund_profile: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     missing = [
         label
@@ -52,11 +53,17 @@ def build_fund_review(
         "fund_code": fund_code,
         "public_facts": {
             "brief": brief,
+            "fund_profile": fund_profile
+            if fund_profile is not None
+            else {"state": "not_available", "text": "本次未取得本地基金资料汇总。"},
             "recent_market_facts": market_context.get("facts", []),
             "retrieval": intelligence.get("retrieval", {}),
             "benchmark_evidence": _benchmark_evidence(brief),
         },
         "market_and_industry_context": market_context,
+        "fund_profile": fund_profile
+        if fund_profile is not None
+        else {"state": "not_available", "text": "本次未取得本地基金资料汇总。"},
         "portfolio_context": portfolio
         if portfolio is not None
         else {"state": "not_provided", "text": "未提供组合上下文，本次不判断组合集中度或重叠。"},

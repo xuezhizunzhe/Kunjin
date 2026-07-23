@@ -29,6 +29,10 @@ class ResearchTest(unittest.TestCase):
 
         self.assertEqual(result["max_drawdown"], "0.2")
         self.assertEqual(result["recovery_date"], "2026-03-01")
+        self.assertEqual(result["peak_to_trough_days"], 31)
+        self.assertEqual(result["trough_to_recovery_days"], 28)
+        self.assertEqual(result["peak_to_recovery_days"], 59)
+        self.assertNotIn("phase two", " ".join(result["warnings"]).casefold())
 
     def test_insufficient_history_is_explicit(self) -> None:
         result = analyze_fund_history([self.nav(date(2026, 1, 1), "1.0")])
